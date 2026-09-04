@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Environment & secrets (never commit)
+.env
+.env.local
+
+# Local state (checkpointer db)
+*.db
+*.sqlite3
+
+# OS
+.DS_Store
+Thumbs.db
