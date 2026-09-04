@@ -19,7 +19,9 @@ dependencies = [
     "langchain-core>=1.6",
     # openai-compatible LLM client (deepseek / zhipu / custom all use ChatOpenAI).
     "langchain-openai>=1.6",
-    "pydantic-settings>=2.0",
+    # Floor 2.2: NoDecode (needed to accept plain comma-separated values for
+    # list-typed env fields like AGENT_MODULES) was added in 2.2.
+    "pydantic-settings>=2.2",
 ]
 
 [project.scripts]

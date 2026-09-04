@@ -14,8 +14,11 @@ Design notes (inherited from chat-agent review):
 
 from __future__ import annotations
 
+import json
+from typing import Annotated
+
 from pydantic import Field, SecretStr, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 # openai-compatible providers the base knows how to assemble. All share the
 # same ChatOpenAI client; this set only guards against config typos.
@@ -46,9 +49,14 @@ class Settings(BaseSettings):
     )
 
     # -- modules ------------------------------------------------------------
-    # Comma-separated module names to load; order == assembly order.
+    # Module names to load; order == assembly order.
+    # Accepted forms: comma-separated ("chat,writer") or a JSON array
+    # (["chat","writer"]). NoDecode stops pydantic-settings from JSON-decoding
+    # list-typed env values BEFORE validation — that pre-decode rejected the
+    # plain comma form in .env with "error parsing value for field
+    # agent_modules"; the before-validator below does the real parsing.
     # The registry resolves each name to agent_base.modules.<name>.
-    agent_modules: list[str] = Field(default_factory=lambda: ["chat"])
+    agent_modules: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["chat"])
 
     # -- LLM (openai-compatible) -------------------------------------------
     llm_provider: str = "deepseek"
@@ -66,14 +74,39 @@ class Settings(BaseSettings):
     @field_validator("agent_modules", mode="before")
     @classmethod
     def _parse_agent_modules(cls, value: object) -> object:
-        """Split a comma-separated ``AGENT_MODULES`` string into a list.
+        """Parse ``AGENT_MODULES`` into a list of names.
 
-        Works for both env-var input (``"chat,writer"``) and direct list
-        input (already-split). Empty segments are dropped.
+        Accepts the friendly comma form (``"chat,writer"``) and a JSON array
+        (``'["chat","writer"]'``). Empty input -> empty list. Works for env
+        vars, .env files, and direct init-kwargs alike.
         """
         if isinstance(value, str):
-            return [part.strip() for part in value.split(",") if part.strip()]
+            text = value.strip()
+            if not text:
+                return []
+            if text.startswith("["):
+                return cls._parse_json_array(text)
+            return [part.strip() for part in text.split(",") if part.strip()]
         return value
+
+    @classmethod
+    def _parse_json_array(cls, text: str) -> list[str]:
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "AGENT_MODULES starts with '[' so it is parsed as a JSON array, "
+                f"but the array is invalid: {text!r}"
+            ) from exc
+        if not isinstance(parsed, list):
+            raise ValueError(f"AGENT_MODULES JSON array must be a list of strings: {text!r}")
+        names: list[str] = []
+        for item in parsed:
+            if not isinstance(item, str):
+                raise ValueError(f"AGENT_MODULES JSON array must be a list of strings: {text!r}")
+            if item.strip():
+                names.append(item.strip())
+        return names
 
     @field_validator("llm_provider")
     @classmethod
