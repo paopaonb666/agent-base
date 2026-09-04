@@ -15,9 +15,15 @@ dependencies = [
     # CVE-2025-67644 (SQLite checkpointer SQL injection) and
     # CVE-2026-34070 (path traversal). See docs/adr/001-langgraph-as-runtime.md.
     "langgraph>=1.2.6",
-    "langchain-core>=0.3",
+    # Message/graph primitives. langchain-openai 1.x needs >=1.6.
+    "langchain-core>=1.6",
+    # openai-compatible LLM client (deepseek / zhipu / custom all use ChatOpenAI).
+    "langchain-openai>=1.6",
     "pydantic-settings>=2.0",
 ]
+
+[project.scripts]
+agent-base = "agent_base.entrypoints.cli:main"
 
 [project.optional-dependencies]
 dev = [
