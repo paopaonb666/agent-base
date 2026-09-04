@@ -1,3 +1,41 @@
+# === Security hard rule: dev docs MUST NOT enter this repo ===
+# Workspace policy (user-mandated, 2026-09-04):
+#   All development / planning / review documents live in D:\job-learn
+#   (a non-git working area). They MUST NOT be tracked here. The
+#   patterns below are defensive: even if such a file is accidentally
+#   copied into the tree, it will be silently excluded from tracking.
+#   Never bypass with `git add -f` on these — a leak of pre-publication
+#   security-review notes would telegraph unpatched vulnerabilities.
+
+# Chinese planning / review / decomposition naming conventions
+*规划*.md
+*计划*.md
+*审查*.md
+*拆解*.md
+*分析*.md
+*复盘*.md
+*草稿*.md
+
+# Working / scratch directories
+dev-notes/
+scratch/
+planning/
+drafts/
+notes/
+working/
+
+# Workbuddy memory + skills (workspace-level, not project source)
+.workbuddy/
+
+# Editor / OS temp + backup files
+*.bak
+*.tmp
+*.orig
+*.rej
+*.swp
+*.swo
+*~
+
 # Python
 __pycache__/
 *.py[cod]
