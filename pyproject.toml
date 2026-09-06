@@ -46,6 +46,8 @@ agent-base = "agent_base.entrypoints.cli:main"
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    # 覆盖率门（阶段 5）由 addopts 中的 --cov* 打开，本地与 CI 都必须装。
+    "pytest-cov>=5.0",
     "ruff>=0.4",
     "mypy>=1.10",
     "pip-audit>=2.7",
