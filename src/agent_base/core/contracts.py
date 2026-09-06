@@ -1,13 +1,13 @@
-"""The ``AgentModule`` contract + ``ModuleContext``.
+"""``AgentModule`` 契约 + ``ModuleContext``。
 
-This is the single extension point every agent module implements. The base
-never imports business logic; modules implement this protocol and the
-registry (``core/registry.py``) wires them into the runtime.
+这是每个 agent 模块都要实现的唯一扩展点。基座从不导入业务逻辑；
+模块实现这个协议，并由 registry（``core/registry.py``）把它们接入
+运行时。
 
-The contract is intentionally minimal and grows by stage:
-- Stage 1: ``name`` / ``description`` / ``build_graph`` / ``get_tools``
-- Stage 3: the tool pool and checkpointer are wired into ``ModuleContext``;
-  modules bind ``ctx.tools`` and compile with ``ctx.checkpointer``
+契约刻意保持最小化，并按阶段增长：
+- 阶段 1：``name`` / ``description`` / ``build_graph`` / ``get_tools``
+- 阶段 3：工具池和 checkpointer 被接入 ``ModuleContext``；模块绑定
+  ``ctx.tools`` 并用 ``ctx.checkpointer`` 编译
 """
 
 from __future__ import annotations
@@ -23,23 +23,23 @@ from langgraph.graph.state import CompiledStateGraph
 if TYPE_CHECKING:  # pragma: no cover - import avoided at runtime
     from agent_base.core.config import Settings
 
-# CompiledStateGraph is generic over (StateT, ContextT, InputT, OutputT).
-# The base treats compiled graphs opaquely — it only passes them back to
-# entrypoints — so all four parameters are bound to Any.
+# CompiledStateGraph 对 (StateT, ContextT, InputT, OutputT) 是泛型的。
+# 基座把编译后的图当作不透明对象处理——它只会把图回传给入口——
+# 因此四个参数都绑定为 Any。
 Graph: TypeAlias = CompiledStateGraph[Any, Any, Any, Any]
 
 
 @dataclass
 class ModuleContext:
-    """The runtime services the base hands to every module.
+    """基座交给每个模块的运行时服务。
 
-    ``settings``     — validated configuration
-    ``llm``          — assembled chat model (openai-compatible)
-    ``checkpointer`` — conversation-state saver (Stage 3); ``None`` only
-                       when a caller constructs the context by hand (tests)
-    ``tools``        — the shared tool pool (Stage 3): every module's
-                       ``get_tools()`` contribution, timeout-wrapped; bind
-                       to the LLM and execute via ``ToolNode``
+    ``settings``     —— 已校验的配置
+    ``llm``          —— 装配好的对话模型（openai 兼容）
+    ``checkpointer`` —— 对话状态存储器（阶段 3）；仅当调用方手动构造
+                        context（测试）时才是 ``None``
+    ``tools``        —— 共享工具池（阶段 3）：每个模块 ``get_tools()``
+                        的贡献，加上超时包装；绑定到 LLM 并通过
+                        ``ToolNode`` 执行
     """
 
     settings: Settings
@@ -50,16 +50,16 @@ class ModuleContext:
 
 @runtime_checkable
 class AgentModule(Protocol):
-    """A runnable agent module.
+    """一个可运行的 agent 模块。
 
-    ``name``        — stable identifier; must match the AGENT_MODULES entry
-                      and the module's directory name (registry enforces it)
-    ``description`` — human-readable summary for discovery / supervisor
-    ``build_graph`` — construct the module's compiled LangGraph; compile
-                      with ``name=<module name>`` so the supervisor can
-                      orchestrate the graph as a sub-agent
-    ``get_tools``   — tools this module contributes to the shared pool
-                      (Stage 3: collected into ``ModuleContext.tools``)
+    ``name``        —— 稳定标识符；必须与 AGENT_MODULES 条目及模块的
+                      目录名一致（registry 强制执行）
+    ``description`` —— 用于发现 / supervisor 的人类可读摘要
+    ``build_graph`` —— 构建该模块编译后的 LangGraph；以
+                      ``name=<模块名>`` 编译，这样 supervisor 就能把图
+                      作为 sub-agent 来编排
+    ``get_tools``   —— 该模块贡献给共享池的工具（阶段 3：收集进
+                      ``ModuleContext.tools``）
     """
 
     name: str

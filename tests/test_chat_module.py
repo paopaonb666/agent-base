@@ -1,4 +1,4 @@
-"""Tests for the chat sample module (mock LLM, no network)."""
+"""chat 样板模块的测试（mock LLM，无网络）。"""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ async def test_chat_graph_compiled_with_name_for_supervisor() -> None:
 
 
 async def test_chat_graph_tool_roundtrip() -> None:
-    """A tool-calling turn flows: model calls echo -> ToolMessage -> reply."""
+    """一次工具调用轮的流程：模型调用 echo -> ToolMessage -> 回复。"""
     scripted = [
         AIMessage(
             content="",
@@ -72,12 +72,12 @@ async def test_chat_graph_tool_roundtrip() -> None:
 
 
 async def test_broken_tool_does_not_crash_conversation() -> None:
-    """Stage 3 acceptance: a tool exception becomes ToolMessage feedback."""
+    """阶段 3 验收：工具异常变成 ToolMessage 反馈。"""
     from langchain_core.tools import tool
 
     @tool
     def explode() -> str:
-        """Always fails."""
+        """总是失败。"""
         raise RuntimeError("boom")
 
     scripted = [
@@ -96,5 +96,5 @@ async def test_broken_tool_does_not_crash_conversation() -> None:
     result = await graph.ainvoke({"messages": [HumanMessage(content="use explode")]})
     tool_message = result["messages"][2]
     assert type(tool_message).__name__ == "ToolMessage"
-    assert "boom" in str(tool_message.content)  # error text fed back to the model
+    assert "boom" in str(tool_message.content)  # 错误文本被反馈给模型
     assert result["messages"][-1].content == "recovered from tool failure"

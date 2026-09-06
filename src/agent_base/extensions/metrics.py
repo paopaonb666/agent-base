@@ -1,13 +1,12 @@
-"""Request metrics with route-template labels (Stage 4).
+"""带路由模板 label 的请求指标（阶段 4）。
 
-Inherits B4/B5 from the chat-agent review: the counter and histogram labels
-use the ROUTE TEMPLATE (``/v1/agents/{module}/invoke``), never the raw
-request path — a per-conversation path would create one time series per
-id and explode Prometheus cardinality.
+继承自 chat-agent 评审中的 B4/B5：计数器和直方图的 label 使用路由模板
+（``/v1/agents/{module}/invoke``），绝不用原始请求路径——按对话划分的
+路径会为每个 id 创建一条时间序列，让 Prometheus 基数爆炸。
 
-Deliberately dependency-free: rendering the Prometheus text exposition
-format is a few dozen lines, and keeping prometheus-client out of the base
-keeps the dependency tree thin. Token / business metrics belong to modules.
+刻意不引入依赖：渲染 Prometheus 文本展示格式只要几十行，而把
+prometheus-client 挡在基座之外能让依赖树保持轻薄。token / 业务指标
+属于模块。
 """
 
 from __future__ import annotations
@@ -16,10 +15,9 @@ BUCKETS: tuple[float, ...] = (0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0)
 
 
 class Metrics:
-    """In-process request counters + latency histograms, event-loop safe.
+    """进程内的请求计数器 + 延迟直方图，事件循环安全。
 
-    The server records observations from a single asyncio loop, so plain
-    dicts need no locking.
+    服务器在单个 asyncio 循环中记录观测值，所以普通 dict 不需要加锁。
     """
 
     def __init__(self) -> None:
@@ -27,13 +25,13 @@ class Metrics:
         self._durations: dict[str, list[float]] = {}
 
     def observe(self, method: str, route: str, status: int, duration: float) -> None:
-        """Record one completed request under its route template."""
+        """在其路由模板下记录一个已完成的请求。"""
         key = (method, route, status)
         self._requests[key] = self._requests.get(key, 0) + 1
         self._durations.setdefault(route, []).append(duration)
 
     def render(self) -> str:
-        """Render the Prometheus text exposition format."""
+        """渲染 Prometheus 文本展示格式。"""
         lines: list[str] = []
         for (method, route, status), count in sorted(self._requests.items()):
             lines.append(

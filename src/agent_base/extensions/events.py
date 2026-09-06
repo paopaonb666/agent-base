@@ -1,13 +1,12 @@
-"""The SSE event contract (Stage 4).
+"""SSE 事件契约（阶段 4）。
 
-Inherits A2 from the chat-agent review: the agent's progress is explicit —
-step transitions, token deltas, sources, termination — as a closed set of
-Pydantic models, so the wire format is validated and versionable instead
-of ad-hoc strings. ``SourcesEvent`` is deliberately part of the contract
-even though the base never emits it: future modules (e.g. RAG) publish
-citations through it without touching the encoder.
+继承自 chat-agent 评审中的 A2：agent 的进展是显式的——step 转换、token
+增量、来源、终止——以一组封闭的 Pydantic 模型呈现，因此线上格式是经过
+校验且可版本化的，而不是临时的字符串。``SourcesEvent`` 刻意作为契约的
+一部分，尽管基座从不发出它：未来模块（如 RAG）可以通过它发布引用，
+而不必改动编码器。
 
-Wire format: Server-Sent Events, one event per model::
+线上格式：Server-Sent Events，每个模型一个事件::
 
     event: delta
     data: {"type":"delta","content":"he"}
@@ -21,7 +20,7 @@ from pydantic import BaseModel, Field
 
 
 class StepEvent(BaseModel):
-    """A named stage of the agent's run (node running / completed / error)."""
+    """agent 运行中的一个具名阶段（节点 running / completed / error）。"""
 
     type: Literal["step"] = "step"
     name: str
@@ -30,42 +29,42 @@ class StepEvent(BaseModel):
 
 
 class DeltaEvent(BaseModel):
-    """A token-level piece of the assistant's reply (streamed)."""
+    """assistant 回复中 token 级别的一小段（流式）。"""
 
     type: Literal["delta"] = "delta"
     content: str
 
 
 class Source(BaseModel):
-    """One cited origin (future RAG modules publish these)."""
+    """一条被引用的来源（未来的 RAG 模块会发布这些）。"""
 
     title: str
     url: str | None = None
 
 
 class SourcesEvent(BaseModel):
-    """Citations attached to a reply (base never emits; contract reserved)."""
+    """附着在回复上的引用（基座从不发出；契约预留）。"""
 
     type: Literal["sources"] = "sources"
     sources: list[Source] = Field(default_factory=list)
 
 
 class DoneEvent(BaseModel):
-    """Terminal success marker; carries the thread id for resumption."""
+    """终止性的成功标记；携带 thread id 以便恢复会话。"""
 
     type: Literal["done"] = "done"
     thread_id: str | None = None
 
 
 class ErrorEvent(BaseModel):
-    """Terminal failure marker with a human-readable message."""
+    """终止性的失败标记，带有人类可读的消息。"""
 
     type: Literal["error"] = "error"
     message: str
 
 
 class PingEvent(BaseModel):
-    """Heartbeat keeping intermediaries from closing an idle stream."""
+    """心跳，防止中间环节关闭空闲的流。"""
 
     type: Literal["ping"] = "ping"
 
@@ -74,5 +73,5 @@ AgentEvent = StepEvent | DeltaEvent | SourcesEvent | DoneEvent | ErrorEvent | Pi
 
 
 def encode_sse(event: AgentEvent) -> str:
-    """Render one contract event as a Server-Sent Events frame."""
+    """把一个契约事件渲染为 Server-Sent Events 帧。"""
     return f"event: {event.type}\ndata: {event.model_dump_json()}\n\n"

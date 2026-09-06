@@ -1,4 +1,4 @@
-"""The ``WriterModule`` AgentModule implementation."""
+"""``WriterModule`` 的 AgentModule 实现。"""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from agent_base.modules.writer.graph import build_writer_graph
 
 
 class WriterModule:
-    """A text-drafting specialist — the second reference module."""
+    """一个文本起草专家——第二个参考模块。"""
 
     def __init__(self) -> None:
         self.name = "writer"

@@ -1,16 +1,15 @@
-"""Multi-agent collaboration: the supervisor template (Stage 4).
+"""多 Agent 协作：supervisor 模板（阶段 4）。
 
-Wraps LangGraph's native ``create_supervisor`` (langgraph-supervisor): every
-registered module becomes a sub-agent, routed by a supervisor node that
-reads each module's ``name`` + ``description`` (the same contract fields
-used for discovery). The base adds no orchestration logic of its own —
-that is the whole point of the thin-base principle.
+包装 LangGraph 原生的 ``create_supervisor``（langgraph-supervisor）：每个
+已注册的模块都成为一个 sub-agent，由一个 supervisor 节点读取每个模块的
+``name`` + ``description``（与用于发现的契约字段相同）来路由。基座自身
+不添加任何编排逻辑——这正是“薄基座”原则的全部意义所在。
 
-Requirements on modules (enforced here as early failures):
-- every module graph must be compiled with ``name=<module name>`` so the
-  supervisor can hand off to it (checked by langgraph-supervisor itself);
-- ``description`` is what the supervisor model sees when routing, so it
-  must be a meaningful summary (the registry already validates non-empty).
+对模块的要求（在这里作为早期失败强制执行）：
+- 每个模块图都必须以 ``name=<模块名>`` 编译，这样 supervisor 才能把
+  控制权交给它（由 langgraph-supervisor 本身检查）；
+- ``description`` 是 supervisor 模型在路由时看到的内容，因此必须是有
+  意义的摘要（registry 已校验其非空）。
 """
 
 from __future__ import annotations
@@ -33,24 +32,24 @@ DEFAULT_PROMPT = (
 
 
 def build_supervisor_graph(ctx: ModuleContext, modules: dict[str, AgentModule]) -> Graph:
-    """Orchestrate every registered module as a supervisor-led sub-agent."""
+    """把每个已注册的模块编排为由 supervisor 主导的 sub-agent。"""
     if not modules:
         raise ValueError("supervisor requires at least one module in AGENT_MODULES")
 
-    # Each sub-agent is the module's own compiled graph; the names come
-    # from the modules (and match their AGENT_MODULES entries).
+    # 每个 sub-agent 都是该模块自己的编译图；名字来自模块
+    # （并且与它们的 AGENT_MODULES 条目一致）。
     agents = [module.build_graph(ctx) for module in modules.values()]
 
-    # Handoff tools carry the module descriptions so the supervisor model
-    # can route on what each agent actually does.
+    # Handoff 工具携带模块描述，这样 supervisor 模型就能根据每个 agent
+    # 实际做什么来路由。
     handoffs = [
         create_handoff_tool(agent_name=module.name, description=module.description)
         for module in modules.values()
     ]
 
     workflow = create_supervisor(
-        # Graph alias vs Pregel / list-invariance mismatches in the library's
-        # stubs; runtime compatibility is covered by tests/test_collab.py.
+        # 该库的类型桩里 Graph 别名 vs Pregel / 列表不变性存在不匹配；
+        # 运行时兼容性由 tests/test_collab.py 覆盖。
         agents=agents,  # type: ignore[arg-type]
         model=ctx.llm,
         tools=handoffs,  # type: ignore[arg-type]

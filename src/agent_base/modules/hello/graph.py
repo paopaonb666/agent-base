@@ -1,12 +1,12 @@
-"""Graph construction for the hello module.
+"""hello 模块的图构建。
 
-This is the module-guide's five-step recipe implemented for real: the
-smallest possible module (one LLM node, no tools). It exists to prove the
-guide's promise — a new module plugs in without touching base code.
+这是 module-guide 五步配方在真实代码中的落地：最小的可行模块（一个
+LLM 节点，无工具）。它的存在是为了证明手册的承诺——新模块接入时无需
+触碰基座代码。
 
-The graph is compiled with the runtime's checkpointer (conversation state
-per thread) and ``name="hello"`` so the supervisor can orchestrate it as a
-sub-agent like any other registered module.
+该图用运行时的 checkpointer 编译（按 thread 持久化对话状态），并以
+``name="hello"`` 编译，这样 supervisor 就能像编排其他已注册模块一样
+把它作为 sub-agent 编排。
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ MODULE_NAME = "hello"
 
 
 def build_hello_graph(ctx: ModuleContext) -> Graph:
-    """Build and compile the hello graph: a single LLM node."""
+    """构建并编译 hello 图：单个 LLM 节点。"""
     llm = ctx.llm
 
     def reply(state: MessagesState) -> dict[str, Any]:

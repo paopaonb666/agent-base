@@ -1,20 +1,18 @@
-"""Graph construction for the chat module.
+"""chat 模块的图构建。
 
-A single LLM node over the conversation history, plus a ``ToolNode`` loop
-when the shared tool pool is non-empty (Stage 3). The node streams the
-model and accumulates the chunks, so:
+在对话历史上运行单个 LLM 节点，当共享工具池非空时再外加一个 ``ToolNode`` 循环
+（Stage 3）。该节点以流式输出模型并累积各个分块，因此：
 
-- the server's SSE layer sees token-level ``delta`` events (it taps the
-  same stream), and
-- cancellation propagates — aborting the graph run cancels the in-flight
-  LLM request instead of letting it finish in the background (Stage 4).
+- 服务端的 SSE 层能看到 token 级别的 ``delta`` 事件（它监听的是同一股流），并且
+- 取消能够传播——中止图运行会取消正在进行的 LLM 请求，而不是让它在后台跑完
+  （Stage 4）。
 
-State uses the standard ``MessagesState`` channel whose ``add_messages``
-reducer accumulates history across turns; compiled with the runtime's
-checkpointer, history persists per ``thread_id`` (in memory or sqlite).
+状态使用标准的 ``MessagesState`` 通道，其 ``add_messages`` reducer 会跨轮次累积
+历史；用运行时的 checkpointer 编译后，历史会按 ``thread_id`` 持久化（内存或
+sqlite）。
 
-The graph is compiled with ``name="chat"``: the supervisor (Stage 4)
-requires every sub-agent graph to carry its module's name.
+该图以 ``name="chat"`` 编译：supervisor（Stage 4）要求每个 sub-agent 图都携带
+其模块的名字。
 """
 
 from __future__ import annotations
@@ -32,17 +30,17 @@ MODULE_NAME = "chat"
 
 
 def build_chat_graph(ctx: ModuleContext) -> Graph:
-    """Build and compile the chat graph (LLM node + optional tool loop)."""
+    """构建并编译 chat 图（LLM 节点 + 可选的工具循环）。"""
     tools = ctx.tools
-    # bind_tools on every call would also be fine; the pool is rebuilt per
-    # graph so binding once here is enough.
+    # 每次调用都 bind_tools 也可以；池是每个图重建一次，所以这里绑定
+    # 一次就够了。
     model = ctx.llm.bind_tools(tools) if tools else ctx.llm
 
     async def call_model(state: MessagesState) -> dict[str, Any]:
         final: AIMessageChunk | None = None
         async for chunk in model.astream(state["messages"]):
-            # astream's declared yield type is a message union; the runtime
-            # chunks are AIMessageChunk (chat models only).
+            # astream 声明的产出类型是消息联合体；运行时的分块是
+            # AIMessageChunk（仅对话模型）。
             piece = cast(AIMessageChunk, chunk)
             final = piece if final is None else final + piece
         if final is None:
@@ -52,9 +50,8 @@ def build_chat_graph(ctx: ModuleContext) -> Graph:
     graph = StateGraph(MessagesState)
     graph.add_node("agent", call_model)
     if tools:
-        # handle_tool_error normalizes tool failures into ToolMessage
-        # feedback, so a broken tool never crashes the conversation
-        # (Stage 3 acceptance).
+        # handle_tool_error 把工具失败归一成 ToolMessage 反馈，
+        # 这样坏掉的工具绝不会打断对话（阶段 3 验收）。
         graph.add_node("tools", ToolNode(tools, handle_tool_errors=handle_tool_error))
         graph.add_edge(START, "agent")
         graph.add_conditional_edges("agent", tools_condition)

@@ -1,7 +1,7 @@
-"""Stage 2 extension points (extra modules not part of ``core``).
+"""阶段 2 的扩展点（不属于 ``core`` 的额外模块）。
 
-``observability`` — request_id propagation + structured logging, env-gated
-tracing. Stage 3 will add ``memory`` (checkpointer wiring) here.
+``observability`` —— request_id 传播 + 结构化日志，追踪由环境开关控制。
+阶段 3 会在这里加入 ``memory``（checkpointer 接线）。
 """
 
 from agent_base.extensions.observability import (

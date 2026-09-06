@@ -1,9 +1,8 @@
-"""Stage 5 acceptance: the module-guide's five-step recipe plugs in for real.
+"""阶段 5 验收：module-guide 的五步配方在真实代码中接入。
 
-The ``hello`` module under ``src/agent_base/modules/hello/`` was added by
-following the guide verbatim — no base code was touched. These tests prove it
-works like any built-in module: contract, mock-LLM conversation, and full
-runtime assembly (CLI / server share this path).
+``src/agent_base/modules/hello/`` 下的 ``hello`` 模块是通过逐字遵循手册
+添加的——没有触碰任何基座代码。这些测试证明它像任何内置模块一样工作：
+契约、mock-LLM 对话、以及完整的运行时装配（CLI / server 共用这条路径）。
 """
 
 from __future__ import annotations
@@ -44,7 +43,7 @@ async def test_hello_graph_responds() -> None:
 
 
 async def test_hello_assembles_in_full_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The full assembly path (create_runtime) accepts hello alongside chat/writer."""
+    """完整装配路径（create_runtime）接受 hello 与 chat/writer 并存。"""
     runtime = await create_runtime(
         Settings(_env_file=None, agent_modules="chat,writer,hello", llm_api_key="sk-test")
     )

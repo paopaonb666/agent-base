@@ -1,8 +1,8 @@
-"""The ``ChatModule`` AgentModule implementation.
+"""``ChatModule`` 的 AgentModule 实现。
 
-Reference implementation of the full contract: ``name`` / ``description`` /
-``build_graph`` / ``get_tools``. Graph construction is delegated to
-``graph.py`` and tools to ``tools.py``, keeping this file a thin adapter.
+完整契约的参考实现：``name`` / ``description`` / ``build_graph`` /
+``get_tools``。图构建委托给 ``graph.py``，工具委托给 ``tools.py``，
+让本文件保持为一个薄适配层。
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from agent_base.modules.chat.tools import get_tools
 
 
 class ChatModule:
-    """A minimal conversational agent — the template every module copies."""
+    """一个最小化的对话 agent——每个模块都要照抄的模板。"""
 
     def __init__(self) -> None:
         self.name = "chat"

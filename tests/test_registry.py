@@ -1,4 +1,4 @@
-"""Tests for core.registry (explicit-manifest loading, ADR-002)."""
+"""core.registry 的测试（显式清单加载，ADR-002）。"""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ def test_invalid_name_rejected(bad: str) -> None:
         load_modules([bad])
 
 
-# ── fixture-module tests: prove the mechanism is decoupled from the base ──
+# ── fixture 模块测试：证明该机制与基座解耦 ──
 
 
 def _write_module(tmp_path: Path, package: str, name: str, body: str = "") -> None:
@@ -70,11 +70,10 @@ def test_module_name_mismatch_rejected(tmp_path: Path, monkeypatch: pytest.Monke
 def test_hello_module_loads_without_touching_base(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The module-guide's five-step recipe, exercised against a throwaway package.
+    """module-guide 五步配方，针对一个一次性包来演练。
 
-    Proof that adding a module requires no base-code change: the registry
-    resolves it purely from the injected prefix + name, then validates the
-    contract.
+    证明新增模块无需任何基座代码改动：registry 纯粹从注入的 prefix + name
+    解析它，然后校验契约。
     """
     body = (
         "class Hello:\n"
@@ -94,7 +93,7 @@ def test_hello_module_loads_without_touching_base(
     assert modules["hello"].description == "hello sample"
 
 
-# ── contract validation branches ──
+# ── 契约校验分支 ──
 
 
 def test_module_empty_description_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -147,7 +146,7 @@ def test_module_missing_get_tools_rejected(tmp_path: Path, monkeypatch: pytest.M
 
 
 def test_module_import_failure_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A module whose OWN import explodes fails with the import error, not 'unknown'."""
+    """自身 import 就爆炸的模块，应以 import 错误失败，而非 'unknown'。"""
     body = "import module_that_does_not_exist_anywhere_123\n"
     _write_module(tmp_path, "fm_broken", "broken", body)
     monkeypatch.syspath_prepend(str(tmp_path))

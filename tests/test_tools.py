@@ -1,4 +1,4 @@
-"""Tests for the shared tool pool (Stage 3): assembly, timeout, fail-soft."""
+"""共享工具池的测试（阶段 3）：装配、超时、软失败。"""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from agent_base.modules.chat.module import ChatModule
 
 
 class _FakeModule:
-    """Minimal AgentModule stand-in: only get_tools matters to the pool."""
+    """最小化的 AgentModule 替身：对池而言只有 get_tools 重要。"""
 
     def __init__(self, name: str, tools: list[BaseTool]) -> None:
         self.name = name
@@ -30,7 +30,7 @@ class _FakeModule:
 
 @tool
 def add(a: int, b: int) -> int:
-    """Add two integers."""
+    """两个整数相加。"""
     return a + b
 
 
@@ -46,7 +46,7 @@ def test_pool_collects_in_module_order() -> None:
 def test_pool_duplicate_name_fails_fast() -> None:
     @tool
     def echo(text: str) -> str:
-        """Another echo — collides with the chat module's tool."""
+        """另一个 echo——与 chat 模块的工具冲突。"""
         return text
 
     modules = {
@@ -67,7 +67,7 @@ def test_pool_wraps_with_default_timeout() -> None:
 async def test_timeout_tool_async_cuts_off() -> None:
     @tool
     async def slow() -> str:
-        """Sleeps past any budget."""
+        """睡过任何预算。"""
         await asyncio.sleep(10)
         return "late"
 
@@ -81,7 +81,7 @@ def test_timeout_tool_sync_cuts_off() -> None:
 
     @tool
     def slow_sync() -> str:
-        """Sleeps past any budget (sync path)."""
+        """睡过任何预算（同步路径）。"""
         time.sleep(10)
         return "late"
 

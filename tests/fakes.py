@@ -1,4 +1,4 @@
-"""Shared test fakes (importable by test modules via pytest rootdir mode)."""
+"""共享的测试替身（通过 pytest rootdir 模式供测试模块导入）。"""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from pydantic import PrivateAttr
 
 
 def _to_chunk(msg: AIMessage) -> AIMessageChunk:
-    """Convert a scripted AIMessage into a stream chunk, tool_calls intact."""
+    """把一个脚本化的 AIMessage 转换成流式分块，保留 tool_calls。"""
     if msg.tool_calls:
         return AIMessageChunk(
             content=msg.content,
@@ -32,12 +32,11 @@ def _to_chunk(msg: AIMessage) -> AIMessageChunk:
 
 
 class ScriptedChatModel(BaseChatModel):
-    """Pops one scripted ``AIMessage`` per model call; streams it as one chunk.
+    """每次模型调用弹出一条脚本化的 ``AIMessage``；把它作为单个分块流式输出。
 
-    Unlike ``GenericFakeChatModel`` this survives ``astream`` for tool-call
-    responses (empty content + tool_calls), which the chat node's streaming
-    accumulation needs. ``bind_tools`` passes through so graphs built with
-    the shared tool pool work unchanged.
+    与 ``GenericFakeChatModel`` 不同，它能扛过工具调用响应（空 content +
+    tool_calls）的 ``astream``，这正是 chat 节点的流式累积所需要的。
+    ``bind_tools`` 原样通过，因此用共享工具池构建的图可以原封不动地工作。
     """
 
     _queue: list[AIMessage] = PrivateAttr(default_factory=list)
@@ -62,8 +61,8 @@ class ScriptedChatModel(BaseChatModel):
         run_manager: Any = None,
         **kwargs: Any,
     ) -> ChatResult:
-        # NOTE: generations must be a keyword — pydantic v2 BaseModel rejects
-        # positional init args (ChatResult([...]) raises TypeError).
+        # 注意：generations 必须是关键字参数——pydantic v2 的 BaseModel 会拒绝
+        # 位置式初始化参数（ChatResult([...]) 会抛出 TypeError）。
         return ChatResult(generations=[ChatGeneration(message=self._next())])
 
     async def _astream(
@@ -82,10 +81,10 @@ class ScriptedChatModel(BaseChatModel):
 
 
 class CancellableChatModel(BaseChatModel):
-    """Hangs until cancelled; records whether cancellation reached the model.
+    """挂起直到被取消；记录取消是否到达了模型。
 
-    Used by the SSE cancellation test: if client disconnect does NOT
-    propagate, ``cancelled`` stays False and the test fails.
+    供 SSE 取消测试使用：如果客户端断开没有被传播，``cancelled`` 会一直
+    为 False，测试就会失败。
     """
 
     cancelled: bool = False

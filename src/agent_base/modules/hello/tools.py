@@ -1,4 +1,4 @@
-"""Tools contributed by the hello module (module-guide step 4)."""
+"""hello 模块贡献的工具（module-guide 第 4 步）。"""
 
 from __future__ import annotations
 
@@ -6,5 +6,5 @@ from langchain_core.tools import BaseTool
 
 
 def get_tools() -> list[BaseTool]:
-    """The hello module contributes no tools."""
+    """hello 模块不贡献任何工具。"""
     return []

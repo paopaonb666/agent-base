@@ -1,7 +1,6 @@
-"""The ``HelloModule`` AgentModule implementation (module-guide step 3).
+"""``HelloModule`` 的 AgentModule 实现（module-guide 第 3 步）。
 
-The smallest possible AgentModule: graph construction delegated to
-``graph.py``, no contributed tools.
+最小的可行 AgentModule：图构建委托给 ``graph.py``，不贡献任何工具。
 """
 
 from __future__ import annotations
@@ -13,7 +12,7 @@ from agent_base.modules.hello.graph import build_hello_graph
 
 
 class HelloModule:
-    """A hello-world sample module — the guide's five-step recipe, verbatim."""
+    """一个 hello-world 样板模块——手册五步配方的逐字实现。"""
 
     def __init__(self) -> None:
         self.name = "hello"

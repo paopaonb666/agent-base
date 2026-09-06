@@ -1,4 +1,4 @@
-"""Stage-0 smoke tests: the package must be importable and its metadata sane."""
+"""阶段 0 冒烟测试：包必须可导入，且其元数据健全。"""
 
 import agent_base
 

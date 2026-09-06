@@ -1,25 +1,24 @@
-"""Interactive CLI entrypoint.
+"""交互式 CLI 入口。
 
-Usage::
+用法::
 
-    python -m agent_base --message "你好"           # one-shot
-    python -m agent_base --module chat             # interactive loop
-    python -m agent_base --module supervisor       # multi-agent session (Stage 4)
-    python -m agent_base --thread-id <id>          # resume a conversation
+    python -m agent_base --message "你好"           # 单轮
+    python -m agent_base --module chat             # 交互式循环
+    python -m agent_base --module supervisor       # 多 Agent 会话（阶段 4）
+    python -m agent_base --thread-id <id>          # 恢复一次对话
     python -m agent_base --version
 
-Conversation state (Stage 3): every session runs under a ``thread_id`` and
-the checkpointer (memory by default, sqlite via CHECKPOINTER_BACKEND)
-persists history per thread. Pass ``--thread-id`` to resume a previous
-conversation — with the sqlite backend this survives process restarts.
-Each turn sends only the NEW message; history is replayed from the
-checkpointer, never re-sent by the CLI.
+对话状态（阶段 3）：每个会话都在一个 ``thread_id`` 下运行，checkpointer
+（默认 memory，通过 CHECKPOINTER_BACKEND 用 sqlite）按 thread 持久化
+历史。传入 ``--thread-id`` 可恢复之前的对话——使用 sqlite 后端时，
+进程重启后依然存在。每一轮只发送**新**的消息；历史从 checkpointer
+回放，CLI 从不重发。
 
-Observability (Stage 2): each session runs under a fresh ``request_id``;
-all logs emitted during the session carry it.
+可观测性（阶段 2）：每个会话都在一个全新的 ``request_id`` 下运行；
+会话期间发出的所有日志都会带上它。
 
-The session runs inside ``asyncio.run`` because the runtime is async-first
-(the sqlite checkpointer and true LLM-call cancellation both require it).
+会话运行在 ``asyncio.run`` 中，因为运行时是异步优先的（sqlite
+checkpointer 和真正的 LLM 调用取消都需要它）。
 """
 
 from __future__ import annotations
@@ -82,17 +81,17 @@ def build_parser() -> argparse.ArgumentParser:
 async def _invoke(
     runtime: AgentRuntime, module_name: str, thread_id: str, text: str
 ) -> list[BaseMessage]:
-    """Send one user turn; the checkpointer replays the rest of the history."""
+    """发送一轮用户消息；其余历史由 checkpointer 回放。"""
     graph = runtime.graph(module_name)
-    # The thread id is namespaced per module: different graphs share one
-    # checkpointer, and an un-namespaced id would mix their states.
+    # thread id 按模块划分命名空间：不同的图共用一个 checkpointer，
+    # 未划分命名空间的 id 会把它们的状态混在一起。
     config: RunnableConfig = {"configurable": {"thread_id": f"{module_name}:{thread_id}"}}
     result: Any = await graph.ainvoke({"messages": [HumanMessage(content=text)]}, config)
     return cast(list[BaseMessage], result["messages"])
 
 
 def _reply(messages: list[BaseMessage]) -> str:
-    """The human-facing reply: the last assistant message, if any."""
+    """面向人类的回复：最后一条 assistant 消息（如果有的话）。"""
     for message in reversed(messages):
         if isinstance(message, AIMessage) and message.content:
             return str(message.content)
@@ -148,8 +147,8 @@ async def _run(args: argparse.Namespace) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         finally:
-            # Always close the trace — even when the LLM call blew up — so a
-            # session has a definitive end marker under one request_id.
+            # 始终关闭 trace——即便 LLM 调用爆炸了——这样一次会话在同一个
+            # request_id 下就有一个确定的结束标记。
             logger.info("cli: done request_id=%s", get_request_id())
     await runtime.close()
     return 0
@@ -163,8 +162,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         return 130
     except Exception as exc:
-        # Entry points fail with a message, not a stack dump (the session
-        # log already carries the request_id for debugging).
+        # 入口以一条消息失败，而不是堆栈转储（会话日志已经携带 request_id
+        # 可供调试）。
         print(f"error: {exc}", file=sys.stderr)
         return 1
 

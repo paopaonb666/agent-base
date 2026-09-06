@@ -1,1 +1,1 @@
-"""Entrypoints for the agent base (CLI now; server lands in Stage 4)."""
+"""agent 基座的入口（现在是 CLI；服务器在阶段 4 落地）。"""

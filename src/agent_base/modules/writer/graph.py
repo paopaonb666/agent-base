@@ -1,9 +1,8 @@
-"""Graph construction for the writer module.
+"""writer 模块的图构建。
 
-One LLM node with a writing-focused system prompt. Structurally identical
-to the chat module (streaming accumulation + checkpointer + named compile)
-— the only difference is the prompt, which is exactly the point: modules
-differ in behavior, not in wiring.
+一个带写作取向系统提示词的 LLM 节点。结构上与 chat 模块完全相同
+（流式累积 + checkpointer + 具名编译）——唯一的区别就是提示词，而这
+正是要点所在：模块的区别在于行为，而不在于接线。
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ WRITER_PROMPT = (
 
 
 def build_writer_graph(ctx: ModuleContext) -> Graph:
-    """Build and compile the writer graph."""
+    """构建并编译 writer 图。"""
 
     async def call_model(state: MessagesState) -> dict[str, Any]:
         final: AIMessageChunk | None = None

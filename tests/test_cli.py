@@ -1,4 +1,4 @@
-"""Light tests for the CLI entrypoint (no LLM/network)."""
+"""CLI 入口的轻量测试（无 LLM / 网络）。"""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from agent_base.entrypoints.cli import build_parser, main
 
 
 class _FakeGraph:
-    """Minimal graph double: appends a scripted assistant reply."""
+    """最小化的图替身：追加一条脚本化的 assistant 回复。"""
 
     def __init__(self, reply: str = "hello") -> None:
         self._reply = reply
@@ -30,7 +30,7 @@ class _FakeGraph:
 
 
 class _FakeRuntime:
-    """Minimal runtime double covering the CLI's touchpoints."""
+    """最小化的运行时替身，覆盖 CLI 的各个触点。"""
 
     settings = SimpleNamespace(log_json=False)
     closed = False
@@ -81,7 +81,7 @@ def test_cli_version(capsys: pytest.CaptureFixture[str]) -> None:
 
 
 def test_python_m_invocation(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`python -m agent_base` runs main() (module __main__ shim)."""
+    """`python -m agent_base` 会运行 main()（模块 __main__ 垫片）。"""
     monkeypatch.setattr(sys.modules["agent_base.entrypoints.cli"], "main", lambda argv=None: 0)
     with pytest.raises(SystemExit) as exc:
         runpy.run_module("agent_base.__main__", run_name="__main__")
@@ -89,7 +89,7 @@ def test_python_m_invocation(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 async def test_invoke_namespaces_thread_per_module(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The thread id must be namespaced per module (shared checkpointer)."""
+    """thread id 必须按模块划分命名空间（共用的 checkpointer）。"""
     runtime = _FakeRuntime()
     graph = runtime._graph
     messages = await cli._invoke(runtime, "chat", "thread-1", "hi")
@@ -110,7 +110,7 @@ async def test_one_shot_prints_reply_and_thread_id(
 async def test_one_shot_without_reply_prints_thread_id_only(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """An empty assistant reply must not print an empty line."""
+    """空的 assistant 回复绝不能打印空行。"""
     runtime = _install_runtime(monkeypatch, _FakeRuntime(_FakeGraph(reply="")))
     await cli._one_shot(runtime, "chat", "t1", "hi")
     out, err = capsys.readouterr()
@@ -121,7 +121,7 @@ async def test_one_shot_without_reply_prints_thread_id_only(
 async def test_interactive_turn_and_quit(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    answers = iter(["hi", "", "quit"])  # empty line is skipped, quit exits
+    answers = iter(["hi", "", "quit"])  # 空行被跳过，quit 退出
 
     def _input(prompt: str = "") -> str:
         print(prompt, end="")
@@ -141,7 +141,7 @@ async def test_interactive_eof_exits(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr("builtins.input", _eof)
     runtime = _install_runtime(monkeypatch)
-    await cli._interactive(runtime, "chat", "t1")  # must return, not raise
+    await cli._interactive(runtime, "chat", "t1")  # 必须正常返回，而非抛异常
 
 
 async def test_run_one_shot_returns_0_and_closes(

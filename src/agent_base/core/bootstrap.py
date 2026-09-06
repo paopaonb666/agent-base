@@ -1,17 +1,16 @@
-"""Assemble the runtime: load modules, build the LLM, wire state + tools.
+"""装配运行时：加载模块、构建 LLM、接线状态与工具。
 
-This is the thin "wiring" layer between config / registry / llm / memory /
-tools and the entrypoints. It contains no business logic — it only composes
-the pieces the base owns and hands a ready runtime to the CLI / server.
+这是 config / registry / llm / memory / tools 与各入口之间的薄“接线”层。
+它不包含业务逻辑——只负责组合基座所拥有的各个部件，并把一个就绪的
+运行时交给 CLI / 服务器。
 
-Stage 3 additions: the checkpointer (``extensions/memory``) and the shared
-tool pool (``core/tools``) are assembled here and flow into every module's
-``ModuleContext``. ``create_runtime`` is async because the sqlite
-checkpointer binds to the calling event loop.
+阶段 3 新增：checkpointer（``extensions/memory``）与共享工具池
+（``core/tools``）在此装配，并流入每个模块的 ``ModuleContext``。
+``create_runtime`` 之所以是异步的，是因为 sqlite checkpointer 会绑定到
+调用它的事件循环。
 
-Stage 4 addition: the reserved module name ``supervisor`` builds a
-supervisor graph (``extensions/collab``) that orchestrates every registered
-module as a sub-agent.
+阶段 4 新增：保留的模块名 ``supervisor`` 会构建一个 supervisor 图
+（``extensions/collab``），把每个已注册的模块编排为 sub-agent。
 """
 
 from __future__ import annotations
@@ -30,14 +29,14 @@ from agent_base.core.registry import load_modules
 from agent_base.core.tools import build_tool_pool
 from agent_base.extensions.memory import build_checkpointer, close_checkpointer
 
-# Reserved module name that builds the supervisor graph over all loaded
-# modules instead of a single module's graph (Stage 4).
+# 保留的模块名：不构建单个模块的图，而是在所有已加载模块之上构建
+# supervisor 图（阶段 4）。
 SUPERVISOR_MODULE = "supervisor"
 
 
 @dataclass
 class AgentRuntime:
-    """A fully-assembled runtime: settings + llm + modules + state + tools."""
+    """一个装配完毕的运行时：settings + llm + modules + state + tools。"""
 
     settings: Settings
     llm: BaseChatModel
@@ -47,7 +46,7 @@ class AgentRuntime:
     _supervisor: Graph | None = field(default=None, repr=False)
 
     def context(self) -> ModuleContext:
-        """The ModuleContext handed to every module's build_graph."""
+        """交给每个模块的 ``build_graph`` 的 ``ModuleContext``。"""
         return ModuleContext(
             settings=self.settings,
             llm=self.llm,
@@ -56,10 +55,10 @@ class AgentRuntime:
         )
 
     def graph(self, module_name: str) -> Graph:
-        """Build (and compile) the named module's graph.
+        """构建（并编译）指定模块的图。
 
-        ``supervisor`` is reserved: it returns the multi-agent supervisor
-        graph orchestrating every registered module (Stage 4).
+        ``supervisor`` 是保留名：它返回编排所有已注册模块的多 Agent
+        supervisor 图（阶段 4）。
         """
         if module_name == SUPERVISOR_MODULE:
             return self.supervisor_graph()
@@ -74,26 +73,26 @@ class AgentRuntime:
         return module.build_graph(self.context())
 
     def supervisor_graph(self) -> Graph:
-        """Lazily build the supervisor graph over all registered modules."""
+        """惰性地在所有已注册模块之上构建 supervisor 图。"""
         if self._supervisor is None:
-            # Deferred import: extensions may grow; core should not depend on
-            # the import graph of every extension at module load time.
+            # 延迟导入：扩展可能会增多；core 不应在模块加载时依赖
+            # 每个扩展的导入图。
             from agent_base.extensions.collab import build_supervisor_graph
 
             self._supervisor = build_supervisor_graph(self.context(), self.modules)
         return self._supervisor
 
     async def close(self) -> None:
-        """Release runtime-held resources (the sqlite connection, if any)."""
+        """释放运行时持有的资源（如果有的话，即 sqlite 连接）。"""
         if self.checkpointer is not None:
             await close_checkpointer(self.checkpointer)
 
 
 async def create_runtime(settings: Settings | None = None) -> AgentRuntime:
-    """Create a runtime from settings (or defaults). Fails fast on bad config.
+    """根据 settings（或默认值）创建运行时；配置错误时快速失败。
 
-    Must run inside the event loop that will execute the graphs (the sqlite
-    checkpointer binds aiosqlite to the calling loop).
+    必须在将要执行这些图的事件循环中运行（sqlite checkpointer 会把
+    aiosqlite 绑定到调用它的循环）。
     """
     resolved = settings if settings is not None else Settings()
     resolved.ensure_production_ready()

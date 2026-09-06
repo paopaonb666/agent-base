@@ -1,6 +1,6 @@
-"""The ``hello`` module (module-guide step 5: enable via AGENT_MODULES).
+"""``hello`` 模块（module-guide 第 5 步：通过 AGENT_MODULES 启用）。
 
-Not enabled by default — AGENT_MODULES is the single on-switch (ADR-002).
+默认未启用——AGENT_MODULES 是唯一的开关（ADR-002）。
 """
 
 from __future__ import annotations

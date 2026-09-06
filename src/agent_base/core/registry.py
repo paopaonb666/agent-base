@@ -1,16 +1,14 @@
-"""Explicit-manifest module registry (ADR-002).
+"""显式清单的模块注册表（ADR-002）。
 
-``AGENT_MODULES`` is the single source of truth for which modules are active
-and in what order. For each name the registry:
+``AGENT_MODULES`` 是“哪些模块处于激活状态、以及以什么顺序”的唯一事实
+来源。对于每个名字，registry 会：
 
-1. validates the name against a strict identifier pattern (anti path-traversal
-   / import-arbitrary-code);
-2. imports ``{prefix}.{name}`` (default ``agent_base.modules.{name}``);
-3. reads the ``module`` attribute — the ``AgentModule`` instance;
-4. validates it conforms to the contract and that its declared ``name``
-   matches the requested one.
+1. 用严格的标识符模式校验名字（反路径遍历 / 反导入任意代码）；
+2. 导入 ``{prefix}.{name}``（默认 ``agent_base.modules.{name}``）；
+3. 读取 ``module`` 属性——即 ``AgentModule`` 实例；
+4. 校验它符合契约、且其声明的 ``name`` 与请求的名字一致。
 
-Any failure aborts startup — a bad module is never silently skipped.
+任何失败都会中止启动——有问题的模块永远不会被静默跳过。
 """
 
 from __future__ import annotations
@@ -21,14 +19,14 @@ from typing import Any, cast
 
 from agent_base.core.contracts import AgentModule
 
-# Module names: lowercase identifier, no path separators, no leading digit.
-# importlib guards keywords, but a strict allowlist here keeps the failure
-# message actionable and rules out ``..``-style escapes.
+# 模块名：小写标识符，无路径分隔符，不能以数字开头。
+# importlib 会防御关键字，但这里使用严格白名单能让失败信息更可操作，
+# 并排除 ``..`` 之类的逃逸写法。
 _MODULE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
 class RegistryError(ValueError):
-    """Raised when module loading fails (unknown name / dup / contract)."""
+    """模块加载失败（未知名字 / 重复 / 契约问题）时抛出。"""
 
 
 def load_modules(
@@ -36,13 +34,13 @@ def load_modules(
     *,
     prefix: str = "agent_base.modules",
 ) -> dict[str, AgentModule]:
-    """Load and validate the named modules in order.
+    """按顺序加载并校验指定的模块。
 
-    Returns an ordered mapping ``name -> AgentModule`` (insertion order ==
-    assembly order). Raises ``RegistryError`` on the first problem.
+    返回有序映射 ``name -> AgentModule``（插入顺序 == 装配顺序）。
+    遇到第一个问题即抛出 ``RegistryError``。
 
-    ``prefix`` is injectable so tests can point the registry at a fixture
-    package and prove the mechanism is decoupled from the base itself.
+    ``prefix`` 可注入，以便测试把 registry 指向一个 fixture 包，
+    从而证明该机制与基座本身解耦。
     """
     modules: dict[str, AgentModule] = {}
     for name in names:

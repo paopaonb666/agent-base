@@ -60,6 +60,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
       - name: pip-audit
-        # --skip-editable: the local agent-base package itself is not a PyPI
-        # dependency; everything it depends on is still audited.
+        # --skip-editable：本地 agent-base 包本身不是 PyPI 依赖；
+        # 它所依赖的一切仍会被审计。
         run: pip-audit --skip-editable

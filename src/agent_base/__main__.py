@@ -1,4 +1,4 @@
-"""Enable ``python -m agent_base`` to launch the CLI."""
+"""支持通过 ``python -m agent_base`` 启动 CLI。"""
 
 from agent_base.entrypoints.cli import main
 

@@ -1,4 +1,4 @@
-"""Tests for the SSE event contract (Stage 4, A2 inheritance)."""
+"""SSE 事件契约的测试（阶段 4，A2 继承）。"""
 
 from __future__ import annotations
 

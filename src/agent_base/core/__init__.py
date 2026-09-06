@@ -1,8 +1,7 @@
-"""Core wiring for the agent base: config, contract, registry, llm, bootstrap.
+"""agent 基座的核心装配：config、contract、registry、llm、bootstrap。
 
-No business logic lives here — only the runtime assembly that modules plug
-into. See ``Agent基座软件开发计划.md`` (kept outside this repo) for the
-stage-by-stage roadmap.
+这里没有任何业务逻辑——只有模块插入其上的运行时装配。分阶段路线图见
+``Agent基座软件开发计划.md``（置于本仓库之外）。
 """
 
 from agent_base.core.config import Settings, SettingsError

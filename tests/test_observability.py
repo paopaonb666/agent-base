@@ -1,8 +1,8 @@
-"""Tests for Stage 2 observability: request_id propagation + structured logs.
+"""阶段 2 可观测性的测试：request_id 传播 + 结构化日志。
 
-Covers the A1 inheritance from the chat-agent review: a request id must flow
-from a contextvar into every log record (filter), and formatting must support
-both human (dev) and JSON (production) output. Tracing remains env-gated.
+覆盖 chat-agent 评审中的 A1 继承：request id 必须从 contextvar 流入每一条
+日志记录（filter），且格式化必须同时支持人类可读（开发）和 JSON（生产）
+输出。追踪仍由环境开关控制。
 """
 
 from __future__ import annotations
@@ -70,7 +70,7 @@ class TestFormatters:
     def test_human_formatter_includes_request_id(self) -> None:
         f = HumanFormatter()
         record = logging.LogRecord("m", logging.INFO, "f", 1, "hello", None, None)
-        record.request_id = "rid-xyz"  # injected by the filter in real flow
+        record.request_id = "rid-xyz"  # 真实流程中由 filter 注入
         line = f.format(record)
         assert "rid-xyz" in line
         assert "INFO" in line
@@ -107,8 +107,8 @@ class TestFormatters:
 class TestSetupLogging:
     def test_setup_is_idempotent(self) -> None:
         root = logging.getLogger()
-        # Other tests (CLI) call setup_logging too; this test must not depend
-        # on run order, so start from a clean slate.
+        # 其他测试（CLI）也会调用 setup_logging；本测试不应依赖运行顺序，
+        # 因此从干净的状态开始。
         for handler in list(root.handlers):
             if handler.get_name() == "agent_base.console":
                 root.removeHandler(handler)
@@ -117,7 +117,7 @@ class TestSetupLogging:
         after_first = len(root.handlers)
         setup_logging()
         assert len(root.handlers) == after_first
-        assert after_first == before + 1  # exactly one named handler added
+        assert after_first == before + 1  # 恰好新增了一个具名处理器
 
     def test_setup_replaces_formatter_for_json(self) -> None:
         setup_logging(json_lines=True)
@@ -127,13 +127,12 @@ class TestSetupLogging:
         assert isinstance(handler.formatter, JsonFormatter)
 
     def test_any_logger_gets_request_id(self) -> None:
-        """End-to-end: a logger the base never owns still carries request_id.
+        """端到端：一个基座从不拥有的 logger 依然携带 request_id。
 
-        Regression for the root-logger-filter bug: ``Logger.filter`` only
-        consults the logger's OWN filters, so the filter must live on the
-        handler for records from arbitrary loggers (e.g. langchain) to be
-        enriched. The handler stream is swapped for an in-memory buffer to
-        stay independent of pytest's stderr capture.
+        针对 root-logger-filter 缺陷的回归测试：``Logger.filter`` 只会查询
+        logger 自己的过滤器，所以为了让任意 logger（如 langchain）发出的
+        记录也能被增强，过滤器必须放在处理器上。处理器的流被替换为内存
+        缓冲区，以保持独立于 pytest 的 stderr 捕获。
         """
         setup_logging()
         handler = next(
@@ -155,7 +154,7 @@ class TestTracingConfig:
         monkeypatch.delenv("LANGSMITH_API_KEY", raising=False)
         monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
         monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
-        # Must not raise; output is asserted via caplog below.
+        # 必须不抛异常；输出通过下面的 caplog 断言。
         log_tracing_config()
 
     def test_reports_langsmith_on(
