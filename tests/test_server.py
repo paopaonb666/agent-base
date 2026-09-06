@@ -1,8 +1,7 @@
-"""Tests for the SSE service entrypoint (Stage 4).
+"""SSE 服务入口的测试（阶段 4）。
 
-Covers the acceptance points: SSE event sequence, health degradation,
-route-template metric labels, and cancellation propagation (client
-disconnect must cancel the in-flight LLM call).
+覆盖验收点：SSE 事件序列、健康降级、路由模板指标 label、以及取消传播
+（客户端断开必须取消正在进行的 LLM 调用）。
 """
 
 from __future__ import annotations
@@ -40,7 +39,7 @@ def _client(model: Any = None) -> TestClient:
 
 
 def _frames(raw: str) -> list[dict[str, Any]]:
-    """Parse an SSE body into (event type, payload) dicts."""
+    """把一个 SSE 响应体解析为 (事件类型, 载荷) 字典列表。"""
     events = []
     for block in raw.strip().split("\n\n"):
         lines = block.split("\n")
@@ -76,7 +75,7 @@ def test_invoke_unknown_module_404() -> None:
 
 
 def test_cors_preflight_allowed() -> None:
-    """Browser preflight (OPTIONS) must pass CORS, not die with 405."""
+    """浏览器预检（OPTIONS）必须通过 CORS，而不是以 405 失败。"""
     with _client() as client:
         response = client.options(
             "/v1/agents/chat/invoke",
@@ -130,7 +129,7 @@ def test_invoke_sse_sequence() -> None:
         raw = "".join(response.iter_text())
     events = _frames(raw)
     types = [e["event"] for e in events]
-    # ping ... step(running agent) ... delta(s) ... step(completed agent) ... done
+    # ping ... step(agent 运行) ... delta(s) ... step(agent 完成) ... done
     assert types[0] == "ping"
     assert "delta" in types
     assert "done" in types
@@ -144,9 +143,9 @@ def test_invoke_sse_sequence() -> None:
 def test_invoke_error_becomes_error_event() -> None:
     class ExplodingModel(ScriptedChatModel):
         async def _astream(self, *args: Any, **kwargs: Any) -> Any:
-            # A generator that fails before yielding (the shape astream expects).
+            # 一个在产出前就失败的生成器（astream 期望的形状）。
             raise RuntimeError("llm exploded")
-            yield  # pragma: no cover - unreachable; marks this a generator
+            yield  # pragma: no cover - 不可达；用于把本函数标记为生成器
 
     with (
         _client(ExplodingModel([])) as client,
@@ -170,11 +169,43 @@ def test_thread_id_resumes_conversation() -> None:
             json={"message": "two", "thread_id": thread_id},
         ) as response:
             raw = "".join(response.iter_text())
-    # Turn 2 must include the recovered turn-1 history in its step payload;
-    # the runtime state proves it via the deltas only containing the new
-    # reply and the second invocation succeeding on the same thread.
+    # 第 2 轮必须在其 step 载荷中包含恢复出的第 1 轮历史；运行时状态通过
+    # delta 只包含新回复、且第二次调用在同一个 thread 上成功来证明这一点。
     deltas = "".join(e["content"] for e in _frames(raw) if e["event"] == "delta")
     assert deltas == "second"
+
+
+def test_get_thread_history_returns_messages() -> None:
+    """只读端点把 checkpointer 里的历史序列化为 human/assistant 消息。"""
+    model = ScriptedChatModel([AIMessage(content="first"), AIMessage(content="second")])
+    with _client(model) as client:
+        with client.stream("POST", "/v1/agents/chat/invoke", json={"message": "one"}) as response:
+            done = _frames("".join(response.iter_text()))[-1]
+        thread_id = done["thread_id"]
+        with client.stream(
+            "POST",
+            "/v1/agents/chat/invoke",
+            json={"message": "two", "thread_id": thread_id},
+        ) as response:
+            "".join(response.iter_text())
+        history = client.get(f"/v1/agents/chat/threads/{thread_id}")
+
+    assert history.status_code == 200
+    body = history.json()
+    assert body["thread_id"] == thread_id
+    assert body["module"] == "chat"
+    assert body["messages"] == [
+        {"role": "human", "content": "one"},
+        {"role": "assistant", "content": "first"},
+        {"role": "human", "content": "two"},
+        {"role": "assistant", "content": "second"},
+    ]
+
+
+def test_get_thread_history_unknown_module_404() -> None:
+    with _client() as client:
+        response = client.get("/v1/agents/nobody/threads/abc")
+    assert response.status_code == 404
 
 
 def test_metrics_uses_route_template_labels() -> None:
@@ -185,24 +216,24 @@ def test_metrics_uses_route_template_labels() -> None:
             pass
         text = client.get("/metrics").text
     assert 'route="/health"' in text
-    assert 'route="/v1/agents/{module}/invoke"' in text  # template, not raw path
+    assert 'route="/v1/agents/{module}/invoke"' in text  # 模板，而非原始路径
     assert "/v1/agents/chat/invoke" not in text.replace("/v1/agents/{module}/invoke", "")
     assert 'status="200"' in text
 
 
 async def test_client_disconnect_cancels_llm_call() -> None:
-    """Stage 4 acceptance: disconnect stops the in-flight LLM request."""
+    """阶段 4 验收：断开连接会停止正在进行的 LLM 请求。"""
     model = CancellableChatModel()
     runtime = _runtime(model)
     graph = runtime.graph("chat")
     config: dict[str, Any] = {"configurable": {"thread_id": "chat:t-cancel"}}
     stream = _event_stream(graph, "hi", config, "t-cancel")  # type: ignore[arg-type]
 
-    # Consume like an SSE client; the model hangs, so after the initial
-    # ping the stream sits idle exactly like a real slow LLM call.
+    # 像 SSE 客户端一样消费；模型会挂起，因此在最初的 ping 之后，
+    # 流会像一次真实的慢速 LLM 调用一样处于空闲状态。
     task = asyncio.ensure_future(_consume(stream))
-    await asyncio.sleep(0.2)  # producer has reached the hanging model call
-    task.cancel()  # what starlette does when the client disconnects
+    await asyncio.sleep(0.2)  # 生产者已到达挂起的模型调用
+    task.cancel()  # 客户端断开时 starlette 所做的动作
     with contextlib.suppress(asyncio.CancelledError):
         await task
     assert model.cancelled is True

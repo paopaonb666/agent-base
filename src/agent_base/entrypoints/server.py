@@ -1,24 +1,23 @@
-"""FastAPI + SSE service entrypoint (Stage 4).
+"""FastAPI + SSE 服务入口（阶段 4）。
 
-Run::
+运行::
 
     uvicorn agent_base.entrypoints.server:app --reload
 
-Endpoints:
-- ``POST /v1/agents/{module}/invoke`` — one conversation turn as an SSE
-  stream of contract events (ping / step / delta / done / error); the
-  response carries the thread id in the ``done`` event for resumption.
-- ``GET /health`` — component health (checkpointer probe + model config),
-  ``degraded`` instead of crashing (A4 inheritance).
-- ``GET /metrics`` — Prometheus text format, route-template labels (B4/B5).
+端点：
+- ``POST /v1/agents/{module}/invoke`` —— 一次对话轮，以 SSE 流的形式
+  输出契约事件（ping / step / delta / done / error）；响应的 ``done``
+  事件携带 thread id 以便恢复会话。
+- ``GET /health`` —— 组件健康（checkpointer 探针 + 模型配置），
+  出问题时返回 ``degraded`` 而不是崩溃（A4 继承）。
+- ``GET /metrics`` —— Prometheus 文本格式，使用路由模板 label（B4/B5）。
 
-Cancellation: when the client disconnects, the SSE generator's ``finally``
-cancels the producer task, which cancels the in-flight ``astream`` and
-with it the LLM request — token spend stops instead of finishing in the
-background. That is why the whole runtime is async-first.
+取消：当客户端断开连接时，SSE 生成器的 ``finally`` 会取消生产者任务，
+从而取消正在进行的 ``astream`` 以及随之而来的 LLM 请求——token 消耗
+随即停止，而不是在后台跑完。这正是整个运行时异步优先的原因。
 
-Observability: every request runs under a ``request_id`` (``X-Request-ID``
-header honored, echoed back) so logs can be traced end to end (A1).
+可观测性：每个请求都在一个 ``request_id`` 下运行（会尊重并回显
+``X-Request-ID`` 头），因此日志可以端到端追踪（A1）。
 """
 
 from __future__ import annotations
@@ -60,10 +59,41 @@ _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
 
 class InvokeRequest(BaseModel):
-    """One conversation turn."""
+    """一次对话轮。"""
 
     message: str
-    thread_id: str | None = None  # None -> a new thread is created
+    thread_id: str | None = None  # None -> 创建一个新 thread
+
+
+def _serialize_message(message: Any) -> dict[str, Any] | None:
+    """把一条 LangChain 消息序列化为前端可渲染的简单结构。
+
+    返回 ``None`` 表示这条消息不该显示（例如仅含 tool_calls 的 AI 消息）。
+    前端 agent-base-ui 用它与 invoke 流式事件对齐，以便回放历史会话。
+    """
+    mtype = getattr(message, "type", "")
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        text = content
+    elif content:
+        text = "".join(
+            str(part.get("text", "")) if isinstance(part, dict) else str(part) for part in content
+        )
+    else:
+        text = ""
+    if mtype == "human":
+        return {"role": "human", "content": text}
+    if mtype == "ai":
+        if not text:
+            return None  # 仅含 tool_calls 的 AI 消息，没有可展示文本
+        return {"role": "assistant", "content": text}
+    if mtype == "tool":
+        return {
+            "role": "tool",
+            "name": str(getattr(message, "name", "") or ""),
+            "content": text,
+        }
+    return None
 
 
 async def _produce(
@@ -73,7 +103,7 @@ async def _produce(
     config: RunnableConfig,
     user_thread_id: str,
 ) -> None:
-    """Push graph events onto the queue; sentinel-terminate."""
+    """把图事件推入队列；用哨兵值终止。"""
     running: set[str] = set()
     try:
         stream: Any = graph.astream(
@@ -104,7 +134,7 @@ async def _produce(
 
 
 async def _heartbeat(queue: asyncio.Queue[AgentEvent | None]) -> None:
-    """Emit a ping every interval so idle streams stay open."""
+    """每隔一段时间发出一个 ping，让空闲的流保持打开。"""
     while True:
         await asyncio.sleep(HEARTBEAT_SECONDS)
         await queue.put(PingEvent())
@@ -113,13 +143,13 @@ async def _heartbeat(queue: asyncio.Queue[AgentEvent | None]) -> None:
 async def _event_stream(
     graph: Any, message: str, config: RunnableConfig, user_thread_id: str
 ) -> AsyncIterator[str]:
-    """SSE frames for one conversation turn (contract events, encoded)."""
+    """一次对话轮的 SSE 帧（契约事件，已编码）。"""
     queue: asyncio.Queue[AgentEvent | None] = asyncio.Queue()
     producer = asyncio.create_task(_produce(queue, graph, message, config, user_thread_id))
     heartbeat = asyncio.create_task(_heartbeat(queue))
     try:
-        # Immediate liveness signal so clients (and proxies) see the
-        # stream is open before the first model token arrives.
+        # 立即发出存活信号，让客户端（和代理）在第一个模型 token
+        # 到达之前就知道流已打开。
         yield encode_sse(PingEvent())
         while True:
             event = await queue.get()
@@ -127,15 +157,15 @@ async def _event_stream(
                 break
             yield encode_sse(event)
     finally:
-        # Client disconnect lands here: cancel both tasks so the
-        # in-flight LLM request is aborted (token spend stops).
+        # 客户端断开会走到这里：取消两个任务，使正在进行的 LLM 请求
+        # 中止（token 消耗停止）。
         for task in (producer, heartbeat):
             task.cancel()
         await asyncio.gather(producer, heartbeat, return_exceptions=True)
 
 
 def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
-    """Build the service app; tests inject a runtime, production builds one."""
+    """构建服务应用；测试注入一个 runtime，生产环境则现场构建。"""
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -146,11 +176,10 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
     metrics = Metrics()
     app.state.metrics = metrics
 
-    # CORS: the SSE endpoint serves cross-origin browser clients
-    # (agent-base-ui). The middleware answers the OPTIONS preflight and
-    # stamps Access-Control-Allow-Origin on responses; without it the
-    # preflight reaches the router and dies with 405 Method Not Allowed.
-    # Origins come from config (CORS_ORIGINS, default localhost:3000).
+    # CORS：SSE 端点服务于跨域浏览器客户端（agent-base-ui）。中间件会
+    # 应答 OPTIONS 预检请求，并在响应上打上 Access-Control-Allow-Origin；
+    # 没有它，预检请求会到达路由器并以 405 Method Not Allowed 失败。
+    # 来源来自配置（CORS_ORIGINS，默认 localhost:3000）。
     cors_settings = runtime.settings if runtime is not None else Settings()
     app.add_middleware(
         CORSMiddleware,
@@ -167,8 +196,8 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         with request_id(rid):
             response = await call_next(request)
         response.headers["X-Request-ID"] = rid
-        # B4/B5 lesson: label by ROUTE TEMPLATE, never the raw path —
-        # raw paths (one per thread id) would explode metric cardinality.
+        # B4/B5 经验：用路由模板打 label，绝不用原始路径——
+        # 原始路径（每个 thread id 一条）会让指标基数爆炸。
         route = request.scope.get("route")
         template = getattr(route, "path", request.url.path)
         metrics.observe(
@@ -184,8 +213,8 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         user_thread_id = body.thread_id or new_request_id()
-        # Module-scoped thread id: graphs share one checkpointer; an
-        # un-namespaced id would mix their states.
+        # 按模块划分的 thread id：图共用一个 checkpointer；未划分命名空间
+        # 的 id 会把它们的状态混在一起。
         config: RunnableConfig = {"configurable": {"thread_id": f"{module}:{user_thread_id}"}}
         return StreamingResponse(
             _event_stream(graph, body.message, config, user_thread_id),
@@ -193,9 +222,33 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
             headers=_SSE_HEADERS,
         )
 
+    @app.get("/v1/agents/{module}/threads/{thread_id}")
+    async def get_thread_history(module: str, thread_id: str, request: Request) -> dict[str, Any]:
+        """返回某会话已持久化的消息历史（供前端恢复会话显示）。
+
+        agent-base 没有 thread-list 端点；这个只读端点读取 checkpointer 里
+        该 thread 的最新状态，并把其中的消息序列化成与 invoke 事件对齐的
+        简单结构。前端 agent-base-ui 点击历史时用它回放对话。
+        """
+        runtime: AgentRuntime = request.app.state.runtime
+        try:
+            graph = runtime.graph(module)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        # thread id 按模块划分命名空间，与 invoke 端点保持一致。
+        config: RunnableConfig = {"configurable": {"thread_id": f"{module}:{thread_id}"}}
+        snapshot = await graph.aget_state(config)
+        raw_messages = (snapshot.values or {}).get("messages", []) if snapshot else []
+        messages = [
+            serialized
+            for serialized in (_serialize_message(m) for m in raw_messages)
+            if serialized is not None
+        ]
+        return {"thread_id": thread_id, "module": module, "messages": messages}
+
     @app.get("/health")
     async def health(request: Request) -> dict[str, Any]:
-        """Component health; ``degraded`` reports partial failure (A4)."""
+        """组件健康；``degraded`` 表示部分失败（A4）。"""
         runtime: AgentRuntime = request.app.state.runtime
         components: dict[str, str] = {}
         if runtime.checkpointer is None:
