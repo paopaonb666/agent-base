@@ -22,6 +22,16 @@ dependencies = [
     # Floor 2.2: NoDecode (needed to accept plain comma-separated values for
     # list-typed env fields like AGENT_MODULES) was added in 2.2.
     "pydantic-settings>=2.2",
+    # Stage 3: sqlite checkpointer backend (memory backend needs nothing).
+    # aiosqlite: the runtime is async-first; the sync SqliteSaver cannot
+    # serve astream (NotImplementedError), so we use AsyncSqliteSaver.
+    "langgraph-checkpoint-sqlite>=2.0",
+    "aiosqlite>=0.20",
+    # Stage 4: supervisor multi-agent template (create_supervisor).
+    "langgraph-supervisor>=0.0.31",
+    # Stage 4: HTTP + SSE service entrypoint.
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
 ]
 
 [project.scripts]
@@ -34,6 +44,8 @@ dev = [
     "ruff>=0.4",
     "mypy>=1.10",
     "pip-audit>=2.7",
+    # fastapi TestClient is httpx-based.
+    "httpx>=0.27",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -68,4 +80,6 @@ pretty = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-addopts = "-q --strict-markers"
+# Coverage gate (Stage 5): every `pytest` run — local or CI — measures
+# branch coverage over the whole package and fails below 85%.
+addopts = "-q --strict-markers --cov=agent_base --cov-branch --cov-report=term-missing --cov-fail-under=85"

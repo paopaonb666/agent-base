@@ -59,6 +59,13 @@ htmlcov/
 .env
 .env.local
 
+# Project docs (user-mandated: keep out of the GitHub repo)
+docs/
+
+# Editor/IDE + workspace assistant metadata
+.idea/
+.trae/
+
 # Local state (checkpointer db)
 *.db
 *.sqlite3

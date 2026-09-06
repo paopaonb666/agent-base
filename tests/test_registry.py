@@ -92,3 +92,64 @@ def test_hello_module_loads_without_touching_base(
     modules = load_modules(["hello"], prefix="fm_hello")
     assert modules["hello"].name == "hello"
     assert modules["hello"].description == "hello sample"
+
+
+# ── contract validation branches ──
+
+
+def test_module_empty_description_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    body = (
+        "class Fake:\n"
+        "    name = 'nodesc'\n"
+        "    description = ''\n"
+        "    def build_graph(self, ctx):\n"
+        "        raise NotImplementedError\n"
+        "    def get_tools(self):\n"
+        "        return []\n"
+        "module = Fake()\n"
+    )
+    _write_module(tmp_path, "fm_nodesc", "nodesc", body)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    with pytest.raises(RegistryError, match="non-empty 'description'"):
+        load_modules(["nodesc"], prefix="fm_nodesc")
+
+
+def test_module_missing_build_graph_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = (
+        "class Fake:\n"
+        "    name = 'nograph'\n"
+        "    description = 'fake'\n"
+        "    def get_tools(self):\n"
+        "        return []\n"
+        "module = Fake()\n"
+    )
+    _write_module(tmp_path, "fm_nograph", "nograph", body)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    with pytest.raises(RegistryError, match="build_graph"):
+        load_modules(["nograph"], prefix="fm_nograph")
+
+
+def test_module_missing_get_tools_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    body = (
+        "class Fake:\n"
+        "    name = 'notools'\n"
+        "    description = 'fake'\n"
+        "    def build_graph(self, ctx):\n"
+        "        raise NotImplementedError\n"
+        "module = Fake()\n"
+    )
+    _write_module(tmp_path, "fm_notools", "notools", body)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    with pytest.raises(RegistryError, match="get_tools"):
+        load_modules(["notools"], prefix="fm_notools")
+
+
+def test_module_import_failure_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A module whose OWN import explodes fails with the import error, not 'unknown'."""
+    body = "import module_that_does_not_exist_anywhere_123\n"
+    _write_module(tmp_path, "fm_broken", "broken", body)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    with pytest.raises(RegistryError, match="failed to import"):
+        load_modules(["broken"], prefix="fm_broken")

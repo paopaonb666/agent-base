@@ -14,10 +14,60 @@ Agent 软件基座——所有 agent 模块扩展的统一起点。
 | --- | --- | --- |
 | 0 | 工程地基（脚手架 / 工具链 / CI 四道门 / ADR） | ✅ 已完成 |
 | 1 | 核心装配层（config / contracts / registry / llm / bootstrap）+ chat 样板模块 + CLI 入口 | ✅ 已完成 |
-| 2 | 可观测性（request_id 贯穿 / 结构化日志） | ⬚ |
-| 3 | 工具扩展点 + 对话状态（checkpointer） | ⬚ |
-| 4 | FastAPI + SSE 服务入口 + supervisor 多 Agent 模板 | ⬚ |
-| 5 | 收尾 + 文档闭环（module-guide 五步接入实操） | ⬚ |
+| 2 | 可观测性（request_id 贯穿 / 结构化日志 / LangSmith·Langfuse 开关） | ✅ 已完成 |
+| 3 | 工具扩展点（共享工具池 + 超时 + 异常归一）+ 对话状态（checkpointer） | ✅ 已完成 |
+| 4 | FastAPI + SSE 服务入口 + supervisor 多 Agent 模板 | ✅ 已完成 |
+| 5 | 收尾 + 文档闭环（五步接入实操 / coverage ≥85% / CircuitBreaker 归档） | ✅ 已完成 |
+
+## 架构图
+
+```
+                         ┌──────────────────────────────────────────────┐
+                         │                agent-base（基座）             │
+                         │                                              │
+  CLI / SSE 服务 ───────▶ │  entrypoints   core                extensions│
+  (python -m / uvicorn)   │  ┌──────────┐  ┌────────────────┐  ┌───────┐ │
+                          │  │ cli.py   │─▶│ bootstrap      │◀─│memory │ │ ◀─ 对话状态
+                          │  │ server.py│  │ （装配中枢）    │  │collab │ │ ◀─ supervisor
+                          │  └──────────┘  └──┬──┬──┬──┬────┘  │events │ │ ◀─ SSE 契约
+                          │                   │  │  │  │       │metrics│ │ ◀─ 指标
+                          │                   ▼  ▼  ▼  ▼       │observ.│ │ ◀─ request_id
+                          │              config contracts     └───────┘ │
+                          │              registry llm tools            │
+                          │                                              │
+                          │  modules/（业务方按五步接入，不改基座代码）   │
+                          │  ┌──────┐ ┌──────┐ ┌──────┐                 │
+                          │  │ chat │ │writer│ │hello │  … 未来模块      │
+                          │  └──────┘ └──────┘ └──────┘                 │
+                          └──────────────────────────────────────────────┘
+                                        ▲ AgentModule 契约（ADR-002）
+                                        │
+                                  LangGraph 运行时（不自研，>=1.2.6）
+```
+
+数据流：入口（CLI / HTTP SSE）→ `create_runtime` 按 `AGENT_MODULES` 契约装配 →
+模块图挂在运行时上执行；扩展点（状态 / 协作 / 事件 / 指标 / 可观测）由基座统一供给。
+
+## 环境要求
+
+- Python ≥ 3.10（开发推荐 3.12）
+- 可选：Node.js + pnpm（仅当使用配套前端 agent-base-ui 时）
+
+## 依赖清单
+
+运行依赖（`pyproject.toml` [project.dependencies]）：
+
+| 依赖 | 用途 | 版本地板及理由 |
+| --- | --- | --- |
+| `langgraph` | 运行时（delegated，不自研） | `>=1.2.6`：修复 CVE-2025-68664（反序列化注入）、CVE-2025-67644（SQLite checkpointer SQL 注入）、CVE-2026-34070（路径遍历），见 ADR-001 |
+| `langchain-core` / `langchain-openai` | 消息图元 + OpenAI 兼容模型客户端 | `>=1.6`：langchain-openai 1.x 的下限 |
+| `pydantic-settings` | 配置即校验（fail-fast） | `>=2.2`：NoDecode 支持逗号分隔的列表类字段（`AGENT_MODULES`） |
+| `langgraph-checkpoint-sqlite` + `aiosqlite` | sqlite 对话状态后端 | `>=2.0`：AsyncSqliteSaver 服务 astream |
+| `langgraph-supervisor` | supervisor 多 Agent 模板 | `>=0.0.31` |
+| `fastapi` / `uvicorn` | HTTP + SSE 服务入口 | `>=0.115` / `>=0.30` |
+
+开发依赖（`[dev]`）：pytest / pytest-asyncio / pytest-cov / ruff / mypy / pip-audit / httpx。
+安全审计由 CI 常驻：`pip-audit --skip-editable`。
 
 ## 快速开始
 
@@ -29,38 +79,91 @@ cp .env.example .env           # 填入 LLM_API_KEY（阶段 1 起由 config.py 
 pytest
 ```
 
+### 配置说明（.env）
+
+`.env.example` 是配置契约（由 `core/config.py` 消费），关键项：
+
+| 变量 | 说明 |
+| --- | --- |
+| `LLM_API_KEY` | 必填。OpenAI 兼容模型的 API key（DeepSeek / 智谱 / 自定义均走同一客户端）。production 下缺失将拒绝启动 |
+| `LLM_PROVIDER` | `deepseek` \| `zhipu` \| `openai-compatible`（仅做拼写校验，不改变客户端） |
+| `LLM_BASE_URL` / `LLM_MODEL` | 模型服务地址与模型名，切换 provider 只需改这两项 |
+| `AGENT_MODULES` | 逗号分隔的模块清单，顺序即装配顺序（默认 `chat,writer`） |
+| `CORS_ORIGINS` | 允许跨域调用 SSE 端点的来源（默认 `http://localhost:3000`，即 agent-base-ui） |
+| `CHECKPOINTER_BACKEND` | `memory`（默认，零依赖）\| `sqlite`（进程重启可恢复对话） |
+| `TOOL_TIMEOUT_SECONDS` | 工具单次执行超时（默认 30s） |
+| `LOG_JSON` | `true` 输出结构化 JSON 日志（生产建议开启） |
+
 运行一个对话（阶段 1 起可用）：
 
 ```bash
 python -m agent_base --message "你好"      # 单轮对话（需 .env 已配 LLM_API_KEY）
 python -m agent_base --module chat         # 交互式多轮对话
+python -m agent_base --module chat --thread-id <id>   # 恢复之前的会话（阶段 3）
+python -m agent_base --module supervisor   # 多 Agent 会话（阶段 4，编排在 AGENT_MODULES 里注册的所有模块）
 python -m agent_base --version
 ```
+
+运行 SSE 服务（阶段 4 起可用）：
+
+```bash
+uvicorn agent_base.entrypoints.server:app --reload
+
+curl -N -X POST http://localhost:8000/v1/agents/chat/invoke \
+  -H "Content-Type: application/json" -d '{"message": "你好"}'
+# SSE 事件：ping → step(running/completed) → delta... → done(thread_id)
+# 其他端点：GET /health（分项健康，degraded 不崩溃）；GET /metrics（Prometheus 文本，路由模板 label）
+```
+
+## 配合前端 agent-base-ui
+
+配套 Web 界面在独立仓库 `agent-base-ui`（同级目录 / `e:\ai_study\agent-base-ui`）：
+
+```bash
+# 1. 启动本后端（默认 8000 端口）
+uvicorn agent_base.entrypoints.server:app --reload
+
+# 2. 另开终端启动前端（见 agent-base-ui/README.md 的详细说明）
+cd ../agent-base-ui
+pnpm install
+pnpm dev        # http://localhost:3000
+```
+
+前端设置页填入 `http://localhost:8000` 与目标模块（chat / writer / supervisor）即可对话。
+两者通过 SSE 契约解耦，前端不依赖后端具体实现。（完整体验：先配 `.env` 的 `LLM_API_KEY`。）
 
 ## 质量门（四道，本地与 CI 完全一致）
 
 ```bash
 ruff check src tests && ruff format --check src tests   # 1. lint + format
 mypy                                                     # 2. 类型检查（strict）
-pytest                                                   # 3. 测试
-pip-audit                                                # 4. 依赖安全审计
+pytest                                                   # 3. 测试（内置 branch coverage ≥85% 门槛）
+pip-audit --skip-editable                               # 4. 依赖安全审计
 ```
 
 ## 项目结构
 
 ```
 agent-base/
-├── pyproject.toml            # 依赖 + 工具链配置（ruff / mypy / pytest）
+├── pyproject.toml            # 依赖 + 工具链配置（ruff / mypy / pytest + coverage 门槛 ≥85%）
 ├── .env.example             # 配置契约（由 core/config.py 消费）
 ├── src/agent_base/
-│   ├── core/                # config / contracts / registry / llm / bootstrap
+│   ├── core/                # config / contracts / registry / llm / bootstrap / tools（工具池）
+│   ├── extensions/          # 扩展点：observability（request_id + 日志）· memory（checkpointer）
+│   │                        #           · collab（supervisor）· events（SSE 契约）· metrics
 │   ├── modules/chat/        # 样板模块（graph + module + tools，兼作接入模板）
-│   └── entrypoints/cli.py   # CLI 入口（--module / --message / --version）
-├── tests/                   # config / registry / chat / cli / smoke
+│   ├── modules/writer/      # 第二样板模块（供 supervisor 编排演示）
+│   ├── modules/hello/       # 五步手册的真实落地实例（tests/test_hello_module.py 验证）
+│   └── entrypoints/
+│       ├── cli.py           # CLI 入口（--module / --message / --thread-id / --version）
+│       └── server.py        # FastAPI + SSE 服务入口（/invoke · /health · /metrics）
+├── tests/                   # config / registry / llm / chat / cli / smoke / observability
+│                            # / memory / tools / events / server / collab / hello
 ├── docs/
 │   ├── adr/                 # 架构决策记录
-│   └── module-guide.md      # 五步接入手册（新模块接入不改基座）
-└── .github/workflows/ci.yml # CI：lint → typecheck → test → audit
+│   ├── future/              # 未来模块路线图存档（circuit-breaker → reliability 模块）
+│   └── module-guide.md      # 五步接入手册 + 应用层规范（新模块接入不改基座）
+└── .github/workflows/ci.yml # CI：lint → typecheck → test（含 coverage 门槛）→ audit
 ```
 
 ## 设计决策

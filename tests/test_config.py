@@ -43,6 +43,29 @@ def test_invalid_json_array_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
         Settings(_env_file=None)
 
 
+def test_malformed_json_array_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A '['-prefixed value is JSON-array territory; broken JSON must fail loudly."""
+    monkeypatch.setenv("AGENT_MODULES", "[chat")
+    with pytest.raises(ValidationError, match="invalid"):
+        Settings(_env_file=None)
+
+
+def test_json_array_of_wrong_type_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defensive branch: '['-prefixed JSON that is not a list."""
+    monkeypatch.setenv("AGENT_MODULES", "[1,2]")
+    with pytest.raises(ValidationError, match="list of strings"):
+        Settings(_env_file=None)
+
+
+def test_json_non_list_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The parser's own guard: a '[…]' value whose decoded JSON is not a list."""
+    import agent_base.core.config as config_module
+
+    monkeypatch.setattr(config_module.json, "loads", lambda text: {"not": "a list"})
+    with pytest.raises(ValueError, match="must be a list of strings"):
+        Settings(agent_modules="[anything]")
+
+
 def test_dotenv_comma_separated_modules(tmp_path: Path) -> None:
     """Regression: a .env file must accept the plain comma form.
 

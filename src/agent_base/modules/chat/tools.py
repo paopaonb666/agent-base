@@ -1,15 +1,25 @@
 """Tools contributed by the chat module.
 
-The shared tool pool and ``ToolNode`` execution land in Stage 3. Until then
-the sample module contributes an empty tool list — this file exists to fix
-the physical layout (graph / module / tools) that every module follows.
+Stage 3: the sample tool demonstrates the full contribution → pool →
+``ToolNode`` round-trip. Every module follows this layout; tools returned
+here are shared across modules through ``ModuleContext.tools``.
 """
 
 from __future__ import annotations
 
-from langchain_core.tools import BaseTool
+from langchain_core.tools import BaseTool, tool
+
+
+@tool
+def echo(text: str) -> str:
+    """Echo the given text back, prefixed with 'echo:'.
+
+    Sample tool proving the shared tool pool works end to end; replace with
+    real module tools as modules grow.
+    """
+    return f"echo: {text}"
 
 
 def get_tools() -> list[BaseTool]:
     """Return the tools this module contributes to the shared pool."""
-    return []
+    return [echo]

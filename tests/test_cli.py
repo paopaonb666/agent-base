@@ -2,10 +2,63 @@
 
 from __future__ import annotations
 
+import runpy
+import sys
+from types import SimpleNamespace
+from typing import Any
+
 import pytest
+from langchain_core.messages import AIMessage
 
 from agent_base import __version__
+from agent_base.entrypoints import cli
 from agent_base.entrypoints.cli import build_parser, main
+
+
+class _FakeGraph:
+    """Minimal graph double: appends a scripted assistant reply."""
+
+    def __init__(self, reply: str = "hello") -> None:
+        self._reply = reply
+        self.config: dict[str, Any] | None = None
+
+    async def ainvoke(self, payload: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+        self.config = config
+        user_text = str(payload["messages"][-1].content)
+        content = f"{self._reply} to: {user_text}" if self._reply else ""
+        return {"messages": [*payload["messages"], AIMessage(content=content)]}
+
+
+class _FakeRuntime:
+    """Minimal runtime double covering the CLI's touchpoints."""
+
+    settings = SimpleNamespace(log_json=False)
+    closed = False
+
+    def __init__(self, graph: _FakeGraph | None = None) -> None:
+        self._graph = graph or _FakeGraph()
+
+    def graph(self, module_name: str) -> _FakeGraph:
+        if module_name == "missing_xyz":
+            raise KeyError(
+                f"module {module_name!r} is not enabled; available: chat, writer, supervisor"
+            )
+        return self._graph
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _install_runtime(
+    monkeypatch: pytest.MonkeyPatch, runtime: _FakeRuntime | None = None
+) -> _FakeRuntime:
+    runtime = runtime or _FakeRuntime()
+
+    async def _create_runtime(**kwargs: Any) -> _FakeRuntime:
+        return runtime
+
+    monkeypatch.setattr(cli, "create_runtime", _create_runtime)
+    return runtime
 
 
 def test_parser_defaults() -> None:
@@ -25,3 +78,116 @@ def test_cli_version(capsys: pytest.CaptureFixture[str]) -> None:
         main(["--version"])
     assert exc.value.code == 0
     assert __version__ in capsys.readouterr().out
+
+
+def test_python_m_invocation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`python -m agent_base` runs main() (module __main__ shim)."""
+    monkeypatch.setattr(sys.modules["agent_base.entrypoints.cli"], "main", lambda argv=None: 0)
+    with pytest.raises(SystemExit) as exc:
+        runpy.run_module("agent_base.__main__", run_name="__main__")
+    assert exc.value.code == 0
+
+
+async def test_invoke_namespaces_thread_per_module(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The thread id must be namespaced per module (shared checkpointer)."""
+    runtime = _FakeRuntime()
+    graph = runtime._graph
+    messages = await cli._invoke(runtime, "chat", "thread-1", "hi")
+    assert graph.config == {"configurable": {"thread_id": "chat:thread-1"}}
+    assert [m.content for m in messages] == ["hi", "hello to: hi"]
+
+
+async def test_one_shot_prints_reply_and_thread_id(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    runtime = _install_runtime(monkeypatch)
+    await cli._one_shot(runtime, "chat", "t1", "hi")
+    out, err = capsys.readouterr()
+    assert "hello to: hi" in out
+    assert "thread_id: t1" in err
+
+
+async def test_one_shot_without_reply_prints_thread_id_only(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An empty assistant reply must not print an empty line."""
+    runtime = _install_runtime(monkeypatch, _FakeRuntime(_FakeGraph(reply="")))
+    await cli._one_shot(runtime, "chat", "t1", "hi")
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "thread_id: t1" in err
+
+
+async def test_interactive_turn_and_quit(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    answers = iter(["hi", "", "quit"])  # empty line is skipped, quit exits
+
+    def _input(prompt: str = "") -> str:
+        print(prompt, end="")
+        return next(answers)
+
+    monkeypatch.setattr("builtins.input", _input)
+    runtime = _install_runtime(monkeypatch)
+    await cli._interactive(runtime, "chat", "t1")
+    out, _ = capsys.readouterr()
+    assert "agent> hello to: hi" in out
+    assert "thread_id: t1" in out
+
+
+async def test_interactive_eof_exits(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _eof(prompt: str = "") -> str:
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", _eof)
+    runtime = _install_runtime(monkeypatch)
+    await cli._interactive(runtime, "chat", "t1")  # must return, not raise
+
+
+async def test_run_one_shot_returns_0_and_closes(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    runtime = _install_runtime(monkeypatch)
+    args = SimpleNamespace(module="chat", message="hi", thread_id="abc123")
+    assert await cli._run(args) == 0
+    assert runtime.closed
+    out, err = capsys.readouterr()
+    assert "hello to: hi" in out
+    assert "thread_id: abc123" in err
+
+
+async def test_run_settings_error_returns_2(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def _fail(**kwargs: Any) -> _FakeRuntime:
+        raise cli.SettingsError("bad config")
+
+    monkeypatch.setattr(cli, "create_runtime", _fail)
+    args = SimpleNamespace(module="chat", message=None, thread_id=None)
+    assert await cli._run(args) == 2
+    assert "configuration error: bad config" in capsys.readouterr().err
+
+
+async def test_run_unknown_module_returns_2(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _install_runtime(monkeypatch)
+    args = SimpleNamespace(module="missing_xyz", message="hi", thread_id=None)
+    assert await cli._run(args) == 2
+    assert "error:" in capsys.readouterr().err
+
+
+def test_main_one_shot_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_runtime(monkeypatch)
+    assert main(["--message", "hi"]) == 0
+
+
+def test_main_unhandled_error_returns_1(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def _explode(**kwargs: Any) -> _FakeRuntime:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(cli, "create_runtime", _explode)
+    assert main(["--message", "hi"]) == 1
+    assert "error: boom" in capsys.readouterr().err

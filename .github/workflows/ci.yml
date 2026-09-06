@@ -56,6 +56,10 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install
-        run: pip install -e ".[dev]"
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
       - name: pip-audit
-        run: pip-audit
+        # --skip-editable: the local agent-base package itself is not a PyPI
+        # dependency; everything it depends on is still audited.
+        run: pip-audit --skip-editable
