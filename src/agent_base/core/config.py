@@ -1,15 +1,14 @@
-"""Configuration for the agent base, consumed by the runtime.
+"""agent 基座的配置，供运行时消费。
 
-This module is the single consumer of the config CONTRACT declared in
-``.env.example``. pydantic-settings maps environment variables
-(case-insensitive) onto these fields; ``.env`` is loaded automatically when
-present.
+本模块是 ``.env.example`` 中声明的配置契约（CONTRACT）的唯一消费方。
+pydantic-settings 把环境变量（大小写不敏感）映射到这些字段上；存在
+``.env`` 时会被自动加载。
 
-Design notes (inherited from chat-agent review):
-- B5 "配置即校验": every field that can be wrong is validated at startup,
-  not silently defaulted.
-- SEC-C2 lesson: no weak default secrets; production refuses to boot
-  without ``LLM_API_KEY``.
+设计说明（继承自 chat-agent 评审）：
+- B5 “配置即校验”：每个可能出错的字段都在启动时校验，而不是静默地
+  使用默认值。
+- SEC-C2 经验：不使用弱默认密钥；production 环境在没有 ``LLM_API_KEY``
+  时拒绝启动。
 """
 
 from __future__ import annotations
@@ -20,25 +19,25 @@ from typing import Annotated
 from pydantic import Field, SecretStr, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-# openai-compatible providers the base knows how to assemble. All share the
-# same ChatOpenAI client; this set only guards against config typos.
+# 基座知道如何装配的 openai 兼容 provider。它们共用同一个 ChatOpenAI
+# 客户端；这个集合仅用于防止配置拼写错误。
 KNOWN_PROVIDERS: frozenset[str] = frozenset({"deepseek", "zhipu", "openai-compatible"})
 
-# checkpointer backends the base recognizes. sqlite is wired in Stage 3.
-KNOWN_CHECKPOINTER_BACKENDS: frozenset[str] = frozenset({"memory", "sqlite"})
+# 基座识别的 checkpointer 后端。sqlite 在阶段 3 接线，mysql 为可选后端。
+KNOWN_CHECKPOINTER_BACKENDS: frozenset[str] = frozenset({"memory", "sqlite", "mysql"})
 
 KNOWN_ENVIRONMENTS: frozenset[str] = frozenset({"development", "production"})
 
 
 class SettingsError(ValueError):
-    """Raised when configuration fails validation (fail-fast)."""
+    """当配置校验失败时抛出（快速失败）。"""
 
 
 class Settings(BaseSettings):
-    """Runtime configuration.
+    """运行时配置。
 
-    Fields mirror the ``.env.example`` contract. Unknown env vars are ignored
-    (``extra="ignore"``) so that unrelated shell variables never leak in.
+    字段与 ``.env.example`` 契约一一对应。未知环境变量会被忽略
+    （``extra="ignore"``），因此无关的 shell 变量永远不会泄漏进来。
     """
 
     model_config = SettingsConfigDict(
@@ -48,56 +47,64 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    # -- modules ------------------------------------------------------------
-    # Module names to load; order == assembly order.
-    # Accepted forms: comma-separated ("chat,writer") or a JSON array
-    # (["chat","writer"]). NoDecode stops pydantic-settings from JSON-decoding
-    # list-typed env values BEFORE validation — that pre-decode rejected the
-    # plain comma form in .env with "error parsing value for field
-    # agent_modules"; the before-validator below does the real parsing.
-    # The registry resolves each name to agent_base.modules.<name>.
+    # -- 模块 ------------------------------------------------------------
+    # 要加载的模块名；顺序即装配顺序。
+    # 接受的格式：逗号分隔（"chat,writer"）或 JSON 数组
+    # (["chat","writer"])。NoDecode 会阻止 pydantic-settings 在**校验之前**
+    # 就对列表类型的 env 值做 JSON 解码——那种预解码会以
+    # "error parsing value for field agent_modules" 拒绝 .env 中的普通
+    # 逗号形式；下面的 before 校验器才做真正的解析。
+    # registry 会把每个名字解析为 agent_base.modules.<name>。
     agent_modules: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["chat"])
 
-    # -- service ------------------------------------------------------------
-    # Origins allowed to call the service cross-origin (browser clients like
-    # agent-base-ui). Same csv / JSON-array forms as AGENT_MODULES.
+    # -- 服务 ------------------------------------------------------------
+    # 允许跨域调用本服务的来源（浏览器客户端，如 agent-base-ui）。
+    # 与 AGENT_MODULES 一样支持 csv / JSON 数组两种形式。
     cors_origins: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["http://localhost:3000"]
     )
 
-    # -- LLM (openai-compatible) -------------------------------------------
+    # -- LLM（openai 兼容） ---------------------------------------------
     llm_provider: str = "deepseek"
     llm_api_key: SecretStr = SecretStr("")
     llm_base_url: str = "https://api.deepseek.com/v1"
     llm_model: str = "deepseek-chat"
 
-    # -- conversation state (checkpointer; wired in Stage 3) ---------------
+    # -- 对话状态（checkpointer；阶段 3 接线） ---------------------------
     checkpointer_backend: str = "memory"
     checkpointer_sqlite_path: str = "./agent_base_state.db"
 
-    # -- tool pool (Stage 3) ------------------------------------------------
-    # Wall-clock budget per tool execution, enforced by the pool wrapper.
+    # MySQL 后端连接参数（仅当 CHECKPOINTER_BACKEND=mysql 时生效）。
+    # 要求 MySQL >= 8.0.19（或 MariaDB >= 10.7.1）。
+    checkpointer_mysql_host: str = "127.0.0.1"
+    checkpointer_mysql_port: int = 3306
+    checkpointer_mysql_user: str = "root"
+    checkpointer_mysql_password: SecretStr = SecretStr("")
+    checkpointer_mysql_database: str = "agent_base"
+
+    # -- 工具池（阶段 3） ------------------------------------------------
+    # 每次工具执行的挂钟时间预算，由池的包装器强制执行。
     tool_timeout_seconds: float = 30.0
 
-    # -- environment --------------------------------------------------------
+    # -- 环境 --------------------------------------------------------
     env: str = "development"
 
-    # -- observability ------------------------------------------------------
-    # Structured JSON log lines (human-readable by default in development).
-    # Production deployments should set LOG_JSON=true for machine-parseable
-    # logs. Tracing (LangSmith/Langfuse) stays env-gated and is not modelled
-    # here -- see extensions/observability.log_tracing_config.
+    # -- 可观测性 ------------------------------------------------------
+    # 结构化 JSON 日志行（开发环境默认人类可读）。
+    # 生产部署应设置 LOG_JSON=true 以获得机器可解析的日志。
+    # 追踪（LangSmith/Langfuse）仍由环境开关控制，不在这里建模——
+    # 见 extensions/observability.log_tracing_config。
     log_json: bool = False
 
     @field_validator("agent_modules", "cors_origins", mode="before")
     @classmethod
     def _parse_csv_or_json_list(cls, value: object, info: ValidationInfo) -> object:
-        """Parse a list-typed field from its friendly string form.
+        """把列表类型的字段从其友好的字符串形式解析出来。
 
-        ``AGENT_MODULES`` and ``CORS_ORIGINS`` both accept the comma form
-        (``"chat,writer"`` / ``"http://localhost:3000,https://x.example.com"``)
-        and a JSON array (``'["chat","writer"]'``). Empty input -> empty list.
-        Works for env vars, .env files, and direct init-kwargs alike.
+        ``AGENT_MODULES`` 和 ``CORS_ORIGINS`` 都接受逗号形式
+        （``"chat,writer"`` / ``"http://localhost:3000,https://x.example.com"``）
+        和 JSON 数组（``'["chat","writer"]'``）。空输入 -> 空列表。
+        对环境变量、.env 文件和直接传入的 init 关键字参数都同样适用。
         """
         if isinstance(value, str):
             text = value.strip()
@@ -154,10 +161,10 @@ class Settings(BaseSettings):
         return value
 
     def ensure_production_ready(self) -> None:
-        """Fail fast on production-misconfiguration.
+        """在 production 配置错误时快速失败。
 
-        Production requires a real API key; booting without one would put the
-        service into a silently-broken state (chat-agent review SEC-C2).
+        production 要求真实的 API key；没有它启动会让服务陷入静默损坏的
+        状态（chat-agent 评审 SEC-C2）。
         """
         if self.env != "production":
             return

@@ -68,6 +68,8 @@ Agent 软件基座——所有 agent 模块扩展的统一起点。
 
 开发依赖（`[dev]`）：pytest / pytest-asyncio / pytest-cov / ruff / mypy / pip-audit / httpx。
 安全审计由 CI 常驻：`pip-audit --skip-editable`。
+数据库迁移（`mysql` 后端）：Alembic + SQLAlchemy + PyMySQL（均为 dev 依赖）。
+对话状态表由 [`alembic/`](alembic/) 版本化管理，初始迁移复用 langgraph 内置迁移。
 
 ## 快速开始
 
@@ -90,7 +92,7 @@ pytest
 | `LLM_BASE_URL` / `LLM_MODEL` | 模型服务地址与模型名，切换 provider 只需改这两项 |
 | `AGENT_MODULES` | 逗号分隔的模块清单，顺序即装配顺序（默认 `chat,writer`） |
 | `CORS_ORIGINS` | 允许跨域调用 SSE 端点的来源（默认 `http://localhost:3000`，即 agent-base-ui） |
-| `CHECKPOINTER_BACKEND` | `memory`（默认，零依赖）\| `sqlite`（进程重启可恢复对话） |
+| `CHECKPOINTER_BACKEND` | `memory`（默认，零依赖）\| `sqlite`（进程重启可恢复对话）\| `mysql`（MySQL 持久化，配 `CHECKPOINTER_MYSQL_*`） |
 | `TOOL_TIMEOUT_SECONDS` | 工具单次执行超时（默认 30s） |
 | `LOG_JSON` | `true` 输出结构化 JSON 日志（生产建议开启） |
 
@@ -114,6 +116,25 @@ curl -N -X POST http://localhost:8000/v1/agents/chat/invoke \
 # SSE 事件：ping → step(running/completed) → delta... → done(thread_id)
 # 其他端点：GET /health（分项健康，degraded 不崩溃）；GET /metrics（Prometheus 文本，路由模板 label）
 ```
+
+## 数据库迁移（mysql 后端）
+
+对话状态（checkpointer）表由 **Alembic** 版本化管理，初迁移复用 langgraph 内置迁移：
+
+```bash
+# 全新库：应用全部迁移（建出 checkpoint_* 表）
+python -m alembic upgrade head
+
+# 已由 langgraph setup() 建过表的库：只对齐版本、不重复执行 DDL
+python -m alembic stamp head
+
+# 连接参数优先级：AGENT_BASE_DB_* 环境变量 > .env 的 CHECKPOINTER_MYSQL_*
+# 例：AGENT_BASE_DB_NAME=mydb AGENT_BASE_DB_PASSWORD=*** python -m alembic upgrade head
+```
+
+迁移目录：[`alembic/`](alembic/)（`alembic.ini`、`env.py`、`versions/`）。
+说明：迁移通过读取 `checkpoint_migrations` 当前最大版本判断进度，与
+`AIOMySQLSaver.setup()` 的幂等逻辑一致，二者共存且不冲突。
 
 ## 配合前端 agent-base-ui
 
@@ -157,6 +178,7 @@ agent-base/
 │   └── entrypoints/
 │       ├── cli.py           # CLI 入口（--module / --message / --thread-id / --version）
 │       └── server.py        # FastAPI + SSE 服务入口（/invoke · /health · /metrics）
+├── alembic/                 # 数据库迁移（alembic.ini + env.py + versions/）
 ├── tests/                   # config / registry / llm / chat / cli / smoke / observability
 │                            # / memory / tools / events / server / collab / hello
 ├── docs/

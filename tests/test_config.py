@@ -1,4 +1,4 @@
-"""Tests for core.config (pydantic-settings + fail-fast)."""
+"""core.config 的测试（pydantic-settings + 快速失败）。"""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from agent_base.core.config import Settings, SettingsError
 
 
 def test_default_modules() -> None:
-    # _env_file=None keeps the test hermetic against an ambient repo .env.
+    # _env_file=None 让测试对环境中既有的仓库 .env 保持隔离。
     assert Settings(_env_file=None).agent_modules == ["chat"]
 
 
@@ -44,21 +44,21 @@ def test_invalid_json_array_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_malformed_json_array_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A '['-prefixed value is JSON-array territory; broken JSON must fail loudly."""
+    """以 '[' 开头的值属于 JSON 数组范畴；损坏的 JSON 必须响亮地失败。"""
     monkeypatch.setenv("AGENT_MODULES", "[chat")
     with pytest.raises(ValidationError, match="invalid"):
         Settings(_env_file=None)
 
 
 def test_json_array_of_wrong_type_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Defensive branch: '['-prefixed JSON that is not a list."""
+    """防御性分支：以 '[' 开头的 JSON 却不是列表。"""
     monkeypatch.setenv("AGENT_MODULES", "[1,2]")
     with pytest.raises(ValidationError, match="list of strings"):
         Settings(_env_file=None)
 
 
 def test_json_non_list_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The parser's own guard: a '[…]' value whose decoded JSON is not a list."""
+    """解析器自身的防护：一个 '[…]' 值，其解码后的 JSON 不是列表。"""
     import agent_base.core.config as config_module
 
     monkeypatch.setattr(config_module.json, "loads", lambda text: {"not": "a list"})
@@ -67,11 +67,11 @@ def test_json_non_list_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_dotenv_comma_separated_modules(tmp_path: Path) -> None:
-    """Regression: a .env file must accept the plain comma form.
+    """回归测试：.env 文件必须接受普通的逗号形式。
 
-    pydantic-settings JSON-decodes list-typed env values before validation;
-    without NoDecode, ``AGENT_MODULES=chat`` in .env crashed startup with
-    ``error parsing value for field "agent_modules"``.
+    pydantic-settings 会在校验前对列表类型的 env 值做 JSON 解码；没有
+    NoDecode 时，.env 中的 ``AGENT_MODULES=chat`` 会以
+    ``error parsing value for field "agent_modules"`` 导致启动崩溃。
     """
     env_file = tmp_path / ".env"
     env_file.write_text("AGENT_MODULES=chat\n", encoding="utf-8")
@@ -92,6 +92,20 @@ def test_unknown_provider_rejected() -> None:
 def test_unknown_checkpointer_backend_rejected() -> None:
     with pytest.raises(ValidationError):
         Settings(checkpointer_backend="redis")
+
+
+def test_mysql_backend_accepted() -> None:
+    settings = Settings(_env_file=None, checkpointer_backend="mysql")
+    assert settings.checkpointer_backend == "mysql"
+    assert settings.checkpointer_mysql_host == "127.0.0.1"
+    assert settings.checkpointer_mysql_port == 3306
+    assert settings.checkpointer_mysql_user == "root"
+    assert settings.checkpointer_mysql_database == "agent_base"
+
+
+def test_mysql_password_is_secret_str() -> None:
+    settings = Settings(checkpointer_mysql_password="s3cret")
+    assert settings.checkpointer_mysql_password.get_secret_value() == "s3cret"
 
 
 def test_unknown_env_rejected() -> None:
