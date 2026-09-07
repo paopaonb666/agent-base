@@ -17,6 +17,8 @@ uvicorn 的循环上），所以 sqlite 后端使用异步 saver：同步的
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -71,37 +73,37 @@ async def _build_sqlite_checkpointer(settings: Settings) -> BaseCheckpointSaver[
     return saver
 
 
-class _KeepaliveMySQLConnection:
-    """aiomysql 连接的保活代理。
+# MySQL 保活间隔：默认 wait_timeout 是 8 小时，30 分钟一次 ping 远在
+# 其之前，连接基本不会被服务端掐断；即便被掐，ping(reconnect=True)
+# 也会自动重连。
+MYSQL_KEEPALIVE_SECONDS = 1800.0
 
-    saver 持有贯穿进程生命周期的单个连接；MySQL 的 ``wait_timeout`` 到期
-    后服务端会掐断它，长会话的下一次查询会直接失败。aiomysql 的
-    ``ping(reconnect=True)`` 恰好提供"探活 + 重连"——在每次取游标前
-    ping 一次即可，代价是每次查询多一个往返（checkpoint 操作频率很低，
-    可忽略）。其余属性全部透传（``ensure_closed`` 等关闭路径不受影响）。
-    """
 
-    def __init__(self, conn: Any) -> None:
-        self._conn = conn
-
-    async def cursor(self, *args: Any, **kwargs: Any) -> Any:
-        await self._conn.ping(reconnect=True)
-        return await self._conn.cursor(*args, **kwargs)
-
-    def __getattr__(self, attr: str) -> Any:
-        return getattr(self._conn, attr)
+async def _mysql_keepalive(conn: Any, interval_seconds: float) -> None:
+    """周期性 ping MySQL 连接（掉线自动重连），直到被取消。"""
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            await conn.ping(reconnect=True)
+        except Exception:
+            # ping 失败不致命：下一次循环再试；查询层的失败由调用方处理。
+            continue
 
 
 async def _build_mysql_checkpointer(settings: Settings) -> BaseCheckpointSaver[Any]:
-    """构建 MySQL checkpointer（异步 ``AIOMySQLSaver``，要求 MySQL >= 8.0.19）。
+    """构建 MySQL checkpointer（按服务器版本选择官方 saver 或 5.7 兼容 saver）。
 
     与 sqlite 后端同理，连接直接 await 并保持存活到 ``close_checkpointer()``；
     刻意不使用 ``from_conn_string`` 上下文管理器，以免连接被提前关闭。
-    连接用保活代理包裹，规避 wait_timeout 掐断长驻连接的问题。
+    另起一个后台保活任务周期性 ping 连接（掉线自动重连），规避
+    ``wait_timeout`` 掐断长驻连接的问题——任务句柄挂在 saver 上，
+    由 ``close_checkpointer`` 负责取消。官方 saver 要求 MySQL >= 8.0.19；
+    5.7 服务器自动改用 ``MySQL57Saver``（extensions/mysql57.py）。
     """
-    # 延迟导入：只有选择 mysql 时才需要 aiomysql。
+    # 延迟导入：只有选择 mysql 时才需要 aiomysql / 官方 saver 依赖。
     import aiomysql  # type: ignore[import-untyped]
-    from langgraph.checkpoint.mysql.aio import AIOMySQLSaver
+
+    from agent_base.extensions.mysql57 import MySQL57Saver, probe_mysql_major_version
 
     conn = await aiomysql.connect(
         host=settings.checkpointer_mysql_host,
@@ -111,13 +113,28 @@ async def _build_mysql_checkpointer(settings: Settings) -> BaseCheckpointSaver[A
         db=settings.checkpointer_mysql_database,
         autocommit=True,
     )
-    saver = AIOMySQLSaver(conn=_KeepaliveMySQLConnection(conn))
+    saver: BaseCheckpointSaver[Any]
+    if await probe_mysql_major_version(conn) < 8:
+        saver = MySQL57Saver(conn=conn)
+    else:
+        from langgraph.checkpoint.mysql.aio import AIOMySQLSaver
+
+        saver = AIOMySQLSaver(conn=conn)
     await saver.setup()
+    saver._keepalive_task = asyncio.create_task(  # type: ignore[attr-defined]
+        _mysql_keepalive(conn, MYSQL_KEEPALIVE_SECONDS)
+    )
     return saver
 
 
 async def close_checkpointer(checkpointer: BaseCheckpointSaver[Any]) -> None:
     """尽力而为地拆除（测试会创建很多 saver；进程可以跳过）。"""
+    # 取消 MySQL 保活任务（如果有的话），再关连接。
+    task = getattr(checkpointer, "_keepalive_task", None)
+    if task is not None and not task.done():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
     conn = getattr(checkpointer, "conn", None)
     # 优先使用异步的 ensure_closed（aiomysql），否则退回 close（aiosqlite）。
     closer = getattr(conn, "ensure_closed", None) or getattr(conn, "close", None)
