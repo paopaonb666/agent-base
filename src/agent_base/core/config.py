@@ -96,6 +96,10 @@ class Settings(BaseSettings):
     # 见 extensions/observability.log_tracing_config。
     log_json: bool = False
 
+    # /health 是否真实探测 LLM 端点可达性（会打真实网络，默认关闭——
+    # 关闭时只校验 key 非空与 base_url 格式；生产环境可按需开启）。
+    health_probe_model: bool = False
+
     @field_validator("agent_modules", "cors_origins", mode="before")
     @classmethod
     def _parse_csv_or_json_list(cls, value: object, info: ValidationInfo) -> object:
@@ -160,12 +164,25 @@ class Settings(BaseSettings):
             raise ValueError(f"unknown ENV {value!r}; expected one of {sorted(KNOWN_ENVIRONMENTS)}")
         return value
 
+    @field_validator("tool_timeout_seconds")
+    @classmethod
+    def _validate_tool_timeout(cls, value: float) -> float:
+        # 非正数会让工具池立即超时，等于静默禁用所有工具。
+        if value <= 0:
+            raise ValueError(f"TOOL_TIMEOUT_SECONDS must be > 0, got {value}")
+        return value
+
     def ensure_production_ready(self) -> None:
-        """在 production 配置错误时快速失败。
+        """在配置错误时快速失败（安全项对所有环境生效，其余限 production）。
 
         production 要求真实的 API key；没有它启动会让服务陷入静默损坏的
         状态（chat-agent 评审 SEC-C2）。
         """
+        if "*" in self.cors_origins:
+            raise SettingsError(
+                'CORS_ORIGINS="*" is not allowed (in any environment): a wildcard '
+                "origin lets any site call the invoke endpoint on the user's behalf"
+            )
         if self.env != "production":
             return
         if not self.llm_api_key.get_secret_value().strip():
@@ -173,3 +190,20 @@ class Settings(BaseSettings):
                 "LLM_API_KEY is required in production (ENV=production); "
                 "refusing to start with an empty key"
             )
+        if self.checkpointer_backend == "mysql":
+            missing = [
+                name
+                for name, value in (
+                    ("CHECKPOINTER_MYSQL_USER", self.checkpointer_mysql_user),
+                    ("CHECKPOINTER_MYSQL_DATABASE", self.checkpointer_mysql_database),
+                    (
+                        "CHECKPOINTER_MYSQL_PASSWORD",
+                        self.checkpointer_mysql_password.get_secret_value(),
+                    ),
+                )
+                if not str(value).strip()
+            ]
+            if missing:
+                raise SettingsError(
+                    f"{', '.join(missing)} required in production with CHECKPOINTER_BACKEND=mysql"
+                )

@@ -59,6 +59,13 @@ def _load_one(name: str, *, prefix: str) -> AgentModule:
         if exc.name == full_name:
             raise RegistryError(f"unknown module {name!r} (no such package {full_name!r})") from exc
         raise RegistryError(f"module {name!r} failed to import: {exc}") from exc
+    except Exception as exc:
+        # SyntaxError、NameError 等 import 期错误同样以 RegistryError 归一：
+        # 本文件的契约是"任何失败都以 RegistryError 中止"，入口层据此
+        # 给出统一的报错形态，而不是裸堆栈。
+        raise RegistryError(
+            f"module {name!r} failed to import: {type(exc).__name__}: {exc}"
+        ) from exc
 
     obj = getattr(package, "module", None)
     if obj is None:

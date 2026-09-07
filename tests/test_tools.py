@@ -86,11 +86,26 @@ def test_timeout_tool_sync_cuts_off() -> None:
         return "late"
 
     pool = build_tool_pool({"m": _FakeModule("m", [slow_sync])}, timeout=0.05)
+    started = time.perf_counter()
     with pytest.raises(ToolTimeoutError, match="exceeded"):
         pool[0].invoke({})
+    # 回归断言：超时必须在预算附近返回，而不是等失控工具跑满全程。
+    assert time.perf_counter() - started < 5
 
 
 def test_wrapped_tool_preserves_schema_and_result() -> None:
     pool = build_tool_pool({"m": _FakeModule("m", [add])}, timeout=5)
     assert pool[0].invoke({"a": 2, "b": 3}) == 5
     assert "a" in pool[0].args_schema.model_fields
+
+
+def test_handle_tool_error_sanitized() -> None:
+    """错误文本进 ToolMessage（模型 + 历史回放可见）：URL 脱敏、长度封顶。"""
+    from agent_base.core.tools import handle_tool_error
+
+    leaked = handle_tool_error(ValueError("connect to http://10.0.0.1:8123/internal failed"))
+    assert "http://" not in leaked
+    assert "<redacted-url>" in leaked
+
+    huge = handle_tool_error(ValueError("x" * 2000))
+    assert len(huge) <= 300

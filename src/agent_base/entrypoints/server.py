@@ -23,12 +23,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import re
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, StreamingResponse
@@ -37,7 +40,7 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel
 
 from agent_base import __version__
-from agent_base.core.bootstrap import AgentRuntime, create_runtime
+from agent_base.core.bootstrap import SUPERVISOR_MODULE, AgentRuntime, create_runtime
 from agent_base.core.config import Settings
 from agent_base.extensions.events import (
     AgentEvent,
@@ -49,11 +52,25 @@ from agent_base.extensions.events import (
     encode_sse,
 )
 from agent_base.extensions.metrics import Metrics
-from agent_base.extensions.observability import new_request_id, request_id
+from agent_base.extensions.observability import (
+    new_request_id,
+    request_id,
+    setup_logging,
+)
 
 logger = logging.getLogger(__name__)
 
 HEARTBEAT_SECONDS = 15.0
+
+# SSE 事件队列上限：慢客户端（半开连接、不读数据）停止消费时，生产者在
+# 队列满后阻塞等待——内存有界，背压自然传导到 LLM 流。ping 允许丢弃。
+SSE_QUEUE_MAXSIZE = 256
+
+# 模型端点探活（/health）：结果缓存，避免每个探活请求都打真实网络。
+MODEL_PROBE_TTL_SECONDS = 30.0
+MODEL_PROBE_TIMEOUT_SECONDS = 3.0
+
+_URL_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://\S+")
 
 _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
@@ -96,6 +113,45 @@ def _serialize_message(message: Any) -> dict[str, Any] | None:
     return None
 
 
+def _safe_error_text(exc: Exception) -> str:
+    """给客户端的错误摘要：类型名 + 消息，URL 脱敏、长度封顶。
+
+    原始 ``str(exc)`` 可能携带内部端点、文件路径等部署细节；完整堆栈
+    已经带着 request_id 进了服务端日志，客户端只需要可行动的摘要。
+    """
+    text = _URL_RE.sub("<redacted-url>", f"{type(exc).__name__}: {exc}")
+    return text[:300]
+
+
+# 探活结果缓存：{base_url: (monotonic 时间, 结果)}。
+_model_probe_cache: dict[str, tuple[float, str]] = {}
+
+
+async def _probe_model(settings: Settings) -> str:
+    """探测 openai 兼容端点的网络可达性（带 TTL 缓存）。
+
+    只证明"端点在网络层可达"——任何 HTTP 应答（含 401/404）都算 ok；
+    配额、鉴权属于业务语义，不由 /health 判定。网络错误/超时 = error。
+    """
+    cache_key = settings.llm_base_url
+    now = time.monotonic()
+    hit = _model_probe_cache.get(cache_key)
+    if hit is not None and now - hit[0] < MODEL_PROBE_TTL_SECONDS:
+        return hit[1]
+    status = "error"
+    try:
+        async with httpx.AsyncClient(timeout=MODEL_PROBE_TIMEOUT_SECONDS) as client:
+            await client.get(
+                f"{cache_key.rstrip('/')}/models",
+                headers={"Authorization": f"Bearer {settings.llm_api_key.get_secret_value()}"},
+            )
+        status = "ok"  # 任何 HTTP 应答都证明可达
+    except Exception:
+        logger.warning("health: model endpoint probe failed for %s", cache_key)
+    _model_probe_cache[cache_key] = (now, status)
+    return status
+
+
 async def _produce(
     queue: asyncio.Queue[AgentEvent | None],
     graph: Any,
@@ -128,23 +184,35 @@ async def _produce(
         await queue.put(DoneEvent(thread_id=user_thread_id))
     except Exception as exc:
         logger.exception("sse: stream failed")
-        await queue.put(ErrorEvent(message=str(exc)))
+        await queue.put(ErrorEvent(message=_safe_error_text(exc)))
     finally:
-        queue.put_nowait(None)
+        # 哨兵必须送达：队列暂时满就等消费者排空。若任务已被取消（客户端
+        # 断开），sleep 抛 CancelledError，循环随之终止。
+        while True:
+            try:
+                queue.put_nowait(None)
+                break
+            except asyncio.QueueFull:
+                await asyncio.sleep(0.05)
 
 
 async def _heartbeat(queue: asyncio.Queue[AgentEvent | None]) -> None:
-    """每隔一段时间发出一个 ping，让空闲的流保持打开。"""
+    """每隔一段时间发出一个 ping，让空闲的流保持打开。
+
+    ping 是可丢弃的保活信号：队列满（慢客户端背压）时直接丢，
+    不与关键事件争抢容量。
+    """
     while True:
         await asyncio.sleep(HEARTBEAT_SECONDS)
-        await queue.put(PingEvent())
+        with contextlib.suppress(asyncio.QueueFull):
+            queue.put_nowait(PingEvent())
 
 
 async def _event_stream(
     graph: Any, message: str, config: RunnableConfig, user_thread_id: str
 ) -> AsyncIterator[str]:
     """一次对话轮的 SSE 帧（契约事件，已编码）。"""
-    queue: asyncio.Queue[AgentEvent | None] = asyncio.Queue()
+    queue: asyncio.Queue[AgentEvent | None] = asyncio.Queue(maxsize=SSE_QUEUE_MAXSIZE)
     producer = asyncio.create_task(_produce(queue, graph, message, config, user_thread_id))
     heartbeat = asyncio.create_task(_heartbeat(queue))
     try:
@@ -169,7 +237,11 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        app.state.runtime = runtime if runtime is not None else await create_runtime()
+        rt = runtime if runtime is not None else await create_runtime()
+        # 日志契约（LOG_JSON / request_id 过滤器）在 server 路径同样生效，
+        # 而不是只在 CLI——否则生产日志既非结构化也无法端到端追踪（A1）。
+        setup_logging(json_lines=rt.settings.log_json)
+        app.state.runtime = rt
         yield
 
     app = FastAPI(title="agent-base", version=__version__, lifespan=lifespan)
@@ -186,6 +258,9 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         allow_origins=cors_settings.cors_origins,
         allow_methods=["*"],
         allow_headers=["*"],
+        # X-Request-ID 是非简单响应头：不 expose 的话浏览器 JS 读不到，
+        # 前端无法用它做端到端追踪。
+        expose_headers=["X-Request-ID"],
         allow_credentials=False,
     )
 
@@ -246,21 +321,46 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         ]
         return {"thread_id": thread_id, "module": module, "messages": messages}
 
+    @app.get("/v1/modules")
+    async def list_modules(request: Request) -> dict[str, Any]:
+        """列出已注册的模块（供前端配置面板选择，免去试错模块名）。"""
+        rt: AgentRuntime = request.app.state.runtime
+        modules = [
+            {"name": m.name, "description": str(getattr(m, "description", ""))}
+            for m in rt.modules.values()
+        ]
+        modules.append(
+            {
+                "name": SUPERVISOR_MODULE,
+                "description": "多 Agent 协作：把所有已注册模块编排为 sub-agent",
+            }
+        )
+        return {"modules": modules}
+
     @app.get("/health")
     async def health(request: Request) -> dict[str, Any]:
         """组件健康；``degraded`` 表示部分失败（A4）。"""
-        runtime: AgentRuntime = request.app.state.runtime
+        rt: AgentRuntime = request.app.state.runtime
         components: dict[str, str] = {}
-        if runtime.checkpointer is None:
+        if rt.checkpointer is None:
             components["checkpointer"] = "unconfigured"
         else:
             try:
-                await runtime.checkpointer.aget_tuple({"configurable": {"thread_id": "__health__"}})
+                await rt.checkpointer.aget_tuple({"configurable": {"thread_id": "__health__"}})
                 components["checkpointer"] = "ok"
             except Exception:
                 components["checkpointer"] = "error"
-        key = runtime.settings.llm_api_key.get_secret_value().strip()
-        components["model"] = "ok" if key else "unconfigured"
+        key = rt.settings.llm_api_key.get_secret_value().strip()
+        if not key:
+            components["model"] = "unconfigured"
+        elif not rt.settings.llm_base_url.startswith(("http://", "https://")):
+            components["model"] = "misconfigured"
+        elif rt.settings.health_probe_model:
+            # 真实探活由开关控制（LLM_HEALTH_PROBE_MODEL=true）：探活会打
+            # 真实网络，默认关闭——负载均衡器的主动检查通常已覆盖此需求。
+            components["model"] = await _probe_model(rt.settings)
+        else:
+            components["model"] = "ok"
         status = "ok" if all(v == "ok" for v in components.values()) else "degraded"
         return {"status": status, "components": components}
 

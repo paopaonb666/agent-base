@@ -29,13 +29,19 @@ import logging
 import sys
 import uuid
 from collections.abc import Sequence
+from contextlib import suppress
 from typing import Any, cast
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 
 from agent_base import __version__
-from agent_base.core.bootstrap import SUPERVISOR_MODULE, AgentRuntime, create_runtime
+from agent_base.core.bootstrap import (
+    SUPERVISOR_MODULE,
+    AgentRuntime,
+    UnknownModuleError,
+    create_runtime,
+)
 from agent_base.core.config import SettingsError
 from agent_base.extensions.observability import (
     get_request_id,
@@ -136,21 +142,27 @@ async def _run(args: argparse.Namespace) -> int:
     setup_logging(json_lines=runtime.settings.log_json)
     log_tracing_config()
     thread_id = args.thread_id or uuid.uuid4().hex[:12]
-    with request_id():
-        logger.info("cli: start module=%s thread_id=%s", args.module, thread_id)
-        try:
-            if args.message is not None:
-                await _one_shot(runtime, args.module, thread_id, args.message)
-            else:
-                await _interactive(runtime, args.module, thread_id)
-        except KeyError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 2
-        finally:
-            # 始终关闭 trace——即便 LLM 调用爆炸了——这样一次会话在同一个
-            # request_id 下就有一个确定的结束标记。
-            logger.info("cli: done request_id=%s", get_request_id())
-    await runtime.close()
+    try:
+        with request_id():
+            logger.info("cli: start module=%s thread_id=%s", args.module, thread_id)
+            try:
+                if args.message is not None:
+                    await _one_shot(runtime, args.module, thread_id, args.message)
+                else:
+                    await _interactive(runtime, args.module, thread_id)
+            except UnknownModuleError as exc:
+                # 只接住"模块不存在"；图内部真正的 KeyError 不该被吞成这条文案。
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            finally:
+                # 始终关闭 trace——即便 LLM 调用爆炸了——这样一次会话在同一个
+                # request_id 下就有一个确定的结束标记。
+                logger.info("cli: done request_id=%s", get_request_id())
+    finally:
+        # 任何退出路径（含 UnknownModuleError 的 return 2 与 KeyboardInterrupt
+        # 中断）都要释放 checkpointer 连接。
+        with suppress(Exception):
+            await runtime.close()
     return 0
 
 

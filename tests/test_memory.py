@@ -16,7 +16,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from agent_base.core.bootstrap import AgentRuntime, create_runtime
-from agent_base.core.config import Settings
+from agent_base.core.config import Settings, SettingsError
 from agent_base.extensions.memory import build_checkpointer, close_checkpointer
 from agent_base.modules.chat.module import ChatModule
 from fakes import ScriptedChatModel
@@ -43,6 +43,16 @@ async def test_sqlite_backend_returns_async_saver(tmp_path: Path) -> None:
         assert db.exists()  # setup() 创建了该文件
     finally:
         await close_checkpointer(saver)
+
+
+async def test_sqlite_unwritable_path_fails_fast(tmp_path: Path) -> None:
+    """父目录不存在时启动即报配置错误，而不是会话中途的原始异常。"""
+    settings = _settings(
+        checkpointer_backend="sqlite",
+        checkpointer_sqlite_path=str(tmp_path / "missing_dir" / "state.db"),
+    )
+    with pytest.raises(SettingsError, match="not writable"):
+        await build_checkpointer(settings)
 
 
 async def test_thread_state_recovers_across_runtimes(tmp_path: Path) -> None:

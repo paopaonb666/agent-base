@@ -11,6 +11,7 @@ import pytest
 from langchain_core.messages import AIMessage
 
 from agent_base import __version__
+from agent_base.core.bootstrap import UnknownModuleError
 from agent_base.entrypoints import cli
 from agent_base.entrypoints.cli import build_parser, main
 
@@ -40,7 +41,7 @@ class _FakeRuntime:
 
     def graph(self, module_name: str) -> _FakeGraph:
         if module_name == "missing_xyz":
-            raise KeyError(
+            raise UnknownModuleError(
                 f"module {module_name!r} is not enabled; available: chat, writer, supervisor"
             )
         return self._graph
@@ -175,6 +176,32 @@ async def test_run_unknown_module_returns_2(
     args = SimpleNamespace(module="missing_xyz", message="hi", thread_id=None)
     assert await cli._run(args) == 2
     assert "error:" in capsys.readouterr().err
+
+
+async def test_unknown_module_still_closes_runtime(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """错误退出路径也必须释放 checkpointer 连接。"""
+    runtime = _install_runtime(monkeypatch)
+    args = SimpleNamespace(module="missing_xyz", message="hi", thread_id=None)
+    assert await cli._run(args) == 2
+    assert runtime.closed
+
+
+async def test_internal_key_error_propagates_and_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """图内部真正的 KeyError 不许被吞成"模块不存在"文案。"""
+
+    class _ExplodingGraph(_FakeGraph):
+        async def ainvoke(self, payload: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+            raise KeyError("internal state key")
+
+    runtime = _install_runtime(monkeypatch, _FakeRuntime(_ExplodingGraph()))
+    args = SimpleNamespace(module="chat", message="hi", thread_id=None)
+    with pytest.raises(KeyError, match="internal state key"):
+        await cli._run(args)
+    assert runtime.closed
 
 
 def test_main_one_shot_ok(monkeypatch: pytest.MonkeyPatch) -> None:

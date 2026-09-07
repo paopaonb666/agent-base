@@ -25,13 +25,26 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from agent_base.core.config import Settings
 from agent_base.core.contracts import AgentModule, Graph, ModuleContext
 from agent_base.core.llm import build_llm
-from agent_base.core.registry import load_modules
+from agent_base.core.registry import RegistryError, load_modules
 from agent_base.core.tools import build_tool_pool
 from agent_base.extensions.memory import build_checkpointer, close_checkpointer
 
 # 保留的模块名：不构建单个模块的图，而是在所有已加载模块之上构建
 # supervisor 图（阶段 4）。
 SUPERVISOR_MODULE = "supervisor"
+
+
+class UnknownModuleError(KeyError):
+    """请求的模块不在 AGENT_MODULES 清单中（入口层据此给出友好报错）。"""
+
+
+def validate_module_names(modules: dict[str, AgentModule]) -> None:
+    """启动时的清单完整性检查：supervisor 是保留名，不能被业务模块占用。"""
+    if SUPERVISOR_MODULE in modules:
+        raise RegistryError(
+            f"module name {SUPERVISOR_MODULE!r} is reserved for the multi-agent "
+            "supervisor; rename the module"
+        )
 
 
 @dataclass
@@ -43,6 +56,7 @@ class AgentRuntime:
     modules: dict[str, AgentModule]
     tools: list[BaseTool] = field(default_factory=list)
     checkpointer: BaseCheckpointSaver[Any] | None = None
+    _graphs: dict[str, Graph] = field(default_factory=dict, repr=False)
     _supervisor: Graph | None = field(default=None, repr=False)
 
     def context(self) -> ModuleContext:
@@ -55,22 +69,28 @@ class AgentRuntime:
         )
 
     def graph(self, module_name: str) -> Graph:
-        """构建（并编译）指定模块的图。
+        """构建（并编译）指定模块的图；编译结果按模块缓存。
 
-        ``supervisor`` 是保留名：它返回编排所有已注册模块的多 Agent
-        supervisor 图（阶段 4）。
+        server 的每个请求都会调用这里——不缓存的话每次请求都要重新
+        bind_tools + compile。``supervisor`` 是保留名：它返回编排所有
+        已注册模块的多 Agent supervisor 图（同样缓存，阶段 4）。
         """
         if module_name == SUPERVISOR_MODULE:
             return self.supervisor_graph()
+        cached = self._graphs.get(module_name)
+        if cached is not None:
+            return cached
         try:
             module = self.modules[module_name]
         except KeyError:
             available = ", ".join([*sorted(self.modules), SUPERVISOR_MODULE]) or "(none)"
-            raise KeyError(
+            raise UnknownModuleError(
                 f"module {module_name!r} is not enabled; "
                 f"available: {available}. Add it to AGENT_MODULES."
             ) from None
-        return module.build_graph(self.context())
+        graph = module.build_graph(self.context())
+        self._graphs[module_name] = graph
+        return graph
 
     def supervisor_graph(self) -> Graph:
         """惰性地在所有已注册模块之上构建 supervisor 图。"""
@@ -98,6 +118,7 @@ async def create_runtime(settings: Settings | None = None) -> AgentRuntime:
     resolved.ensure_production_ready()
     llm = build_llm(resolved)
     modules = load_modules(resolved.agent_modules)
+    validate_module_names(modules)
     tools = build_tool_pool(modules, timeout=resolved.tool_timeout_seconds)
     checkpointer = await build_checkpointer(resolved)
     return AgentRuntime(

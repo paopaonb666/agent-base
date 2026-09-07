@@ -17,6 +17,8 @@ uvicorn 的循环上），所以 sqlite 后端使用异步 saver：同步的
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -47,6 +49,18 @@ async def _build_sqlite_checkpointer(settings: Settings) -> BaseCheckpointSaver[
     import aiosqlite
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
+    # 先预检路径可写性：否则坏路径会以原始的 aiosqlite.OperationalError
+    # 在会话中途爆出，而不是启动时一条可读的配置错误。
+    from agent_base.core.config import SettingsError
+
+    path = Path(settings.checkpointer_sqlite_path)
+    parent = path.parent if str(path.parent) else Path(".")
+    if not parent.is_dir() or not os.access(parent, os.W_OK):
+        raise SettingsError(
+            f"CHECKPOINTER_SQLITE_PATH {settings.checkpointer_sqlite_path!r} is not "
+            "writable: the parent directory does not exist or denies write access"
+        )
+
     # 注意：刻意不使用 AsyncSqliteSaver.from_conn_string——它的上下文
     # 管理器在连接被垃圾回收时会立即关闭连接，这会在会话中途悄无声息地
     # 杀死 saver。一个直接 await 的连接会一直存活到
@@ -57,11 +71,33 @@ async def _build_sqlite_checkpointer(settings: Settings) -> BaseCheckpointSaver[
     return saver
 
 
+class _KeepaliveMySQLConnection:
+    """aiomysql 连接的保活代理。
+
+    saver 持有贯穿进程生命周期的单个连接；MySQL 的 ``wait_timeout`` 到期
+    后服务端会掐断它，长会话的下一次查询会直接失败。aiomysql 的
+    ``ping(reconnect=True)`` 恰好提供"探活 + 重连"——在每次取游标前
+    ping 一次即可，代价是每次查询多一个往返（checkpoint 操作频率很低，
+    可忽略）。其余属性全部透传（``ensure_closed`` 等关闭路径不受影响）。
+    """
+
+    def __init__(self, conn: Any) -> None:
+        self._conn = conn
+
+    async def cursor(self, *args: Any, **kwargs: Any) -> Any:
+        await self._conn.ping(reconnect=True)
+        return await self._conn.cursor(*args, **kwargs)
+
+    def __getattr__(self, attr: str) -> Any:
+        return getattr(self._conn, attr)
+
+
 async def _build_mysql_checkpointer(settings: Settings) -> BaseCheckpointSaver[Any]:
     """构建 MySQL checkpointer（异步 ``AIOMySQLSaver``，要求 MySQL >= 8.0.19）。
 
     与 sqlite 后端同理，连接直接 await 并保持存活到 ``close_checkpointer()``；
     刻意不使用 ``from_conn_string`` 上下文管理器，以免连接被提前关闭。
+    连接用保活代理包裹，规避 wait_timeout 掐断长驻连接的问题。
     """
     # 延迟导入：只有选择 mysql 时才需要 aiomysql。
     import aiomysql  # type: ignore[import-untyped]
@@ -75,7 +111,7 @@ async def _build_mysql_checkpointer(settings: Settings) -> BaseCheckpointSaver[A
         db=settings.checkpointer_mysql_database,
         autocommit=True,
     )
-    saver = AIOMySQLSaver(conn=conn)
+    saver = AIOMySQLSaver(conn=_KeepaliveMySQLConnection(conn))
     await saver.setup()
     return saver
 

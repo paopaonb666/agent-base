@@ -129,3 +129,41 @@ def test_development_without_key_is_lenient() -> None:
 
 def test_api_key_is_secret_str() -> None:
     assert Settings(llm_api_key="sk-secret").llm_api_key.get_secret_value() == "sk-secret"
+
+
+def test_cors_wildcard_rejected_in_any_env() -> None:
+    with pytest.raises(SettingsError, match="CORS_ORIGINS"):
+        Settings(_env_file=None, cors_origins="*").ensure_production_ready()
+    with pytest.raises(SettingsError, match="CORS_ORIGINS"):
+        Settings(_env_file=None, env="development", cors_origins=["*"]).ensure_production_ready()
+
+
+def test_non_positive_tool_timeout_rejected() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, tool_timeout_seconds=0)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, tool_timeout_seconds=-1.5)
+
+
+def test_production_mysql_requires_connection_fields() -> None:
+    settings = Settings(
+        _env_file=None,
+        env="production",
+        llm_api_key="sk-1",
+        checkpointer_backend="mysql",
+        checkpointer_mysql_password="",
+    )
+    with pytest.raises(SettingsError, match="CHECKPOINTER_MYSQL"):
+        settings.ensure_production_ready()
+
+
+def test_production_mysql_complete_is_ok() -> None:
+    Settings(
+        _env_file=None,
+        env="production",
+        llm_api_key="sk-1",
+        checkpointer_backend="mysql",
+        checkpointer_mysql_user="app",
+        checkpointer_mysql_database="agent_base",
+        checkpointer_mysql_password="pw",
+    ).ensure_production_ready()

@@ -152,3 +152,11 @@ def test_module_import_failure_rejected(tmp_path: Path, monkeypatch: pytest.Monk
     monkeypatch.syspath_prepend(str(tmp_path))
     with pytest.raises(RegistryError, match="failed to import"):
         load_modules(["broken"], prefix="fm_broken")
+
+
+def test_module_syntax_error_normalized(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """语法错误等非 ModuleNotFoundError 的 import 失败同样归一为 RegistryError。"""
+    _write_module(tmp_path, "fm_syntax", "syntax_err", "def broken(:\n    pass\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    with pytest.raises(RegistryError, match="SyntaxError"):
+        load_modules(["syntax_err"], prefix="fm_syntax")

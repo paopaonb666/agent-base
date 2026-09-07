@@ -11,12 +11,14 @@ import contextlib
 import json
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from agent_base.core.bootstrap import AgentRuntime
 from agent_base.core.config import Settings
+from agent_base.entrypoints import server as server_module
 from agent_base.entrypoints.server import _event_stream, create_app
 from agent_base.modules.chat.module import ChatModule
 from agent_base.modules.writer.module import WriterModule
@@ -66,6 +68,15 @@ def test_health_degrades_without_model_key() -> None:
         body = client.get("/health").json()
     assert body["status"] == "degraded"
     assert body["components"]["model"] == "unconfigured"
+
+
+def test_lifespan_wires_logging(monkeypatch: pytest.MonkeyPatch) -> None:
+    """LOG_JSON / request_id 日志契约必须在 server 路径同样生效（A1）。"""
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(server_module, "setup_logging", lambda **kw: calls.append(kw))
+    with TestClient(create_app(runtime=_runtime())):
+        pass
+    assert calls == [{"json_lines": False}]
 
 
 def test_invoke_unknown_module_404() -> None:
@@ -242,3 +253,72 @@ async def test_client_disconnect_cancels_llm_call() -> None:
 async def _consume(stream: Any) -> None:
     async for _ in stream:
         pass
+
+
+def test_list_modules_endpoint() -> None:
+    """模块列表端点：配置面板的合法模块名来源（免试错）。"""
+    with _client() as client:
+        response = client.get("/v1/modules")
+    assert response.status_code == 200
+    names = [m["name"] for m in response.json()["modules"]]
+    assert names == ["chat", "writer", "supervisor"]
+    assert all(m["description"] for m in response.json()["modules"])
+
+
+def test_cors_exposes_request_id_header() -> None:
+    """X-Request-ID 必须对浏览器 JS 可读（expose_headers）。"""
+    with _client() as client:
+        response = client.get("/health", headers={"Origin": "http://localhost:3000"})
+    assert response.headers.get("access-control-expose-headers") == "X-Request-ID"
+
+
+def test_health_degrades_when_checkpointer_fails() -> None:
+    """checkpointer 探针失败 -> degraded（核心降级路径）。"""
+
+    class _BrokenSaver:
+        async def aget_tuple(self, config: dict[str, Any]) -> None:
+            raise RuntimeError("db down")
+
+    runtime = _runtime()
+    runtime.checkpointer = _BrokenSaver()  # type: ignore[assignment]
+    with TestClient(create_app(runtime=runtime)) as client:
+        body = client.get("/health").json()
+    assert body["components"]["checkpointer"] == "error"
+    assert body["status"] == "degraded"
+
+
+def test_health_flags_misconfigured_base_url() -> None:
+    runtime = _runtime()
+    runtime.settings = Settings(_env_file=None, llm_api_key="sk-test", llm_base_url="not-a-url")
+    with TestClient(create_app(runtime=runtime)) as client:
+        body = client.get("/health").json()
+    assert body["components"]["model"] == "misconfigured"
+    assert body["status"] == "degraded"
+
+
+def test_health_model_probe_disabled_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """探活开关默认关闭：不应该打真实网络。"""
+
+    def _no_probe(settings: Any) -> str:
+        raise AssertionError("probe must not run when health_probe_model is False")
+
+    monkeypatch.setattr(server_module, "_probe_model", _no_probe)
+    with _client() as client:
+        body = client.get("/health").json()
+    assert body["components"]["model"] == "ok"
+
+
+def test_health_model_probe_error_degrades(monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = _runtime()
+    runtime.settings = Settings(_env_file=None, llm_api_key="sk-test", health_probe_model=True)
+
+    async def _failing_probe(settings: Any) -> str:
+        return "error"
+
+    monkeypatch.setattr(server_module, "_probe_model", _failing_probe)
+    with TestClient(create_app(runtime=runtime)) as client:
+        body = client.get("/health").json()
+    assert body["components"]["model"] == "error"
+    assert body["status"] == "degraded"

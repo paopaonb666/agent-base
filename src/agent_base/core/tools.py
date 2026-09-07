@@ -7,15 +7,16 @@ LLM，并通过 LangGraph 的 ``ToolNode`` 执行它，后者把工具失败归�
 
 每个工具都用挂钟超时（``TOOL_TIMEOUT_SECONDS``）包装。在异步路径
 （服务器和 CLI 使用的路径）中，超时会干净地取消 await；在同步路径中，
-底层调用仍会在其工作线程中继续运行，但超过截止时间后结果会被丢弃
-（有界泄漏，已记录在案的权衡——Python 线程无法被杀死）。
+调用方在截止时刻立即收到 ``ToolTimeoutError``，但底层调用仍在其工作
+线程中继续运行直至自然结束（有界泄漏，已记录在案的权衡——Python 线程
+无法被杀死）。
 """
 
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FutureTimeoutError
+import re
+import threading
 from typing import Any
 
 from langchain_core.tools import BaseTool
@@ -23,6 +24,11 @@ from langchain_core.tools import BaseTool
 from agent_base.core.contracts import AgentModule
 
 DEFAULT_TOOL_TIMEOUT_SECONDS = 30.0
+
+# 工具错误文本会进入 ToolMessage（模型 + 会话历史回放都会看到）：
+# URL 脱敏、长度封顶，避免把内部端点/巨型负载泄给前端。
+_TOOL_ERROR_URL_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://\S+")
+_TOOL_ERROR_MAX_CHARS = 300
 
 
 class ToolTimeoutError(TimeoutError):
@@ -40,7 +46,8 @@ def handle_tool_error(exc: Exception) -> str:
     其余的一律重新抛出；基座的契约更强——坏掉的工具绝不能打断对话，
     因此每个异常都被转换为模型能够回应的 ``ToolMessage``（阶段 3）。
     """
-    return f"tool execution failed: {exc!r}"
+    text = _TOOL_ERROR_URL_RE.sub("<redacted-url>", str(exc))
+    return f"tool execution failed: {text}"[:_TOOL_ERROR_MAX_CHARS]
 
 
 class _TimeoutTool(BaseTool):
@@ -50,21 +57,35 @@ class _TimeoutTool(BaseTool):
     timeout: float
 
     def _run(self, **kwargs: Any) -> Any:
-        # 执行器 + future.result：即使工作线程本身无法被中断，
-        # 截止时间也会在我们这一侧得到遵守。
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(self.inner.invoke, kwargs)
+        # daemon 线程 + Event.wait：截止时间在调用方一侧得到遵守，超时后
+        # 调用方立即返回；失控工具留在后台跑完（Python 线程无法被杀死）。
+        # 刻意不用 ThreadPoolExecutor——它的 non-daemon 工作线程会被
+        # 解释器退出的 atexit join 卡住，一个失控工具就能拖住整个进程。
+        result: list[Any] = []
+        error: list[BaseException] = []
+        done = threading.Event()
+
+        def _target() -> None:
             try:
-                return future.result(timeout=self.timeout)
-            except FutureTimeoutError as exc:
-                raise ToolTimeoutError(
-                    f"tool {self.name!r} exceeded {self.timeout}s timeout"
-                ) from exc
+                result.append(self.inner.invoke(kwargs))
+            except BaseException as exc:
+                error.append(exc)
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=_target, name=f"tool-{self.name}", daemon=True)
+        worker.start()
+        if not done.wait(timeout=self.timeout):
+            raise ToolTimeoutError(f"tool {self.name!r} exceeded {self.timeout}s timeout")
+        if error:
+            raise error[0]
+        return result[0]
 
     async def _arun(self, **kwargs: Any) -> Any:
         try:
             return await asyncio.wait_for(self.inner.ainvoke(kwargs), timeout=self.timeout)
-        except TimeoutError as exc:  # asyncio.TimeoutError 即内置的 TimeoutError（3.11+）
+        # 3.10 上 asyncio.TimeoutError 与内置 TimeoutError 是不同类型，两者都要接住。
+        except (TimeoutError, asyncio.TimeoutError) as exc:
             raise ToolTimeoutError(f"tool {self.name!r} exceeded {self.timeout}s timeout") from exc
 
 
