@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from agent_base.core.bootstrap import AgentRuntime
@@ -322,3 +322,31 @@ def test_health_model_probe_error_degrades(monkeypatch: pytest.MonkeyPatch) -> N
         body = client.get("/health").json()
     assert body["components"]["model"] == "error"
     assert body["status"] == "degraded"
+
+
+async def test_list_threads_endpoint() -> None:
+    """线程列表端点：按模块命名空间过滤、每线程取最新、标题为首条用户消息。"""
+    runtime = _runtime(ScriptedChatModel([AIMessage("回复A"), AIMessage("回复B")]))
+    graph = runtime.graph("chat")
+    await graph.ainvoke(
+        {"messages": [HumanMessage(content="第一条线程的问题")]},
+        {"configurable": {"thread_id": "chat:thread-a"}},
+    )
+    await graph.ainvoke(
+        {"messages": [HumanMessage(content="第二条线程的问题")]},
+        {"configurable": {"thread_id": "chat:thread-b"}},
+    )
+    with TestClient(create_app(runtime=runtime)) as client:
+        body = client.get("/v1/agents/chat/threads").json()
+    ids = {t["thread_id"] for t in body["threads"]}
+    assert {"thread-a", "thread-b"} <= ids
+    titles = {t["thread_id"]: t["title"] for t in body["threads"]}
+    assert titles["thread-a"] == "第一条线程的问题"
+    assert all(t["module"] == "chat" for t in body["threads"])
+    assert all(t["updated_at"] > 0 for t in body["threads"])
+
+
+def test_list_threads_unknown_module_404() -> None:
+    with _client() as client:
+        response = client.get("/v1/agents/nonexist/threads")
+    assert response.status_code == 404

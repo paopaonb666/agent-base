@@ -29,6 +29,7 @@ import re
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -65,6 +66,11 @@ HEARTBEAT_SECONDS = 15.0
 # SSE 事件队列上限：慢客户端（半开连接、不读数据）停止消费时，生产者在
 # 队列满后阻塞等待——内存有界，背压自然传导到 LLM 流。ping 允许丢弃。
 SSE_QUEUE_MAXSIZE = 256
+
+# 线程列表端点的扫描/数量上限：alist 按 checkpoint 粒度迭代（一个线程
+# 有多轮 checkpoint），无上限会在大库上退化成全表遍历。
+_THREAD_LIST_SCAN_LIMIT = 2000
+_THREAD_LIST_LIMIT = 50
 
 # 模型端点探活（/health）：结果缓存，避免每个探活请求都打真实网络。
 MODEL_PROBE_TTL_SECONDS = 30.0
@@ -296,6 +302,55 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
             media_type="text/event-stream",
             headers=_SSE_HEADERS,
         )
+
+    @app.get("/v1/agents/{module}/threads")
+    async def list_threads(module: str, request: Request) -> dict[str, Any]:
+        """列出某模块命名空间下的所有已持久化线程（供前端侧栏显示）。
+
+        只依赖 checkpointer 的公开 ``alist`` 接口（跨后端通用），按
+        ``module:`` 前缀过滤、每线程取最新 checkpoint。标题取该线程
+        第一条用户消息（与前端本地保存规则一致）。迭代设上限，防止
+        大库上无界扫描。
+        """
+        rt: AgentRuntime = request.app.state.runtime
+        if module not in rt.modules:
+            raise HTTPException(status_code=404, detail=str(KeyError(module)))
+        if rt.checkpointer is None:
+            return {"threads": []}
+        prefix = f"{module}:"
+        threads: dict[str, dict[str, Any]] = {}
+        scanned = 0
+        async for tp in rt.checkpointer.alist(None):
+            scanned += 1
+            if scanned > _THREAD_LIST_SCAN_LIMIT:
+                break
+            full_id = tp.config["configurable"].get("thread_id", "")
+            if not full_id.startswith(prefix):
+                continue
+            short_id = full_id[len(prefix) :]
+            if short_id in threads or not short_id:
+                continue
+            messages = tp.checkpoint.get("channel_values", {}).get("messages", [])
+            title = next(
+                (str(m.content)[:60] for m in messages if getattr(m, "type", "") == "human"),
+                short_id,
+            )
+            try:
+                updated_at = int(
+                    datetime.fromisoformat(str(tp.checkpoint.get("ts", ""))).timestamp() * 1000
+                )
+            except ValueError:
+                updated_at = 0
+            threads[short_id] = {
+                "thread_id": short_id,
+                "module": module,
+                "title": title,
+                "updated_at": updated_at,
+            }
+            if len(threads) >= _THREAD_LIST_LIMIT:
+                break
+        ordered = sorted(threads.values(), key=lambda t: t["updated_at"], reverse=True)
+        return {"threads": ordered}
 
     @app.get("/v1/agents/{module}/threads/{thread_id}")
     async def get_thread_history(module: str, thread_id: str, request: Request) -> dict[str, Any]:

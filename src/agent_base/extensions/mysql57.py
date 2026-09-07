@@ -26,12 +26,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections import defaultdict
-from typing import Any
+from typing import Any, cast
 
 from langchain_core.runnables import RunnableConfig
-from langgraph.checkpoint.base import CheckpointTuple, get_checkpoint_id
+from langgraph.checkpoint.base import Checkpoint, CheckpointTuple, get_checkpoint_id
 from langgraph.checkpoint.mysql.aio import AIOMySQLSaver
 from langgraph.checkpoint.serde.types import TASKS
 
@@ -153,6 +154,44 @@ class MySQL57Saver(AIOMySQLSaver):
                         raise
             for v in range(version + 1, _OFFICIAL_LATEST_VERSION + 1):
                 await cur.execute("INSERT INTO checkpoint_migrations (v) VALUES (%s)", (v,))
+
+    async def _load_checkpoint_tuple(self, value: dict[str, Any]) -> CheckpointTuple:
+        """官方版本的等价实现，但直接消费已解析的 channel_values /
+        pending_writes——_assemble_rows 已在 Python 侧组装好，无需再走
+        官方的 JSON 字符串反序列化（那正是 5.7 不支持的 SQL 产物）。"""
+        checkpoint = cast(
+            Checkpoint,
+            {
+                **value["checkpoint"],
+                "channel_values": {
+                    **value["checkpoint"].get("channel_values"),
+                    **self._load_blobs(value["channel_values"]),
+                },
+            },
+        )
+        return CheckpointTuple(
+            {
+                "configurable": {
+                    "thread_id": value["thread_id"],
+                    "checkpoint_ns": value["checkpoint_ns"],
+                    "checkpoint_id": value["checkpoint_id"],
+                }
+            },
+            checkpoint,
+            json.loads(value["metadata"]),
+            (
+                {
+                    "configurable": {
+                        "thread_id": value["thread_id"],
+                        "checkpoint_ns": value["checkpoint_ns"],
+                        "checkpoint_id": value["parent_checkpoint_id"],
+                    }
+                }
+                if value["parent_checkpoint_id"]
+                else None
+            ),
+            await asyncio.to_thread(self._load_writes, value["pending_writes"]),
+        )
 
     async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         """按官方语义取最新（或指定）checkpoint，读取 SQL 为 5.7 兼容形态。"""
