@@ -5,8 +5,8 @@ Agent 软件基座——所有 agent 模块扩展的统一起点。
 **基座 = LangGraph 运行时（不自研）+ 薄封装层（模块注册 / 配置 / 装配）+ 扩展点预留。**
 
 > **范围红线**：RAG、长期记忆、知识库、业务鉴权、业务存储等**不属于基座**——
-> 它们未来以"模块"形式接入（见 `docs/adr/`）。基座只提供运行时、注册规范、
-> 配置管理、可运行入口与扩展点。
+> 它们未来以"模块"形式接入（ADR 见本地 `docs/adr/`，不入库）。基座只提供运行时、
+> 注册规范、配置管理、可运行入口与扩展点。
 
 ## 当前状态
 
@@ -181,7 +181,8 @@ agent-base/
 ├── alembic/                 # 数据库迁移（alembic.ini + env.py + versions/）
 ├── tests/                   # config / registry / llm / chat / cli / smoke / observability
 │                            # / memory / tools / events / server / collab / hello
-├── docs/
+│                            # / bootstrap / metrics
+├── docs/                    # 本地文档（按用户策略不入库；克隆后不存在是预期行为）
 │   ├── adr/                 # 架构决策记录
 │   ├── future/              # 未来模块路线图存档（circuit-breaker → reliability 模块）
 │   └── module-guide.md      # 五步接入手册 + 应用层规范（新模块接入不改基座）
@@ -190,6 +191,8 @@ agent-base/
 
 ## 设计决策
 
-- [ADR-001：LangGraph 作为基座运行时](docs/adr/001-langgraph-as-runtime.md)
-- [ADR-002：显式清单模块注册](docs/adr/002-module-contract.md)
-- [module-guide：五步接入新模块](docs/module-guide.md)
+以下文档保存在本地工作区 `docs/`（按用户策略不入库，克隆后不会存在）：
+
+- ADR-001：LangGraph 作为基座运行时（`docs/adr/001-langgraph-as-runtime.md`）
+- ADR-002：显式清单模块注册（`docs/adr/002-module-contract.md`）
+- module-guide：五步接入新模块 + 应用层规范（`docs/module-guide.md`）
