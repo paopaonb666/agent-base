@@ -406,6 +406,24 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         ]
         return {"thread_id": thread_id, "module": module, "messages": messages}
 
+    @app.delete("/v1/agents/{module}/threads/{thread_id}")
+    async def delete_thread(module: str, thread_id: str, request: Request) -> dict[str, Any]:
+        """删除某模块命名空间下的一个已持久化线程。
+
+        前端删除会话时调用：只删本地索引会让线程在清缓存/换设备后
+        "复活"。按 invoke 端点相同的 ``module:thread_id`` 命名空间删除
+        checkpointer 里的全部 checkpoint。
+        """
+        rt: AgentRuntime = request.app.state.runtime
+        if module not in rt.modules:
+            raise HTTPException(status_code=404, detail=f"unknown module {module!r}")
+        if rt.checkpointer is None:
+            return {"deleted": False, "reason": "checkpointer unconfigured"}
+        # adelete_thread 接收原始 thread_id 字符串；与 invoke/get 一致地
+        # 使用 module:thread_id 命名空间。
+        await rt.checkpointer.adelete_thread(f"{module}:{thread_id}")
+        return {"deleted": True}
+
     @app.get("/v1/modules")
     async def list_modules(request: Request) -> dict[str, Any]:
         """列出已注册的模块（供前端配置面板选择，免去试错模块名）。"""

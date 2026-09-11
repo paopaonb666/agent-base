@@ -384,3 +384,23 @@ def test_list_threads_unknown_module_404() -> None:
     with _client() as client:
         response = client.get("/v1/agents/nonexist/threads")
     assert response.status_code == 404
+
+
+async def test_delete_thread_endpoint() -> None:
+    """删除端点按 module:thread_id 命名空间删掉整个线程，且不影响其他线程。"""
+    runtime = _runtime(ScriptedChatModel([AIMessage("回复A"), AIMessage("回复B")]))
+    graph = runtime.graph("chat")
+    config_a = {"configurable": {"thread_id": "chat:thread-a"}}
+    config_b = {"configurable": {"thread_id": "chat:thread-b"}}
+    await graph.ainvoke({"messages": [HumanMessage(content="待删除")]}, config_a)
+    await graph.ainvoke({"messages": [HumanMessage(content="保留")]}, config_b)
+    with TestClient(create_app(runtime=runtime)) as client:
+        assert client.delete("/v1/agents/chat/threads/thread-a").json() == {"deleted": True}
+        remaining = client.get("/v1/agents/chat/threads").json()
+    assert [t["thread_id"] for t in remaining["threads"]] == ["thread-b"]
+
+
+def test_delete_thread_unknown_module_404() -> None:
+    with _client() as client:
+        response = client.delete("/v1/agents/nonexist/threads/t1")
+    assert response.status_code == 404
