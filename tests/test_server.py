@@ -232,6 +232,40 @@ def test_metrics_uses_route_template_labels() -> None:
     assert 'status="200"' in text
 
 
+def test_metrics_unmatched_route_uses_constant_label() -> None:
+    """404 请求没有路由模板：必须用常量兜底，否则每个攻击路径都会
+    永久新增一条指标时间序列（基数爆炸）。"""
+    with _client() as client:
+        client.get("/no-such-path-1")
+        client.get("/no-such-path-2")
+        text = client.get("/metrics").text
+    assert 'route="unmatched"' in text
+    assert "/no-such-path" not in text
+
+
+def test_untrusted_request_id_is_replaced() -> None:
+    """客户端提供的 X-Request-ID 过白名单才回显：否则换行符可以
+    伪造日志行、非法字符会炸掉响应头。"""
+    with _client() as client:
+        ok = client.get("/health", headers={"X-Request-ID": "abc-123_456.xyz"})
+        forged = client.get("/health", headers={"X-Request-ID": "bad id\ninjected: yes"})
+    assert ok.headers["X-Request-ID"] == "abc-123_456.xyz"
+    forged_id = forged.headers["X-Request-ID"]
+    assert "\n" not in forged_id and forged_id != "bad id\ninjected: yes"
+
+
+def test_invoke_rejects_empty_message_and_bad_thread_id() -> None:
+    with _client() as client:
+        assert client.post("/v1/agents/chat/invoke", json={"message": ""}).status_code == 422
+        assert client.post(
+            "/v1/agents/chat/invoke", json={"message": "hi", "thread_id": "../escape"}
+        ).status_code == 422
+        assert (
+            client.post("/v1/agents/chat/invoke", json={"message": "x" * 100_001}).status_code
+            == 422
+        )
+
+
 async def test_client_disconnect_cancels_llm_call() -> None:
     """阶段 4 验收：断开连接会停止正在进行的 LLM 请求。"""
     model = CancellableChatModel()

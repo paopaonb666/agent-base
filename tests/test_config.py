@@ -145,6 +145,13 @@ def test_non_positive_tool_timeout_rejected() -> None:
         Settings(_env_file=None, tool_timeout_seconds=-1.5)
 
 
+def test_nan_tool_timeout_rejected() -> None:
+    # NaN 与任何数比较都是 False，<= 0 拦不住它；wait_for(timeout=nan)
+    # 行为不可预测，必须在配置层拒绝。
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, tool_timeout_seconds=float("nan"))
+
+
 def test_production_mysql_requires_connection_fields() -> None:
     settings = Settings(
         _env_file=None,

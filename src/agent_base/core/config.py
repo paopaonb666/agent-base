@@ -167,8 +167,9 @@ class Settings(BaseSettings):
     @field_validator("tool_timeout_seconds")
     @classmethod
     def _validate_tool_timeout(cls, value: float) -> float:
-        # 非正数会让工具池立即超时，等于静默禁用所有工具。
-        if value <= 0:
+        # 非正数会让工具池立即超时，等于静默禁用所有工具；NaN 的所有
+        # 比较都是 False，必须用 not (value > 0) 一并拒绝。
+        if not (value > 0):
             raise ValueError(f"TOOL_TIMEOUT_SECONDS must be > 0, got {value}")
         return value
 

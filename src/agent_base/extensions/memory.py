@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -81,13 +82,23 @@ MYSQL_KEEPALIVE_SECONDS = 1800.0
 
 async def _mysql_keepalive(conn: Any, interval_seconds: float) -> None:
     """周期性 ping MySQL 连接（掉线自动重连），直到被取消。"""
+    logger = logging.getLogger(__name__)
+    was_ok = True
     while True:
         await asyncio.sleep(interval_seconds)
         try:
             await conn.ping(reconnect=True)
         except Exception:
             # ping 失败不致命：下一次循环再试；查询层的失败由调用方处理。
+            # 但不能完全静默：状态变化时记一条 WARNING，否则 DB 掉线后
+            # 唯一线索是请求层失败，无从诊断。
+            if was_ok:
+                logger.warning("mysql keepalive: ping failed; will retry next cycle")
+                was_ok = False
             continue
+        if not was_ok:
+            logger.info("mysql keepalive: connection recovered")
+            was_ok = True
 
 
 async def _build_mysql_checkpointer(settings: Settings) -> BaseCheckpointSaver[Any]:

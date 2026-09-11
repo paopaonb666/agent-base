@@ -38,7 +38,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from langchain_core.messages import AIMessageChunk, HumanMessage
 from langchain_core.runnables import RunnableConfig
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from agent_base import __version__
 from agent_base.core.bootstrap import SUPERVISOR_MODULE, AgentRuntime, create_runtime
@@ -68,8 +68,10 @@ HEARTBEAT_SECONDS = 15.0
 SSE_QUEUE_MAXSIZE = 256
 
 # 线程列表端点的扫描/数量上限：alist 按 checkpoint 粒度迭代（一个线程
-# 有多轮 checkpoint），无上限会在大库上退化成全表遍历。
+# 有多轮 checkpoint），无上限会在大库上退化成全表遍历。扫描预算只计
+# 目标模块的 checkpoint，另设一个覆盖所有模块的总行数上限兜底。
 _THREAD_LIST_SCAN_LIMIT = 2000
+_THREAD_LIST_TOTAL_LIMIT = 20_000
 _THREAD_LIST_LIMIT = 50
 
 # 模型端点探活（/health）：结果缓存，避免每个探活请求都打真实网络。
@@ -80,12 +82,35 @@ _URL_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://\S+")
 
 _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
+# 客户端提供的 X-Request-ID 必须通过此白名单，否则拒绝并另发新 id：
+# 该值会被回显到响应头并写进每条日志，放行任意字符串等于允许
+# 伪造日志行 / 触发非法响应头。
+_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
 
 class InvokeRequest(BaseModel):
     """一次对话轮。"""
 
-    message: str
-    thread_id: str | None = None  # None -> 创建一个新 thread
+    message: str = Field(min_length=1, max_length=100_000)
+    # thread_id 是 checkpointer 的一部分键：限定字符集与长度，避免任意
+    # 字符串直接落库/进日志。
+    thread_id: str | None = Field(
+        default=None, max_length=128, pattern=r"^[\w.-]+$"
+    )  # None -> 创建一个新 thread
+
+
+def _extract_text(content: Any) -> str:
+    """提取消息 content 里的纯文本：str 直接返回；列表型 content
+    （部分 provider 的多段内容）拼接各段的 text 字段，避免把
+    Python repr 原样发给客户端。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (list, tuple)):
+        return "".join(
+            str(part.get("text", "")) if isinstance(part, dict) else str(part)
+            for part in content
+        )
+    return str(content)
 
 
 def _serialize_message(message: Any) -> dict[str, Any] | None:
@@ -95,15 +120,7 @@ def _serialize_message(message: Any) -> dict[str, Any] | None:
     前端 agent-base-ui 用它与 invoke 流式事件对齐，以便回放历史会话。
     """
     mtype = getattr(message, "type", "")
-    content = getattr(message, "content", "")
-    if isinstance(content, str):
-        text = content
-    elif content:
-        text = "".join(
-            str(part.get("text", "")) if isinstance(part, dict) else str(part) for part in content
-        )
-    else:
-        text = ""
+    text = _extract_text(getattr(message, "content", ""))
     if mtype == "human":
         return {"role": "human", "content": text}
     if mtype == "ai":
@@ -181,7 +198,7 @@ async def _produce(
                     running.add(node)
                     await queue.put(StepEvent(name=node, status="running"))
                 if isinstance(chunk, AIMessageChunk) and chunk.content:
-                    await queue.put(DeltaEvent(content=str(chunk.content)))
+                    await queue.put(DeltaEvent(content=_extract_text(chunk.content)))
             elif mode == "updates":
                 for node in payload:
                     if str(node).startswith("__"):
@@ -272,15 +289,17 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
 
     @app.middleware("http")
     async def observability_middleware(request: Request, call_next: Any) -> Any:
-        rid = request.headers.get("X-Request-ID") or new_request_id()
+        client_rid = request.headers.get("X-Request-ID") or ""
+        rid = client_rid if _REQUEST_ID_RE.fullmatch(client_rid) else new_request_id()
         started = time.perf_counter()
         with request_id(rid):
             response = await call_next(request)
         response.headers["X-Request-ID"] = rid
         # B4/B5 经验：用路由模板打 label，绝不用原始路径——
-        # 原始路径（每个 thread id 一条）会让指标基数爆炸。
+        # 原始路径（每个 thread id 一条）会让指标基数爆炸。404/405 没有
+        # 匹配路由，用常量兜底而不是原始路径。
         route = request.scope.get("route")
-        template = getattr(route, "path", request.url.path)
+        template = getattr(route, "path", None) or "unmatched"
         metrics.observe(
             request.method, str(template), response.status_code, time.perf_counter() - started
         )
@@ -292,7 +311,10 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         try:
             graph = runtime.graph(module)
         except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            # UnknownModuleError 是 KeyError 子类：str() 会带 KeyError 的
+            # 引号包装，取 args[0] 给客户端一条干净的报错。
+            detail = str(exc.args[0]) if exc.args else "unknown module"
+            raise HTTPException(status_code=404, detail=detail) from exc
         user_thread_id = body.thread_id or new_request_id()
         # 按模块划分的 thread id：图共用一个 checkpointer；未划分命名空间
         # 的 id 会把它们的状态混在一起。
@@ -314,19 +336,26 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         """
         rt: AgentRuntime = request.app.state.runtime
         if module not in rt.modules:
-            raise HTTPException(status_code=404, detail=str(KeyError(module)))
+            raise HTTPException(status_code=404, detail=f"unknown module {module!r}")
         if rt.checkpointer is None:
             return {"threads": []}
         prefix = f"{module}:"
         threads: dict[str, dict[str, Any]] = {}
         scanned = 0
+        total = 0
         async for tp in rt.checkpointer.alist(None):
-            scanned += 1
-            if scanned > _THREAD_LIST_SCAN_LIMIT:
+            # 扫描预算只计目标模块的 checkpoint：否则繁忙模块的行会耗尽
+            # 预算，让目标模块在大库里返回空列表。总行数上限兜底，避免
+            # 无界遍历。
+            total += 1
+            if total > _THREAD_LIST_TOTAL_LIMIT:
                 break
             full_id = tp.config["configurable"].get("thread_id", "")
             if not full_id.startswith(prefix):
                 continue
+            scanned += 1
+            if scanned > _THREAD_LIST_SCAN_LIMIT:
+                break
             short_id = full_id[len(prefix) :]
             if short_id in threads or not short_id:
                 continue
@@ -364,7 +393,8 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         try:
             graph = runtime.graph(module)
         except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            detail = str(exc.args[0]) if exc.args else "unknown module"
+            raise HTTPException(status_code=404, detail=detail) from exc
         # thread id 按模块划分命名空间，与 invoke 端点保持一致。
         config: RunnableConfig = {"configurable": {"thread_id": f"{module}:{thread_id}"}}
         snapshot = await graph.aget_state(config)

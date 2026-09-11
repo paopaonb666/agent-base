@@ -103,6 +103,10 @@ _SELECT_PENDING_WRITES = """
 SELECT task_id, channel, type, `blob`, idx FROM checkpoint_writes
 WHERE thread_id = %s AND checkpoint_ns_hash = UNHEX(MD5(%s)) AND checkpoint_id = %s"""
 
+# alist 未显式给 limit 时的默认 SQL 上限：无 LIMIT 会把整个 checkpoints
+# 表拉进内存（调用方如线程列表端点的迭代上限根本来不及生效）。
+_ALIST_DEFAULT_LIMIT = 2000
+
 
 class MySQL57Saver(AIOMySQLSaver):
     """在 MySQL 5.7 上工作的 ``AIOMySQLSaver``（见模块 docstring）。
@@ -150,7 +154,8 @@ class MySQL57Saver(AIOMySQLSaver):
                     await cur.execute(ddl)
                 except Exception as exc:
                     # CREATE INDEX 没有幂等写法；重复建索引（1061）无害。
-                    if getattr(exc, "args", [None])[0] != 1061:
+                    # args 可能为空元组：直接下标会抛 IndexError 掩盖真实错误。
+                    if not exc.args or exc.args[0] != 1061:
                         raise
             for v in range(version + 1, _OFFICIAL_LATEST_VERSION + 1):
                 await cur.execute("INSERT INTO checkpoint_migrations (v) VALUES (%s)", (v,))
@@ -243,6 +248,8 @@ class MySQL57Saver(AIOMySQLSaver):
         if limit is not None:
             query += " LIMIT %(limit)s"
             args = {**args, "limit": int(limit)}
+        else:
+            query += f" LIMIT {_ALIST_DEFAULT_LIMIT}"
         async with self._cursor() as cur:
             await cur.execute(query, args)
             values = await cur.fetchall()
@@ -287,21 +294,28 @@ class MySQL57Saver(AIOMySQLSaver):
         to_migrate = [v for v in values if v["checkpoint"]["v"] < 4 and v["parent_checkpoint_id"]]
         if not to_migrate:
             return
-        placeholders = ",".join(["%s"] * len(to_migrate))
-        await cur.execute(
-            "SELECT checkpoint_id, task_path, task_id, type, `blob`, idx "
-            f"FROM checkpoint_writes WHERE thread_id = %s AND checkpoint_id IN ({placeholders}) "
-            "AND channel = %s",
-            (values[0]["thread_id"], *[v["parent_checkpoint_id"] for v in to_migrate], TASKS),
-        )
-        grouped: dict[str, list[tuple[str, str, str, bytes]]] = defaultdict(list)
-        for row in await cur.fetchall():
-            grouped[row["checkpoint_id"]].append(
-                (row["task_path"], row["task_id"], row["type"], row["blob"])
+        # values 可能跨多个 thread_id（如 alist(None) 的线程列表路径）：
+        # 按 thread_id 分组查询，否则 A 线程的 parent id 混进 B 线程的
+        # 过滤条件里，两条线程都取不到（或取错）迁移行。
+        by_thread: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for value in to_migrate:
+            by_thread[value["thread_id"]].append(value)
+        grouped: dict[tuple[str, str], list[tuple[str, str, str, bytes]]] = defaultdict(list)
+        for thread_id, group in by_thread.items():
+            placeholders = ",".join(["%s"] * len(group))
+            await cur.execute(
+                "SELECT checkpoint_id, task_path, task_id, type, `blob`, idx "
+                f"FROM checkpoint_writes WHERE thread_id = %s AND checkpoint_id IN ({placeholders}) "
+                "AND channel = %s",
+                (thread_id, *[v["parent_checkpoint_id"] for v in group], TASKS),
             )
+            for row in await cur.fetchall():
+                grouped[(thread_id, row["checkpoint_id"])].append(
+                    (row["task_path"], row["task_id"], row["type"], row["blob"])
+                )
         for value in to_migrate:
             sends = sorted(
-                grouped.get(value["parent_checkpoint_id"], []),
+                grouped.get((value["thread_id"], value["parent_checkpoint_id"]), []),
                 key=lambda s: (s[0], s[1]),  # (task_path, task_id)，与官方一致
             )
             if value["channel_values"] is None:
@@ -316,4 +330,10 @@ async def probe_mysql_major_version(conn: Any) -> int:
     async with conn.cursor() as cur:
         await cur.execute("SELECT VERSION()")
         row = await cur.fetchone()
+    if row is None:
+        # 某些代理/边缘节点可能返回空结果：给一条可读的配置错误，
+        # 而不是启动时的 TypeError。
+        from agent_base.core.config import SettingsError
+
+        raise SettingsError("could not read server version: SELECT VERSION() returned no rows")
     return int(str(row[0]).split(".")[0])
