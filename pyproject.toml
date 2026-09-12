@@ -37,6 +37,8 @@ dependencies = [
     # 阶段 4：HTTP + SSE 服务入口。
     "fastapi>=0.115",
     "uvicorn>=0.30",
+    # 文件上传端点的 multipart/form 解析（FastAPI 官方要求）。
+    "python-multipart>=0.0.9",
     # 工具库 parsing（M4 前置）：PDF 文本提取。pypdf 纯 Python 且轻量，
     # PDF 又是文档读取的主格式，因此进主依赖开箱即用；DOCX 等重依赖
     # 格式走 [doc] extras 优雅降级。

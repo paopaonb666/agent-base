@@ -29,13 +29,14 @@ import contextlib
 import logging
 import re
 import time
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from langchain_core.messages import AIMessageChunk, HumanMessage
@@ -62,6 +63,7 @@ from agent_base.extensions.observability import (
     request_id,
     setup_logging,
 )
+from agent_base.tools.parsing import DocumentParseError, parse_document
 
 logger = logging.getLogger(__name__)
 
@@ -509,6 +511,41 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         # 使用 module:thread_id 命名空间。
         await rt.checkpointer.adelete_thread(f"{module}:{thread_id}")
         return {"deleted": True}
+
+    @app.post("/v1/agents/{module}/files")
+    async def upload_file(module: str, request: Request, file: UploadFile) -> dict[str, Any]:
+        """上传并解析文档（M4a 解析层的 HTTP 入口）。
+
+        前端把返回的 ``text`` 组合进下一条消息，模型即可阅读文件内容；
+        解析走 ``tools/parsing``（格式按扩展名推断，限额走
+        DOC_PARSE_MAX_*），任何解析失败都以 400 返回可读原因。
+        """
+        rt: AgentRuntime = request.app.state.runtime
+        if not _known_module(rt, module):
+            raise HTTPException(status_code=404, detail=f"unknown module {module!r}")
+        data = await file.read()
+        if not data:
+            raise HTTPException(status_code=400, detail="上传文件为空")
+        max_bytes = rt.settings.doc_parse_max_input_bytes
+        if len(data) > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"文件超出大小上限：{len(data)} 字节 > {max_bytes} 字节",
+            )
+        try:
+            doc = parse_document(data, filename=file.filename or "")
+        except DocumentParseError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "file_id": uuid.uuid4().hex[:12],
+            "filename": file.filename or "",
+            "format": doc.format,
+            "pages": doc.pages,
+            "paragraphs": doc.paragraphs,
+            "truncated": doc.truncated,
+            "text_len": len(doc.text),
+            "text": doc.text,
+        }
 
     @app.get("/v1/modules")
     async def list_modules(request: Request) -> dict[str, Any]:

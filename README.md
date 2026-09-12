@@ -67,6 +67,7 @@ Agent 软件基座——所有 agent 模块扩展的统一起点。
 | `fastapi` / `uvicorn` | HTTP + SSE 服务入口 | `>=0.115` / `>=0.30` |
 | `pypdf` | 工具库 parsing：PDF 文本提取（M4 前置） | `>=5.0`：纯 Python 且轻量，PDF 是文档读取的主格式，进主依赖开箱即用 |
 | `httpx` / `tzdata` | 工具库基础：Tavily 搜索引擎 HTTP 客户端 / Windows 上的时区数据库 | `>=0.27`（原 dev 依赖转正）/ `>=2024.1`（POSIX 自带） |
+| `python-multipart` | 文件上传端点的 multipart/form 解析 | `>=0.0.9`：FastAPI 官方要求 |
 
 可选 extras：
 
@@ -111,6 +112,7 @@ pytest                         # 覆盖率门（≥85%）依赖 MySQL 集成测�
 | `CHECKPOINTER_BACKEND` | `sqlite`（默认，重启可恢复对话）\| `memory`（零依赖，不持久化）\| `mysql`（MySQL 持久化，配 `CHECKPOINTER_MYSQL_*`） |
 | `TOOL_TIMEOUT_SECONDS` | 工具单次执行超时（默认 30s） |
 | `TOOL_CALL_LOG_ENABLED` | 工具调用审计（M5）：每条调用含参数/结果/耗时落库，UI 渲染调用面板 |
+| `DOC_PARSE_MAX_INPUT_BYTES` / `DOC_PARSE_MAX_OUTPUT_CHARS` | 上传文档解析限额（默认 10MB / 5 万字符） |
 | `TOOLKIT_ENABLED` | 装配进共享池的基座内置工具清单（默认 `current_time,calculator,json_query`）；`web_search` 需配 `SEARCH_*`，`python_repl` 为 exec 级默认关 |
 | `LOG_JSON` | `true` 输出结构化 JSON 日志（生产建议开启） |
 

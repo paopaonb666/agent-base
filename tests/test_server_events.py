@@ -212,3 +212,67 @@ def test_tool_calls_endpoint_returns_audit_records() -> None:
     with TestClient(create_app(runtime=runtime2)) as client:
         body = client.get("/v1/agents/chat/threads/t-history/tool-calls").json()
     assert body == {"tool_calls": []}
+
+
+# ── 文件上传端点（M4a 解析层的 HTTP 入口） ──────────────────────────
+
+
+def test_upload_file_parses_real_pdf() -> None:
+    import sys
+
+    from fastapi.testclient import TestClient as _TC
+
+    sys.path.insert(0, "tests")
+    from test_parsing import _make_pdf
+
+    runtime = _runtime()
+    with _TC(create_app(runtime=runtime)) as client:
+        response = client.post(
+            "/v1/agents/chat/files",
+            files={
+                "file": (
+                    "resume.pdf",
+                    _make_pdf(["resume line one", "page two content"]),
+                    "application/pdf",
+                )
+            },
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["format"] == "pdf"
+    assert body["pages"] == 2
+    assert body["truncated"] is False
+    assert body["text_len"] > 0
+    assert "resume line one" in body["text"]
+
+
+def test_upload_rejects_bad_input() -> None:
+    from fastapi.testclient import TestClient as _TC
+
+    runtime = _runtime()
+    runtime.settings = Settings(_env_file=None, llm_api_key="sk-test", doc_parse_max_input_bytes=64)
+    with _TC(create_app(runtime=runtime)) as client:
+        # 不支持的扩展名 → 400
+        r1 = client.post(
+            "/v1/agents/chat/files", files={"file": ("x.exe", b"MZ", "application/x-exe")}
+        )
+        assert r1.status_code == 400
+        # 损坏的 PDF → 400 可读错误
+        r2 = client.post(
+            "/v1/agents/chat/files",
+            files={"file": ("bad.pdf", b"%PDF-1.4 broken", "application/pdf")},
+        )
+        assert r2.status_code == 400
+        # 超出大小上限 → 413
+        r3 = client.post(
+            "/v1/agents/chat/files", files={"file": ("big.txt", b"x" * 100, "text/plain")}
+        )
+        assert r3.status_code == 413
+        # 空文件 → 400
+        r4 = client.post("/v1/agents/chat/files", files={"file": ("e.txt", b"", "text/plain")})
+        assert r4.status_code == 400
+    # 未知模块 → 404
+    runtime2 = _runtime()
+    with _TC(create_app(runtime=runtime2)) as client:
+        r5 = client.post("/v1/agents/nobody/files", files={"file": ("a.txt", b"hi", "text/plain")})
+        assert r5.status_code == 404
