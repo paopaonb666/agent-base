@@ -836,7 +836,7 @@ class _SqlMemoryStoreBase:
                 op.user_id,
                 op.agent_id,
                 op.thread_id,
-                json.dumps(op.detail, ensure_ascii=False),
+                json.dumps(op.detail, ensure_ascii=False, default=str),
                 op.status,
                 op.error_text,
                 op.duration_ms,

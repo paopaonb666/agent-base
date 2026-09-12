@@ -175,3 +175,47 @@ async def test_memory_health_component() -> None:
     with _client() as c:
         health = c.get("/health").json()
         assert health["components"]["memory"] == "ok"
+
+
+# ─────────────────────── 管理收尾端点（M6f） ───────────────────────
+
+
+async def test_memory_blocks_profile_audit_endpoints() -> None:
+    client = _client()
+    with client as c:
+        # blocks：PUT 创建（缺省全局作用域）→ GET 列出 → 覆盖写版本递增
+        # → DELETE。
+        created = c.put(
+            "/v1/memory/blocks/persona",
+            json={"content": "务实的工程助手", "char_limit": 1500},
+        )
+        assert created.status_code == 200
+        assert created.json()["agent_id"] == "*"
+        assert created.json()["version"] == 1
+        listed = c.get("/v1/memory/blocks")
+        assert listed.json()["blocks"][0]["label"] == "persona"
+        bumped = c.put("/v1/memory/blocks/persona", json={"content": "更务实的助手"})
+        assert bumped.json()["version"] == 2
+        scoped = c.get("/v1/memory/blocks", params={"module": "chat"})
+        assert scoped.json()["blocks"] == []  # 创建时是全局块
+        assert c.delete("/v1/memory/blocks/persona").json() == {"deleted": True}
+        assert c.get("/v1/memory/blocks").json()["blocks"] == []
+
+        # profile：先造画像（服务层）→ GET 读取。
+        rt = client.app.state.runtime
+        await rt.memory.save_profile("default", {"偏好": ["简洁回答"]})
+        profile = c.get("/v1/memory/profile").json()
+        assert profile["profile"] == {"偏好": ["简洁回答"]}
+
+        # audit：手动落一条 op 后校验结构与 user 作用域过滤。
+        await rt.memory.record_op(op="manual", user_id="default", detail={"note": "x"})
+        audit = c.get("/v1/memory/audit").json()
+        assert audit["ops"] and audit["ops"][0]["op"] == "manual"
+        assert audit["ops"][0]["detail"] == {"note": "x"}
+        empty = c.get("/v1/memory/audit", headers={"X-User-Id": "someone-else"})
+        assert empty.json()["ops"] == []
+
+    with _client(memory_enabled=False) as c:
+        assert c.get("/v1/memory/blocks").status_code == 503
+        assert c.get("/v1/memory/profile").status_code == 503
+        assert c.get("/v1/memory/audit").status_code == 503

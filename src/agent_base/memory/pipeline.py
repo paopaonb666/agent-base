@@ -368,13 +368,24 @@ class MemoryPipeline:
                 MEMORY_METRICS.observe(op, "error", time.perf_counter() - started)
                 return None
             duration_ms = int((time.perf_counter() - started) * 1000)
+            if isinstance(result, dict):
+                detail = result
+            elif isinstance(result, list):
+                # 候选记忆等数据类列表：取可读摘要（Candidate.content 等）。
+                detail = {
+                    "result": [
+                        getattr(item, "content", str(item))[:120] for item in result
+                    ]
+                }
+            else:
+                detail = {"result": result}
             await self._service.record_op(
                 op=op,
                 user_id=user_id,
                 agent_id=agent_id,
                 thread_id=thread_id,
                 duration_ms=duration_ms,
-                detail={"result": result} if not isinstance(result, dict) else result,
+                detail=detail,
             )
             MEMORY_METRICS.observe(op, "ok", time.perf_counter() - started)
             return result

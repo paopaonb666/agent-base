@@ -104,6 +104,8 @@ class MemoryService:
                     user_id=user_id,
                     agent_id=agent_id,
                     thread_id=thread_id,
+                    # default=str：审计 detail 是诊断信息而非契约数据，
+                    # 序列化不了的对象降级为字符串表示，绝不让审计失败。
                     detail=detail or {},
                     status=status,
                     error_text=error_text,

@@ -4,9 +4,13 @@ Agent 软件基座——所有 agent 模块扩展的统一起点。
 
 **基座 = LangGraph 运行时（不自研）+ 薄封装层（模块注册 / 配置 / 装配）+ 扩展点预留。**
 
-> **范围红线**：RAG、长期记忆、知识库、业务鉴权、业务存储等**不属于基座**——
-> 它们未来以"模块"形式接入（ADR 见本地 `docs/adr/`，不入库）。基座只提供运行时、
-> 注册规范、配置管理、可运行入口与扩展点。
+> **范围红线**：业务鉴权、业务存储等**不属于基座**——它们以"模块"形式接入
+> （ADR 见本地 `docs/adr/`，不入库）。基座只提供运行时、注册规范、配置管理、
+> 可运行入口与扩展点。
+>
+> **M6 更新**：长期记忆、用户画像与文档知识库（RAG-lite）已作为基座基础设施
+> 落地（`src/agent_base/memory/`，存储跟随 `CHECKPOINTER_BACKEND`），详见下文
+> [记忆系统（M6）](#记忆系统m6)。
 
 ## 当前状态
 
@@ -141,6 +145,44 @@ curl -N -X POST http://localhost:8000/v1/agents/chat/invoke \
 # 其他端点：GET /health（分项健康，degraded 不崩溃）；GET /metrics（Prometheus 文本，路由模板 label）
 ```
 
+## 记忆系统（M6）
+
+`src/agent_base/memory/` 是一套自研的混合式记忆系统（调研 mem0 / Letta / Memobase /
+Zep / LangMem 后的落地形态），存储跟随 `CHECKPOINTER_BACKEND`（memory/sqlite/mysql），
+五张自管表由 alembic 0004（MySQL）与运行时自举（sqlite）幂等建表：
+
+| 能力 | 说明 |
+| --- | --- |
+| 跨会话长期记忆 | mem0 式两阶段形成：后台 LLM 抽取候选事实 → 与既有记忆比对做 ADD/UPDATE/DELETE/NOOP 整合（去重/纠错/失效剔除），全量审计落 `memory_ops` |
+| 常驻记忆块 | Letta 式 persona/human/自定义块，agent 用 `memory_update_block` 工具自我编辑，每轮注入上下文 |
+| 用户画像 | Memobase 式结构化 JSON 画像，随对话分节合并演化，整体注入（不参与相似度召回） |
+| 会话滚动摘要 | 消息数超阈值后后台合并更新，供短期压缩替换超预算旧历史 |
+| 文档知识库 | 上传的 PDF/DOCX/TXT 自动切块 + 向量化入 `doc_chunks`（用户级知识资产，独立于会话存活），`knowledge_search` 工具检索 |
+| 混合检索 | 向量余弦（默认硅基流动 BAAI/bge-m3，1024 维）+ BM25（中文二元组）+ 时间半衰期 + 显著度；embedding 不可用自动降级为关键词路径 |
+| 上下文工程 | 每轮注入「画像 + 记忆块 + 摘要 + 相关记忆」注入块；chat 图对模型输入做注入去重与 token 预算修剪（工具配对不拆散），checkpointer 全量历史保留（recall 语义） |
+| Agent 工具 | `memory_search` / `memory_save` / `memory_update_block` / `knowledge_search` 进共享工具池（超时 + 审计自动生效） |
+
+管理端点（均以 `X-User-Id` 头为作用域，缺省 `default`）：
+
+```
+POST   /v1/memory                 # 手工写入记忆（落库前尽力向量化）
+GET    /v1/memory?q=&module=&kind=  # q 存在→混合检索；否则按更新时间浏览
+PATCH  /v1/memory/{memory_id}     # 部分更新（改内容会重新向量化）
+DELETE /v1/memory/{memory_id}
+GET    /v1/memory/blocks          # 列出常驻记忆块（?module= 限定模块）
+PUT    /v1/memory/blocks/{label}  # 手工写块（覆盖式，版本递增）
+DELETE /v1/memory/blocks/{label}
+GET    /v1/memory/profile         # 当前用户的结构化画像
+GET    /v1/memory/audit           # 记忆操作审计（抽取/整合/画像/摘要/摄取…）
+```
+
+关键配置（完整清单见 `.env.example` 的「记忆系统」节）：`MEMORY_ENABLED` 总开关；
+`MEMORY_EMBEDDING_API_KEY`（openai 兼容 `/embeddings`，留空降级关键词检索）；
+`MEMORY_CAPTURE_ENABLED` / `MEMORY_CAPTURE_EVERY_TURNS`（形成频率）；
+`MEMORY_CONTEXT_MAX_CHARS` / `MEMORY_CONTEXT_MAX_TOKENS`（注入与模型输入预算）。
+指标：`/metrics` 的 `memory_operations_total{op,outcome}`；健康：`/health` 的
+`memory` 组件（未启用时缺席，不算降级）。
+
 ## 数据库迁移（mysql 后端）
 
 对话状态（checkpointer）表由 **Alembic** 版本化管理，初迁移复用 langgraph 内置迁移：
@@ -194,6 +236,8 @@ agent-base/
 ├── .env.example             # 配置契约（由 core/config.py 消费）
 ├── src/agent_base/
 │   ├── core/                # config / contracts / registry / llm / bootstrap / tools（工具池）
+│   ├── memory/              # 记忆系统（M6）：store / embeddings / retrieval / pipeline
+│   │                        #           · context / tools / service
 │   ├── extensions/          # 扩展点：observability（request_id + 日志）· memory（checkpointer）
 │   │                        #           · collab（supervisor）· events（SSE 契约）· metrics
 │   ├── modules/chat/        # 样板模块（graph + module + tools，兼作接入模板）

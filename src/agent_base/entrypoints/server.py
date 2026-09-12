@@ -69,7 +69,7 @@ from agent_base.extensions.observability import (
 )
 from agent_base.memory.context import ATTACHMENT_CONTEXT_PREFIX
 from agent_base.memory.service import MemoryService
-from agent_base.memory.store import KNOWN_MEMORY_KINDS, KNOWN_MEMORY_STATUSES
+from agent_base.memory.store import KNOWN_MEMORY_KINDS, KNOWN_MEMORY_STATUSES, MemoryBlock
 from agent_base.memory.tools import set_memory_scope
 from agent_base.tools.parsing import DocumentParseError, parse_document
 
@@ -134,6 +134,15 @@ class MemoryPatchRequest(BaseModel):
     tags: list[str] | None = Field(default=None, max_length=10)
     salience: float | None = Field(default=None, ge=0.0, le=1.0)
     status: str | None = None
+
+
+class MemoryBlockPutRequest(BaseModel):
+    """手工写一个常驻记忆块（M6f）。"""
+
+    content: str = Field(min_length=1, max_length=8000)
+    # None → "*"（全模块共享的块，如全局人设）。
+    module: str | None = Field(default=None, max_length=64)
+    char_limit: int = Field(default=2000, ge=50, le=8000)
 
 
 def _extract_text(content: Any) -> str:
@@ -927,6 +936,100 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         memory = _require_memory(rt)
         deleted = await memory.delete_memory(memory_id)
         return {"deleted": deleted}
+
+    @app.get("/v1/memory/blocks")
+    async def list_memory_blocks(request: Request, module: str | None = None) -> dict[str, Any]:
+        """列出当前用户的常驻记忆块（M6f；module 缺省查全局块）。"""
+        rt: AgentRuntime = request.app.state.runtime
+        memory = _require_memory(rt)
+        user_id = _memory_user_id(request)
+        blocks = await memory.store.list_blocks(user_id, module or "*")
+        return {
+            "blocks": [
+                {
+                    "agent_id": block.agent_id,
+                    "label": block.label,
+                    "content": block.content,
+                    "char_limit": block.char_limit,
+                    "version": block.version,
+                    "updated_at": block.updated_at,
+                }
+                for block in blocks
+            ]
+        }
+
+    @app.put("/v1/memory/blocks/{label}")
+    async def put_memory_block(
+        label: str, body: MemoryBlockPutRequest, request: Request
+    ) -> dict[str, Any]:
+        """手工写一个常驻记忆块（覆盖式；与 agent 的 memory_update_block
+        工具同表，版本号递增）。"""
+        rt: AgentRuntime = request.app.state.runtime
+        memory = _require_memory(rt)
+        user_id = _memory_user_id(request)
+        agent_id = body.module or "*"
+        existing = await memory.store.get_block(user_id, agent_id, label)
+        block = MemoryBlock(
+            user_id=user_id,
+            agent_id=agent_id,
+            label=label,
+            content=body.content,
+            char_limit=body.char_limit,
+            version=(existing.version if existing else 0) + 1,
+        )
+        await memory.store.upsert_block(block)
+        return {
+            "agent_id": block.agent_id,
+            "label": block.label,
+            "content": block.content,
+            "char_limit": block.char_limit,
+            "version": block.version,
+            "updated_at": block.updated_at,
+        }
+
+    @app.delete("/v1/memory/blocks/{label}")
+    async def delete_memory_block(
+        label: str, request: Request, module: str | None = None
+    ) -> dict[str, Any]:
+        """删除一个常驻记忆块。"""
+        rt: AgentRuntime = request.app.state.runtime
+        memory = _require_memory(rt)
+        user_id = _memory_user_id(request)
+        deleted = await memory.store.delete_block(user_id, module or "*", label)
+        return {"deleted": deleted}
+
+    @app.get("/v1/memory/profile")
+    async def get_memory_profile(request: Request) -> dict[str, Any]:
+        """读取当前用户的结构化画像（M6c 形成，M6f 暴露）。"""
+        rt: AgentRuntime = request.app.state.runtime
+        memory = _require_memory(rt)
+        user_id = _memory_user_id(request)
+        return {"profile": await memory.get_profile(user_id)}
+
+    @app.get("/v1/memory/audit")
+    async def list_memory_audit(request: Request, limit: int = 50) -> dict[str, Any]:
+        """记忆系统的操作审计（M6）：抽取/整合/画像/摘要/摄取/手工增删。"""
+        rt: AgentRuntime = request.app.state.runtime
+        memory = _require_memory(rt)
+        user_id = _memory_user_id(request)
+        ops = await memory.store.list_ops(user_id, limit=max(1, min(limit, 200)))
+        return {
+            "ops": [
+                {
+                    "op_id": op.op_id,
+                    "op": op.op,
+                    "user_id": op.user_id,
+                    "agent_id": op.agent_id,
+                    "thread_id": op.thread_id,
+                    "detail": op.detail,
+                    "status": op.status,
+                    "error_text": op.error_text or None,
+                    "duration_ms": op.duration_ms,
+                    "created_at": op.created_at,
+                }
+                for op in ops
+            ]
+        }
 
     @app.get("/v1/modules")
     async def list_modules(request: Request) -> dict[str, Any]:
