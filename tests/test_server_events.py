@@ -370,3 +370,148 @@ async def test_delete_thread_cascades_files() -> None:
         response = client.delete("/v1/agents/chat/threads/del-1")
     assert response.json() == {"deleted": True}
     assert await store.get_many(["f9"]) == []
+
+
+# ── 图片附件多模态（M4c） ────────────────────────────────────────────
+
+_PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"fake png body for tests"
+
+
+def test_upload_image_sniffs_magic() -> None:
+    runtime, store = _runtime_with_files()
+    with TestClient(create_app(runtime=runtime)) as client:
+        response = client.post(
+            "/v1/agents/chat/files",
+            files={"file": ("pic.png", _PNG_BYTES, "image/png")},
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["format"] == "png"
+    assert body["text_len"] == 0
+    assert "warning" not in body  # 图片是有意无文本，不算异常
+    # 原始字节入库（可重解析/下载）
+    rows = asyncio.run(store.get_many([body["file_id"]]))
+    assert rows[0].content.startswith(b"\x89PNG")
+
+
+def test_upload_rejects_disguised_image() -> None:
+    runtime, _ = _runtime_with_files()
+    with TestClient(create_app(runtime=runtime)) as client:
+        # 扩展名 .png 但内容不是图片（magic 校验失败）
+        response = client.post(
+            "/v1/agents/chat/files",
+            files={"file": ("evil.png", b"MZ not an image", "image/png")},
+        )
+    assert response.status_code == 400
+    assert "magic" in response.json()["detail"]
+
+
+def test_invoke_image_injection_is_multimodal() -> None:
+    captured: list[list[Any]] = []
+
+    class _Cap(ScriptedChatModel):
+        async def _astream(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[no-untyped-def]
+            captured.append(list(messages))
+            async for chunk in super()._astream(
+                messages, stop=stop, run_manager=run_manager, **kwargs
+            ):
+                yield chunk
+
+    runtime, store = _runtime_with_files()
+    runtime.llm = _Cap([AIMessage(content="看到图片了")])
+    asyncio.run(
+        store.save(
+            UploadedFileInfo(
+                file_id="img1",
+                filename="photo.png",
+                format="png",
+                text_len=0,
+                extracted_text="",
+                content=_PNG_BYTES,
+                thread_id="",
+                module="chat",
+            )
+        )
+    )
+    with TestClient(create_app(runtime=runtime)) as client:
+        response = client.post(
+            "/v1/agents/chat/invoke",
+            json={"message": "图里有什么", "thread_id": "img-1", "attachments": ["img1"]},
+        )
+    if response.status_code != 200:
+        raise AssertionError(f"invoke 失败: {response.status_code} {response.text[:200]}")
+    human = [m for m in captured[-1] if m.type == "human"]
+    assert human, "模型没有被调用"
+    content = human[0].content
+    assert isinstance(content, list), "图片应走多模态 content blocks"
+    assert content[0] == {"type": "text", "text": "图里有什么"}
+    assert content[1]["type"] == "image_url"
+    assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+    # 纯图片不产生 SystemMessage（没有文档文本可注入）
+    assert not any(m.type == "system" for m in captured[-1])
+
+
+def test_invoke_mixed_doc_and_image() -> None:
+    from langchain_core.messages import SystemMessage
+
+    captured: list[list[Any]] = []
+
+    class _Cap2(ScriptedChatModel):
+        async def _astream(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[no-untyped-def]
+            captured.append(list(messages))
+            async for chunk in super()._astream(
+                messages, stop=stop, run_manager=run_manager, **kwargs
+            ):
+                yield chunk
+
+    runtime, store = _runtime_with_files()
+    runtime.llm = _Cap2([AIMessage(content="收到")])
+    asyncio.run(
+        store.save(
+            UploadedFileInfo(
+                file_id="doc1",
+                filename="doc.pdf",
+                format="pdf",
+                text_len=5,
+                extracted_text="文档正文",
+                content=b"%PDF",
+                thread_id="",
+                module="chat",
+            )
+        )
+    )
+    asyncio.run(
+        store.save(
+            UploadedFileInfo(
+                file_id="img2",
+                filename="photo.jpg",
+                format="jpeg",
+                text_len=0,
+                extracted_text="",
+                content=b"\xff\xd8\xffjpegbody",
+                thread_id="",
+                module="chat",
+            )
+        )
+    )
+    with TestClient(create_app(runtime=runtime)) as client:
+        response = client.post(
+            "/v1/agents/chat/invoke",
+            json={"message": "对比一下", "thread_id": "mix-1", "attachments": ["doc1", "img2"]},
+        )
+    if response.status_code != 200:
+        raise AssertionError(f"invoke 失败: {response.status_code} {response.text[:200]}")
+    messages = captured[-1]
+    # 文档 → SystemMessage；图片 → 多模态 human content
+    system = [m for m in messages if isinstance(m, SystemMessage)]
+    assert len(system) == 1 and "文档正文" in system[0].content
+    human = [m for m in messages if m.type == "human"]
+    content = human[0].content
+    assert isinstance(content, list)
+    assert any(p.get("type") == "image_url" for p in content)
+    # 历史序列化：human 的 content 提取为纯文本，图片块不上屏
+    with TestClient(create_app(runtime=runtime)) as client:
+        history = client.get("/v1/agents/chat/threads/mix-1").json()
+    human_out = next(m for m in history["messages"] if m["role"] == "human")
+    assert human_out["content"] == "对比一下"
+    assert [a["format"] for a in human_out["attachments"]] == ["pdf", "jpeg"]

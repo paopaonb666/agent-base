@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import logging
 import re
@@ -120,6 +121,29 @@ def _extract_text(content: Any) -> str:
             str(part.get("text", "")) if isinstance(part, dict) else str(part) for part in content
         )
     return str(content)
+
+
+# 图片附件（多模态对话）：按 magic bytes 嗅探真实类型——扩展名可伪装，
+# 内容头不会。webp 的 RIFF/WEBP 头单独检查。
+_IMAGE_SIGNATURES: tuple[tuple[bytes, str, str], ...] = (
+    (b"\x89PNG\r\n\x1a\n", "image/png", "png"),
+    (b"\xff\xd8\xff", "image/jpeg", "jpeg"),
+    (b"GIF87a", "image/gif", "gif"),
+    (b"GIF89a", "image/gif", "gif"),
+)
+IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "gif"}
+# filestore 中图片附件的归一化 format 值（mime 去前缀）。
+IMAGE_STORED_FORMATS = {"png", "jpeg", "webp", "gif"}
+
+
+def _sniff_image_mime(data: bytes) -> str | None:
+    """按 magic bytes 识别图片真实类型；无法识别返回 None。"""
+    for signature, mime, _ in _IMAGE_SIGNATURES:
+        if data.startswith(signature):
+            return mime
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
 
 
 def _known_module(rt: AgentRuntime, module: str) -> bool:
@@ -413,7 +437,11 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
                 )
             await file_store.bind_thread(body.attachments, f"{module}:{user_thread_id}")
             blocks = []
+            image_parts: list[UploadedFileInfo] = []
             for info in attachment_infos:
+                if info.format in IMAGE_STORED_FORMATS:
+                    image_parts.append(info)
+                    continue
                 if info.extracted_text.strip():
                     pages = f"{info.pages} 页，" if info.pages else ""
                     blocks.append(
@@ -423,15 +451,29 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
                 else:
                     note = info.warning or "无法提取文本"
                     blocks.append(f"[附件文件：{info.filename}]（{note}）")
-            messages_input.append(
-                SystemMessage(
-                    content="以下是用户上传的附件内容，供回答时参考：\n\n" + "\n\n".join(blocks)
+            if blocks:
+                messages_input.append(
+                    SystemMessage(
+                        content="以下是用户上传的附件内容，供回答时参考：\n\n" + "\n\n".join(blocks)
+                    )
                 )
-            )
+            # 图片：多模态 content blocks（vision 模型直接看图）。
+            human_content: Any = body.message
+            if image_parts:
+                content: list[dict[str, Any]] = [{"type": "text", "text": body.message}]
+                for img in image_parts:
+                    encoded = base64.b64encode(img.content).decode("ascii")
+                    content.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/{img.format};base64,{encoded}"},
+                        }
+                    )
+                human_content = content
             attachments_meta = [info.meta() for info in attachment_infos]
             messages_input.append(
                 HumanMessage(
-                    content=body.message,
+                    content=human_content,
                     additional_kwargs={"attachments": attachments_meta},
                 )
             )
@@ -567,11 +609,12 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
 
     @app.post("/v1/agents/{module}/files")
     async def upload_file(module: str, request: Request, file: UploadFile) -> dict[str, Any]:
-        """上传并解析文档（M4a 解析层的 HTTP 入口）。
+        """上传附件（M4a 解析层 + M4c 图片多模态的 HTTP 入口）。
 
-        前端把返回的 ``text`` 组合进下一条消息，模型即可阅读文件内容；
-        解析走 ``tools/parsing``（格式按扩展名推断，限额走
-        DOC_PARSE_MAX_*），任何解析失败都以 400 返回可读原因。
+        文档（pdf/docx/txt/md）走 ``tools/parsing`` 提取文本，注入对话
+        上下文；图片（png/jpg/webp/gif）按 magic bytes 嗅探后整字节入库，
+        invoke 时以多模态 content blocks 注入 vision 模型。两类都返回
+        元信息（不含全文与字节）；解析/校验失败以 400 返回可读原因。
         """
         rt: AgentRuntime = request.app.state.runtime
         if not _known_module(rt, module):
@@ -585,6 +628,36 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
                 status_code=413,
                 detail=f"文件超出大小上限：{len(data)} 字节 > {max_bytes} 字节",
             )
+        suffix = (file.filename or "").rsplit(".", 1)[-1].lower()
+        file_store = rt.file_store
+        if file_store is None:
+            raise HTTPException(status_code=503, detail="附件存储未启用（存储后端不可用）")
+        if suffix in IMAGE_EXTENSIONS:
+            # 图片：不走文本解析，按 magic bytes 校验后整字节入库，
+            # invoke 时以多模态 content blocks 注入 vision 模型。
+            mime = _sniff_image_mime(data)
+            if mime is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"文件内容不是有效的图片：扩展名 {suffix!r} 与实际"
+                        "内容不符（magic 校验失败）"
+                    ),
+                )
+            info = UploadedFileInfo(
+                file_id=uuid.uuid4().hex[:12],
+                filename=file.filename or "",
+                format=mime.split("/", 1)[1],
+                pages=None,
+                paragraphs=None,
+                truncated=False,
+                text_len=0,
+                extracted_text="",
+                content=data,
+            )
+            await file_store.save(info)
+            asyncio.get_running_loop().create_task(file_store.purge_orphans())
+            return info.meta()
         try:
             doc = parse_document(data, filename=file.filename or "")
         except DocumentParseError as exc:
@@ -593,9 +666,6 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         warning = ""
         if not doc.text.strip():
             warning = "未能从文件中提取到文本：可能是扫描件或纯图片 PDF"
-        file_store = rt.file_store
-        if file_store is None:
-            raise HTTPException(status_code=503, detail="附件存储未启用（存储后端不可用）")
         info = UploadedFileInfo(
             file_id=uuid.uuid4().hex[:12],
             filename=file.filename or "",

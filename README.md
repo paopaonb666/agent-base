@@ -113,6 +113,10 @@ pytest                         # 覆盖率门（≥85%）依赖 MySQL 集成测�
 | `TOOL_TIMEOUT_SECONDS` | 工具单次执行超时（默认 30s） |
 | `TOOL_CALL_LOG_ENABLED` | 工具调用审计（M5）：每条调用含参数/结果/耗时落库，UI 渲染调用面板 |
 | `DOC_PARSE_MAX_INPUT_BYTES` / `DOC_PARSE_MAX_OUTPUT_CHARS` | 上传文档解析限额（默认 10MB / 5 万字符） |
+
+> **附件格式**：文档（pdf/docx/txt/md）提取文本注入上下文；图片
+>（png/jpg/webp/gif）按 magic bytes 校验后整字节入库，以多模态
+> content blocks 直达 vision 模型（需搭配视觉模型使用）。
 | `TOOLKIT_ENABLED` | 装配进共享池的基座内置工具清单（默认 `current_time,calculator,json_query`）；`web_search` 需配 `SEARCH_*`，`python_repl` 为 exec 级默认关 |
 | `LOG_JSON` | `true` 输出结构化 JSON 日志（生产建议开启） |
 
