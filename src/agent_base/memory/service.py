@@ -21,6 +21,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from agent_base.extensions.metrics import MEMORY_METRICS
+from agent_base.memory.context import compose_context
 from agent_base.memory.embeddings import EmbeddingClient, NullEmbedding, build_embedding_client
 from agent_base.memory.pipeline import MemoryPipeline, render_transcript
 from agent_base.memory.retrieval import ScoredMemory, recall_memories
@@ -306,6 +307,33 @@ class MemoryService:
         except Exception:
             # 管线内部已逐步失败安全；这里兜底防任何漏网异常干扰调用方。
             logger.exception("memory: capture_turn 意外失败")
+            return None
+
+    async def compose_context(
+        self, *, user_id: str, agent_id: str, thread_id: str, query: str
+    ) -> str | None:
+        """组装本轮的注入块（M6d）：画像 + 记忆块 + 会话摘要 + 相关记忆。
+
+        任何一步失败都降级为"缺那一节"；整体无内容时返回 None。
+        """
+        try:
+            global_blocks = await self.store.list_blocks(user_id, "*")
+            agent_blocks = await self.store.list_blocks(user_id, agent_id)
+            blocks = [*global_blocks, *agent_blocks]
+            profile = (
+                await self.get_profile(user_id) if self._settings.memory_profile_enabled else None
+            )
+            summary_record = await self.store.get_summary(user_id, thread_id)
+            recalled = await self.search(user_id=user_id, agent_id=agent_id, query=query)
+            return compose_context(
+                profile=profile,
+                blocks=blocks,
+                summary=summary_record.summary if summary_record else None,
+                recalled=recalled,
+                max_chars=self._settings.memory_context_max_chars,
+            )
+        except Exception:
+            logger.warning("memory: 注入块组装失败（本轮不注入）", exc_info=True)
             return None
 
     async def purge_thread(self, thread_id: str) -> None:

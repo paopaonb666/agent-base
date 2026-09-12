@@ -67,6 +67,7 @@ from agent_base.extensions.observability import (
     request_id,
     setup_logging,
 )
+from agent_base.memory.context import ATTACHMENT_CONTEXT_PREFIX
 from agent_base.memory.service import MemoryService
 from agent_base.memory.store import KNOWN_MEMORY_KINDS, KNOWN_MEMORY_STATUSES
 from agent_base.tools.parsing import DocumentParseError, parse_document
@@ -526,8 +527,19 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
                 "user_id": scope_user_id,
             }
         }
-        # 附件（M4b）：解析引用的 file_id → 取记录 → 绑定线程 → 注入。
         messages_input: list[Any] = []
+        # 记忆上下文注入（M6d）：画像/记忆块/摘要/相关记忆打包成注入块，
+        # 置于全部消息之前（attachments 注入块在其后）。失败静默降级。
+        if runtime.memory is not None:
+            context_block = await runtime.memory.compose_context(
+                user_id=scope_user_id,
+                agent_id=module,
+                thread_id=f"{module}:{user_thread_id}",
+                query=body.message,
+            )
+            if context_block:
+                messages_input.append(SystemMessage(content=context_block))
+        # 附件（M4b）：解析引用的 file_id → 取记录 → 绑定线程 → 注入。
         if body.attachments:
             file_store = runtime.file_store
             if file_store is None:
@@ -558,7 +570,8 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
             if blocks:
                 messages_input.append(
                     SystemMessage(
-                        content="以下是用户上传的附件内容，供回答时参考：\n\n" + "\n\n".join(blocks)
+                        content=f"{ATTACHMENT_CONTEXT_PREFIX}，供回答时参考：\n\n"
+                        + "\n\n".join(blocks)
                     )
                 )
             # 图片：多模态 content blocks（vision 模型直接看图）。

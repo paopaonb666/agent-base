@@ -68,10 +68,18 @@ class ScriptedChatModel(BaseChatModel):
     """
 
     _queue: list[AIMessage] = PrivateAttr(default_factory=list)
+    # 收到的模型输入录制（M6d 上下文工程测试用）。
+    _received: list[list[BaseMessage]] = PrivateAttr(default_factory=list)
 
     def __init__(self, responses: list[AIMessage] | None = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._queue = list(responses or [])
+        self._received = []
+
+    @property
+    def received(self) -> list[list[BaseMessage]]:
+        """每次模型调用收到的完整输入（诊断/断言用）。"""
+        return self._received
 
     @property
     def _llm_type(self) -> str:
@@ -91,6 +99,7 @@ class ScriptedChatModel(BaseChatModel):
     ) -> ChatResult:
         # 注意：generations 必须是关键字参数——pydantic v2 的 BaseModel 会拒绝
         # 位置式初始化参数（ChatResult([...]) 会抛出 TypeError）。
+        self._received.append(list(messages))
         return ChatResult(generations=[ChatGeneration(message=self._next())])
 
     async def _astream(
@@ -100,6 +109,7 @@ class ScriptedChatModel(BaseChatModel):
         run_manager: Any = None,
         **kwargs: Any,
     ) -> Any:
+        self._received.append(list(messages))
         yield ChatGenerationChunk(message=_to_chunk(self._next()))
 
     def bind_tools(  # type: ignore[override]

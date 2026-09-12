@@ -145,6 +145,10 @@ class Settings(BaseSettings):
     # 召回与注入预算：每轮最多召回的记忆条数与注入上下文的字符预算。
     memory_recall_top_k: int = 6
     memory_context_max_chars: int = 3000
+    # chat 图的模型侧 token 预算（M6d 上下文工程）：超过预算的旧历史被
+    # 修剪出"发给模型"的输入（checkpointer 全量历史不动）。这是近似估算
+    # （CJK 0.6 token/字 + ASCII 0.25 token/字符），宁小勿大。
+    memory_context_max_tokens: int = 12_000
     # 记忆形成管线（M6c）：每 N 轮对话跑一次抽取+整合（后台异步，绝不
     # 阻塞对话流）。
     memory_capture_enabled: bool = True
@@ -299,6 +303,7 @@ class Settings(BaseSettings):
         "memory_embedding_batch_size",
         "memory_recall_top_k",
         "memory_context_max_chars",
+        "memory_context_max_tokens",
         "memory_extraction_max_input_chars",
         "memory_doc_chunk_chars",
     )

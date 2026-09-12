@@ -20,11 +20,13 @@ from __future__ import annotations
 from typing import Any, cast
 
 from langchain_core.messages import AIMessageChunk
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
 from agent_base.core.contracts import Graph, ModuleContext
 from agent_base.core.tools import handle_tool_error
+from agent_base.memory.context import build_model_input
 
 MODULE_NAME = "chat"
 
@@ -36,9 +38,15 @@ def build_chat_graph(ctx: ModuleContext) -> Graph:
     # 一次就够了。
     model = ctx.llm.bind_tools(tools) if tools else ctx.llm
 
-    async def call_model(state: MessagesState) -> dict[str, Any]:
+    async def call_model(state: MessagesState, config: RunnableConfig) -> dict[str, Any]:
+        # 上下文工程（M6d）：注入型系统消息去重 + token 预算修剪（保尾部、
+        # 工具配对不拆散）。只影响发给模型的输入——checkpointer 里的全量
+        # 历史不动（recall 语义）；没有记忆系统时这是纯上下文保护。
+        model_input = build_model_input(
+            state["messages"], max_tokens=ctx.settings.memory_context_max_tokens
+        )
         final: AIMessageChunk | None = None
-        async for chunk in model.astream(state["messages"]):
+        async for chunk in model.astream(model_input):
             # astream 声明的产出类型是消息联合体；运行时的分块是
             # AIMessageChunk（仅对话模型）。
             piece = cast(AIMessageChunk, chunk)
