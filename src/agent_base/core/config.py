@@ -129,6 +129,41 @@ class Settings(BaseSettings):
     # 防止整本 PDF 的文本一次性灌进模型上下文。
     doc_parse_max_output_chars: int = 50_000
 
+    # -- 记忆系统（memory/；M6） ------------------------------------------
+    # 总开关：关闭时不装配记忆服务，invoke 链路与既有行为完全一致。
+    memory_enabled: bool = True
+    # 语义检索（embedding）：openai 兼容 /embeddings 端点（默认指向硅基
+    # 流动，BAAI/bge-m3，1024 维，中英双语）。API key 为空时自动降级为
+    # BM25 关键词 + 时间衰减检索，其余记忆功能不受影响。
+    memory_embedding_enabled: bool = True
+    memory_embedding_base_url: str = "https://api.siliconflow.cn/v1"
+    memory_embedding_api_key: SecretStr = SecretStr("")
+    memory_embedding_model: str = "BAAI/bge-m3"
+    memory_embedding_dims: int = 1024
+    memory_embedding_batch_size: int = 16
+    memory_embedding_timeout_seconds: float = 10.0
+    # 召回与注入预算：每轮最多召回的记忆条数与注入上下文的字符预算。
+    memory_recall_top_k: int = 6
+    memory_context_max_chars: int = 3000
+    # 记忆形成管线（M6c）：每 N 轮对话跑一次抽取+整合（后台异步，绝不
+    # 阻塞对话流）。
+    memory_capture_enabled: bool = True
+    memory_capture_every_turns: int = 1
+    # 会话滚动摘要（M6c/M6d）：线程内消息数超过阈值后触发摘要更新。
+    memory_summary_enabled: bool = True
+    memory_summary_trigger_messages: int = 12
+    # 用户画像（M6c）：随对话合并演化的结构化画像。
+    memory_profile_enabled: bool = True
+    # 遗忘策略：episodic 记忆的保留天数（0 表示不过期）；检索打分的
+    # 时间半衰期（天）——越久未被访问的记忆权重越低。
+    memory_episodic_ttl_days: int = 30
+    memory_time_decay_half_life_days: float = 14.0
+    # 抽取管线的单次输入字符上限（防止长会话把 prompt 撑爆）。
+    memory_extraction_max_input_chars: int = 8000
+    # 文档知识库分块（M6e）：按字符数分块 + 相邻块重叠。
+    memory_doc_chunk_chars: int = 800
+    memory_doc_chunk_overlap: int = 100
+
     # -- 环境 --------------------------------------------------------
     env: str = "development"
 
@@ -258,6 +293,62 @@ class Settings(BaseSettings):
                 "(e.g. duckduckgo, bing); leave unset for the default"
             )
         return backend
+
+    @field_validator(
+        "memory_embedding_dims",
+        "memory_embedding_batch_size",
+        "memory_recall_top_k",
+        "memory_context_max_chars",
+        "memory_extraction_max_input_chars",
+        "memory_doc_chunk_chars",
+    )
+    @classmethod
+    def _validate_memory_positive_ints(cls, value: int, info: ValidationInfo) -> int:
+        # 非正数的上限/预算等于让记忆功能要么拒绝一切、要么注入一切，
+        # 必须是启动时的配置错误而不是静默运行时行为。
+        if value <= 0:
+            raise ValueError(f"{info.field_name} must be > 0, got {value}")
+        return value
+
+    @field_validator(
+        "memory_embedding_timeout_seconds", "memory_time_decay_half_life_days"
+    )
+    @classmethod
+    def _validate_memory_durations(cls, value: float, info: ValidationInfo) -> float:
+        # NaN 的所有比较都是 False，必须用 not (value > 0) 一并拒绝。
+        if not (value > 0):
+            raise ValueError(f"{info.field_name} must be > 0, got {value}")
+        return value
+
+    @field_validator("memory_capture_every_turns", "memory_summary_trigger_messages")
+    @classmethod
+    def _validate_memory_trigger_intervals(cls, value: int, info: ValidationInfo) -> int:
+        if value < 1:
+            raise ValueError(f"{info.field_name} must be >= 1, got {value}")
+        return value
+
+    @field_validator("memory_episodic_ttl_days")
+    @classmethod
+    def _validate_memory_ttl(cls, value: int) -> int:
+        # 0 是合法值：表示 episodic 记忆不过期。
+        if value < 0:
+            raise ValueError(f"memory_episodic_ttl_days must be >= 0, got {value}")
+        return value
+
+    @field_validator("memory_doc_chunk_overlap")
+    @classmethod
+    def _validate_memory_chunk_overlap(cls, value: int, info: ValidationInfo) -> int:
+        if value < 0:
+            raise ValueError(f"memory_doc_chunk_overlap must be >= 0, got {value}")
+        # 重叠必须小于块长（与 memory_doc_chunk_chars 同属一组配置），
+        # 否则分块会陷入死循环。
+        chars = info.data.get("memory_doc_chunk_chars")
+        if chars is not None and value >= chars:
+            raise ValueError(
+                f"memory_doc_chunk_overlap must be < memory_doc_chunk_chars "
+                f"({chars}), got {value}"
+            )
+        return value
 
     def ensure_production_ready(self) -> None:
         """在配置错误时快速失败（安全项对所有环境生效，其余限 production）。
