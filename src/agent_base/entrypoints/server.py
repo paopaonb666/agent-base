@@ -39,7 +39,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, StreamingResponse
-from langchain_core.messages import AIMessageChunk, HumanMessage
+from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
@@ -57,6 +57,7 @@ from agent_base.extensions.events import (
     ToolCallEvent,
     encode_sse,
 )
+from agent_base.extensions.filestore import UploadedFileInfo
 from agent_base.extensions.metrics import TOOL_METRICS, Metrics
 from agent_base.extensions.observability import (
     new_request_id,
@@ -103,6 +104,9 @@ class InvokeRequest(BaseModel):
     thread_id: str | None = Field(
         default=None, max_length=128, pattern=r"^[\w.-]+$"
     )  # None -> 创建一个新 thread
+    # 附件对话（M4b）：本条消息引用的上传文件 id（≤5 个），服务端把解析
+    # 文本作为 SystemMessage 注入上下文——用户气泡保持干净。
+    attachments: list[str] = Field(default_factory=list, max_length=5)
 
 
 def _extract_text(content: Any) -> str:
@@ -140,8 +144,16 @@ def _serialize_message(message: Any) -> dict[str, Any] | None:
     """
     mtype = getattr(message, "type", "")
     text = _extract_text(getattr(message, "content", ""))
+    if mtype == "system":
+        # 附件注入的系统消息：内容只在当轮给模型，历史回放由 human 消息
+        # 上的附件元数据承载——blob 永不上屏。
+        return None
     if mtype == "human":
-        return {"role": "human", "content": text}
+        attachments = (getattr(message, "additional_kwargs", {}) or {}).get("attachments")
+        out: dict[str, Any] = {"role": "human", "content": text}
+        if isinstance(attachments, list) and attachments:
+            out["attachments"] = attachments
+        return out
     if mtype == "ai":
         tool_calls: list[dict[str, Any]] = [
             {
@@ -239,7 +251,7 @@ async def _probe_model(settings: Settings) -> str:
 async def _produce(
     queue: asyncio.Queue[AgentEvent | None],
     graph: Any,
-    message: str,
+    messages_input: list[Any],
     config: RunnableConfig,
     user_thread_id: str,
 ) -> None:
@@ -247,7 +259,7 @@ async def _produce(
     running: set[str] = set()
     try:
         stream: Any = graph.astream(
-            {"messages": [HumanMessage(content=message)]},
+            {"messages": messages_input},
             config,
             # custom：工具通过 get_stream_writer 发的 UI 事件（M3.5）——
             # 联网搜索的进度步骤与来源引用由此到达前端。
@@ -299,11 +311,11 @@ async def _heartbeat(queue: asyncio.Queue[AgentEvent | None]) -> None:
 
 
 async def _event_stream(
-    graph: Any, message: str, config: RunnableConfig, user_thread_id: str
+    graph: Any, messages_input: list[Any], config: RunnableConfig, user_thread_id: str
 ) -> AsyncIterator[str]:
     """一次对话轮的 SSE 帧（契约事件，已编码）。"""
     queue: asyncio.Queue[AgentEvent | None] = asyncio.Queue(maxsize=SSE_QUEUE_MAXSIZE)
-    producer = asyncio.create_task(_produce(queue, graph, message, config, user_thread_id))
+    producer = asyncio.create_task(_produce(queue, graph, messages_input, config, user_thread_id))
     heartbeat = asyncio.create_task(_heartbeat(queue))
     try:
         # 立即发出存活信号，让客户端（和代理）在第一个模型 token
@@ -386,8 +398,47 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         # 按模块划分的 thread id：图共用一个 checkpointer；未划分命名空间
         # 的 id 会把它们的状态混在一起。
         config: RunnableConfig = {"configurable": {"thread_id": f"{module}:{user_thread_id}"}}
+        # 附件（M4b）：解析引用的 file_id → 取记录 → 绑定线程 → 注入。
+        messages_input: list[Any] = []
+        if body.attachments:
+            file_store = runtime.file_store
+            if file_store is None:
+                raise HTTPException(status_code=503, detail="附件存储未启用（存储后端不可用）")
+            attachment_infos = await file_store.get_many(body.attachments)
+            missing = sorted(set(body.attachments) - {info.file_id for info in attachment_infos})
+            if missing:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"附件不存在或已过期：{', '.join(missing)}；请重新上传",
+                )
+            await file_store.bind_thread(body.attachments, f"{module}:{user_thread_id}")
+            blocks = []
+            for info in attachment_infos:
+                if info.extracted_text.strip():
+                    pages = f"{info.pages} 页，" if info.pages else ""
+                    blocks.append(
+                        f"[附件文件：{info.filename}（{info.format}，{pages}"
+                        f"{info.text_len} 字符）]\n{info.extracted_text}"
+                    )
+                else:
+                    note = info.warning or "无法提取文本"
+                    blocks.append(f"[附件文件：{info.filename}]（{note}）")
+            messages_input.append(
+                SystemMessage(
+                    content="以下是用户上传的附件内容，供回答时参考：\n\n" + "\n\n".join(blocks)
+                )
+            )
+            attachments_meta = [info.meta() for info in attachment_infos]
+            messages_input.append(
+                HumanMessage(
+                    content=body.message,
+                    additional_kwargs={"attachments": attachments_meta},
+                )
+            )
+        else:
+            messages_input.append(HumanMessage(content=body.message))
         return StreamingResponse(
-            _event_stream(graph, body.message, config, user_thread_id),
+            _event_stream(graph, messages_input, config, user_thread_id),
             media_type="text/event-stream",
             headers=_SSE_HEADERS,
         )
@@ -510,6 +561,8 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         # adelete_thread 接收原始 thread_id 字符串；与 invoke/get 一致地
         # 使用 module:thread_id 命名空间。
         await rt.checkpointer.adelete_thread(f"{module}:{thread_id}")
+        if rt.file_store is not None:
+            await rt.file_store.delete_for_thread(f"{module}:{thread_id}")
         return {"deleted": True}
 
     @app.post("/v1/agents/{module}/files")
@@ -536,16 +589,29 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
             doc = parse_document(data, filename=file.filename or "")
         except DocumentParseError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {
-            "file_id": uuid.uuid4().hex[:12],
-            "filename": file.filename or "",
-            "format": doc.format,
-            "pages": doc.pages,
-            "paragraphs": doc.paragraphs,
-            "truncated": doc.truncated,
-            "text_len": len(doc.text),
-            "text": doc.text,
-        }
+        # 空提取文本（扫描件/纯图片 PDF）不是错误，但要显式告知前端。
+        warning = ""
+        if not doc.text.strip():
+            warning = "未能从文件中提取到文本：可能是扫描件或纯图片 PDF"
+        file_store = rt.file_store
+        if file_store is None:
+            raise HTTPException(status_code=503, detail="附件存储未启用（存储后端不可用）")
+        info = UploadedFileInfo(
+            file_id=uuid.uuid4().hex[:12],
+            filename=file.filename or "",
+            format=doc.format,
+            pages=doc.pages,
+            paragraphs=doc.paragraphs,
+            truncated=doc.truncated,
+            text_len=len(doc.text),
+            extracted_text=doc.text,
+            content=data,
+            warning=warning,
+        )
+        await file_store.save(info)
+        # 机会式清理 24h 未绑定的孤儿附件（fire-and-forget）。
+        asyncio.get_running_loop().create_task(file_store.purge_orphans())
+        return info.meta()
 
     @app.get("/v1/modules")
     async def list_modules(request: Request) -> dict[str, Any]:

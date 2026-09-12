@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 from typing import Any
@@ -26,6 +27,7 @@ from agent_base.entrypoints.server import (
     create_app,
 )
 from agent_base.extensions.events import SourcesEvent, StepEvent
+from agent_base.extensions.filestore import MemoryUploadedFileStore, UploadedFileInfo
 from agent_base.extensions.toollog import MemoryToolCallRecorder, ToolCallRecord
 from agent_base.modules.chat.module import ChatModule
 from agent_base.tools.streaming import emit_sources, emit_step
@@ -217,16 +219,12 @@ def test_tool_calls_endpoint_returns_audit_records() -> None:
 # ── 文件上传端点（M4a 解析层的 HTTP 入口） ──────────────────────────
 
 
-def test_upload_file_parses_real_pdf() -> None:
-    import sys
-
-    from fastapi.testclient import TestClient as _TC
-
-    sys.path.insert(0, "tests")
+def test_upload_file_persists_and_returns_meta() -> None:
     from test_parsing import _make_pdf
 
     runtime = _runtime()
-    with _TC(create_app(runtime=runtime)) as client:
+    runtime.file_store = MemoryUploadedFileStore()
+    with TestClient(create_app(runtime=runtime)) as client:
         response = client.post(
             "/v1/agents/chat/files",
             files={
@@ -239,19 +237,20 @@ def test_upload_file_parses_real_pdf() -> None:
         )
     assert response.status_code == 200
     body = response.json()
+    # 响应只回元信息：全文留在服务端，由 invoke 时注入上下文
     assert body["format"] == "pdf"
     assert body["pages"] == 2
     assert body["truncated"] is False
     assert body["text_len"] > 0
-    assert "resume line one" in body["text"]
+    assert "text" not in body
+    assert "extracted_text" not in body
 
 
 def test_upload_rejects_bad_input() -> None:
-    from fastapi.testclient import TestClient as _TC
-
     runtime = _runtime()
+    runtime.file_store = MemoryUploadedFileStore()
     runtime.settings = Settings(_env_file=None, llm_api_key="sk-test", doc_parse_max_input_bytes=64)
-    with _TC(create_app(runtime=runtime)) as client:
+    with TestClient(create_app(runtime=runtime)) as client:
         # 不支持的扩展名 → 400
         r1 = client.post(
             "/v1/agents/chat/files", files={"file": ("x.exe", b"MZ", "application/x-exe")}
@@ -273,6 +272,101 @@ def test_upload_rejects_bad_input() -> None:
         assert r4.status_code == 400
     # 未知模块 → 404
     runtime2 = _runtime()
-    with _TC(create_app(runtime=runtime2)) as client:
+    with TestClient(create_app(runtime=runtime2)) as client:
         r5 = client.post("/v1/agents/nobody/files", files={"file": ("a.txt", b"hi", "text/plain")})
         assert r5.status_code == 404
+
+
+# ── 文件上传端点（M4a 解析层的 HTTP 入口） ──────────────────────────
+
+
+def _runtime_with_files() -> tuple[AgentRuntime, MemoryUploadedFileStore]:
+    runtime = _runtime()
+    store = MemoryUploadedFileStore()
+    runtime.file_store = store
+    return runtime, store
+
+
+def test_invoke_injects_attachments_as_system_message() -> None:
+    from langchain_core.messages import SystemMessage
+
+    captured: list[list[Any]] = []
+
+    class _CapturingModel(ScriptedChatModel):
+        async def _astream(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[no-untyped-def]
+            captured.append(list(messages))
+            async for chunk in super()._astream(
+                messages, stop=stop, run_manager=run_manager, **kwargs
+            ):
+                yield chunk
+
+    runtime, store = _runtime_with_files()
+    model = _CapturingModel([AIMessage(content="收到")])
+    runtime.llm = model
+    asyncio.run(
+        store.save(
+            UploadedFileInfo(
+                file_id="f1",
+                filename="简历.pdf",
+                format="pdf",
+                pages=2,
+                text_len=6,
+                extracted_text="刘骁铖 简历正文",
+                content=b"%PDF",
+                thread_id="",
+                module="chat",
+            )
+        )
+    )
+    with TestClient(create_app(runtime=runtime)) as client:
+        response = client.post(
+            "/v1/agents/chat/invoke",
+            json={"message": "读一下附件", "thread_id": "att-1", "attachments": ["f1"]},
+        )
+    if response.status_code != 200:
+        raise AssertionError(f"invoke 失败: {response.status_code} {response.text[:200]}")
+    # 模型收到：SystemMessage（附件全文）+ HumanMessage（干净正文）
+    assert captured, "模型没有被调用"
+    system_texts = [m for m in captured[-1] if isinstance(m, SystemMessage)]
+    assert any("简历正文" in str(m.content) for m in system_texts)
+    human = [m for m in captured[-1] if m.type == "human"]
+    assert human and human[0].content == "读一下附件"
+    assert human[0].additional_kwargs["attachments"][0]["filename"] == "简历.pdf"
+    # 历史回放：human 带附件元数据、无 system、无 blob
+    history = client.get("/v1/agents/chat/threads/att-1").json()
+    roles = [m["role"] for m in history["messages"]]
+    assert "system" not in roles
+    human_out = history["messages"][0]
+    assert human_out["attachments"][0]["file_id"] == "f1"
+    assert "简历正文" not in json.dumps(history["messages"], ensure_ascii=False)
+
+
+def test_invoke_unknown_file_id_rejected() -> None:
+    runtime, _ = _runtime_with_files()
+    with TestClient(create_app(runtime=runtime)) as client:
+        response = client.post(
+            "/v1/agents/chat/invoke",
+            json={"message": "hi", "thread_id": "att-2", "attachments": ["ghost"]},
+        )
+    assert response.status_code == 400
+    assert "ghost" in response.json()["detail"]
+
+
+async def test_delete_thread_cascades_files() -> None:
+    runtime, store = _runtime_with_files()
+    await store.save(
+        UploadedFileInfo(
+            file_id="f9",
+            filename="a.pdf",
+            format="pdf",
+            text_len=3,
+            extracted_text="abc",
+            content=b"%PDF",
+            thread_id="chat:del-1",
+            module="chat",
+        )
+    )
+    with TestClient(create_app(runtime=runtime)) as client:
+        response = client.delete("/v1/agents/chat/threads/del-1")
+    assert response.json() == {"deleted": True}
+    assert await store.get_many(["f9"]) == []

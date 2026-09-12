@@ -30,6 +30,7 @@ from agent_base.core.contracts import AgentModule, Graph, ModuleContext
 from agent_base.core.llm import build_llm
 from agent_base.core.registry import RegistryError, load_modules
 from agent_base.core.tools import build_tool_pool
+from agent_base.extensions.filestore import UploadedFileStore, build_uploaded_file_store
 from agent_base.extensions.memory import build_checkpointer, close_checkpointer
 from agent_base.extensions.toollog import ToolCallRecorder, build_tool_call_recorder
 from agent_base.tools.registry import build_toolkit_tools, toolkit_timeouts
@@ -62,6 +63,7 @@ class AgentRuntime:
     tools: list[BaseTool] = field(default_factory=list)
     checkpointer: BaseCheckpointSaver[Any] | None = None
     tool_recorder: ToolCallRecorder | None = None
+    file_store: UploadedFileStore | None = None
     _graphs: dict[str, Graph] = field(default_factory=dict, repr=False)
     _supervisor: Graph | None = field(default=None, repr=False)
 
@@ -114,6 +116,8 @@ class AgentRuntime:
             await close_checkpointer(self.checkpointer)
         if self.tool_recorder is not None and hasattr(self.tool_recorder, "aclose"):
             await self.tool_recorder.aclose()
+        if self.file_store is not None and hasattr(self.file_store, "aclose"):
+            await self.file_store.aclose()
 
 
 async def create_runtime(settings: Settings | None = None) -> AgentRuntime:
@@ -140,6 +144,7 @@ async def create_runtime(settings: Settings | None = None) -> AgentRuntime:
         recorder=recorder,
     )
     checkpointer = await build_checkpointer(resolved)
+    file_store = await build_uploaded_file_store(resolved)
     return AgentRuntime(
         settings=resolved,
         llm=llm,
@@ -147,4 +152,5 @@ async def create_runtime(settings: Settings | None = None) -> AgentRuntime:
         tools=tools,
         checkpointer=checkpointer,
         tool_recorder=recorder,
+        file_store=file_store,
     )
