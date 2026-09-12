@@ -49,6 +49,16 @@ logger = logging.getLogger(__name__)
 KNOWN_MEMORY_KINDS: tuple[str, ...] = ("semantic", "episodic", "procedural")
 KNOWN_MEMORY_STATUSES: tuple[str, ...] = ("active", "superseded", "archived")
 
+# 用户画像的确定性 memory_id 前缀：画像复用 memories 表（agent_id="*"、
+# tags=["profile"]），以 id 前缀与普通记忆区分——检索时被排除（画像由
+# 上下文组装单独注入），管理端点里可见可删。
+PROFILE_ID_PREFIX = "profile:"
+
+
+def profile_memory_id(user_id: str) -> str:
+    """某用户画像记录的确定性 id。"""
+    return f"{PROFILE_ID_PREFIX}{user_id}"
+
 
 class MemoryStoreError(ValueError):
     """存储层的快速失败：非法类别/状态等数据错误在写入边界被拒绝。"""

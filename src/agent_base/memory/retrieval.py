@@ -23,7 +23,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
-from agent_base.memory.store import MemoryRecord, decode_embedding
+from agent_base.memory.store import PROFILE_ID_PREFIX, MemoryRecord, decode_embedding
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +206,8 @@ async def recall_memories(
     records = await store.list_memories(user_id, agent_id=agent_id)
     timestamp = time.time() if now is None else now
     records = filter_expired(records, episodic_ttl_days, now=timestamp)
+    # 用户画像不是可召回记忆：它由上下文组装单独、整体注入（M6d）。
+    records = [record for record in records if not record.memory_id.startswith(PROFILE_ID_PREFIX)]
     if not records:
         return []
     query_embedding: list[float] | None = None

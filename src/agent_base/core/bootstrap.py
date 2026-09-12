@@ -151,7 +151,7 @@ async def create_runtime(settings: Settings | None = None) -> AgentRuntime:
     )
     checkpointer = await build_checkpointer(resolved)
     file_store = await build_uploaded_file_store(resolved)
-    memory_service = await build_memory_service(resolved)
+    memory_service = await build_memory_service(resolved, llm)
     return AgentRuntime(
         settings=resolved,
         llm=llm,

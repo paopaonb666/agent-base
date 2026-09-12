@@ -33,7 +33,7 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Coroutine
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
@@ -204,6 +204,39 @@ def _require_memory(rt: AgentRuntime) -> MemoryService:
     return rt.memory
 
 
+def _build_capture_hook(
+    runtime: AgentRuntime, module: str, user_thread_id: str, graph: Any, config: RunnableConfig
+) -> Coroutine[Any, Any, None] | None:
+    """构造轮次完成后的记忆形成回调（M6c）；管线不可用时返回 None。
+
+    回调从 checkpointer 快照取本轮完整消息（含工具轮次），交给
+    ``capture_turn``——形成管线内部失败安全，这里再兜一层异常。
+    user_id 取自 config（invoke 端点已从 X-User-Id 头写入 configurable）。
+    """
+    memory = runtime.memory
+    if memory is None or memory.pipeline is None:
+        return None
+
+    async def _capture() -> None:
+        try:
+            snapshot = await graph.aget_state(config)
+            messages = (snapshot.values or {}).get("messages", []) if snapshot else []
+            if not messages:
+                return
+            raw_user = (config.get("configurable") or {}).get("user_id")
+            user_id = raw_user if isinstance(raw_user, str) and raw_user else "default"
+            await memory.capture_turn(
+                user_id=user_id,
+                agent_id=module,
+                thread_id=f"{module}:{user_thread_id}",
+                messages=messages,
+            )
+        except Exception:
+            logger.warning("memory: 后台记忆形成失败（不影响对话）", exc_info=True)
+
+    return _capture()
+
+
 def _serialize_message(message: Any) -> dict[str, Any] | None:
     """把一条 LangChain 消息序列化为前端可渲染的简单结构。
 
@@ -327,8 +360,14 @@ async def _produce(
     messages_input: list[Any],
     config: RunnableConfig,
     user_thread_id: str,
+    on_complete: Coroutine[Any, Any, None] | None = None,
 ) -> None:
-    """把图事件推入队列；用哨兵值终止。"""
+    """把图事件推入队列；用哨兵值终止。
+
+    ``on_complete``（M6c）：轮次正常完成后触发的后台回调（记忆形成管
+    线）。fire-and-forget 的独立任务——不阻塞哨兵送达，客户端中途断开
+    或本轮出错时不会被调用。
+    """
     running: set[str] = set()
     try:
         stream: Any = graph.astream(
@@ -357,6 +396,9 @@ async def _produce(
                         continue
                     await queue.put(StepEvent(name=str(node), status="completed"))
         await queue.put(DoneEvent(thread_id=user_thread_id))
+        if on_complete is not None:
+            # 独立任务：随后的哨兵与 finally 取消都不影响它跑完。
+            asyncio.get_running_loop().create_task(on_complete)
     except Exception as exc:
         logger.exception("sse: stream failed")
         await queue.put(ErrorEvent(message=_safe_error_text(exc)))
@@ -384,11 +426,17 @@ async def _heartbeat(queue: asyncio.Queue[AgentEvent | None]) -> None:
 
 
 async def _event_stream(
-    graph: Any, messages_input: list[Any], config: RunnableConfig, user_thread_id: str
+    graph: Any,
+    messages_input: list[Any],
+    config: RunnableConfig,
+    user_thread_id: str,
+    on_complete: Coroutine[Any, Any, None] | None = None,
 ) -> AsyncIterator[str]:
     """一次对话轮的 SSE 帧（契约事件，已编码）。"""
     queue: asyncio.Queue[AgentEvent | None] = asyncio.Queue(maxsize=SSE_QUEUE_MAXSIZE)
-    producer = asyncio.create_task(_produce(queue, graph, messages_input, config, user_thread_id))
+    producer = asyncio.create_task(
+        _produce(queue, graph, messages_input, config, user_thread_id, on_complete)
+    )
     heartbeat = asyncio.create_task(_heartbeat(queue))
     try:
         # 立即发出存活信号，让客户端（和代理）在第一个模型 token
@@ -469,8 +517,15 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=detail) from exc
         user_thread_id = body.thread_id or new_request_id()
         # 按模块划分的 thread id：图共用一个 checkpointer；未划分命名空间
-        # 的 id 会把它们的状态混在一起。
-        config: RunnableConfig = {"configurable": {"thread_id": f"{module}:{user_thread_id}"}}
+        # 的 id 会把它们的状态混在一起。user_id（M6）进 configurable：
+        # 记忆工具经 RunnableConfig 注入读取（M6e）。
+        scope_user_id = _memory_user_id(request)
+        config: RunnableConfig = {
+            "configurable": {
+                "thread_id": f"{module}:{user_thread_id}",
+                "user_id": scope_user_id,
+            }
+        }
         # 附件（M4b）：解析引用的 file_id → 取记录 → 绑定线程 → 注入。
         messages_input: list[Any] = []
         if body.attachments:
@@ -528,8 +583,11 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
             )
         else:
             messages_input.append(HumanMessage(content=body.message))
+        # 记忆形成（M6c）：轮次正常完成后在后台跑抽取/整合/画像/摘要。
+        # 需要形成管线可用（llm 已装配）且记忆系统启用。
+        on_complete = _build_capture_hook(runtime, module, user_thread_id, graph, config)
         return StreamingResponse(
-            _event_stream(graph, messages_input, config, user_thread_id),
+            _event_stream(graph, messages_input, config, user_thread_id, on_complete),
             media_type="text/event-stream",
             headers=_SSE_HEADERS,
         )
@@ -654,6 +712,10 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         await rt.checkpointer.adelete_thread(f"{module}:{thread_id}")
         if rt.file_store is not None:
             await rt.file_store.delete_for_thread(f"{module}:{thread_id}")
+        if rt.memory is not None:
+            # 记忆级联（M6）：清该线程的滚动摘要与知识库分块；跨会话
+            # 记忆刻意保留（出处仍在 source_thread_id）。
+            await rt.memory.purge_thread(f"{module}:{thread_id}")
         return {"deleted": True}
 
     @app.post("/v1/agents/{module}/files")

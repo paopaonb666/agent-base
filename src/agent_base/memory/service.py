@@ -18,19 +18,22 @@ import logging
 import time
 import uuid
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from agent_base.extensions.metrics import MEMORY_METRICS
 from agent_base.memory.embeddings import EmbeddingClient, NullEmbedding, build_embedding_client
+from agent_base.memory.pipeline import MemoryPipeline, render_transcript
 from agent_base.memory.retrieval import ScoredMemory, recall_memories
 from agent_base.memory.store import (
     KNOWN_MEMORY_KINDS,
     KNOWN_MEMORY_STATUSES,
+    MemoryOp,
     MemoryRecord,
     MemoryStore,
     MemoryStoreError,
     build_memory_store,
     encode_embedding,
+    profile_memory_id,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - import avoided at runtime
@@ -47,10 +50,51 @@ def new_memory_id() -> str:
 class MemoryService:
     """记忆系统门面：一个实例服务整个运行时（三种后端一致）。"""
 
-    def __init__(self, store: MemoryStore, embedder: EmbeddingClient, settings: Settings) -> None:
+    def __init__(
+        self,
+        store: MemoryStore,
+        embedder: EmbeddingClient,
+        settings: Settings,
+        llm: Any | None = None,
+    ) -> None:
         self.store = store
         self.embedder = embedder
         self._settings = settings
+        self._llm = llm
+        # 形成管线（M6c）：仅在拿到对话模型时可用；测试与禁用场景下为 None。
+        self.pipeline: MemoryPipeline | None = (
+            MemoryPipeline(llm, settings, self) if llm is not None else None
+        )
+
+    async def record_op(
+        self,
+        *,
+        op: str,
+        user_id: str = "",
+        agent_id: str = "",
+        thread_id: str = "",
+        detail: dict[str, Any] | None = None,
+        status: str = "ok",
+        error_text: str = "",
+        duration_ms: int = 0,
+    ) -> None:
+        """写一条操作审计（成功与失败都记录）；审计失败只记日志。"""
+        try:
+            await self.store.record_op(
+                MemoryOp(
+                    op_id=uuid.uuid4().hex[:32],
+                    op=op,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    thread_id=thread_id,
+                    detail=detail or {},
+                    status=status,
+                    error_text=error_text,
+                    duration_ms=duration_ms,
+                )
+            )
+        except Exception:
+            logger.warning("memory: 审计写入失败", exc_info=True)
 
     # -- 写路径 -----------------------------------------------------------------
     async def _embed_one(self, text: str) -> list[float] | None:
@@ -192,6 +236,82 @@ class MemoryService:
             return "error"
         return "ok"
 
+    # -- 用户画像（M6c；memories 表里的确定性记录） -------------------------------
+    async def get_profile(self, user_id: str) -> dict[str, Any] | None:
+        """读取结构化用户画像（JSON dict）；不存在或畸形返回 None。"""
+        import json
+
+        record = await self.store.get_memory(profile_memory_id(user_id))
+        if record is None:
+            return None
+        try:
+            parsed = json.loads(record.content)
+        except ValueError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    async def save_profile(self, user_id: str, profile: dict[str, Any]) -> None:
+        """整包保存用户画像（管线合并后的完整 JSON）。
+
+        画像不需要向量——它由上下文组装整体注入而不是按相似度召回，
+        跳过 embedding 省一次 API 调用；检索侧已按 id 前缀排除画像。
+        """
+        import json
+
+        memory_id = profile_memory_id(user_id)
+        existing = await self.store.get_memory(memory_id)
+        now = time.time()
+        await self.store.upsert_memory(
+            MemoryRecord(
+                memory_id=memory_id,
+                user_id=user_id,
+                agent_id="*",
+                kind="semantic",
+                content=json.dumps(profile, ensure_ascii=False),
+                tags=["profile"],
+                salience=1.0,
+                source_refs=["profile"],
+                created_at=existing.created_at if existing else now,
+                updated_at=now,
+                last_accessed_at=existing.last_accessed_at if existing else None,
+                access_count=existing.access_count if existing else 0,
+            )
+        )
+
+    # -- 形成管线编排（M6c） ------------------------------------------------------
+    async def capture_turn(
+        self, *, user_id: str, agent_id: str, thread_id: str, messages: list[Any]
+    ) -> dict[str, Any] | None:
+        """一轮对话结束后的记忆形成（后台调用；绝不抛异常）。
+
+        ``messages`` 是该线程的全部持久化消息（来自 checkpointer 快照）：
+        转写渲染、轮次计数与触发阈值都在这里统一处理。
+        """
+        if self.pipeline is None:
+            return None
+        human_count = sum(1 for m in messages if getattr(m, "type", "") == "human")
+        transcript = render_transcript(
+            messages[-24:], self._settings.memory_extraction_max_input_chars
+        )
+        if not transcript.strip():
+            return None
+        try:
+            return await self.pipeline.capture_turn(
+                user_id=user_id,
+                agent_id=agent_id,
+                thread_id=thread_id,
+                transcript=transcript,
+                human_count=human_count,
+            )
+        except Exception:
+            # 管线内部已逐步失败安全；这里兜底防任何漏网异常干扰调用方。
+            logger.exception("memory: capture_turn 意外失败")
+            return None
+
+    async def purge_thread(self, thread_id: str) -> None:
+        """线程删除的级联清理（滚动摘要 + 知识库分块；跨会话记忆保留）。"""
+        await self.store.delete_for_thread(thread_id)
+
     async def aclose(self) -> None:
         closer = getattr(self.store, "aclose", None)
         if closer is not None:
@@ -201,8 +321,12 @@ class MemoryService:
             await embedder_close()
 
 
-async def build_memory_service(settings: Settings) -> MemoryService | None:
-    """按 settings 装配记忆服务；未启用或后端不可用时返回 None。"""
+async def build_memory_service(settings: Settings, llm: Any | None = None) -> MemoryService | None:
+    """按 settings 装配记忆服务；未启用或后端不可用时返回 None。
+
+    ``llm`` 是运行时的对话模型（形成管线复用它）；测试可以不传——
+    检索与手工管理照常工作，仅形成管线缺席。
+    """
     if not settings.memory_enabled:
         logger.info("memory: 记忆系统已禁用（MEMORY_ENABLED=false）")
         return None
@@ -210,7 +334,7 @@ async def build_memory_service(settings: Settings) -> MemoryService | None:
     if store is None:
         return None
     embedder = build_embedding_client(settings)
-    return MemoryService(store=store, embedder=embedder, settings=settings)
+    return MemoryService(store=store, embedder=embedder, settings=settings, llm=llm)
 
 
 __all__ = [
