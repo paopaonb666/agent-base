@@ -31,6 +31,7 @@ class _StubDDGS:
 
     def __init__(self, rows: list[dict[str, str]]) -> None:
         self._rows = rows
+        self.seen_backends: list[str] = []
 
     def __enter__(self) -> _StubDDGS:
         return self
@@ -38,8 +39,10 @@ class _StubDDGS:
     def __exit__(self, *args: object) -> None:
         return None
 
-    def text(self, query: str, max_results: int) -> list[dict[str, str]]:
+    def text(self, query: str, max_results: int, **kwargs: object) -> list[dict[str, str]]:
         assert max_results == 5
+        if "backend" in kwargs:
+            self.seen_backends.append(str(kwargs["backend"]))
         return self._rows
 
 
@@ -131,11 +134,21 @@ async def test_tavily_engine_propagates_http_errors() -> None:
 
 async def test_duckduckgo_engine_maps_response() -> None:
     rows = [{"title": "T", "href": "https://ddg.co/1", "body": "snippet"}]
-    engine = DuckDuckGoEngine(ddgs_factory=lambda: _StubDDGS(rows))
+    stub = _StubDDGS(rows)
+    engine = DuckDuckGoEngine(ddgs_factory=lambda: stub)
     results = await engine.search("query", 5)
     assert results[0] == SearchResult(
         title="T", url="https://ddg.co/1", snippet="snippet", position=1, engine="duckduckgo"
     )
+    # 默认钉选 duckduckgo 上游：避免 auto 模式扇出不可达引擎拖死聚合。
+    assert stub.seen_backends == ["duckduckgo"]
+
+
+async def test_duckduckgo_engine_honors_backend_override() -> None:
+    stub = _StubDDGS([{"title": "T", "href": "https://bing.co/1", "body": "s"}])
+    engine = DuckDuckGoEngine(ddgs_factory=lambda: stub, backend="bing")
+    await engine.search("query", 5)
+    assert stub.seen_backends == ["bing"]
 
 
 def test_build_engines_skips_unusable(monkeypatch: pytest.MonkeyPatch) -> None:

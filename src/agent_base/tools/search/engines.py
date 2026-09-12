@@ -85,14 +85,24 @@ class TavilyEngine(SearchEngine):
 
 
 class DuckDuckGoEngine(SearchEngine):
-    """通过 DuckDuckGo 免费搜索 API 执行搜索（``ddgs`` 是同步库）。"""
+    """通过 DuckDuckGo 免费搜索 API 执行搜索（``ddgs`` 是同步库）。
+
+    ``backend`` 钉选 ddgs 的上游引擎：默认 ``auto`` 会同时扇出十几个
+    上游（google/yahoo/brave/startpage 等），受限网络下大量超时把聚合
+    拖死；单钉可达引擎（duckduckgo / bing）实测快一个数量级。
+    """
 
     name = "duckduckgo"
 
-    def __init__(self, ddgs_factory: Callable[[], Any] | None = None) -> None:
+    def __init__(
+        self,
+        ddgs_factory: Callable[[], Any] | None = None,
+        backend: str = "duckduckgo",
+    ) -> None:
         # ddgs 9.x 的 DDGS 是动态代理（运行时转发属性），monkeypatch
         # 类属性会被绕过；测试通过注入工厂替身来隔离真实网络。
         self._ddgs_factory = ddgs_factory
+        self._backend = backend
 
     async def search(self, query: str, max_results: int) -> list[SearchResult]:
         # 延迟导入：ddgs 是 [search] extras 的可选依赖，未安装时本引擎
@@ -103,7 +113,7 @@ class DuckDuckGoEngine(SearchEngine):
 
         def _run() -> list[dict[str, Any]]:
             with factory() as ddgs:
-                return list(ddgs.text(query, max_results=max_results))
+                return list(ddgs.text(query, max_results=max_results, backend=self._backend))
 
         raw = await asyncio.to_thread(_run)
         return [
@@ -143,6 +153,7 @@ def build_engines(
     priority: list[str],
     *,
     tavily_api_key: str = "",
+    ddgs_backend: str = "duckduckgo",
 ) -> list[SearchEngine]:
     """按优先级配置组装引擎列表；不可用的引擎被跳过（记录原因）。"""
     engines: list[SearchEngine] = []
@@ -154,7 +165,7 @@ def build_engines(
                 logger.warning("TAVILY_API_KEY is empty; tavily engine skipped")
         elif name == "duckduckgo":
             if ddgs_available():
-                engines.append(DuckDuckGoEngine())
+                engines.append(DuckDuckGoEngine(backend=ddgs_backend))
             else:
                 logger.warning(
                     "ddgs package is not installed (pip install 'agent-base[search]'); "

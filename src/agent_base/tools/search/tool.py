@@ -80,6 +80,7 @@ def build_web_search_tool(
         engine_factory(
             [e.strip().lower() for e in settings.search_engine_priority.split(",") if e.strip()],
             tavily_api_key=settings.tavily_api_key.get_secret_value(),
+            ddgs_backend=settings.search_ddgs_backend,
         )
     )
     cache = SearchCache(ttl_seconds=settings.search_cache_ttl_seconds)

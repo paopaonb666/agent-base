@@ -109,6 +109,12 @@ class Settings(BaseSettings):
     # 默认 15s 是"多数查询能完成、失败也不会拖垮对话"的折中。
     search_timeout_seconds: float = 15.0
     search_cache_ttl_seconds: float = 300.0
+    # ddgs 的上游引擎钉选。默认 "auto" 会同时扇出十几个上游（google/
+    # yahoo/brave/startpage 等），受限网络下大量超时把聚合拖死，直到
+    # 触发 SEARCH_TIMEOUT_SECONDS。单钉可达引擎（duckduckgo / bing）
+    # 实测快一个数量级；逗号分隔可传多个，但多引擎聚合的稳定性以
+    # 实测为准。
+    search_ddgs_backend: str = "duckduckgo"
 
     # -- 文档解析（工具库 tools/parsing；M4 前置） ------------------------
     # 单个文档的输入大小封顶（字节）：解析在内存中进行，上限挡住超大
@@ -236,6 +242,17 @@ class Settings(BaseSettings):
         if not (value > 0):
             raise ValueError(f"{info.field_name} must be > 0, got {value}")
         return value
+
+    @field_validator("search_ddgs_backend")
+    @classmethod
+    def _validate_search_ddgs_backend(cls, value: str) -> str:
+        backend = value.strip().lower()
+        if not backend:
+            raise ValueError(
+                "SEARCH_DDGS_BACKEND must name at least one ddgs engine "
+                "(e.g. duckduckgo, bing); leave unset for the default"
+            )
+        return backend
 
     def ensure_production_ready(self) -> None:
         """在配置错误时快速失败（安全项对所有环境生效，其余限 production）。
