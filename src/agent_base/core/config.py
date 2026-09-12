@@ -26,6 +26,9 @@ KNOWN_PROVIDERS: frozenset[str] = frozenset({"deepseek", "zhipu", "openai-compat
 # 基座识别的 checkpointer 后端。sqlite 在阶段 3 接线，mysql 为可选后端。
 KNOWN_CHECKPOINTER_BACKENDS: frozenset[str] = frozenset({"memory", "sqlite", "mysql"})
 
+# 工具库（tools/）的搜索引擎实现清单：SEARCH_ENGINE_PRIORITY 的合法取值。
+KNOWN_SEARCH_ENGINES: frozenset[str] = frozenset({"tavily", "duckduckgo"})
+
 KNOWN_ENVIRONMENTS: frozenset[str] = frozenset({"development", "production"})
 
 
@@ -86,6 +89,35 @@ class Settings(BaseSettings):
     # 每次工具执行的挂钟时间预算，由池的包装器强制执行。
     tool_timeout_seconds: float = 30.0
 
+    # -- 工具库（tools/；M1 治理设施） ------------------------------------
+    # 要装配进共享池的基座内置工具名（逗号分隔或 JSON 数组）。默认只开
+    # 零依赖工具；高风险工具（python_repl）与依赖外部服务的工具
+    # （web_search）必须显式开启。名字必须与注册表条目一致，拼错在
+    # 启动时快速失败。
+    toolkit_enabled: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["current_time", "calculator", "json_query"]
+    )
+
+    # -- 网络搜索（tools/search；M3） -------------------------------------
+    # 搜索引擎优先级：按顺序依次尝试，任一成功即返回。tavily 需要
+    # 下面的 API key；duckduckgo 免 key（但需要安装 [search] extras）。
+    search_engine_priority: str = "duckduckgo"
+    tavily_api_key: SecretStr = SecretStr("")
+    # 单次引擎调用的超时与结果缓存 TTL。搜索是交互式对话中的一步，
+    # 超时应显著短于全局 TOOL_TIMEOUT_SECONDS（池超时是它的兜底）。
+    # 注意 ddgs 会聚合多个上游引擎，受限网络下聚合经常超过 10s——
+    # 默认 15s 是"多数查询能完成、失败也不会拖垮对话"的折中。
+    search_timeout_seconds: float = 15.0
+    search_cache_ttl_seconds: float = 300.0
+
+    # -- 文档解析（工具库 tools/parsing；M4 前置） ------------------------
+    # 单个文档的输入大小封顶（字节）：解析在内存中进行，上限挡住超大
+    # 文件把工具线程拖入 OOM 的路径。超限直接报错而不是截断输入。
+    doc_parse_max_input_bytes: int = 10 * 1024 * 1024
+    # 解析输出的文本长度封顶（字符）：超限截断并置 truncated 标志，
+    # 防止整本 PDF 的文本一次性灌进模型上下文。
+    doc_parse_max_output_chars: int = 50_000
+
     # -- 环境 --------------------------------------------------------
     env: str = "development"
 
@@ -100,13 +132,13 @@ class Settings(BaseSettings):
     # 关闭时只校验 key 非空与 base_url 格式；生产环境可按需开启）。
     health_probe_model: bool = False
 
-    @field_validator("agent_modules", "cors_origins", mode="before")
+    @field_validator("agent_modules", "cors_origins", "toolkit_enabled", mode="before")
     @classmethod
     def _parse_csv_or_json_list(cls, value: object, info: ValidationInfo) -> object:
         """把列表类型的字段从其友好的字符串形式解析出来。
 
-        ``AGENT_MODULES`` 和 ``CORS_ORIGINS`` 都接受逗号形式
-        （``"chat,writer"`` / ``"http://localhost:3000,https://x.example.com"``）
+        ``AGENT_MODULES`` / ``CORS_ORIGINS`` / ``TOOLKIT_ENABLED`` 都接受
+        逗号形式（``"chat,writer"`` / ``"http://localhost:3000,https://x.example.com"``）
         和 JSON 数组（``'["chat","writer"]'``）。空输入 -> 空列表。
         对环境变量、.env 文件和直接传入的 init 关键字参数都同样适用。
         """
@@ -171,6 +203,38 @@ class Settings(BaseSettings):
         # 比较都是 False，必须用 not (value > 0) 一并拒绝。
         if not (value > 0):
             raise ValueError(f"TOOL_TIMEOUT_SECONDS must be > 0, got {value}")
+        return value
+
+    @field_validator("doc_parse_max_input_bytes", "doc_parse_max_output_chars")
+    @classmethod
+    def _validate_doc_parse_limits(cls, value: int, info: ValidationInfo) -> int:
+        # 非正数的限额等于让解析层要么拒绝一切输入、要么截断一切输出，
+        # 必须是启动时的配置错误而不是静默运行时行为。
+        if value <= 0:
+            raise ValueError(f"{info.field_name} must be > 0, got {value}")
+        return value
+
+    @field_validator("search_engine_priority")
+    @classmethod
+    def _validate_search_priority(cls, value: str) -> str:
+        engines = [part.strip().lower() for part in value.split(",") if part.strip()]
+        if not engines:
+            raise ValueError("SEARCH_ENGINE_PRIORITY must name at least one engine")
+        unknown = [e for e in engines if e not in KNOWN_SEARCH_ENGINES]
+        if unknown:
+            raise ValueError(
+                f"unknown SEARCH_ENGINE_PRIORITY entries {unknown}; "
+                f"expected subset of {sorted(KNOWN_SEARCH_ENGINES)}"
+            )
+        return value
+
+    @field_validator("search_timeout_seconds", "search_cache_ttl_seconds")
+    @classmethod
+    def _validate_search_durations(cls, value: float, info: ValidationInfo) -> float:
+        # 与 TOOL_TIMEOUT_SECONDS 同理：NaN 的所有比较都是 False，
+        # 必须用 not (value > 0) 一并拒绝。
+        if not (value > 0):
+            raise ValueError(f"{info.field_name} must be > 0, got {value}")
         return value
 
     def ensure_production_ready(self) -> None:

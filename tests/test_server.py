@@ -257,9 +257,12 @@ def test_untrusted_request_id_is_replaced() -> None:
 def test_invoke_rejects_empty_message_and_bad_thread_id() -> None:
     with _client() as client:
         assert client.post("/v1/agents/chat/invoke", json={"message": ""}).status_code == 422
-        assert client.post(
-            "/v1/agents/chat/invoke", json={"message": "hi", "thread_id": "../escape"}
-        ).status_code == 422
+        assert (
+            client.post(
+                "/v1/agents/chat/invoke", json={"message": "hi", "thread_id": "../escape"}
+            ).status_code
+            == 422
+        )
         assert (
             client.post("/v1/agents/chat/invoke", json={"message": "x" * 100_001}).status_code
             == 422

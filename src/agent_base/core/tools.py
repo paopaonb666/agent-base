@@ -17,11 +17,14 @@ from __future__ import annotations
 import asyncio
 import re
 import threading
+import time
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from langchain_core.tools import BaseTool
 
 from agent_base.core.contracts import AgentModule
+from agent_base.extensions.metrics import TOOL_METRICS
 
 DEFAULT_TOOL_TIMEOUT_SECONDS = 30.0
 
@@ -61,62 +64,92 @@ class _TimeoutTool(BaseTool):
         # 调用方立即返回；失控工具留在后台跑完（Python 线程无法被杀死）。
         # 刻意不用 ThreadPoolExecutor——它的 non-daemon 工作线程会被
         # 解释器退出的 atexit join 卡住，一个失控工具就能拖住整个进程。
-        result: list[Any] = []
-        error: list[BaseException] = []
-        done = threading.Event()
+        started = time.perf_counter()
+        outcome = "ok"
+        try:
+            result: list[Any] = []
+            error: list[BaseException] = []
+            done = threading.Event()
 
-        def _target() -> None:
-            try:
-                result.append(self.inner.invoke(kwargs))
-            except BaseException as exc:
-                error.append(exc)
-            finally:
-                done.set()
+            def _target() -> None:
+                try:
+                    result.append(self.inner.invoke(kwargs))
+                except BaseException as exc:
+                    error.append(exc)
+                finally:
+                    done.set()
 
-        worker = threading.Thread(target=_target, name=f"tool-{self.name}", daemon=True)
-        worker.start()
-        if not done.wait(timeout=self.timeout):
-            raise ToolTimeoutError(f"tool {self.name!r} exceeded {self.timeout}s timeout")
-        if error:
-            raise error[0]
-        return result[0]
+            worker = threading.Thread(target=_target, name=f"tool-{self.name}", daemon=True)
+            worker.start()
+            if not done.wait(timeout=self.timeout):
+                outcome = "timeout"
+                raise ToolTimeoutError(f"tool {self.name!r} exceeded {self.timeout}s timeout")
+            if error:
+                outcome = "error"
+                raise error[0]
+            return result[0]
+        finally:
+            TOOL_METRICS.observe_tool(self.name, outcome, time.perf_counter() - started)
 
     async def _arun(self, **kwargs: Any) -> Any:
+        started = time.perf_counter()
+        outcome = "ok"
         try:
-            return await asyncio.wait_for(self.inner.ainvoke(kwargs), timeout=self.timeout)
-        # 3.10 上 asyncio.TimeoutError 与内置 TimeoutError 是不同类型，两者都要接住。
-        except (TimeoutError, asyncio.TimeoutError) as exc:
-            raise ToolTimeoutError(f"tool {self.name!r} exceeded {self.timeout}s timeout") from exc
+            try:
+                return await asyncio.wait_for(self.inner.ainvoke(kwargs), timeout=self.timeout)
+            # 3.10 上 asyncio.TimeoutError 与内置 TimeoutError 是不同类型，两者都要接住。
+            except (TimeoutError, asyncio.TimeoutError) as exc:
+                outcome = "timeout"
+                raise ToolTimeoutError(
+                    f"tool {self.name!r} exceeded {self.timeout}s timeout"
+                ) from exc
+            except BaseException:
+                outcome = "error"
+                raise
+        finally:
+            TOOL_METRICS.observe_tool(self.name, outcome, time.perf_counter() - started)
 
 
 def build_tool_pool(
     modules: dict[str, AgentModule],
     *,
     timeout: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
+    extra_tools: Sequence[BaseTool] = (),
+    timeouts: Mapping[str, float] | None = None,
 ) -> list[BaseTool]:
     """把每个模块的工具收集进一个带超时包装、无冲突的池。
 
-    顺序遵循模块装配顺序（``AGENT_MODULES``）。重复的工具名会中止启动——
+    顺序遵循模块装配顺序（``AGENT_MODULES``），``extra_tools``（工具库
+    注册表产出的基座内置工具）追加在末尾。重复的工具名会中止启动——
     两个同名工具会让工具调用路由变得模糊，因此这是一个快速失败的
-    配置错误。
+    配置错误；该检查覆盖模块工具与工具库工具的整体。
+
+    ``timeouts`` 支持按工具名覆盖全局 ``timeout``（如网络搜索要用显著
+    短于全局的预算）；未列出的工具沿用全局值。
     """
+    overrides = timeouts or {}
     pool: list[BaseTool] = []
     seen: set[str] = set()
+    candidates: list[tuple[str, AgentModule | None, BaseTool]] = []
     for module in modules.values():
         for tool in module.get_tools():
-            if tool.name in seen:
-                raise ToolPoolError(
-                    f"duplicate tool name {tool.name!r} contributed by module "
-                    f"{module.name!r}; tool names must be unique across modules"
-                )
-            seen.add(tool.name)
-            pool.append(
-                _TimeoutTool(
-                    name=tool.name,
-                    description=tool.description,
-                    args_schema=tool.args_schema,
-                    inner=tool,
-                    timeout=timeout,
-                )
+            candidates.append((tool.name, module, tool))
+    candidates.extend((tool.name, None, tool) for tool in extra_tools)
+    for name, owner, tool in candidates:
+        if name in seen:
+            source = f"module {owner.name!r}" if owner is not None else "toolkit"
+            raise ToolPoolError(
+                f"duplicate tool name {name!r} contributed by {source}; "
+                "tool names must be unique across modules and toolkit"
             )
+        seen.add(name)
+        pool.append(
+            _TimeoutTool(
+                name=name,
+                description=tool.description,
+                args_schema=tool.args_schema,
+                inner=tool,
+                timeout=overrides.get(name, timeout),
+            )
+        )
     return pool

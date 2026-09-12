@@ -174,3 +174,40 @@ def test_production_mysql_complete_is_ok() -> None:
         checkpointer_mysql_database="agent_base",
         checkpointer_mysql_password="pw",
     ).ensure_production_ready()
+
+
+# ── 文档解析限额（tools/parsing 契约） ──────────────────────────────
+
+
+def test_doc_parse_defaults() -> None:
+    settings = Settings(_env_file=None)
+    assert settings.doc_parse_max_input_bytes == 10 * 1024 * 1024
+    assert settings.doc_parse_max_output_chars == 50_000
+
+
+def test_doc_parse_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DOC_PARSE_MAX_INPUT_BYTES", "1024")
+    monkeypatch.setenv("DOC_PARSE_MAX_OUTPUT_CHARS", "200")
+    settings = Settings(_env_file=None)
+    assert settings.doc_parse_max_input_bytes == 1024
+    assert settings.doc_parse_max_output_chars == 200
+
+
+def test_doc_parse_nonpositive_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DOC_PARSE_MAX_INPUT_BYTES", "0")
+    with pytest.raises(ValidationError, match="must be > 0"):
+        Settings(_env_file=None)
+    monkeypatch.setenv("DOC_PARSE_MAX_INPUT_BYTES", "1024")
+    monkeypatch.setenv("DOC_PARSE_MAX_OUTPUT_CHARS", "-5")
+    with pytest.raises(ValidationError, match="must be > 0"):
+        Settings(_env_file=None)
+
+
+def test_toolkit_enabled_csv_and_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 与 AGENT_MODULES 同源：逗号与 JSON 数组两种形式都必须被接受。
+    monkeypatch.setenv("TOOLKIT_ENABLED", "current_time,web_search")
+    assert Settings(_env_file=None).toolkit_enabled == ["current_time", "web_search"]
+    monkeypatch.setenv("TOOLKIT_ENABLED", '["calculator"]')
+    assert Settings(_env_file=None).toolkit_enabled == ["calculator"]
+    monkeypatch.setenv("TOOLKIT_ENABLED", "")
+    assert Settings(_env_file=None).toolkit_enabled == []

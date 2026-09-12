@@ -37,12 +37,31 @@ dependencies = [
     # 阶段 4：HTTP + SSE 服务入口。
     "fastapi>=0.115",
     "uvicorn>=0.30",
+    # 工具库 parsing（M4 前置）：PDF 文本提取。pypdf 纯 Python 且轻量，
+    # PDF 又是文档读取的主格式，因此进主依赖开箱即用；DOCX 等重依赖
+    # 格式走 [doc] extras 优雅降级。
+    "pypdf>=5.0",
+    # 工具库基础：httpx 供 Tavily 搜索引擎与后续网络工具使用（此前是
+    # dev 依赖，fastapi TestClient 基于 httpx）；tzdata 是 Windows 上
+    # zoneinfo 的时区数据库（current_time 工具需要，POSIX 自带）。
+    "httpx>=0.27",
+    "tzdata>=2024.1",
 ]
 
 [project.scripts]
 agent-base = "agent_base.entrypoints.cli:main"
 
 [project.optional-dependencies]
+# 网络搜索扩展（DuckDuckGo 引擎）。未安装时 web_search 的 DDG 引擎
+# 不可用（可改用 Tavily：配置 TAVILY_API_KEY 即可，Tavily 走 httpx）。
+search = [
+    "ddgs>=9.0",
+]
+# 文档解析扩展（DOCX）。未安装时 tools/parsing 的 docx 格式不注册，
+# 其余格式不受影响——见 src/agent_base/tools/parsing/docx.py。
+doc = [
+    "python-docx>=1.1",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -91,6 +110,13 @@ strict = true
 files = ["src"]
 warn_unreachable = true
 pretty = true
+
+[[tool.mypy.overrides]]
+# resource 是 POSIX 专属的系统模块：在 Windows 上分析本模块时其属性
+# 不可见，Linux CI 上一切正常。disable 而非行内 ignore，避免两端之间
+# 的 unused-ignore 抖动。
+module = ["agent_base.tools.repl"]
+disable_error_code = ["attr-defined"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

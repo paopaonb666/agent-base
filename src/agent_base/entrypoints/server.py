@@ -6,8 +6,10 @@
 
 端点：
 - ``POST /v1/agents/{module}/invoke`` —— 一次对话轮，以 SSE 流的形式
-  输出契约事件（ping / step / delta / done / error）；响应的 ``done``
-  事件携带 thread id 以便恢复会话。
+  输出契约事件（ping / step / delta / sources / done / error）；响应的
+  ``done`` 事件携带 thread id 以便恢复会话。``sources`` 与工具发出的
+  进度 ``step`` 来自工具经 custom stream 发的载荷（M3.5），经封闭的
+  事件模型校验后透传。
 - ``GET /health`` —— 组件健康（checkpointer 探针 + 模型配置），
   出问题时返回 ``degraded`` 而不是崩溃（A4 继承）。
 - ``GET /metrics`` —— Prometheus 文本格式，使用路由模板 label（B4/B5）。
@@ -49,10 +51,11 @@ from agent_base.extensions.events import (
     DoneEvent,
     ErrorEvent,
     PingEvent,
+    SourcesEvent,
     StepEvent,
     encode_sse,
 )
-from agent_base.extensions.metrics import Metrics
+from agent_base.extensions.metrics import TOOL_METRICS, Metrics
 from agent_base.extensions.observability import (
     new_request_id,
     request_id,
@@ -107,10 +110,18 @@ def _extract_text(content: Any) -> str:
         return content
     if isinstance(content, (list, tuple)):
         return "".join(
-            str(part.get("text", "")) if isinstance(part, dict) else str(part)
-            for part in content
+            str(part.get("text", "")) if isinstance(part, dict) else str(part) for part in content
         )
     return str(content)
+
+
+def _known_module(rt: AgentRuntime, module: str) -> bool:
+    """invoke 之外的线程端点也必须接受 supervisor 保留名：supervisor 的
+    invoke 走 ``runtime.graph`` 的特例路径，能正常产生 checkpointer 记录；
+    若 list/history/delete 只认 ``rt.modules``，supervisor 的对话就会
+    "能聊但不能列历史、不能删"——前后端语义不一致。
+    """
+    return module in rt.modules or module == SUPERVISOR_MODULE
 
 
 def _serialize_message(message: Any) -> dict[str, Any] | None:
@@ -144,6 +155,30 @@ def _safe_error_text(exc: Exception) -> str:
     """
     text = _URL_RE.sub("<redacted-url>", f"{type(exc).__name__}: {exc}")
     return text[:300]
+
+
+def _decode_tool_event(payload: Any) -> AgentEvent | None:
+    """把工具经 custom stream 发来的载荷校验成契约事件。
+
+    工具与前端之间的每一个事件都必须经过封闭的 Pydantic 模型（M3.5
+    的安全前提：坏掉/恶意的工具不能把未校验数据直接透给浏览器）。
+    未知类型或畸形载荷被丢弃并记日志——事件是尽力而为的旁路信号，
+    绝不让它打断对话流。
+    """
+    if not isinstance(payload, dict):
+        logger.warning("sse: dropping non-dict custom event: %r", type(payload).__name__)
+        return None
+    kind = payload.get("type")
+    try:
+        if kind == "step":
+            return StepEvent.model_validate(payload)
+        if kind == "sources":
+            return SourcesEvent.model_validate(payload)
+    except ValueError as exc:
+        logger.warning("sse: dropping malformed %r event: %s", kind, exc)
+        return None
+    logger.warning("sse: dropping unknown custom event type: %r", kind)
+    return None
 
 
 # 探活结果缓存：{base_url: (monotonic 时间, 结果)}。
@@ -188,7 +223,9 @@ async def _produce(
         stream: Any = graph.astream(
             {"messages": [HumanMessage(content=message)]},
             config,
-            stream_mode=["messages", "updates"],
+            # custom：工具通过 get_stream_writer 发的 UI 事件（M3.5）——
+            # 联网搜索的进度步骤与来源引用由此到达前端。
+            stream_mode=["messages", "updates", "custom"],
         )
         async for mode, payload in stream:
             if mode == "messages":
@@ -199,6 +236,10 @@ async def _produce(
                     await queue.put(StepEvent(name=node, status="running"))
                 if isinstance(chunk, AIMessageChunk) and chunk.content:
                     await queue.put(DeltaEvent(content=_extract_text(chunk.content)))
+            elif mode == "custom":
+                event = _decode_tool_event(payload)
+                if event is not None:
+                    await queue.put(event)
             elif mode == "updates":
                 for node in payload:
                     if str(node).startswith("__"):
@@ -335,7 +376,7 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         大库上无界扫描。
         """
         rt: AgentRuntime = request.app.state.runtime
-        if module not in rt.modules:
+        if not _known_module(rt, module):
             raise HTTPException(status_code=404, detail=f"unknown module {module!r}")
         if rt.checkpointer is None:
             return {"threads": []}
@@ -415,7 +456,7 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         checkpointer 里的全部 checkpoint。
         """
         rt: AgentRuntime = request.app.state.runtime
-        if module not in rt.modules:
+        if not _known_module(rt, module):
             raise HTTPException(status_code=404, detail=f"unknown module {module!r}")
         if rt.checkpointer is None:
             return {"deleted": False, "reason": "checkpointer unconfigured"}
@@ -470,9 +511,8 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
     @app.get("/metrics")
     async def metrics_endpoint(request: Request) -> PlainTextResponse:
         metrics: Metrics = request.app.state.metrics
-        return PlainTextResponse(
-            metrics.render(), media_type="text/plain; version=0.0.4; charset=utf-8"
-        )
+        body = metrics.render() + TOOL_METRICS.render_tool_metrics()
+        return PlainTextResponse(body, media_type="text/plain; version=0.0.4; charset=utf-8")
 
     return app
 

@@ -305,8 +305,8 @@ class MySQL57Saver(AIOMySQLSaver):
             placeholders = ",".join(["%s"] * len(group))
             await cur.execute(
                 "SELECT checkpoint_id, task_path, task_id, type, `blob`, idx "
-                f"FROM checkpoint_writes WHERE thread_id = %s AND checkpoint_id IN ({placeholders}) "
-                "AND channel = %s",
+                f"FROM checkpoint_writes WHERE thread_id = %s "
+                f"AND checkpoint_id IN ({placeholders}) AND channel = %s",
                 (thread_id, *[v["parent_checkpoint_id"] for v in group], TASKS),
             )
             for row in await cur.fetchall():

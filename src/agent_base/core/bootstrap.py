@@ -9,6 +9,9 @@
 ``create_runtime`` 之所以是异步的，是因为 sqlite checkpointer 会绑定到
 调用它的事件循环。
 
+M1（工具库）新增：``TOOLKIT_ENABLED`` 选中的基座内置工具在装配进池，
+与模块工具共用重名检查与超时包装。
+
 阶段 4 新增：保留的模块名 ``supervisor`` 会构建一个 supervisor 图
 （``extensions/collab``），把每个已注册的模块编排为 sub-agent。
 """
@@ -28,6 +31,7 @@ from agent_base.core.llm import build_llm
 from agent_base.core.registry import RegistryError, load_modules
 from agent_base.core.tools import build_tool_pool
 from agent_base.extensions.memory import build_checkpointer, close_checkpointer
+from agent_base.tools.registry import build_toolkit_tools, toolkit_timeouts
 
 # 保留的模块名：不构建单个模块的图，而是在所有已加载模块之上构建
 # supervisor 图（阶段 4）。
@@ -119,7 +123,16 @@ async def create_runtime(settings: Settings | None = None) -> AgentRuntime:
     llm = build_llm(resolved)
     modules = load_modules(resolved.agent_modules)
     validate_module_names(modules)
-    tools = build_tool_pool(modules, timeout=resolved.tool_timeout_seconds)
+    # 工具库的内置工具按 TOOLKIT_ENABLED 装配后并入共享池（模块工具在
+    # 前，工具库在后）；重名在任何一侧发生都会快速失败。注册表声明的
+    # per-tool 超时在这里下发给池。
+    toolkit = build_toolkit_tools(resolved)
+    tools = build_tool_pool(
+        modules,
+        timeout=resolved.tool_timeout_seconds,
+        extra_tools=toolkit,
+        timeouts=toolkit_timeouts(resolved),
+    )
     checkpointer = await build_checkpointer(resolved)
     return AgentRuntime(
         settings=resolved, llm=llm, modules=modules, tools=tools, checkpointer=checkpointer

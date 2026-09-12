@@ -65,6 +65,15 @@ Agent 软件基座——所有 agent 模块扩展的统一起点。
 | `langgraph-checkpoint-sqlite` + `aiosqlite` | sqlite 对话状态后端 | `>=2.0`：AsyncSqliteSaver 服务 astream |
 | `langgraph-supervisor` | supervisor 多 Agent 模板 | `>=0.0.31` |
 | `fastapi` / `uvicorn` | HTTP + SSE 服务入口 | `>=0.115` / `>=0.30` |
+| `pypdf` | 工具库 parsing：PDF 文本提取（M4 前置） | `>=5.0`：纯 Python 且轻量，PDF 是文档读取的主格式，进主依赖开箱即用 |
+| `httpx` / `tzdata` | 工具库基础：Tavily 搜索引擎 HTTP 客户端 / Windows 上的时区数据库 | `>=0.27`（原 dev 依赖转正）/ `>=2024.1`（POSIX 自带） |
+
+可选 extras：
+
+- `[search]`：`ddgs`——DuckDuckGo 搜索引擎。未安装且未配 Tavily key 时
+  启用 `web_search` 会在启动时报错。
+- `[doc]`：`python-docx`——DOCX 解析。未安装时 tools/parsing 的 docx
+  格式不注册（`pip install -e ".[doc]"` 安装），其余格式不受影响。
 
 开发依赖（`[dev]`）：pytest / pytest-asyncio / pytest-cov / ruff / mypy / pip-audit / httpx。
 安全审计由 CI 常驻：`pip-audit --skip-editable`。
@@ -76,10 +85,17 @@ Agent 软件基座——所有 agent 模块扩展的统一起点。
 ```bash
 python -m venv .venv
 .venv\Scripts\activate         # Windows（Linux/macOS: source .venv/bin/activate）
-pip install -e ".[dev]"
+pip install -e ".[dev,doc]"    # [doc] 提供 DOCX 解析；缺它时该格式优雅降级
 cp .env.example .env           # 填入 LLM_API_KEY（阶段 1 起由 config.py 消费）
-pytest
+pytest                         # 覆盖率门（≥85%）依赖 MySQL 集成测试（见下）
 ```
+
+> **测试与覆盖率门**：memory/mysql57 的集成测试在探测到可用的 MySQL 时
+> 自动启用——连接参数经 `MYSQL_HOST / MYSQL_PORT / MYSQL_USER /
+> MYSQL_PASSWORD` 环境变量传入（默认 `root` / 空密码连 `127.0.0.1:3306`）。
+> CI 在 test job 里挂了一个 MySQL 5.7 服务容器。本地没有 MySQL 时这些
+> 测试会被跳过，总覆盖率会跌破 85% 门槛（`pytest` 因此失败）——这是
+> 预期行为，起一个 MySQL 或接受本地红灯即可。
 
 ### 配置说明（.env）
 
@@ -94,6 +110,7 @@ pytest
 | `CORS_ORIGINS` | 允许跨域调用 SSE 端点的来源（默认 `http://localhost:3000`，即 agent-base-ui） |
 | `CHECKPOINTER_BACKEND` | `memory`（默认，零依赖）\| `sqlite`（进程重启可恢复对话）\| `mysql`（MySQL 持久化，配 `CHECKPOINTER_MYSQL_*`） |
 | `TOOL_TIMEOUT_SECONDS` | 工具单次执行超时（默认 30s） |
+| `TOOLKIT_ENABLED` | 装配进共享池的基座内置工具清单（默认 `current_time,calculator,json_query`）；`web_search` 需配 `SEARCH_*`，`python_repl` 为 exec 级默认关 |
 | `LOG_JSON` | `true` 输出结构化 JSON 日志（生产建议开启） |
 
 运行一个对话（阶段 1 起可用）：
