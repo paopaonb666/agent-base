@@ -70,6 +70,7 @@ from agent_base.extensions.observability import (
 from agent_base.memory.context import ATTACHMENT_CONTEXT_PREFIX
 from agent_base.memory.service import MemoryService
 from agent_base.memory.store import KNOWN_MEMORY_KINDS, KNOWN_MEMORY_STATUSES
+from agent_base.memory.tools import set_memory_scope
 from agent_base.tools.parsing import DocumentParseError, parse_document
 
 logger = logging.getLogger(__name__)
@@ -368,7 +369,17 @@ async def _produce(
     ``on_complete``（M6c）：轮次正常完成后触发的后台回调（记忆形成管
     线）。fire-and-forget 的独立任务——不阻塞哨兵送达，客户端中途断开
     或本轮出错时不会被调用。
+
+    记忆作用域（M6e）：在这里设置 ContextVar——图节点与工具都运行在
+    本任务上下文里，记忆工具据此拿到 user/thread（工具池的
+    ``_TimeoutTool`` 包装会丢 RunnableConfig，ContextVar 是可靠通道）。
     """
+    _configurable = config.get("configurable") or {}
+    _raw_user = _configurable.get("user_id")
+    set_memory_scope(
+        _raw_user if isinstance(_raw_user, str) and _raw_user else "default",
+        str(_configurable.get("thread_id") or ""),
+    )
     running: set[str] = set()
     try:
         stream: Any = graph.astream(
@@ -743,6 +754,7 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         rt: AgentRuntime = request.app.state.runtime
         if not _known_module(rt, module):
             raise HTTPException(status_code=404, detail=f"unknown module {module!r}")
+        scope = _memory_user_id(request)
         data = await file.read()
         if not data:
             raise HTTPException(status_code=400, detail="上传文件为空")
@@ -803,6 +815,17 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
             warning=warning,
         )
         await file_store.save(info)
+        # 知识库摄取（M6e）：文档文本切块 + 向量化入 doc_chunks（用户级
+        # 知识资产，独立于线程存活）。fire-and-forget，失败不影响上传。
+        if rt.memory is not None and info.extracted_text.strip():
+            asyncio.get_running_loop().create_task(
+                rt.memory.ingest_document(
+                    file_id=info.file_id,
+                    user_id=scope,
+                    agent_id=module,
+                    text=info.extracted_text,
+                )
+            )
         # 机会式清理 24h 未绑定的孤儿附件（fire-and-forget）。
         asyncio.get_running_loop().create_task(file_store.purge_orphans())
         return info.meta()

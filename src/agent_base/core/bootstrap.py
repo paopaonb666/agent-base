@@ -137,21 +137,28 @@ async def create_runtime(settings: Settings | None = None) -> AgentRuntime:
     llm = build_llm(resolved)
     modules = load_modules(resolved.agent_modules)
     validate_module_names(modules)
+    # 记忆服务（M6）先于工具池装配：记忆工具（M6e）作为 extra_tools 进
+    # 池，与模块工具/工具库工具同样受超时包装与审计收口。
+    checkpointer = await build_checkpointer(resolved)
+    file_store = await build_uploaded_file_store(resolved)
+    memory_service = await build_memory_service(resolved, llm)
     # 工具库的内置工具按 TOOLKIT_ENABLED 装配后并入共享池（模块工具在
     # 前，工具库在后）；重名在任何一侧发生都会快速失败。注册表声明的
     # per-tool 超时在这里下发给池；审计记录器挂上收口，全量落库。
     recorder = build_tool_call_recorder(resolved)
     toolkit = build_toolkit_tools(resolved)
+    extra_tools: list[BaseTool] = list(toolkit)
+    if memory_service is not None:
+        from agent_base.memory.tools import build_memory_tools
+
+        extra_tools.extend(build_memory_tools(memory_service))
     tools = build_tool_pool(
         modules,
         timeout=resolved.tool_timeout_seconds,
-        extra_tools=toolkit,
+        extra_tools=extra_tools,
         timeouts=toolkit_timeouts(resolved),
         recorder=recorder,
     )
-    checkpointer = await build_checkpointer(resolved)
-    file_store = await build_uploaded_file_store(resolved)
-    memory_service = await build_memory_service(resolved, llm)
     return AgentRuntime(
         settings=resolved,
         llm=llm,

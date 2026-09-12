@@ -24,10 +24,11 @@ from agent_base.extensions.metrics import MEMORY_METRICS
 from agent_base.memory.context import compose_context
 from agent_base.memory.embeddings import EmbeddingClient, NullEmbedding, build_embedding_client
 from agent_base.memory.pipeline import MemoryPipeline, render_transcript
-from agent_base.memory.retrieval import ScoredMemory, recall_memories
+from agent_base.memory.retrieval import ScoredChunk, ScoredMemory, recall_memories, score_chunks
 from agent_base.memory.store import (
     KNOWN_MEMORY_KINDS,
     KNOWN_MEMORY_STATUSES,
+    DocChunk,
     MemoryOp,
     MemoryRecord,
     MemoryStore,
@@ -46,6 +47,21 @@ logger = logging.getLogger(__name__)
 def new_memory_id() -> str:
     """新生成的记忆 id（uuid hex 截断，与 file_id 同风格）。"""
     return uuid.uuid4().hex[:32]
+
+
+def chunk_text(text: str, *, chunk_chars: int, overlap: int) -> list[str]:
+    """按字符窗口把文档文本切块（相邻块带重叠，保持跨块语义连续）。
+
+    刻意用固定窗口而不是段落感知切分：行为可预测、中英文一视同仁，
+    边界毛刺由重叠带兜住。空文本返回空列表。
+    """
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= chunk_chars:
+        return [text]
+    step = max(1, chunk_chars - overlap)
+    return [text[start : start + chunk_chars] for start in range(0, len(text), step)]
 
 
 class MemoryService:
@@ -227,6 +243,92 @@ class MemoryService:
         MEMORY_METRICS.observe("search", "ok", time.perf_counter() - started)
         return results
 
+    # -- 知识库（M6e）：文档分块摄取与检索 ------------------------------------
+    async def ingest_document(
+        self,
+        *,
+        file_id: str,
+        user_id: str,
+        agent_id: str,
+        text: str,
+        thread_id: str = "",
+    ) -> int:
+        """把已解析的文档文本切块 + 向量化后入知识库；返回分块数。
+
+        失败安全：ingest 是上传路径上的旁路任务，任何异常只记审计与
+        日志。分块是用户级知识资产（``thread_id`` 仅作出处标注）——
+        删除线程不回收分块，知识独立于会话存活。
+        """
+        if not text.strip():
+            return 0
+        started = time.perf_counter()
+        try:
+            parts = chunk_text(
+                text,
+                chunk_chars=self._settings.memory_doc_chunk_chars,
+                overlap=self._settings.memory_doc_chunk_overlap,
+            )
+            vectors = await self.embedder.embed(parts)
+            chunks = [
+                DocChunk(
+                    chunk_id=new_memory_id(),
+                    file_id=file_id,
+                    thread_id=thread_id,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    ordinal=ordinal,
+                    text=part,
+                    embedding=encode_embedding(vectors[ordinal]) if vectors is not None else None,
+                    embedding_dim=self.embedder.dims if vectors is not None else None,
+                )
+                for ordinal, part in enumerate(parts)
+            ]
+            await self.store.put_chunks(chunks)
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            MEMORY_METRICS.observe("ingest", "ok", time.perf_counter() - started)
+            await self.record_op(
+                op="ingest",
+                user_id=user_id,
+                agent_id=agent_id,
+                thread_id=thread_id,
+                duration_ms=duration_ms,
+                detail={"file_id": file_id, "chunks": len(chunks)},
+            )
+            return len(chunks)
+        except Exception as exc:
+            logger.warning("memory: 文档摄取失败（不影响上传）：%s", exc)
+            MEMORY_METRICS.observe("ingest", "error", time.perf_counter() - started)
+            await self.record_op(
+                op="ingest",
+                user_id=user_id,
+                agent_id=agent_id,
+                thread_id=thread_id,
+                status="error",
+                error_text=f"{type(exc).__name__}: {exc}"[:300],
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                detail={"file_id": file_id},
+            )
+            return 0
+
+    async def search_knowledge(
+        self, *, user_id: str, agent_id: str | None, query: str, top_k: int | None = None
+    ) -> list[ScoredChunk]:
+        """知识库混合检索（向量 + BM25 + 时间衰减）。"""
+        chunks = await self.store.list_chunks(user_id, agent_id=agent_id)
+        if not chunks:
+            return []
+        vectors = await self.embedder.embed([query])
+        query_embedding = vectors[0] if vectors else None
+        scored = score_chunks(
+            chunks,
+            query,
+            query_embedding,
+            now=time.time(),
+            half_life_days=self._settings.memory_time_decay_half_life_days,
+        )
+        scored.sort(key=lambda item: item.score, reverse=True)
+        return scored[: max(1, top_k or self._settings.memory_recall_top_k)]
+
     # -- 生命周期 -----------------------------------------------------------------
     async def health_probe(self) -> str:
         """对 /health 的轻量探针：能读审计表即视为存储可用。"""
@@ -368,5 +470,6 @@ async def build_memory_service(settings: Settings, llm: Any | None = None) -> Me
 __all__ = [
     "MemoryService",
     "build_memory_service",
+    "chunk_text",
     "new_memory_id",
 ]

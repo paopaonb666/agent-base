@@ -24,13 +24,20 @@ from agent_base.memory.embeddings import (
     build_embedding_client,
 )
 from agent_base.memory.retrieval import (
+    ScoredChunk,
     ScoredMemory,
     cosine_similarity,
     recall_memories,
+    score_chunks,
     score_memories,
     tokenize,
 )
-from agent_base.memory.service import MemoryService, build_memory_service, new_memory_id
+from agent_base.memory.service import (
+    MemoryService,
+    build_memory_service,
+    chunk_text,
+    new_memory_id,
+)
 from agent_base.memory.store import (
     KNOWN_MEMORY_KINDS,
     KNOWN_MEMORY_STATUSES,
@@ -65,17 +72,20 @@ __all__ = [
     "MysqlMemoryStore",
     "NullEmbedding",
     "OpenAICompatibleEmbedding",
+    "ScoredChunk",
     "ScoredMemory",
     "SessionSummary",
     "SqliteMemoryStore",
     "build_embedding_client",
     "build_memory_service",
     "build_memory_store",
+    "chunk_text",
     "cosine_similarity",
     "decode_embedding",
     "encode_embedding",
     "new_memory_id",
     "recall_memories",
+    "score_chunks",
     "score_memories",
     "tokenize",
 ]

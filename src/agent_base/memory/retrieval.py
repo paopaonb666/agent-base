@@ -23,7 +23,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
-from agent_base.memory.store import PROFILE_ID_PREFIX, MemoryRecord, decode_embedding
+from agent_base.memory.store import PROFILE_ID_PREFIX, DocChunk, MemoryRecord, decode_embedding
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +147,57 @@ class ScoredMemory:
     components: dict[str, float] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class ScoredChunk:
+    """一个带混合分的知识库分块（分量语义同 ScoredMemory，无显著度）。"""
+
+    chunk: DocChunk
+    score: float
+    components: dict[str, float] = field(default_factory=dict)
+
+
+def _hybrid_scores(
+    texts: Sequence[str],
+    embeddings: Sequence[bytes | None],
+    timestamps: Sequence[float],
+    saliences: Sequence[float | None],
+    query: str,
+    query_embedding: Sequence[float] | None,
+    *,
+    now: float,
+    half_life_days: float,
+) -> list[tuple[float, dict[str, float]]]:
+    """混合打分的公共核心（memories 与 doc_chunks 共用）。
+
+    分量缺失（无向量/无关键词命中/无显著度）自动重归一，总分保持
+    0..1 可比。
+    """
+    bm25_raw = _Bm25([tokenize(text) for text in texts]).scores(tokenize(query))
+    bm25_max = max(bm25_raw, default=0.0)
+    results: list[tuple[float, dict[str, float]]] = []
+    for i, keyword_raw in enumerate(bm25_raw):
+        components: dict[str, float] = {
+            "keyword": (keyword_raw / bm25_max) if bm25_max > 0 else 0.0,
+            "recency": recency_factor(timestamps[i], now=now, half_life_days=half_life_days),
+        }
+        salience = saliences[i]
+        if salience is not None:
+            components["salience"] = min(max(salience, 0.0), 1.0)
+        # 向量分量：查询与候选必须同维可比。
+        embedding = embeddings[i]
+        if query_embedding is not None and embedding is not None:
+            sim = cosine_similarity(query_embedding, decode_embedding(embedding))
+            if sim is not None:
+                # 余弦可为负（反向语义）：截到 0..1 只保留正向证据。
+                components["vector"] = min(max(sim, 0.0), 1.0)
+        total_weight = sum(_WEIGHTS[name] for name in components)
+        score = sum(_WEIGHTS[name] * value for name, value in components.items())
+        if total_weight > 0:
+            score /= total_weight
+        results.append((score, components))
+    return results
+
+
 def score_memories(
     records: Sequence[MemoryRecord],
     query: str,
@@ -155,32 +206,50 @@ def score_memories(
     now: float,
     half_life_days: float,
 ) -> list[ScoredMemory]:
-    """对候选集统一打分；分量缺失（无向量/无关键词命中）自动重归一。"""
+    """对记忆候选集统一打分。"""
     if not records:
         return []
-    docs_tokens = [tokenize(record.content) for record in records]
-    bm25_raw = _Bm25(docs_tokens).scores(tokenize(query))
-    bm25_max = max(bm25_raw, default=0.0)
+    scored = _hybrid_scores(
+        [record.content for record in records],
+        [record.embedding for record in records],
+        [record.updated_at for record in records],
+        [record.salience for record in records],
+        query,
+        query_embedding,
+        now=now,
+        half_life_days=half_life_days,
+    )
+    return [
+        ScoredMemory(record=record, score=score, components=components)
+        for record, (score, components) in zip(records, scored, strict=True)
+    ]
 
-    scored: list[ScoredMemory] = []
-    for record, keyword_raw in zip(records, bm25_raw, strict=True):
-        components: dict[str, float] = {
-            "keyword": (keyword_raw / bm25_max) if bm25_max > 0 else 0.0,
-            "recency": recency_factor(record.updated_at, now=now, half_life_days=half_life_days),
-            "salience": min(max(record.salience, 0.0), 1.0),
-        }
-        # 向量分量：查询与候选必须同维可比。
-        if query_embedding is not None and record.embedding is not None:
-            sim = cosine_similarity(query_embedding, decode_embedding(record.embedding))
-            if sim is not None:
-                # 余弦可为负（反向语义）：截到 0..1 只保留正向证据。
-                components["vector"] = min(max(sim, 0.0), 1.0)
-        total_weight = sum(_WEIGHTS[name] for name in components)
-        score = sum(_WEIGHTS[name] * value for name, value in components.items())
-        if total_weight > 0:
-            score /= total_weight
-        scored.append(ScoredMemory(record=record, score=score, components=components))
-    return scored
+
+def score_chunks(
+    chunks: Sequence[DocChunk],
+    query: str,
+    query_embedding: Sequence[float] | None,
+    *,
+    now: float,
+    half_life_days: float,
+) -> list[ScoredChunk]:
+    """对知识库分块统一打分（分块没有显著度，其余分量一致）。"""
+    if not chunks:
+        return []
+    scored = _hybrid_scores(
+        [chunk.text for chunk in chunks],
+        [chunk.embedding for chunk in chunks],
+        [chunk.created_at for chunk in chunks],
+        [None] * len(chunks),
+        query,
+        query_embedding,
+        now=now,
+        half_life_days=half_life_days,
+    )
+    return [
+        ScoredChunk(chunk=chunk, score=score, components=components)
+        for chunk, (score, components) in zip(chunks, scored, strict=True)
+    ]
 
 
 @runtime_checkable
@@ -233,11 +302,13 @@ __all__ = [
     "W_RECENCY",
     "W_SALIENCE",
     "W_VECTOR",
+    "ScoredChunk",
     "ScoredMemory",
     "cosine_similarity",
     "filter_expired",
     "recall_memories",
     "recency_factor",
+    "score_chunks",
     "score_memories",
     "tokenize",
 ]
