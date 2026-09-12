@@ -22,6 +22,7 @@ from langgraph.graph.state import CompiledStateGraph
 
 if TYPE_CHECKING:  # pragma: no cover - import avoided at runtime
     from agent_base.core.config import Settings
+    from agent_base.memory.service import MemoryService
 
 # CompiledStateGraph 对 (StateT, ContextT, InputT, OutputT) 是泛型的。
 # 基座把编译后的图当作不透明对象处理——它只会把图回传给入口——
@@ -46,6 +47,9 @@ class ModuleContext:
     llm: BaseChatModel
     checkpointer: BaseCheckpointSaver[Any] | None = None
     tools: list[BaseTool] = field(default_factory=list)
+    # 记忆服务（M6）：None = 未启用（MEMORY_ENABLED=false 或后端不可用）。
+    # 模块按需取用；不关心记忆的模块可以完全忽略它。
+    memory: MemoryService | None = None
 
 
 @runtime_checkable

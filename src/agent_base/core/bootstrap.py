@@ -33,6 +33,7 @@ from agent_base.core.tools import build_tool_pool
 from agent_base.extensions.filestore import UploadedFileStore, build_uploaded_file_store
 from agent_base.extensions.memory import build_checkpointer, close_checkpointer
 from agent_base.extensions.toollog import ToolCallRecorder, build_tool_call_recorder
+from agent_base.memory.service import MemoryService, build_memory_service
 from agent_base.tools.registry import build_toolkit_tools, toolkit_timeouts
 
 # 保留的模块名：不构建单个模块的图，而是在所有已加载模块之上构建
@@ -64,6 +65,8 @@ class AgentRuntime:
     checkpointer: BaseCheckpointSaver[Any] | None = None
     tool_recorder: ToolCallRecorder | None = None
     file_store: UploadedFileStore | None = None
+    # 记忆服务（M6）：None = 未启用；模块通过 ModuleContext.memory 取用。
+    memory: MemoryService | None = None
     _graphs: dict[str, Graph] = field(default_factory=dict, repr=False)
     _supervisor: Graph | None = field(default=None, repr=False)
 
@@ -74,6 +77,7 @@ class AgentRuntime:
             llm=self.llm,
             checkpointer=self.checkpointer,
             tools=self.tools,
+            memory=self.memory,
         )
 
     def graph(self, module_name: str) -> Graph:
@@ -118,6 +122,8 @@ class AgentRuntime:
             await self.tool_recorder.aclose()
         if self.file_store is not None and hasattr(self.file_store, "aclose"):
             await self.file_store.aclose()
+        if self.memory is not None:
+            await self.memory.aclose()
 
 
 async def create_runtime(settings: Settings | None = None) -> AgentRuntime:
@@ -145,6 +151,7 @@ async def create_runtime(settings: Settings | None = None) -> AgentRuntime:
     )
     checkpointer = await build_checkpointer(resolved)
     file_store = await build_uploaded_file_store(resolved)
+    memory_service = await build_memory_service(resolved)
     return AgentRuntime(
         settings=resolved,
         llm=llm,
@@ -153,4 +160,5 @@ async def create_runtime(settings: Settings | None = None) -> AgentRuntime:
         checkpointer=checkpointer,
         tool_recorder=recorder,
         file_store=file_store,
+        memory=memory_service,
     )

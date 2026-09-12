@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+from collections.abc import Sequence
 from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel, ChatResult
@@ -11,6 +13,32 @@ from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, Tool
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk
 from langchain_core.tools import BaseTool
 from pydantic import PrivateAttr
+
+
+class HashEmbedding:
+    """确定性假 embedding（M6 测试替身）：把 token hash 进固定维度向量。
+
+    用 hashlib 而不是内置 hash（PYTHONHASHSEED 会让后者跨进程不稳定），
+    保证同一文本永远得到同一向量——检索测试因此可以断言"相关者得分
+    更高"。分词复用 retrieval.tokenize（中文二元组），相似文本天然
+    向量相近。
+    """
+
+    def __init__(self, dims: int = 32) -> None:
+        self.dims: int | None = dims
+
+    async def embed(self, texts: Sequence[str]) -> list[list[float]] | None:
+        from agent_base.memory.retrieval import tokenize
+
+        vectors: list[list[float]] = []
+        for text in texts:
+            vec = [0.0] * (self.dims or 32)
+            for token in tokenize(text):
+                digest = hashlib.md5(token.encode("utf-8")).digest()
+                vec[digest[0] % len(vec)] += 1.0
+            norm = sum(x * x for x in vec) ** 0.5
+            vectors.append([x / norm for x in vec] if norm > 0 else vec)
+        return vectors
 
 
 def _to_chunk(msg: AIMessage) -> AIMessageChunk:

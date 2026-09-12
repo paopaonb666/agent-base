@@ -95,6 +95,24 @@ class MemoryRecord:
     last_accessed_at: float | None = None
     access_count: int = 0
 
+    def meta(self) -> dict[str, Any]:
+        """对外元信息（不含 embedding 字节与审计字段）。"""
+        return {
+            "memory_id": self.memory_id,
+            "user_id": self.user_id,
+            "agent_id": self.agent_id,
+            "kind": self.kind,
+            "content": self.content,
+            "tags": list(self.tags),
+            "salience": self.salience,
+            "status": self.status,
+            "source_thread_id": self.source_thread_id,
+            "has_embedding": self.embedding is not None,
+            "access_count": self.access_count,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
 
 @dataclass(frozen=True)
 class MemoryBlock:

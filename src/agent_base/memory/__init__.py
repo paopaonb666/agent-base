@@ -16,6 +16,21 @@ mysql），同一套表结构在三条后端上语义一致。
 - ``service``    —— 对入口层与模块暴露的门面（M6c 起）
 """
 
+from agent_base.memory.embeddings import (
+    EmbeddingClient,
+    EmbeddingError,
+    NullEmbedding,
+    OpenAICompatibleEmbedding,
+    build_embedding_client,
+)
+from agent_base.memory.retrieval import (
+    ScoredMemory,
+    cosine_similarity,
+    recall_memories,
+    score_memories,
+    tokenize,
+)
+from agent_base.memory.service import MemoryService, build_memory_service, new_memory_id
 from agent_base.memory.store import (
     KNOWN_MEMORY_KINDS,
     KNOWN_MEMORY_STATUSES,
@@ -38,16 +53,29 @@ __all__ = [
     "KNOWN_MEMORY_KINDS",
     "KNOWN_MEMORY_STATUSES",
     "DocChunk",
+    "EmbeddingClient",
+    "EmbeddingError",
     "MemoryBlock",
     "MemoryMemoryStore",
     "MemoryOp",
     "MemoryRecord",
+    "MemoryService",
     "MemoryStore",
     "MemoryStoreError",
     "MysqlMemoryStore",
+    "NullEmbedding",
+    "OpenAICompatibleEmbedding",
+    "ScoredMemory",
     "SessionSummary",
     "SqliteMemoryStore",
+    "build_embedding_client",
+    "build_memory_service",
     "build_memory_store",
+    "cosine_similarity",
     "decode_embedding",
     "encode_embedding",
+    "new_memory_id",
+    "recall_memories",
+    "score_memories",
+    "tokenize",
 ]

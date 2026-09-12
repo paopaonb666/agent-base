@@ -113,3 +113,48 @@ class ToolMetrics:
 # 进程级单例：工具池在 bootstrap 装配一次，全局挂钩是它的自然对应物；
 # 与按应用实例化的 Metrics 不同，它没有"每个应用一套"的需求。
 TOOL_METRICS = ToolMetrics()
+
+
+# 记忆系统操作的封闭枚举（M6）：与 TOOL_OUTCOMES 同源，label 不接纳
+# 任意字符串，防基数爆炸。M6c 的管线操作（extract/consolidate/…）沿用
+# 同一个封闭集。
+MEMORY_OUTCOMES: tuple[str, ...] = ("ok", "error", "degraded")
+
+
+class MemoryMetrics:
+    """进程内的记忆操作计数器 + 延迟直方图，事件循环安全。
+
+    操作名来自代码（service/pipeline 的静态调用点），不是用户输入，
+    基数天然有界。
+    """
+
+    def __init__(self) -> None:
+        self._ops: dict[tuple[str, str], int] = {}
+        self._durations: dict[str, deque[float]] = {}
+
+    def observe(self, op: str, outcome: str, duration: float) -> None:
+        """记录一次已完成的记忆操作；outcome 必须属于 MEMORY_OUTCOMES。"""
+        if outcome not in MEMORY_OUTCOMES:
+            raise ValueError(f"unknown memory outcome {outcome!r}; expected {MEMORY_OUTCOMES}")
+        key = (op, outcome)
+        self._ops[key] = self._ops.get(key, 0) + 1
+        self._durations.setdefault(op, deque(maxlen=MAX_SAMPLES_PER_ROUTE)).append(duration)
+
+    def render_memory_metrics(self) -> str:
+        """渲染记忆指标的 Prometheus 文本展示格式。"""
+        lines: list[str] = []
+        for (op, outcome), count in sorted(self._ops.items()):
+            lines.append(f'memory_operations_total{{op="{op}",outcome="{outcome}"}} {count}')
+        for op, durations in sorted(self._durations.items()):
+            for bound in BUCKETS:
+                cum = sum(1 for d in durations if d <= bound)
+                lines.append(f'memory_duration_seconds_bucket{{op="{op}",le="{bound}"}} {cum}')
+            lines.append(
+                f'memory_duration_seconds_bucket{{op="{op}",le="+Inf"}} {len(durations)}'
+            )
+            lines.append(f'memory_duration_seconds_sum{{op="{op}"}} {sum(durations):.6f}')
+            lines.append(f'memory_duration_seconds_count{{op="{op}"}} {len(durations)}')
+        return "\n".join(lines) + "\n" if lines else ""
+
+
+MEMORY_METRICS = MemoryMetrics()

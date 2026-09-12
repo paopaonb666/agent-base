@@ -10,6 +10,8 @@
   ``done`` 事件携带 thread id 以便恢复会话。``sources`` 与工具发出的
   进度 ``step`` 来自工具经 custom stream 发的载荷（M3.5），经封闭的
   事件模型校验后透传。
+- ``POST/GET/PATCH/DELETE /v1/memory`` —— 长期记忆的管理端点（M6b），
+  以 ``X-User-Id`` 头为作用域（缺省 ``default``）。
 - ``GET /health`` —— 组件健康（checkpointer 探针 + 模型配置），
   出问题时返回 ``degraded`` 而不是崩溃（A4 继承）。
 - ``GET /metrics`` —— Prometheus 文本格式，使用路由模板 label（B4/B5）。
@@ -59,12 +61,14 @@ from agent_base.extensions.events import (
     encode_sse,
 )
 from agent_base.extensions.filestore import UploadedFileInfo
-from agent_base.extensions.metrics import TOOL_METRICS, Metrics
+from agent_base.extensions.metrics import MEMORY_METRICS, TOOL_METRICS, Metrics
 from agent_base.extensions.observability import (
     new_request_id,
     request_id,
     setup_logging,
 )
+from agent_base.memory.service import MemoryService
+from agent_base.memory.store import KNOWN_MEMORY_KINDS, KNOWN_MEMORY_STATUSES
 from agent_base.tools.parsing import DocumentParseError, parse_document
 
 logger = logging.getLogger(__name__)
@@ -110,6 +114,26 @@ class InvokeRequest(BaseModel):
     attachments: list[str] = Field(default_factory=list, max_length=5)
 
 
+class MemoryCreateRequest(BaseModel):
+    """手工写入一条长期记忆（M6b 管理端点）。"""
+
+    content: str = Field(min_length=1, max_length=20_000)
+    kind: str = "semantic"
+    tags: list[str] = Field(default_factory=list, max_length=10)
+    # None → "*"（全模块共享）；模块名不校验（模块清单可动态变化）。
+    agent_id: str | None = Field(default=None, max_length=64)
+    salience: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
+class MemoryPatchRequest(BaseModel):
+    """部分更新一条长期记忆；content 变化会触发重新向量化。"""
+
+    content: str | None = Field(default=None, min_length=1, max_length=20_000)
+    tags: list[str] | None = Field(default=None, max_length=10)
+    salience: float | None = Field(default=None, ge=0.0, le=1.0)
+    status: str | None = None
+
+
 def _extract_text(content: Any) -> str:
     """提取消息 content 里的纯文本：str 直接返回；列表型 content
     （部分 provider 的多段内容）拼接各段的 text 字段，避免把
@@ -153,6 +177,31 @@ def _known_module(rt: AgentRuntime, module: str) -> bool:
     "能聊但不能列历史、不能删"——前后端语义不一致。
     """
     return module in rt.modules or module == SUPERVISOR_MODULE
+
+
+def _memory_user_id(request: Request) -> str:
+    """解析记忆作用域的 user_id（M6）：X-User-Id 头，缺省 "default"。
+
+    与 X-Request-ID 同一白名单正则：该值会进记忆表与日志，放行任意
+    字符串等于允许伪造日志行 / 注入脏数据。非法值以 400 拒绝而不是
+    静默替换——调用方应当修自己的头，而不是猜服务端用了什么值。
+    """
+    raw = request.headers.get("X-User-Id")
+    if not raw:
+        return "default"
+    if not _REQUEST_ID_RE.fullmatch(raw):
+        raise HTTPException(
+            status_code=400,
+            detail="X-User-Id 非法：仅允许字母/数字/点/下划线/连字符，1-64 字符",
+        )
+    return raw
+
+
+def _require_memory(rt: AgentRuntime) -> MemoryService:
+    """取记忆服务；未启用时以 503 给出可读原因。"""
+    if rt.memory is None:
+        raise HTTPException(status_code=503, detail="记忆系统未启用（MEMORY_ENABLED=false）")
+    return rt.memory
 
 
 def _serialize_message(message: Any) -> dict[str, Any] | None:
@@ -683,6 +732,104 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         asyncio.get_running_loop().create_task(file_store.purge_orphans())
         return info.meta()
 
+    @app.post("/v1/memory")
+    async def create_memory(body: MemoryCreateRequest, request: Request) -> dict[str, Any]:
+        """手工写入一条长期记忆（M6b 管理端点）。
+
+        与管线写入（M6c）同一条路径：内容落库前尽力向量化，embedding
+        不可用时存纯文本、检索自动走关键词路径。响应不含 embedding 字节。
+        """
+        rt: AgentRuntime = request.app.state.runtime
+        memory = _require_memory(rt)
+        user_id = _memory_user_id(request)
+        if body.kind not in KNOWN_MEMORY_KINDS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"kind 非法：{body.kind!r}；允许 {list(KNOWN_MEMORY_KINDS)}",
+            )
+        try:
+            record = await memory.add_memory(
+                user_id=user_id,
+                agent_id=body.agent_id or "*",
+                content=body.content,
+                kind=body.kind,
+                tags=body.tags,
+                salience=body.salience,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return record.meta()
+
+    @app.get("/v1/memory")
+    async def search_memory(
+        request: Request,
+        q: str | None = None,
+        module: str | None = None,
+        kind: str | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """检索/浏览长期记忆。
+
+        ``q`` 存在 → 混合检索（向量 + BM25 + 时间衰减 + 显著度），按相关
+        度降序；不存在 → 按更新时间浏览。``module`` 限定 agent 作用域
+        （该模块 + 全局共享；缺省查全部）。``kind`` 在两种模式下都生效。
+        """
+        rt: AgentRuntime = request.app.state.runtime
+        memory = _require_memory(rt)
+        user_id = _memory_user_id(request)
+        if kind is not None and kind not in KNOWN_MEMORY_KINDS:
+            raise HTTPException(
+                status_code=400, detail=f"kind 非法：{kind!r}；允许 {list(KNOWN_MEMORY_KINDS)}"
+            )
+        limit = max(1, min(limit, 100))
+        if q:
+            scored = await memory.search(user_id=user_id, agent_id=module, query=q, top_k=limit)
+            results = [
+                {"score": round(item.score, 4), **item.record.meta()}
+                for item in scored
+                if kind is None or item.record.kind == kind
+            ]
+            return {"query": q, "memories": results}
+        records = await memory.list_memories(
+            user_id, agent_id=module, kinds=[kind] if kind else None, limit=limit
+        )
+        return {"memories": [record.meta() for record in records]}
+
+    @app.patch("/v1/memory/{memory_id}")
+    async def patch_memory(
+        memory_id: str, body: MemoryPatchRequest, request: Request
+    ) -> dict[str, Any]:
+        """部分更新一条长期记忆（改内容会重新向量化）。"""
+        rt: AgentRuntime = request.app.state.runtime
+        memory = _require_memory(rt)
+        if body.status is not None and body.status not in KNOWN_MEMORY_STATUSES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"status 非法：{body.status!r}；允许 {list(KNOWN_MEMORY_STATUSES)}",
+            )
+        existing = await memory.get_memory(memory_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail=f"记忆不存在：{memory_id}")
+        try:
+            updated = await memory.update_memory(
+                memory_id,
+                content=body.content,
+                tags=body.tags,
+                salience=body.salience,
+                status=body.status,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return updated.meta() if updated is not None else {}
+
+    @app.delete("/v1/memory/{memory_id}")
+    async def delete_memory(memory_id: str, request: Request) -> dict[str, Any]:
+        """删除一条长期记忆（硬删除；审计仍在 memory_ops）。"""
+        rt: AgentRuntime = request.app.state.runtime
+        memory = _require_memory(rt)
+        deleted = await memory.delete_memory(memory_id)
+        return {"deleted": deleted}
+
     @app.get("/v1/modules")
     async def list_modules(request: Request) -> dict[str, Any]:
         """列出已注册的模块（供前端配置面板选择，免去试错模块名）。"""
@@ -723,13 +870,20 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
             components["model"] = await _probe_model(rt.settings)
         else:
             components["model"] = "ok"
+        # 记忆系统（M6）：未启用不是降级（组件缺席即可），启用时探存储。
+        if rt.memory is not None:
+            components["memory"] = await rt.memory.health_probe()
         status = "ok" if all(v == "ok" for v in components.values()) else "degraded"
         return {"status": status, "components": components}
 
     @app.get("/metrics")
     async def metrics_endpoint(request: Request) -> PlainTextResponse:
         metrics: Metrics = request.app.state.metrics
-        body = metrics.render() + TOOL_METRICS.render_tool_metrics()
+        body = (
+            metrics.render()
+            + TOOL_METRICS.render_tool_metrics()
+            + MEMORY_METRICS.render_memory_metrics()
+        )
         return PlainTextResponse(body, media_type="text/plain; version=0.0.4; charset=utf-8")
 
     return app
