@@ -10,6 +10,11 @@ from langchain_core.tools import BaseTool, tool
 from agent_base.core.config import Settings
 from agent_base.core.tools import ToolPoolError, ToolTimeoutError, build_tool_pool
 from agent_base.extensions.metrics import TOOL_METRICS, ToolMetrics
+from agent_base.extensions.toollog import (
+    ARGS_MAX_CHARS,
+    RESULT_MAX_CHARS,
+    MemoryToolCallRecorder,
+)
 from agent_base.tools.registry import (
     ToolkitError,
     build_toolkit_tools,
@@ -170,3 +175,98 @@ def test_tool_metrics_render_and_validation() -> None:
     assert 'tool_duration_seconds_count{tool="web_search"} 2' in rendered
     with pytest.raises(ValueError, match="unknown tool outcome"):
         metrics.observe_tool("web_search", "bogus", 1.0)
+
+
+# ── 工具调用可观测挂钩（M5） ─────────────────────────────────────────
+
+
+async def test_tool_emits_start_and_end_events(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "agent_base.core.tools.emit_tool_call",
+        lambda call_id, name, phase, **kw: events.append(
+            {"call_id": call_id, "name": name, "phase": phase, **kw}
+        ),
+    )
+    recorder = MemoryToolCallRecorder()
+    pool = build_tool_pool({"m": _FakeModule("m", [_noop])}, recorder=recorder)
+
+    assert await pool[0].ainvoke({}) == "ok"
+
+    assert [e["phase"] for e in events] == ["start", "end"]
+    assert events[0]["call_id"] == events[1]["call_id"]
+    assert events[0]["args"] == {}
+    assert events[1]["status"] == "ok"
+    assert events[1]["result"] == "ok"
+    assert isinstance(events[1]["duration_ms"], int)
+    # 审计记录同步落 memory recorder
+    rows = await recorder.list_for_thread("")
+    assert len(rows) == 1 and rows[0]["tool"] == "_noop"
+
+
+async def test_tool_error_recorded_with_status_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "agent_base.core.tools.emit_tool_call",
+        lambda call_id, name, phase, **kw: events.append({"phase": phase, **kw}),
+    )
+    recorder = MemoryToolCallRecorder()
+    pool = build_tool_pool({"m": _FakeModule("m", [_boom])}, recorder=recorder)
+
+    with pytest.raises(RuntimeError, match="kaput"):
+        await pool[0].ainvoke({})
+
+    assert events[-1]["phase"] == "end" and events[-1]["status"] == "error"
+    assert "kaput" in events[-1]["error"]
+    rows = await recorder.list_for_thread("")
+    assert rows[0]["status"] == "error" and "kaput" in (rows[0]["error"] or "")
+
+
+async def test_tool_timeout_recorded_with_status_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "agent_base.core.tools.emit_tool_call",
+        lambda call_id, name, phase, **kw: events.append({"phase": phase, **kw}),
+    )
+    recorder = MemoryToolCallRecorder()
+    pool = build_tool_pool({"m": _FakeModule("m", [_slow])}, timeout=0.05, recorder=recorder)
+
+    with pytest.raises(ToolTimeoutError):
+        await pool[0].ainvoke({})
+
+    assert events[-1]["phase"] == "end" and events[-1]["status"] == "timeout"
+    rows = await recorder.list_for_thread("")
+    assert rows[0]["status"] == "timeout"
+
+
+async def test_tool_record_fields_are_truncated(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent_base.extensions.toollog import ToolCallRecord as _TCR
+
+    captured: list[_TCR] = []
+
+    class _Cap:
+        def record(self, record: _TCR) -> None:
+            captured.append(record)
+
+    @tool
+    def shout(text: str) -> str:
+        """输出超长结果与超长参数的替身。"""
+        return "y" * (RESULT_MAX_CHARS + 500)
+
+    monkeypatch.setattr("agent_base.core.tools.emit_tool_call", lambda *a, **kw: None)
+    pool = build_tool_pool({"m": _FakeModule("m", [shout])}, recorder=_Cap())
+    await pool[0].ainvoke({"text": "z" * (ARGS_MAX_CHARS + 300)})
+
+    record = captured[0]
+    assert len(record.result_text) == RESULT_MAX_CHARS
+    assert len(record.args_json) == ARGS_MAX_CHARS
+
+
+def test_build_pool_attaches_recorder() -> None:
+    recorder = MemoryToolCallRecorder()
+    pool = build_tool_pool({"m": _FakeModule("m", [_noop])}, recorder=recorder)
+    assert getattr(pool[0], "recorder", None) is recorder

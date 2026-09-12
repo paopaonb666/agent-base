@@ -31,6 +31,7 @@ from agent_base.core.llm import build_llm
 from agent_base.core.registry import RegistryError, load_modules
 from agent_base.core.tools import build_tool_pool
 from agent_base.extensions.memory import build_checkpointer, close_checkpointer
+from agent_base.extensions.toollog import ToolCallRecorder, build_tool_call_recorder
 from agent_base.tools.registry import build_toolkit_tools, toolkit_timeouts
 
 # 保留的模块名：不构建单个模块的图，而是在所有已加载模块之上构建
@@ -60,6 +61,7 @@ class AgentRuntime:
     modules: dict[str, AgentModule]
     tools: list[BaseTool] = field(default_factory=list)
     checkpointer: BaseCheckpointSaver[Any] | None = None
+    tool_recorder: ToolCallRecorder | None = None
     _graphs: dict[str, Graph] = field(default_factory=dict, repr=False)
     _supervisor: Graph | None = field(default=None, repr=False)
 
@@ -107,9 +109,11 @@ class AgentRuntime:
         return self._supervisor
 
     async def close(self) -> None:
-        """释放运行时持有的资源（如果有的话，即 sqlite 连接）。"""
+        """释放运行时持有的资源（checkpointer 连接、审计写线程等）。"""
         if self.checkpointer is not None:
             await close_checkpointer(self.checkpointer)
+        if self.tool_recorder is not None and hasattr(self.tool_recorder, "aclose"):
+            await self.tool_recorder.aclose()
 
 
 async def create_runtime(settings: Settings | None = None) -> AgentRuntime:
@@ -125,15 +129,22 @@ async def create_runtime(settings: Settings | None = None) -> AgentRuntime:
     validate_module_names(modules)
     # 工具库的内置工具按 TOOLKIT_ENABLED 装配后并入共享池（模块工具在
     # 前，工具库在后）；重名在任何一侧发生都会快速失败。注册表声明的
-    # per-tool 超时在这里下发给池。
+    # per-tool 超时在这里下发给池；审计记录器挂上收口，全量落库。
+    recorder = build_tool_call_recorder(resolved)
     toolkit = build_toolkit_tools(resolved)
     tools = build_tool_pool(
         modules,
         timeout=resolved.tool_timeout_seconds,
         extra_tools=toolkit,
         timeouts=toolkit_timeouts(resolved),
+        recorder=recorder,
     )
     checkpointer = await build_checkpointer(resolved)
     return AgentRuntime(
-        settings=resolved, llm=llm, modules=modules, tools=tools, checkpointer=checkpointer
+        settings=resolved,
+        llm=llm,
+        modules=modules,
+        tools=tools,
+        checkpointer=checkpointer,
+        tool_recorder=recorder,
     )

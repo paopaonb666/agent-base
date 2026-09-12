@@ -15,18 +15,32 @@ LLM，并通过 LangGraph 的 ``ToolNode`` 执行它，后者把工具失败归�
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import re
 import threading
 import time
+import uuid
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 from langchain_core.tools import BaseTool
+from langgraph.config import get_config
 
 from agent_base.core.contracts import AgentModule
 from agent_base.extensions.metrics import TOOL_METRICS
+from agent_base.extensions.observability import get_request_id
+from agent_base.extensions.toollog import (
+    ARGS_MAX_CHARS,
+    ERROR_MAX_CHARS,
+    RESULT_MAX_CHARS,
+    ToolCallRecord,
+)
+from agent_base.tools.streaming import emit_tool_call
 
 DEFAULT_TOOL_TIMEOUT_SECONDS = 30.0
+
+logger = logging.getLogger(__name__)
 
 # 工具错误文本会进入 ToolMessage（模型 + 会话历史回放都会看到）：
 # URL 脱敏、长度封顶，避免把内部端点/巨型负载泄给前端。
@@ -53,28 +67,108 @@ def handle_tool_error(exc: Exception) -> str:
     return f"tool execution failed: {text}"[:_TOOL_ERROR_MAX_CHARS]
 
 
+def _json_safe(value: Any) -> dict[str, Any]:
+    """把工具参数转成可 JSON 序列化的形式；不可序列化的值降级为 repr。"""
+    try:
+        loaded: Any = json.loads(json.dumps(value, ensure_ascii=False, default=str))
+        return loaded if isinstance(loaded, dict) else {"_raw": str(value)}
+    except (TypeError, ValueError):
+        return {"_raw": str(value)}
+
+
+def _execution_context() -> tuple[str, str]:
+    """读取当前图执行的 (thread_id, module)；不在图上下文时留空。
+
+    thread_id 命名空间是 ``{module}:{user_thread_id}``（server/CLI 统一
+    规则），module 前缀据此拆出；直调工具（单测、CLI ad-hoc）没有该
+    上下文，记录照常产生，只是这两个字段为空。
+    """
+    try:
+        configurable = get_config().get("configurable") or {}
+        thread_id = str(configurable.get("thread_id") or "")
+    except Exception:
+        return "", ""
+    module = thread_id.split(":", 1)[0] if ":" in thread_id else ""
+    return thread_id, module
+
+
 class _TimeoutTool(BaseTool):
-    """包装 ``inner``，让同步和异步两种运行模式都遵守同一挂钟预算。"""
+    """包装 ``inner``，让同步和异步两种运行模式都遵守同一挂钟预算。
+
+    本类也是**工具调用可观测的唯一收口**（M5）：执行前后发
+    ``tool_call`` 流事件（前端渲染参数/结果面板），完结时把记录交给
+    ``recorder`` 落库——成功、超时、异常三种结局都会被记录。
+    """
 
     inner: BaseTool
     timeout: float
+    recorder: Any = None  # ToolCallRecorder | None；协议类型交由运行时鸭子匹配
+
+    def _track(
+        self,
+        call_id: str,
+        safe_args: dict[str, Any],
+        started: float,
+        outcome: str,
+        result_text: str,
+        error_text: str,
+    ) -> None:
+        """完结一支调用：发流事件 + 交审计记录（两者都绝不抛错打断对话）。"""
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        try:
+            emit_tool_call(
+                call_id,
+                self.name,
+                "end",
+                result=result_text or None,
+                status=outcome,
+                duration_ms=duration_ms,
+                error=error_text or None,
+            )
+        except Exception:
+            logger.debug("tool %s: emit tool_call end failed", self.name, exc_info=True)
+        if self.recorder is not None:
+            try:
+                thread_id, module = _execution_context()
+                self.recorder.record(
+                    ToolCallRecord(
+                        call_id=call_id,
+                        tool=self.name,
+                        status=outcome,
+                        args_json=json.dumps(safe_args, ensure_ascii=False)[:ARGS_MAX_CHARS],
+                        result_text=result_text[:RESULT_MAX_CHARS],
+                        error_text=error_text[:ERROR_MAX_CHARS],
+                        duration_ms=duration_ms,
+                        thread_id=thread_id,
+                        module=module,
+                        request_id=get_request_id(),
+                    )
+                )
+            except Exception:
+                logger.exception("tool %s: recorder.record failed", self.name)
+        TOOL_METRICS.observe_tool(self.name, outcome, time.perf_counter() - started)
 
     def _run(self, **kwargs: Any) -> Any:
         # daemon 线程 + Event.wait：截止时间在调用方一侧得到遵守，超时后
         # 调用方立即返回；失控工具留在后台跑完（Python 线程无法被杀死）。
         # 刻意不用 ThreadPoolExecutor——它的 non-daemon 工作线程会被
         # 解释器退出的 atexit join 卡住，一个失控工具就能拖住整个进程。
+        call_id = uuid.uuid4().hex[:12]
+        safe_args = _json_safe(kwargs)
+        emit_tool_call(call_id, self.name, "start", args=safe_args)
         started = time.perf_counter()
         outcome = "ok"
+        result_text = ""
+        error_text = ""
         try:
             result: list[Any] = []
-            error: list[BaseException] = []
+            error: list[Exception] = []
             done = threading.Event()
 
             def _target() -> None:
                 try:
                     result.append(self.inner.invoke(kwargs))
-                except BaseException as exc:
+                except Exception as exc:
                     error.append(exc)
                 finally:
                     done.set()
@@ -83,31 +177,41 @@ class _TimeoutTool(BaseTool):
             worker.start()
             if not done.wait(timeout=self.timeout):
                 outcome = "timeout"
-                raise ToolTimeoutError(f"tool {self.name!r} exceeded {self.timeout}s timeout")
+                error_text = f"tool {self.name!r} exceeded {self.timeout}s timeout"
+                raise ToolTimeoutError(error_text)
             if error:
                 outcome = "error"
+                error_text = handle_tool_error(error[0])
                 raise error[0]
+            result_text = str(result[0])
             return result[0]
         finally:
-            TOOL_METRICS.observe_tool(self.name, outcome, time.perf_counter() - started)
+            self._track(call_id, safe_args, started, outcome, result_text, error_text)
 
     async def _arun(self, **kwargs: Any) -> Any:
+        call_id = uuid.uuid4().hex[:12]
+        safe_args = _json_safe(kwargs)
+        emit_tool_call(call_id, self.name, "start", args=safe_args)
         started = time.perf_counter()
         outcome = "ok"
+        result_text = ""
+        error_text = ""
         try:
             try:
-                return await asyncio.wait_for(self.inner.ainvoke(kwargs), timeout=self.timeout)
+                value = await asyncio.wait_for(self.inner.ainvoke(kwargs), timeout=self.timeout)
+                result_text = str(value)
+                return value
             # 3.10 上 asyncio.TimeoutError 与内置 TimeoutError 是不同类型，两者都要接住。
             except (TimeoutError, asyncio.TimeoutError) as exc:
                 outcome = "timeout"
-                raise ToolTimeoutError(
-                    f"tool {self.name!r} exceeded {self.timeout}s timeout"
-                ) from exc
-            except BaseException:
+                error_text = f"tool {self.name!r} exceeded {self.timeout}s timeout"
+                raise ToolTimeoutError(error_text) from exc
+            except Exception as exc:
                 outcome = "error"
+                error_text = handle_tool_error(exc)
                 raise
         finally:
-            TOOL_METRICS.observe_tool(self.name, outcome, time.perf_counter() - started)
+            self._track(call_id, safe_args, started, outcome, result_text, error_text)
 
 
 def build_tool_pool(
@@ -116,6 +220,7 @@ def build_tool_pool(
     timeout: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
     extra_tools: Sequence[BaseTool] = (),
     timeouts: Mapping[str, float] | None = None,
+    recorder: Any = None,
 ) -> list[BaseTool]:
     """把每个模块的工具收集进一个带超时包装、无冲突的池。
 
@@ -125,7 +230,8 @@ def build_tool_pool(
     配置错误；该检查覆盖模块工具与工具库工具的整体。
 
     ``timeouts`` 支持按工具名覆盖全局 ``timeout``（如网络搜索要用显著
-    短于全局的预算）；未列出的工具沿用全局值。
+    短于全局的预算）；未列出的工具沿用全局值。``recorder`` 是工具调用
+    审计记录器（extensions/toollog），挂到每个包装器上实现全量落库。
     """
     overrides = timeouts or {}
     pool: list[BaseTool] = []
@@ -150,6 +256,7 @@ def build_tool_pool(
                 args_schema=tool.args_schema,
                 inner=tool,
                 timeout=overrides.get(name, timeout),
+                recorder=recorder,
             )
         )
     return pool

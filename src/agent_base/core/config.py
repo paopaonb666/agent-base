@@ -74,7 +74,9 @@ class Settings(BaseSettings):
     llm_model: str = "deepseek-chat"
 
     # -- 对话状态（checkpointer；阶段 3 接线） ---------------------------
-    checkpointer_backend: str = "memory"
+    # 默认 sqlite：对话（含失败的工具调用消息）superstep 粒度边流边写，
+    # 重启可恢复；memory 仅在显式选择时使用（什么都不持久化）。
+    checkpointer_backend: str = "sqlite"
     checkpointer_sqlite_path: str = "./agent_base_state.db"
 
     # MySQL 后端连接参数（仅当 CHECKPOINTER_BACKEND=mysql 时生效）。
@@ -88,6 +90,9 @@ class Settings(BaseSettings):
     # -- 工具池（阶段 3） ------------------------------------------------
     # 每次工具执行的挂钟时间预算，由池的包装器强制执行。
     tool_timeout_seconds: float = 30.0
+    # 工具调用审计（M5）：每条调用（成功/超时/异常）写入
+    # tool_call_records 表，存储后端跟随 CHECKPOINTER_BACKEND。
+    tool_call_log_enabled: bool = True
 
     # -- 工具库（tools/；M1 治理设施） ------------------------------------
     # 要装配进共享池的基座内置工具名（逗号分隔或 JSON 数组）。默认只开

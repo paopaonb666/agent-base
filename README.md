@@ -108,8 +108,9 @@ pytest                         # 覆盖率门（≥85%）依赖 MySQL 集成测�
 | `LLM_BASE_URL` / `LLM_MODEL` | 模型服务地址与模型名，切换 provider 只需改这两项 |
 | `AGENT_MODULES` | 逗号分隔的模块清单，顺序即装配顺序（默认 `chat,writer`） |
 | `CORS_ORIGINS` | 允许跨域调用 SSE 端点的来源（默认 `http://localhost:3000`，即 agent-base-ui） |
-| `CHECKPOINTER_BACKEND` | `memory`（默认，零依赖）\| `sqlite`（进程重启可恢复对话）\| `mysql`（MySQL 持久化，配 `CHECKPOINTER_MYSQL_*`） |
+| `CHECKPOINTER_BACKEND` | `sqlite`（默认，重启可恢复对话）\| `memory`（零依赖，不持久化）\| `mysql`（MySQL 持久化，配 `CHECKPOINTER_MYSQL_*`） |
 | `TOOL_TIMEOUT_SECONDS` | 工具单次执行超时（默认 30s） |
+| `TOOL_CALL_LOG_ENABLED` | 工具调用审计（M5）：每条调用含参数/结果/耗时落库，UI 渲染调用面板 |
 | `TOOLKIT_ENABLED` | 装配进共享池的基座内置工具清单（默认 `current_time,calculator,json_query`）；`web_search` 需配 `SEARCH_*`，`python_repl` 为 exec 级默认关 |
 | `LOG_JSON` | `true` 输出结构化 JSON 日志（生产建议开启） |
 

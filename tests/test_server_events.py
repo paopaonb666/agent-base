@@ -20,8 +20,13 @@ from langgraph.config import get_stream_writer
 
 from agent_base.core.bootstrap import AgentRuntime
 from agent_base.core.config import Settings
-from agent_base.entrypoints.server import _decode_tool_event, create_app
+from agent_base.entrypoints.server import (
+    _decode_tool_event,
+    _serialize_message,
+    create_app,
+)
 from agent_base.extensions.events import SourcesEvent, StepEvent
+from agent_base.extensions.toollog import MemoryToolCallRecorder, ToolCallRecord
 from agent_base.modules.chat.module import ChatModule
 from agent_base.tools.streaming import emit_sources, emit_step
 from fakes import ScriptedChatModel
@@ -119,3 +124,91 @@ def test_emit_helpers_forward_contract_payloads(monkeypatch: pytest.MonkeyPatch)
     # detail 为空时省略字段，避免把空值灌给前端。
     emit_step("s2", "error")
     assert {"type": "step", "name": "s2", "status": "error"} in sent
+
+
+# ── 工具调用事件契约 + 历史序列化（M5） ─────────────────────────────
+
+
+def test_decode_accepts_tool_call_events() -> None:
+    start = _decode_tool_event(
+        {
+            "type": "tool_call",
+            "call_id": "abc",
+            "name": "web_search",
+            "phase": "start",
+            "args": {"query": "hi"},
+        }
+    )
+    assert start is not None and start.phase == "start" and start.args == {"query": "hi"}
+    end = _decode_tool_event(
+        {
+            "type": "tool_call",
+            "call_id": "abc",
+            "name": "web_search",
+            "phase": "end",
+            "status": "ok",
+            "result": "r",
+            "duration_ms": 12,
+        }
+    )
+    assert end is not None and end.status == "ok" and end.duration_ms == 12
+    bad = _decode_tool_event(
+        {"type": "tool_call", "call_id": "abc", "name": "x", "phase": "middle"}
+    )
+    assert bad is None  # phase 不在契约内 → 丢弃
+
+
+def test_serialize_message_exposes_tool_calls() -> None:
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    ai = AIMessage(
+        content="",
+        tool_calls=[{"name": "calculator", "args": {"expression": "1+1"}, "id": "call-9"}],
+    )
+    out = _serialize_message(ai)
+    assert out is not None and out["role"] == "assistant"
+    assert out["tool_calls"] == [
+        {"id": "call-9", "name": "calculator", "args": {"expression": "1+1"}}
+    ]
+
+    tool = ToolMessage(content="2", name="calculator", tool_call_id="call-9", status="error")
+    out_tool = _serialize_message(tool)
+    assert out_tool == {
+        "role": "tool",
+        "name": "calculator",
+        "content": "2",
+        "tool_call_id": "call-9",
+        "status": "error",
+    }
+    # 空内容且无调用的 AI 消息仍然丢弃。
+    assert _serialize_message(AIMessage(content="")) is None
+
+
+def test_tool_calls_endpoint_returns_audit_records() -> None:
+    recorder = MemoryToolCallRecorder()
+    runtime = _runtime()
+    runtime.tool_recorder = recorder
+    # 记录一条属于 chat:t-history 线程的调用
+
+    recorder.record(
+        ToolCallRecord(
+            call_id="c42",
+            tool="calculator",
+            status="error",
+            args_json='{"expression": "1/0"}',
+            error_text="tool execution failed: 除数为零",
+            duration_ms=3,
+            thread_id="chat:t-history",
+            module="chat",
+        )
+    )
+    with TestClient(create_app(runtime=runtime)) as client:
+        body = client.get("/v1/agents/chat/threads/t-history/tool-calls").json()
+    assert body["tool_calls"][0]["call_id"] == "c42"
+    assert body["tool_calls"][0]["args"] == {"expression": "1/0"}
+    assert body["tool_calls"][0]["status"] == "error"
+    # 无 recorder 的 runtime → 空列表而非报错
+    runtime2 = _runtime()
+    with TestClient(create_app(runtime=runtime2)) as client:
+        body = client.get("/v1/agents/chat/threads/t-history/tool-calls").json()
+    assert body == {"tool_calls": []}

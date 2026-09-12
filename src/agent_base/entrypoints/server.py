@@ -53,6 +53,7 @@ from agent_base.extensions.events import (
     PingEvent,
     SourcesEvent,
     StepEvent,
+    ToolCallEvent,
     encode_sse,
 )
 from agent_base.extensions.metrics import TOOL_METRICS, Metrics
@@ -129,20 +130,41 @@ def _serialize_message(message: Any) -> dict[str, Any] | None:
 
     返回 ``None`` 表示这条消息不该显示（例如仅含 tool_calls 的 AI 消息）。
     前端 agent-base-ui 用它与 invoke 流式事件对齐，以便回放历史会话。
+
+    工具调用可观测（M5）：AI 消息携带 ``tool_calls``（id/name/args——
+    模型给定的调用参数），tool 消息携带 ``tool_call_id``/``status``——
+    前端按 id 把两者配对，回放出完整的"参数 + 结果"调用面板。仅含
+    tool_calls 的 AI 消息也保留（它是调用参数的唯一持久化位置）。
     """
     mtype = getattr(message, "type", "")
     text = _extract_text(getattr(message, "content", ""))
     if mtype == "human":
         return {"role": "human", "content": text}
     if mtype == "ai":
-        if not text:
-            return None  # 仅含 tool_calls 的 AI 消息，没有可展示文本
-        return {"role": "assistant", "content": text}
+        tool_calls: list[dict[str, Any]] = [
+            {
+                "id": str(tc.get("id") or ""),
+                "name": str(tc.get("name") or ""),
+                "args": tc.get("args") if isinstance(tc.get("args"), dict) else {},
+            }
+            for tc in (getattr(message, "tool_calls", None) or [])
+            if isinstance(tc, dict)
+        ]
+        if not text and not tool_calls:
+            return None  # 既无文本也无调用的空 AI 消息，没有可展示内容
+        return {
+            "role": "assistant",
+            "content": text,
+            **({"tool_calls": tool_calls} if tool_calls else {}),
+        }
     if mtype == "tool":
+        raw_status = str(getattr(message, "status", "") or "success")
         return {
             "role": "tool",
             "name": str(getattr(message, "name", "") or ""),
             "content": text,
+            "tool_call_id": str(getattr(message, "tool_call_id", "") or ""),
+            "status": "error" if raw_status == "error" else "ok",
         }
     return None
 
@@ -174,6 +196,8 @@ def _decode_tool_event(payload: Any) -> AgentEvent | None:
             return StepEvent.model_validate(payload)
         if kind == "sources":
             return SourcesEvent.model_validate(payload)
+        if kind == "tool_call":
+            return ToolCallEvent.model_validate(payload)
     except ValueError as exc:
         logger.warning("sse: dropping malformed %r event: %s", kind, exc)
         return None
@@ -446,6 +470,27 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
             if serialized is not None
         ]
         return {"thread_id": thread_id, "module": module, "messages": messages}
+
+    @app.get("/v1/agents/{module}/threads/{thread_id}/tool-calls")
+    async def list_tool_calls(
+        module: str, thread_id: str, request: Request, limit: int = 100
+    ) -> dict[str, Any]:
+        """返回某会话的工具调用审计记录（按时间升序，最新在末尾）。
+
+        数据来自 ``tool_call_records`` 审计表（跟随 checkpointer 后端落库）：
+        无论成功、超时还是异常都有记录，含参数 JSON、结果文本与耗时。
+        ``limit`` 由 FastAPI 做数值校验（1-500）。
+        """
+        rt: AgentRuntime = request.app.state.runtime
+        if not _known_module(rt, module):
+            raise HTTPException(status_code=404, detail=f"unknown module {module!r}")
+        recorder = rt.tool_recorder
+        if recorder is None:
+            return {"tool_calls": []}
+        records = await recorder.list_for_thread(
+            f"{module}:{thread_id}", limit=max(1, min(limit, 500))
+        )
+        return {"tool_calls": records}
 
     @app.delete("/v1/agents/{module}/threads/{thread_id}")
     async def delete_thread(module: str, thread_id: str, request: Request) -> dict[str, Any]:
