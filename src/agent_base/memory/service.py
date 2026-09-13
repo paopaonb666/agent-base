@@ -241,6 +241,7 @@ class MemoryService:
             top_k=top_k or self._settings.memory_recall_top_k,
             episodic_ttl_days=self._settings.memory_episodic_ttl_days,
             half_life_days=self._settings.memory_time_decay_half_life_days,
+            min_score=self._settings.memory_recall_min_score,
         )
         MEMORY_METRICS.observe("search", "ok", time.perf_counter() - started)
         return results
@@ -329,6 +330,15 @@ class MemoryService:
             half_life_days=self._settings.memory_time_decay_half_life_days,
         )
         scored.sort(key=lambda item: item.score, reverse=True)
+        min_score = self._settings.memory_recall_min_score
+        if min_score > 0:
+
+            def _has_evidence(item: ScoredChunk) -> bool:
+                return item.components.get("keyword", 0.0) > 0 or item.components.get(
+                    "vector", 0.0
+                ) > 0
+
+            scored = [item for item in scored if item.score >= min_score and _has_evidence(item)]
         return scored[: max(1, top_k or self._settings.memory_recall_top_k)]
 
     # -- 生命周期 -----------------------------------------------------------------

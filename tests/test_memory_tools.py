@@ -110,13 +110,35 @@ def test_build_memory_tools_names() -> None:
         "memory_search",
         "memory_save",
         "memory_update_block",
+        "memory_delete",
         "knowledge_search",
     ]
 
 
+async def test_memory_delete_with_user_isolation() -> None:
+    service = _service()
+    (search, _save, _block, delete, _knowledge) = build_memory_tools(service)
+    set_memory_scope("alice", "chat:t1")
+    record = await service.add_memory(user_id="alice", agent_id="chat", content="旧代号是蓝鲸")
+    found = await search.ainvoke({"query": "旧代号"})
+    assert f"[id={record.memory_id[:12]}]" in found  # 搜索结果带 id
+    out = await delete.ainvoke({"memory_id": record.memory_id})
+    assert "已删除" in out
+    assert await service.get_memory(record.memory_id) is None
+    # 删除不存在的 id → 友好提示而非异常。
+    again = await delete.ainvoke({"memory_id": record.memory_id})
+    assert "不存在" in again
+    # user 隔离：bob 不能删 alice 的记忆。
+    other = await service.add_memory(user_id="alice", agent_id="chat", content="alice 的私有记忆")
+    set_memory_scope("bob", "chat:t2")
+    denied = await delete.ainvoke({"memory_id": other.memory_id})
+    assert "不属于当前用户" in denied
+    assert await service.get_memory(other.memory_id) is not None
+
+
 async def test_memory_save_and_search_with_scope() -> None:
     service = _service()
-    (search, save, _block, _knowledge) = build_memory_tools(service)
+    (search, save, _block, _delete, _knowledge) = build_memory_tools(service)
     set_memory_scope("alice", "chat:t1")
     saved = await save.ainvoke({"content": "用户的部署环境是 Ubuntu 22.04"})
     assert "已记住" in saved
@@ -130,7 +152,7 @@ async def test_memory_save_and_search_with_scope() -> None:
 
 async def test_memory_update_block_append_replace_and_truncation() -> None:
     service = _service()
-    (_search, _save, block, _knowledge) = build_memory_tools(service)
+    (_search, _save, block, _delete, _knowledge) = build_memory_tools(service)
     set_memory_scope("alice", "chat:t1")
     # append 到不存在的块 → 创建。
     out = await block.ainvoke({"label": "human", "content": "用户是工程师", "operation": "append"})
@@ -170,7 +192,7 @@ async def test_knowledge_search_tool() -> None:
         agent_id="chat",
         text="项目采用 PostgreSQL 15 存储业务数据，Redis 做缓存。",
     )
-    (_search, _save, _block, knowledge) = build_memory_tools(service)
+    (_search, _save, _block, _delete, knowledge) = build_memory_tools(service)
     set_memory_scope("alice", "chat:t1")
     out = await knowledge.ainvoke({"query": "PostgreSQL"})
     assert "PostgreSQL 15" in out

@@ -173,3 +173,17 @@ async def test_recall_memories_end_to_end() -> None:
         now=now,
     )
     assert empty == []
+    # 最低分阈值：毫无关联的提问（纯靠 recency/salience 凑数）不召回。
+    noisy = await recall_memories(
+        store,
+        user_id="alice",
+        agent_id="chat",
+        query="量子纠缠的实验装置",
+        embedder=None,
+        top_k=5,
+        episodic_ttl_days=30,
+        half_life_days=14,
+        now=now,
+        min_score=0.3,
+    )
+    assert noisy == []

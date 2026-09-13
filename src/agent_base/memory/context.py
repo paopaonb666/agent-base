@@ -42,10 +42,10 @@ def estimate_tokens(text: str) -> int:
     return int(cjk * _CJK_TOKEN_PER_CHAR + (len(text) - cjk) * _ASCII_TOKEN_PER_CHAR)
 
 
-def is_injected_system(message: Any) -> bool:
-    """判断一条消息是否是"注入型"系统消息（记忆上下文 / 附件全文）。"""
+def injected_kind(message: Any) -> str | None:
+    """返回消息的注入类型（匹配的标记前缀）；非注入消息返回 None。"""
     if getattr(message, "type", "") != "system":
-        return False
+        return None
     content = message.content
     if isinstance(content, list):  # 多段 content：取 text 段
         content = "".join(
@@ -53,10 +53,17 @@ def is_injected_system(message: Any) -> bool:
             for part in content
         )
     if not isinstance(content, str):
-        return False
-    return content.startswith(MEMORY_CONTEXT_PREFIX) or content.startswith(
-        ATTACHMENT_CONTEXT_PREFIX
-    )
+        return None
+    if content.startswith(MEMORY_CONTEXT_PREFIX):
+        return MEMORY_CONTEXT_PREFIX
+    if content.startswith(ATTACHMENT_CONTEXT_PREFIX):
+        return ATTACHMENT_CONTEXT_PREFIX
+    return None
+
+
+def is_injected_system(message: Any) -> bool:
+    """判断一条消息是否是"注入型"系统消息（记忆上下文 / 附件全文）。"""
+    return injected_kind(message) is not None
 
 
 def render_profile(profile: dict[str, Any]) -> str:
@@ -173,15 +180,24 @@ def build_model_input(messages: list[Any], *, max_tokens: int) -> list[Any]:
     if not messages:
         return []
 
-    # 1) 注入去重：保留最后一次出现的注入块。
-    last_injected = max(
-        (i for i, message in enumerate(messages) if is_injected_system(message)),
+    # 1) 注入去重：只保留"本轮"的注入块——最后一条 human 消息之前的
+    #    连续注入段（记忆块 + 附件全文都可能在本轮注入，必须同时保留；
+    #    UI 实测缺陷 F1）。历史轮次的注入块一律剔除：其内容已随当轮
+    #    消费，留着只会让模型输入轮轮膨胀。
+    last_human = max(
+        (i for i, message in enumerate(messages) if getattr(message, "type", "") == "human"),
         default=None,
     )
+    current_injections: set[int] = set()
+    if last_human is not None:
+        i = last_human - 1
+        while i >= 0 and injected_kind(messages[i]) is not None:
+            current_injections.add(i)
+            i -= 1
     kept_indices = [
         i
         for i, message in enumerate(messages)
-        if not is_injected_system(message) or i == last_injected
+        if injected_kind(message) is None or i in current_injections
     ]
 
     # 2) token 预算：从尾部向前累积。

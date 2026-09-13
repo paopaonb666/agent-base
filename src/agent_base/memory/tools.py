@@ -1,10 +1,11 @@
 """Agent 记忆工具（M6e）：agent 自服务的记忆读写与知识库检索。
 
-四个工具（Letta 式"agent 管理自己的记忆"）：
+五个工具（Letta 式"agent 管理自己的记忆"）：
 
-- ``memory_search``       —— 检索当前用户的长期记忆
+- ``memory_search``       —— 检索当前用户的长期记忆（结果带 memory_id）
 - ``memory_save``         —— 把重要信息显式写入长期记忆
 - ``memory_update_block`` —— 编辑常驻上下文的记忆块（persona/human/自定义）
+- ``memory_delete``       —— 删除过时/错误的记忆（用户更正事实时配合 save）
 - ``knowledge_search``    —— 检索用户上传文档构建的知识库
 
 **作用域传递**：user_id / thread_id 不走 RunnableConfig 注入——工具池的
@@ -87,6 +88,15 @@ class _MemoryBlockArgs(BaseModel):
     content: str = Field(description="块内容", min_length=1, max_length=4000)
 
 
+class _MemoryDeleteArgs(BaseModel):
+    memory_id: str = Field(
+        description="要删除的记忆 id（从 memory_search 结果的 [id=…] 中获取）",
+        min_length=4,
+        max_length=64,
+        pattern=r"^[\w.-]+$",
+    )
+
+
 class _KnowledgeSearchArgs(BaseModel):
     query: str = Field(
         description="要在用户上传的文档里检索的内容", min_length=1, max_length=2000
@@ -107,7 +117,11 @@ def build_memory_tools(memory: MemoryService) -> list[BaseTool]:
         )
         if not scored:
             return "（没有找到相关记忆）"
-        lines = [f"-（相关度 {item.score:.2f}）{item.record.content}" for item in scored]
+        # 带 memory_id：agent 可据此调用 memory_delete 更正过时记忆。
+        lines = [
+            f"-（相关度 {item.score:.2f}）[id={item.record.memory_id[:12]}] {item.record.content}"
+            for item in scored
+        ]
         return "找到的相关记忆：\n" + "\n".join(lines)
 
     async def memory_save(
@@ -155,6 +169,18 @@ def build_memory_tools(memory: MemoryService) -> list[BaseTool]:
         )
         return f"记忆块 {label!r} 已更新（v{version}，{len(merged)}/{char_limit} 字符）"
 
+    async def memory_delete(memory_id: str, **_kwargs: Any) -> str:
+        """删除一条指定 id 的记忆（agent 更正/清理过时记忆时使用）。"""
+        user_id, _, _ = _scope()
+        record = await memory.get_memory(memory_id)
+        if record is None:
+            return f"记忆 {memory_id} 不存在（可能已删除，id 以 memory_search 结果为准）"
+        # user 隔离：只能删自己的记忆。
+        if record.user_id != user_id:
+            return "无法删除：该记忆不属于当前用户。"
+        deleted = await memory.delete_memory(memory_id)
+        return f"已删除：{record.content[:60]}" if deleted else "删除失败（记录已不存在）"
+
     async def knowledge_search(query: str, limit: int = 5, **_kwargs: Any) -> str:
         user_id, agent_id, _ = _scope()
         agent_scope = agent_id if agent_id != "*" else None
@@ -197,6 +223,16 @@ def build_memory_tools(memory: MemoryService) -> list[BaseTool]:
             ),
             args_schema=_MemoryBlockArgs,
             coroutine=memory_update_block,
+        ),
+        StructuredTool(
+            name="memory_delete",
+            description=(
+                "删除一条已过时或错误的长期记忆（先用 memory_search 找到"
+                " id）。当用户更正了此前的事实（如换了项目代号、搬了城市）"
+                "时，配合 memory_save 使用：删旧、存新。"
+            ),
+            args_schema=_MemoryDeleteArgs,
+            coroutine=memory_delete,
         ),
         StructuredTool(
             name="knowledge_search",

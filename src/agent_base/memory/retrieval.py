@@ -1,6 +1,6 @@
 """混合检索（M6b）：向量 + BM25 + 时间衰减 + 显著度。
 
-四个信号（可缺失分量自动重归一，总分保持 0..1 可比）：
+四个信号（缺失分量按 0 计，分数为绝对相关度）：
 
 - **向量余弦**——语义召回（同义改写也能命中）；只在查询与候选双方
   都有**同维**向量时参与；
@@ -169,8 +169,9 @@ def _hybrid_scores(
 ) -> list[tuple[float, dict[str, float]]]:
     """混合打分的公共核心（memories 与 doc_chunks 共用）。
 
-    分量缺失（无向量/无关键词命中/无显著度）自动重归一，总分保持
-    0..1 可比。
+    缺失分量按 0 计、总分恒以全部权重为分母——分数是**绝对相关度**：
+    既无关键词命中也无语义证据的候选，天花板只有 recency+salience
+    （≤0.3），检索侧的最低分阈值才能可靠地把纯噪音挡在门外。
     """
     bm25_raw = _Bm25([tokenize(text) for text in texts]).scores(tokenize(query))
     bm25_max = max(bm25_raw, default=0.0)
@@ -190,10 +191,7 @@ def _hybrid_scores(
             if sim is not None:
                 # 余弦可为负（反向语义）：截到 0..1 只保留正向证据。
                 components["vector"] = min(max(sim, 0.0), 1.0)
-        total_weight = sum(_WEIGHTS[name] for name in components)
         score = sum(_WEIGHTS[name] * value for name, value in components.items())
-        if total_weight > 0:
-            score /= total_weight
         results.append((score, components))
     return results
 
@@ -270,6 +268,7 @@ async def recall_memories(
     episodic_ttl_days: int,
     half_life_days: float,
     now: float | None = None,
+    min_score: float = 0.0,
 ) -> list[ScoredMemory]:
     """一次完整召回：取候选 → TTL 过滤 → 混合打分 → top-k + 访问记账。"""
     records = await store.list_memories(user_id, agent_id=agent_id)
@@ -288,6 +287,16 @@ async def recall_memories(
         records, query, query_embedding, now=timestamp, half_life_days=half_life_days
     )
     scored.sort(key=lambda item: item.score, reverse=True)
+    # 最低分门槛：双条件——总分达标，且至少有一个**相关性证据**
+    # （关键词命中或语义相似）。纯 recency+salience 凑数（天花板 0.3）
+    # 的噪音记忆，宁可空手也不召回（UI 实测发现 F3）。
+    if min_score > 0:
+        scored = [
+            item
+            for item in scored
+            if item.score >= min_score
+            and (item.components.get("keyword", 0.0) > 0 or item.components.get("vector", 0.0) > 0)
+        ]
     top = scored[: max(1, top_k)]
     # 访问记账（被召回本身是记忆"还活着"的证据）：失败只记日志。
     try:

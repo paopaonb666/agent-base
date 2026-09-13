@@ -146,6 +146,24 @@ def test_build_model_input_trims_tail_with_budget() -> None:
     assert build_model_input(messages, max_tokens=10**9) == messages
 
 
+def test_build_model_input_keeps_both_injections_on_attachment_turn() -> None:
+    """回归（UI 实测缺陷 F1）：附件轮同时注入记忆块与附件全文，两者都必须保留。"""
+    messages = [
+        _inj("第一轮的旧注入"),  # 历史里的旧注入 → 应被剔除
+        HumanMessage(content="旧问题"),
+        AIMessage(content="旧回答"),
+        SystemMessage(content=MEMORY_CONTEXT_PREFIX + "本轮记忆块"),
+        SystemMessage(content=ATTACHMENT_CONTEXT_PREFIX + "，供参考：\n\n附件全文"),
+        HumanMessage(content="附件说了什么？"),
+    ]
+    model_input = build_model_input(messages, max_tokens=100_000)
+    injected = [m for m in model_input if is_injected_system(m)]
+    assert len(injected) == 2
+    kinds = {str(m.content)[:12] for m in injected}
+    assert any(k.startswith(MEMORY_CONTEXT_PREFIX) for k in kinds), "记忆块被丢弃"
+    assert any(k.startswith(ATTACHMENT_CONTEXT_PREFIX) for k in kinds), "附件块被丢弃"
+
+
 def test_build_model_input_never_splits_tool_pairs() -> None:
     ai_with_tools = AIMessage(
         content="", tool_calls=[{"name": "web_search", "args": {"q": "x"}, "id": "c1"}]

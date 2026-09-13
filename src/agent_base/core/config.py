@@ -144,6 +144,9 @@ class Settings(BaseSettings):
     memory_embedding_timeout_seconds: float = 10.0
     # 召回与注入预算：每轮最多召回的记忆条数与注入上下文的字符预算。
     memory_recall_top_k: int = 6
+    # 召回最低分阈值（0..1）：低于该分数的候选不召回——没有它，毫无
+    # 关联的提问也会按时间/显著度凑满 top_k，弱相关记忆噪音很大。
+    memory_recall_min_score: float = 0.12
     memory_context_max_chars: int = 3000
     # chat 图的模型侧 token 预算（M6d 上下文工程）：超过预算的旧历史被
     # 修剪出"发给模型"的输入（checkpointer 全量历史不动）。这是近似估算
@@ -313,6 +316,13 @@ class Settings(BaseSettings):
         # 必须是启动时的配置错误而不是静默运行时行为。
         if value <= 0:
             raise ValueError(f"{info.field_name} must be > 0, got {value}")
+        return value
+
+    @field_validator("memory_recall_min_score")
+    @classmethod
+    def _validate_memory_min_score(cls, value: float) -> float:
+        if not (0.0 <= value < 1.0):
+            raise ValueError(f"MEMORY_RECALL_MIN_SCORE must be in [0, 1), got {value}")
         return value
 
     @field_validator(
