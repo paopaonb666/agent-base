@@ -29,6 +29,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hashlib
+import hmac
 import logging
 import re
 import time
@@ -190,22 +192,40 @@ def _known_module(rt: AgentRuntime, module: str) -> bool:
     return module in rt.modules or module == SUPERVISOR_MODULE
 
 
-def _memory_user_id(request: Request) -> str:
-    """解析记忆作用域的 user_id（M6）：X-User-Id 头，缺省 "default"。
+def _memory_user_id(request: Request, settings: Settings) -> str:
+    """解析并校验记忆作用域的 user_id（M6 + 安全加固 P0）。
 
-    与 X-Request-ID 同一白名单正则：该值会进记忆表与日志，放行任意
-    字符串等于允许伪造日志行 / 注入脏数据。非法值以 400 拒绝而不是
-    静默替换——调用方应当修自己的头，而不是猜服务端用了什么值。
+    ``X-User-Id`` 头缺省为 "default"；白名单正则与 X-Request-ID 相同
+    （该值进记忆表与日志，放行任意字符串等于允许伪造日志/脏数据），
+    非法值以 400 拒绝而不是静默替换。
+
+    鉴权：user_id 本质是客户端自我声明——配置了 ``MEMORY_AUTH_SECRET``
+    后必须附带 ``X-User-Sig = HMAC-SHA256(user_id, secret)``（hex），
+    否则 401；未配置密钥仅限 development/单机自用（production 且
+    memory_enabled 会在启动时快速失败）。
     """
     raw = request.headers.get("X-User-Id")
     if not raw:
-        return "default"
-    if not _REQUEST_ID_RE.fullmatch(raw):
+        user_id = "default"
+    elif not _REQUEST_ID_RE.fullmatch(raw):
         raise HTTPException(
             status_code=400,
             detail="X-User-Id 非法：仅允许字母/数字/点/下划线/连字符，1-64 字符",
         )
-    return raw
+    else:
+        user_id = raw
+    secret = settings.memory_auth_secret.get_secret_value().strip()
+    if secret:
+        sig = request.headers.get("X-User-Sig") or ""
+        expected = hmac.new(
+            secret.encode("utf-8"), user_id.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            raise HTTPException(
+                status_code=401,
+                detail="X-User-Sig 缺失或不正确：该部署已启用记忆身份鉴权",
+            )
+    return user_id
 
 
 def _require_memory(rt: AgentRuntime) -> MemoryService:
@@ -540,7 +560,7 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         # 按模块划分的 thread id：图共用一个 checkpointer；未划分命名空间
         # 的 id 会把它们的状态混在一起。user_id（M6）进 configurable：
         # 记忆工具经 RunnableConfig 注入读取（M6e）。
-        scope_user_id = _memory_user_id(request)
+        scope_user_id = _memory_user_id(request, runtime.settings)
         config: RunnableConfig = {
             "configurable": {
                 "thread_id": f"{module}:{user_thread_id}",
@@ -763,7 +783,7 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         rt: AgentRuntime = request.app.state.runtime
         if not _known_module(rt, module):
             raise HTTPException(status_code=404, detail=f"unknown module {module!r}")
-        scope = _memory_user_id(request)
+        scope = _memory_user_id(request, rt.settings)
         data = await file.read()
         if not data:
             raise HTTPException(status_code=400, detail="上传文件为空")
@@ -848,7 +868,7 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         """
         rt: AgentRuntime = request.app.state.runtime
         memory = _require_memory(rt)
-        user_id = _memory_user_id(request)
+        user_id = _memory_user_id(request, rt.settings)
         if body.kind not in KNOWN_MEMORY_KINDS:
             raise HTTPException(
                 status_code=400,
@@ -883,7 +903,7 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         """
         rt: AgentRuntime = request.app.state.runtime
         memory = _require_memory(rt)
-        user_id = _memory_user_id(request)
+        user_id = _memory_user_id(request, rt.settings)
         if kind is not None and kind not in KNOWN_MEMORY_KINDS:
             raise HTTPException(
                 status_code=400, detail=f"kind 非法：{kind!r}；允许 {list(KNOWN_MEMORY_KINDS)}"
@@ -942,7 +962,7 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         """列出当前用户的常驻记忆块（M6f；module 缺省查全局块）。"""
         rt: AgentRuntime = request.app.state.runtime
         memory = _require_memory(rt)
-        user_id = _memory_user_id(request)
+        user_id = _memory_user_id(request, rt.settings)
         blocks = await memory.store.list_blocks(user_id, module or "*")
         return {
             "blocks": [
@@ -966,7 +986,7 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         工具同表，版本号递增）。"""
         rt: AgentRuntime = request.app.state.runtime
         memory = _require_memory(rt)
-        user_id = _memory_user_id(request)
+        user_id = _memory_user_id(request, rt.settings)
         agent_id = body.module or "*"
         existing = await memory.store.get_block(user_id, agent_id, label)
         block = MemoryBlock(
@@ -994,7 +1014,7 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         """删除一个常驻记忆块。"""
         rt: AgentRuntime = request.app.state.runtime
         memory = _require_memory(rt)
-        user_id = _memory_user_id(request)
+        user_id = _memory_user_id(request, rt.settings)
         deleted = await memory.store.delete_block(user_id, module or "*", label)
         return {"deleted": deleted}
 
@@ -1003,7 +1023,7 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         """读取当前用户的结构化画像（M6c 形成，M6f 暴露）。"""
         rt: AgentRuntime = request.app.state.runtime
         memory = _require_memory(rt)
-        user_id = _memory_user_id(request)
+        user_id = _memory_user_id(request, rt.settings)
         return {"profile": await memory.get_profile(user_id)}
 
     @app.get("/v1/memory/audit")
@@ -1011,7 +1031,7 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         """记忆系统的操作审计（M6）：抽取/整合/画像/摘要/摄取/手工增删。"""
         rt: AgentRuntime = request.app.state.runtime
         memory = _require_memory(rt)
-        user_id = _memory_user_id(request)
+        user_id = _memory_user_id(request, rt.settings)
         ops = await memory.store.list_ops(user_id, limit=max(1, min(limit, 200)))
         return {
             "ops": [

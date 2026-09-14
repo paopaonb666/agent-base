@@ -81,11 +81,13 @@ async def test_build_memory_service_disabled() -> None:
 
 
 def _runtime(**overrides: object) -> AgentRuntime:
-    """带内存记忆服务的 runtime（HashEmbedding，无外部依赖）。"""
+    """带内存记忆服务与 chat 模块的 runtime（HashEmbedding，无外部依赖）。"""
+    from agent_base.modules.chat.module import ChatModule
+
     rt = AgentRuntime(
         settings=_settings(**overrides),
         llm=ScriptedChatModel([]),
-        modules={},
+        modules={"chat": ChatModule()},
         tools=[],
         checkpointer=InMemorySaver(),
     )
@@ -219,3 +221,63 @@ async def test_memory_blocks_profile_audit_endpoints() -> None:
         assert c.get("/v1/memory/blocks").status_code == 503
         assert c.get("/v1/memory/profile").status_code == 503
         assert c.get("/v1/memory/audit").status_code == 503
+
+
+# ─────────────────────── 记忆身份鉴权（P0 安全加固） ───────────────────────
+
+
+def _user_sig(user_id: str, secret: str) -> str:
+    import hashlib
+    import hmac as hmac_mod
+
+    return hmac_mod.new(secret.encode("utf-8"), user_id.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def test_memory_user_sig_enforced_when_secret_configured() -> None:
+    client = _client(memory_auth_secret="s3cret-key")
+    with client as c:
+        # 未带签名（含缺省用户）→ 401：不能靠"不发头"绕过鉴权。
+        assert c.get("/v1/memory").status_code == 401
+        assert c.get("/v1/memory", headers={"X-User-Id": "alice"}).status_code == 401
+        # 错误签名 → 401。
+        bad = c.get(
+            "/v1/memory",
+            headers={"X-User-Id": "alice", "X-User-Sig": "0" * 64},
+        )
+        assert bad.status_code == 401
+        # 正确签名 → 200，且作用域隔离仍然生效。
+        good = c.get(
+            "/v1/memory",
+            headers={"X-User-Id": "alice", "X-User-Sig": _user_sig("alice", "s3cret-key")},
+        )
+        assert good.status_code == 200
+        # default 用户用自己的签名也能通过。
+        default_ok = c.get(
+            "/v1/memory", headers={"X-User-Sig": _user_sig("default", "s3cret-key")}
+        )
+        assert default_ok.status_code == 200
+
+
+def test_memory_user_sig_applies_to_invoke_scope() -> None:
+    """invoke 的记忆作用域同样受签名保护（401 在进入 SSE 之前返回）。"""
+    from langchain_core.messages import AIMessage
+
+    rt = _runtime(memory_auth_secret="s3cret-key")
+    rt.llm = ScriptedChatModel([AIMessage(content="ok")])  # 对话轮的脚本回复
+    client = TestClient(create_app(runtime=rt))
+    with client as c:
+        denied = c.post("/v1/agents/chat/invoke", json={"message": "hi"})
+        assert denied.status_code == 401
+        allowed = c.post(
+            "/v1/agents/chat/invoke",
+            json={"message": "hi"},
+            headers={"X-User-Id": "alice", "X-User-Sig": _user_sig("alice", "s3cret-key")},
+        )
+        assert allowed.status_code == 200
+        assert "done" in allowed.text
+
+
+def test_memory_user_sig_not_required_without_secret() -> None:
+    """未配置密钥（development 单机自用）→ 裸 X-User-Id 照常工作。"""
+    with _client() as c:
+        assert c.get("/v1/memory", headers={"X-User-Id": "alice"}).status_code == 200

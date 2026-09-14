@@ -120,7 +120,21 @@ def test_production_without_key_fails_fast() -> None:
 
 
 def test_production_with_key_is_ok() -> None:
-    Settings(env="production", llm_api_key="sk-1").ensure_production_ready()
+    # memory_enabled 默认开启：生产必须配置 MEMORY_AUTH_SECRET（P0）。
+    Settings(
+        env="production", llm_api_key="sk-1", memory_auth_secret="sig-secret"
+    ).ensure_production_ready()
+
+
+def test_production_memory_requires_auth_secret() -> None:
+    """memory 开着却没有鉴权密钥 → 生产拒绝启动（记忆隔离靠签名）。"""
+    settings = Settings(_env_file=None, env="production", llm_api_key="sk-1")
+    with pytest.raises(SettingsError, match="MEMORY_AUTH_SECRET"):
+        settings.ensure_production_ready()
+    # 显式关闭记忆系统则豁免。
+    Settings(
+        _env_file=None, env="production", llm_api_key="sk-1", memory_enabled=False
+    ).ensure_production_ready()
 
 
 def test_development_without_key_is_lenient() -> None:
@@ -157,6 +171,7 @@ def test_production_mysql_requires_connection_fields() -> None:
         _env_file=None,
         env="production",
         llm_api_key="sk-1",
+        memory_auth_secret="sig-secret",  # 先通过记忆鉴权检查，专注测 mysql 分支
         checkpointer_backend="mysql",
         checkpointer_mysql_password="",
     )
@@ -169,6 +184,7 @@ def test_production_mysql_complete_is_ok() -> None:
         _env_file=None,
         env="production",
         llm_api_key="sk-1",
+        memory_auth_secret="sig-secret",
         checkpointer_backend="mysql",
         checkpointer_mysql_user="app",
         checkpointer_mysql_database="agent_base",

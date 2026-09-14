@@ -170,6 +170,13 @@ class Settings(BaseSettings):
     # 文档知识库分块（M6e）：按字符数分块 + 相邻块重叠。
     memory_doc_chunk_chars: int = 800
     memory_doc_chunk_overlap: int = 100
+    # 记忆身份鉴权（安全加固 P0）：X-User-Id 是客户端自我声明，配置了
+    # 密钥后，所有带记忆作用域的请求必须附带
+    # ``X-User-Sig = HMAC-SHA256(user_id, secret)`` 的十六进制签名，
+    # 否则 401——否则任何人可以冒充任何用户读写其记忆。留空时
+    # development 接受裸 X-User-Id（本地开发/单机自用）；production
+    # 且 memory_enabled 时强制要求配置（快速失败）。
+    memory_auth_secret: SecretStr = SecretStr("")
 
     # -- 环境 --------------------------------------------------------
     env: str = "development"
@@ -382,6 +389,12 @@ class Settings(BaseSettings):
             raise SettingsError(
                 "LLM_API_KEY is required in production (ENV=production); "
                 "refusing to start with an empty key"
+            )
+        if self.memory_enabled and not self.memory_auth_secret.get_secret_value().strip():
+            raise SettingsError(
+                "MEMORY_AUTH_SECRET is required in production when MEMORY_ENABLED=true: "
+                "memory isolation is enforced via signed X-User-Id "
+                "(clients must send X-User-Sig = HMAC-SHA256(X-User-Id, secret))"
             )
         if self.checkpointer_backend == "mysql":
             missing = [
