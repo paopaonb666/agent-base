@@ -19,7 +19,7 @@ import logging
 import math
 import re
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -27,9 +27,9 @@ from agent_base.memory.store import PROFILE_ID_PREFIX, DocChunk, MemoryRecord, d
 
 logger = logging.getLogger(__name__)
 
-# 混合权重（和为 1）。向量是语义召回的主力，BM25 兜关键词，时间与
-# 显著度做轻量排序先验——刻意没有做成配置：调权是检索质量工程，参数
-# 面暴露得越多越难推理，先以代码常量锁死（改动走评审）。
+# 混合权重默认值（和为 1）。向量是语义召回的主力，BM25 兜关键词，
+# 时间与显著度做轻量排序先验。M6 加固后可经 MEMORY_WEIGHT_* 配置覆盖
+# （Settings 校验和与范围）；调权是检索质量工程，改动应有评测依据。
 W_VECTOR = 0.40
 W_KEYWORD = 0.30
 W_RECENCY = 0.15
@@ -166,6 +166,7 @@ def _hybrid_scores(
     *,
     now: float,
     half_life_days: float,
+    weights: Mapping[str, float] | None = None,
 ) -> list[tuple[float, dict[str, float]]]:
     """混合打分的公共核心（memories 与 doc_chunks 共用）。
 
@@ -173,6 +174,7 @@ def _hybrid_scores(
     既无关键词命中也无语义证据的候选，天花板只有 recency+salience
     （≤0.3），检索侧的最低分阈值才能可靠地把纯噪音挡在门外。
     """
+    w = weights or _WEIGHTS
     bm25_raw = _Bm25([tokenize(text) for text in texts]).scores(tokenize(query))
     bm25_max = max(bm25_raw, default=0.0)
     results: list[tuple[float, dict[str, float]]] = []
@@ -191,7 +193,7 @@ def _hybrid_scores(
             if sim is not None:
                 # 余弦可为负（反向语义）：截到 0..1 只保留正向证据。
                 components["vector"] = min(max(sim, 0.0), 1.0)
-        score = sum(_WEIGHTS[name] * value for name, value in components.items())
+        score = sum(w[name] * value for name, value in components.items())
         results.append((score, components))
     return results
 
@@ -203,6 +205,7 @@ def score_memories(
     *,
     now: float,
     half_life_days: float,
+    weights: Mapping[str, float] | None = None,
 ) -> list[ScoredMemory]:
     """对记忆候选集统一打分。"""
     if not records:
@@ -216,6 +219,7 @@ def score_memories(
         query_embedding,
         now=now,
         half_life_days=half_life_days,
+        weights=weights,
     )
     return [
         ScoredMemory(record=record, score=score, components=components)
@@ -230,6 +234,7 @@ def score_chunks(
     *,
     now: float,
     half_life_days: float,
+    weights: Mapping[str, float] | None = None,
 ) -> list[ScoredChunk]:
     """对知识库分块统一打分（分块没有显著度，其余分量一致）。"""
     if not chunks:
@@ -243,6 +248,7 @@ def score_chunks(
         query_embedding,
         now=now,
         half_life_days=half_life_days,
+        weights=weights,
     )
     return [
         ScoredChunk(chunk=chunk, score=score, components=components)
@@ -269,6 +275,7 @@ async def recall_memories(
     half_life_days: float,
     now: float | None = None,
     min_score: float = 0.0,
+    weights: Mapping[str, float] | None = None,
 ) -> list[ScoredMemory]:
     """一次完整召回：取候选 → TTL 过滤 → 混合打分 → top-k + 访问记账。"""
     records = await store.list_memories(user_id, agent_id=agent_id)
@@ -284,7 +291,12 @@ async def recall_memories(
         if vectors:
             query_embedding = vectors[0]
     scored = score_memories(
-        records, query, query_embedding, now=timestamp, half_life_days=half_life_days
+        records,
+        query,
+        query_embedding,
+        now=timestamp,
+        half_life_days=half_life_days,
+        weights=weights,
     )
     scored.sort(key=lambda item: item.score, reverse=True)
     # 最低分门槛：双条件——总分达标，且至少有一个**相关性证据**

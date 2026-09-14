@@ -176,6 +176,15 @@ GET    /v1/memory/profile         # 当前用户的结构化画像
 GET    /v1/memory/audit           # 记忆操作审计（抽取/整合/画像/摘要/摄取…）
 ```
 
+**身份与安全**：`X-User-Id` 是客户端自我声明，生产环境（`ENV=production`）且
+记忆开启时**必须**配置 `MEMORY_AUTH_SECRET`，所有记忆作用域请求需附带
+`X-User-Sig = HMAC-SHA256(X-User-Id, secret)`（缺省用户也不例外），否则 401；
+签名生成：`python scripts/memory_user_sig.py --user-id alice --secret <密钥>`。
+浏览器不持有密钥——公网多用户部署请走服务端代理或真实身份体系。
+记忆删除为软/硬两级：`PATCH /v1/memory/{id}` 置 `status=archived` 是软删除
+（保留数据、退出召回），`DELETE` 是硬删除；更换 embedding 模型/维度后运行
+`python scripts/memory_backfill_embeddings.py` 为历史记忆回填向量。
+
 关键配置（完整清单见 `.env.example` 的「记忆系统」节）：`MEMORY_ENABLED` 总开关；
 `MEMORY_EMBEDDING_API_KEY`（openai 兼容 `/embeddings`，留空降级关键词检索）；
 `MEMORY_CAPTURE_ENABLED` / `MEMORY_CAPTURE_EVERY_TURNS`（形成频率）；

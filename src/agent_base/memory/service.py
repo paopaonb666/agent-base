@@ -14,6 +14,8 @@ M6d 追加上下文组装（``compose_context``）。
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import time
 import uuid
@@ -49,6 +51,48 @@ def new_memory_id() -> str:
     return uuid.uuid4().hex[:32]
 
 
+def _trim_profile_to_chars(profile: dict[str, Any], max_chars: int) -> dict[str, Any]:
+    """画像结构级硬截断：从最后一个分节倒序逐条丢弃条目直到序列化
+    长度达标；仍超长（存在巨型单条）则截断字符串值。输出永远是合法
+    JSON——绝不让画像把注入预算缓慢撑爆。"""
+    trimmed: dict[str, Any] = {}
+    for key, value in profile.items():
+        if isinstance(value, list):
+            trimmed[key] = list(value)
+        elif isinstance(value, dict):
+            trimmed[key] = dict(value)
+        else:
+            trimmed[key] = value
+
+    def _length() -> int:
+        return len(json.dumps(trimmed, ensure_ascii=False))
+
+    while _length() > max_chars:
+        last_key = next(
+            (
+                key
+                for key in reversed(list(trimmed))
+                if isinstance(trimmed[key], list) and trimmed[key]
+            ),
+            None,
+        )
+        if last_key is None:
+            break
+        trimmed[last_key].pop()
+        if not trimmed[last_key]:
+            del trimmed[last_key]
+    while _length() > max_chars:
+        str_key: str | None = next(
+            (k for k, v in trimmed.items() if isinstance(v, str) and v),
+            None,
+        )
+        if str_key is None:
+            # 只剩数字/空结构的极端兜底：几乎不可达，但绝不抛错。
+            return {"truncated": True}
+        trimmed[str_key] = trimmed[str_key][: max(1, max_chars // 2)]
+    return trimmed
+
+
 def chunk_text(text: str, *, chunk_chars: int, overlap: int) -> list[str]:
     """按字符窗口把文档文本切块（相邻块带重叠，保持跨块语义连续）。
 
@@ -82,6 +126,9 @@ class MemoryService:
         self.pipeline: MemoryPipeline | None = (
             MemoryPipeline(llm, settings, self) if llm is not None else None
         )
+        # 每用户的整合锁（锐评 #10）：同一用户并发轮次的后台捕获会互相
+        # 看不到对方未写入的记忆，导致重复 ADD——串行化同一用户的捕获。
+        self._capture_locks: dict[str, asyncio.Lock] = {}
 
     async def record_op(
         self,
@@ -242,6 +289,7 @@ class MemoryService:
             episodic_ttl_days=self._settings.memory_episodic_ttl_days,
             half_life_days=self._settings.memory_time_decay_half_life_days,
             min_score=self._settings.memory_recall_min_score,
+            weights=self._hybrid_weights(),
         )
         MEMORY_METRICS.observe("search", "ok", time.perf_counter() - started)
         return results
@@ -328,6 +376,7 @@ class MemoryService:
             query_embedding,
             now=time.time(),
             half_life_days=self._settings.memory_time_decay_half_life_days,
+            weights=self._hybrid_weights(),
         )
         scored.sort(key=lambda item: item.score, reverse=True)
         min_score = self._settings.memory_recall_min_score
@@ -341,21 +390,73 @@ class MemoryService:
             scored = [item for item in scored if item.score >= min_score and _has_evidence(item)]
         return scored[: max(1, top_k or self._settings.memory_recall_top_k)]
 
+    def _hybrid_weights(self) -> dict[str, float]:
+        """从 settings 读混合权重（锐评 #4：可配置化，默认与 M6b 一致）。"""
+        return {
+            "vector": self._settings.memory_weight_vector,
+            "keyword": self._settings.memory_weight_keyword,
+            "recency": self._settings.memory_weight_recency,
+            "salience": self._settings.memory_weight_salience,
+        }
+
     # -- 生命周期 -----------------------------------------------------------------
     async def health_probe(self) -> str:
-        """对 /health 的轻量探针：能读审计表即视为存储可用。"""
+        """对 /health 的探针（锐评 #19）：存储可读 + embedding 可达。
+
+        存储不可读 = error；embedding 端点不可达 = degraded（检索自动
+        降级 BM25，服务仍在但能力受损）。embedding 探测带 TTL 缓存，
+        不会被 LB 轮询打爆。
+        """
         try:
             await self.store.list_ops(limit=1)
         except Exception:
             logger.warning("memory: health probe failed", exc_info=True)
             return "error"
+        probe = getattr(self.embedder, "probe", None)
+        if probe is not None and await probe() == "error":
+            return "degraded"
         return "ok"
+
+    async def backfill_embeddings(self, *, batch: int = 32) -> int:
+        """为向量缺失/维度不符的 active 记忆回填 embedding（锐评 #3）。
+
+        更换 embedding 模型/维度后运行（scripts/memory_backfill_embeddings.py）。
+        回填保持原 updated_at——这是维护操作，不该刷高召回的时间衰减分。
+        embedding 未配置或中途不可用都会安全终止并返回已回填数。
+        """
+        if self.embedder.dims is None:
+            logger.info("memory: 未配置 embedding，回填无事可做")
+            return 0
+        total = 0
+        while True:
+            records = await self.store.list_memories_needing_embedding(
+                self.embedder.dims, batch
+            )
+            if not records:
+                break
+            vectors = await self.embedder.embed([record.content for record in records])
+            if vectors is None:
+                logger.warning(
+                    "memory: embedding 服务不可用，回填中断（已回填 %s 条）", total
+                )
+                break
+            for record, vector in zip(records, vectors, strict=True):
+                await self.store.upsert_memory(
+                    replace(
+                        record,
+                        embedding=encode_embedding(vector),
+                        embedding_dim=self.embedder.dims,
+                    )
+                )
+                total += 1
+            if len(records) < batch:
+                break
+        logger.info("memory: 向量回填完成，共 %s 条", total)
+        return total
 
     # -- 用户画像（M6c；memories 表里的确定性记录） -------------------------------
     async def get_profile(self, user_id: str) -> dict[str, Any] | None:
         """读取结构化用户画像（JSON dict）；不存在或畸形返回 None。"""
-        import json
-
         record = await self.store.get_memory(profile_memory_id(user_id))
         if record is None:
             return None
@@ -370,12 +471,14 @@ class MemoryService:
 
         画像不需要向量——它由上下文组装整体注入而不是按相似度召回，
         跳过 embedding 省一次 API 调用；检索侧已按 id 前缀排除画像。
+        保存前做结构级硬截断（锐评漏项）：prompt 里的"600 字以内"只是
+        软约束，这里保证序列化长度不超过 MEMORY_PROFILE_MAX_CHARS，
+        防止画像随对话缓慢膨胀注入预算。
         """
-        import json
-
         memory_id = profile_memory_id(user_id)
         existing = await self.store.get_memory(memory_id)
         now = time.time()
+        profile = _trim_profile_to_chars(profile, self._settings.memory_profile_max_chars)
         await self.store.upsert_memory(
             MemoryRecord(
                 memory_id=memory_id,
@@ -410,18 +513,20 @@ class MemoryService:
         )
         if not transcript.strip():
             return None
-        try:
-            return await self.pipeline.capture_turn(
-                user_id=user_id,
-                agent_id=agent_id,
-                thread_id=thread_id,
-                transcript=transcript,
-                human_count=human_count,
-            )
-        except Exception:
-            # 管线内部已逐步失败安全；这里兜底防任何漏网异常干扰调用方。
-            logger.exception("memory: capture_turn 意外失败")
-            return None
+        lock = self._capture_locks.setdefault(user_id, asyncio.Lock())
+        async with lock:
+            try:
+                return await self.pipeline.capture_turn(
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    thread_id=thread_id,
+                    transcript=transcript,
+                    human_count=human_count,
+                )
+            except Exception:
+                # 管线内部已逐步失败安全；这里兜底防任何漏网异常干扰调用方。
+                logger.exception("memory: capture_turn 意外失败")
+                return None
 
     async def compose_context(
         self, *, user_id: str, agent_id: str, thread_id: str, query: str

@@ -205,6 +205,10 @@ class MemoryStore(Protocol):
 
     async def touch_memories(self, memory_ids: Sequence[str]) -> None: ...
 
+    async def list_memories_needing_embedding(
+        self, dims: int, limit: int = 100
+    ) -> list[MemoryRecord]: ...
+
     # -- memory blocks -------------------------------------------------------
     async def upsert_block(self, block: MemoryBlock) -> None: ...
 
@@ -690,6 +694,23 @@ class _SqlMemoryStoreBase:
             (self._to_sql_ts(time.time()), *memory_ids),
         )
 
+    async def list_memories_needing_embedding(
+        self, dims: int, limit: int = 100
+    ) -> list[MemoryRecord]:
+        """回填查询：active 且向量缺失/维度不符的非画像记忆（锐评 #3）。
+
+        画像记录（profile:*）刻意排除——它们整体注入不走向量召回，且
+        永远没有向量，纳入会让回填死循环。
+        """
+        rows = await self._fetch_all(
+            f"SELECT {self._MEMORY_COLUMNS} FROM memories WHERE status = 'active'"
+            " AND memory_id NOT LIKE 'profile:%'"
+            " AND (embedding IS NULL OR embedding_dim IS NULL OR embedding_dim != ?)"
+            " ORDER BY updated_at DESC LIMIT ?",
+            (dims, max(1, limit)),
+        )
+        return [self._record_from_row(row) for row in rows]
+
     # -- memory blocks -----------------------------------------------------------
     async def upsert_block(self, block: MemoryBlock) -> None:
         await self._execute(
@@ -923,6 +944,23 @@ class MemoryMemoryStore:
                 access_count=record.access_count + 1,
             )
 
+    async def list_memories_needing_embedding(
+        self, dims: int, limit: int = 100
+    ) -> list[MemoryRecord]:
+        matched = [
+            record
+            for record in self._memories.values()
+            if record.status == "active"
+            and not record.memory_id.startswith(PROFILE_ID_PREFIX)
+            and (
+                record.embedding is None
+                or record.embedding_dim is None
+                or record.embedding_dim != dims
+            )
+        ]
+        matched.sort(key=lambda r: r.updated_at, reverse=True)
+        return matched[: max(1, limit)]
+
     async def upsert_block(self, block: MemoryBlock) -> None:
         self._blocks[(block.user_id, block.agent_id, block.label)] = block
 
@@ -1041,27 +1079,36 @@ class SqliteMemoryStore(_SqlMemoryStoreBase):
 
 
 class MysqlMemoryStore(_SqlMemoryStoreBase):
-    """MySQL 记忆表：aiomysql 按操作连接（写入频率低，无需连接池）。"""
+    """MySQL 记忆表：aiomysql 连接池（锐评 #2——每操作建连在高负载下
+
+    开销显著；记忆读写是每轮一到两次的稳定流量，小池即可，池在首次
+    操作时惰性创建。
+    """
 
     _PLACEHOLDER = "%s"
     _OPS_TIEBREAK = "seq DESC"
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
+        self._pool: Any = None
         self._table_ready = False
 
-    async def _connect(self) -> Any:
-        import aiomysql  # type: ignore[import-untyped]
+    async def _get_pool(self) -> Any:
+        if self._pool is None:
+            import aiomysql  # type: ignore[import-untyped]
 
-        s = self._settings
-        return await aiomysql.connect(
-            host=s.checkpointer_mysql_host,
-            port=s.checkpointer_mysql_port,
-            user=s.checkpointer_mysql_user,
-            password=s.checkpointer_mysql_password.get_secret_value(),
-            db=s.checkpointer_mysql_database,
-            autocommit=True,
-        )
+            s = self._settings
+            self._pool = await aiomysql.create_pool(
+                host=s.checkpointer_mysql_host,
+                port=s.checkpointer_mysql_port,
+                user=s.checkpointer_mysql_user,
+                password=s.checkpointer_mysql_password.get_secret_value(),
+                db=s.checkpointer_mysql_database,
+                minsize=1,
+                maxsize=max(1, s.memory_mysql_pool_size),
+                autocommit=True,
+            )
+        return self._pool
 
     async def _ensure_tables(self, cursor: Any) -> None:
         if self._table_ready:
@@ -1071,24 +1118,25 @@ class MysqlMemoryStore(_SqlMemoryStoreBase):
         self._table_ready = True
 
     async def _execute(self, sql: str, params: Sequence[Any] = ()) -> int:
-        conn = await self._connect()
-        try:
-            async with conn.cursor() as cur:
-                await self._ensure_tables(cur)
-                await cur.execute(self._sql(sql), tuple(params))
-                return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
-        finally:
-            conn.close()
+        pool = await self._get_pool()
+        async with pool.acquire() as conn, conn.cursor() as cur:
+            await self._ensure_tables(cur)
+            await cur.execute(self._sql(sql), tuple(params))
+            return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
     async def _fetch_all(self, sql: str, params: Sequence[Any] = ()) -> list[tuple[Any, ...]]:
-        conn = await self._connect()
-        try:
-            async with conn.cursor() as cur:
-                await self._ensure_tables(cur)
-                await cur.execute(self._sql(sql), tuple(params))
-                return list(await cur.fetchall())
-        finally:
-            conn.close()
+        pool = await self._get_pool()
+        async with pool.acquire() as conn, conn.cursor() as cur:
+            await self._ensure_tables(cur)
+            await cur.execute(self._sql(sql), tuple(params))
+            return list(await cur.fetchall())
+
+    async def aclose(self) -> None:
+        """归还并关闭连接池（MemoryService.aclose 经 getattr 调用）。"""
+        if self._pool is not None:
+            self._pool.close()
+            await self._pool.wait_closed()
+            self._pool = None
 
     def _to_sql_ts(self, seconds: float) -> Any:
         return datetime.fromtimestamp(seconds)

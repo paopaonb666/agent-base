@@ -89,6 +89,7 @@ class OpenAICompatibleEmbedding:
         self._owns_client = client is None
         self._blocked_until = 0.0
         self._dims_warned = False
+        self._probe_result: tuple[float, str] | None = None
 
     async def _http(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -158,6 +159,30 @@ class OpenAICompatibleEmbedding:
                 self.dims,
                 actual,
             )
+
+    async def probe(self) -> str:
+        """轻量可达性探测（/health 用，锐评 #19）。
+
+        与 LLM 探活同一语义：任何 HTTP 应答都算 ok（网络可达即证明），
+        配额/鉴权不属于健康判定。结果缓存 60s——/health 会被负载均衡
+        轮询，不能每次都打真实网络。
+        """
+        now = time.monotonic()
+        if self._probe_result is not None and now - self._probe_result[0] < 60.0:
+            return self._probe_result[1]
+        status = "error"
+        try:
+            client = await self._http()
+            await client.get(
+                f"{self._base_url}/models",
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                timeout=self._timeout_seconds,
+            )
+            status = "ok"
+        except httpx.HTTPError:
+            logger.warning("memory: embedding 端点探活失败 %s", self._base_url)
+        self._probe_result = (now, status)
+        return status
 
     async def aclose(self) -> None:
         if self._owns_client and self._client is not None:

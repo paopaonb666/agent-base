@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 from typing import Annotated
 
-from pydantic import Field, SecretStr, ValidationInfo, field_validator
+from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 # 基座知道如何装配的 openai 兼容 provider。它们共用同一个 ChatOpenAI
@@ -87,6 +87,14 @@ class Settings(BaseSettings):
     checkpointer_mysql_password: SecretStr = SecretStr("")
     checkpointer_mysql_database: str = "agent_base"
 
+    # 记忆表 MySQL 连接池（锐评 #2）：memory store 每次操作从池里取
+    # 连接，不再每操作建连/关连。小池即可——记忆读写的频率是每轮对话
+    # 一到两次，不是每 token。
+    memory_mysql_pool_size: int = 5
+    # 用户画像注入的硬截断上限（字符，锐评漏项）：prompt 里"600 字以内"
+    # 只是软约束，保存时做结构级硬截断兜底，防止画像缓慢膨胀注入预算。
+    memory_profile_max_chars: int = 1500
+
     # -- 工具池（阶段 3） ------------------------------------------------
     # 每次工具执行的挂钟时间预算，由池的包装器强制执行。
     tool_timeout_seconds: float = 30.0
@@ -147,6 +155,13 @@ class Settings(BaseSettings):
     # 召回最低分阈值（0..1）：低于该分数的候选不召回——没有它，毫无
     # 关联的提问也会按时间/显著度凑满 top_k，弱相关记忆噪音很大。
     memory_recall_min_score: float = 0.12
+    # 混合检索权重（锐评 #4）：四分量分别对应向量余弦/BM25/时间衰减/
+    # 显著度，和必须为 1（误差 0.01）。调权是检索质量工程，改动应有
+    # 评测依据；默认与 M6b 的代码常量一致。
+    memory_weight_vector: float = 0.40
+    memory_weight_keyword: float = 0.30
+    memory_weight_recency: float = 0.15
+    memory_weight_salience: float = 0.15
     memory_context_max_chars: int = 3000
     # chat 图的模型侧 token 预算（M6d 上下文工程）：超过预算的旧历史被
     # 修剪出"发给模型"的输入（checkpointer 全量历史不动）。这是近似估算
@@ -316,6 +331,8 @@ class Settings(BaseSettings):
         "memory_context_max_tokens",
         "memory_extraction_max_input_chars",
         "memory_doc_chunk_chars",
+        "memory_mysql_pool_size",
+        "memory_profile_max_chars",
     )
     @classmethod
     def _validate_memory_positive_ints(cls, value: int, info: ValidationInfo) -> int:
@@ -331,6 +348,33 @@ class Settings(BaseSettings):
         if not (0.0 <= value < 1.0):
             raise ValueError(f"MEMORY_RECALL_MIN_SCORE must be in [0, 1), got {value}")
         return value
+
+    @field_validator(
+        "memory_weight_vector",
+        "memory_weight_keyword",
+        "memory_weight_recency",
+        "memory_weight_salience",
+    )
+    @classmethod
+    def _validate_memory_weight(cls, value: float, info: ValidationInfo) -> float:
+        if not (0.0 <= value <= 1.0):
+            raise ValueError(f"{info.field_name} must be in [0, 1], got {value}")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_memory_weights_sum(self) -> Settings:
+        weights = (
+            self.memory_weight_vector,
+            self.memory_weight_keyword,
+            self.memory_weight_recency,
+            self.memory_weight_salience,
+        )
+        if abs(sum(weights) - 1.0) > 0.01:
+            raise ValueError(
+                f"memory hybrid weights must sum to 1.0 (±0.01), got {sum(weights)} "
+                f"from {weights}"
+            )
+        return self
 
     @field_validator(
         "memory_embedding_timeout_seconds", "memory_time_decay_half_life_days"

@@ -342,3 +342,47 @@ async def test_mysql_store_semantics() -> None:
         async with cleanup.cursor() as cur:
             await cur.execute(f"DROP DATABASE IF EXISTS `{db}`")
         cleanup.close()
+
+
+async def _check_needing_embedding(store: MemoryMemoryStore | SqliteMemoryStore) -> None:
+    """回填查询只返回 active、非画像、向量缺失或维度不符的记录。"""
+    stale = _record(
+        memory_id="stale-dim", embedding=encode_embedding([1.0]), embedding_dim=1
+    )
+    missing = _record(memory_id="no-vec", embedding=None, embedding_dim=None)
+    fresh = _record(
+        memory_id="ok-vec",
+        embedding=encode_embedding([0.1, 0.2, 0.3]),
+        embedding_dim=3,
+    )
+    archived_no_vec = _record(memory_id="archived", status="archived", embedding=None)
+    await store.upsert_memory(stale)
+    await store.upsert_memory(missing)
+    await store.upsert_memory(fresh)
+    await store.upsert_memory(archived_no_vec)
+    from agent_base.memory.store import MemoryRecord, profile_memory_id
+
+    await store.upsert_memory(
+        MemoryRecord(
+            memory_id=profile_memory_id("alice"),
+            user_id="alice",
+            agent_id="*",
+            kind="semantic",
+            content="画像",
+            tags=["profile"],
+        )
+    )
+    needed = await store.list_memories_needing_embedding(3)
+    assert {r.memory_id for r in needed} == {"stale-dim", "no-vec"}
+
+
+async def test_list_memories_needing_embedding_filter_in_memory() -> None:
+    await _check_needing_embedding(MemoryMemoryStore())
+
+
+async def test_list_memories_needing_embedding_filter_sqlite(tmp_path: Path) -> None:
+    store = await SqliteMemoryStore.create(str(tmp_path / "bf.db"))
+    try:
+        await _check_needing_embedding(store)
+    finally:
+        await store.aclose()

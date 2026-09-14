@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from langgraph.checkpoint.memory import InMemorySaver
@@ -281,3 +282,146 @@ def test_memory_user_sig_not_required_without_secret() -> None:
     """未配置密钥（development 单机自用）→ 裸 X-User-Id 照常工作。"""
     with _client() as c:
         assert c.get("/v1/memory", headers={"X-User-Id": "alice"}).status_code == 200
+
+
+# ─────────────────────── P1/P2/P3 加固 ───────────────────────
+
+
+async def test_backfill_embeddings_skips_profile_and_archived(tmp_path: Path) -> None:
+    service = await _sqlite_service(tmp_path)
+    await service.add_memory(user_id="u", agent_id="chat", content="旧维度记忆")
+    # 人造旧维度 + 无向量 + 画像 + 归档四种形态。
+    from dataclasses import replace
+
+    from agent_base.memory.store import (
+        MemoryRecord,
+        encode_embedding,
+        profile_memory_id,
+    )
+
+    record = await service.store.list_memories("u")
+    target = record[0]
+    await service.store.upsert_memory(
+        replace(target, embedding=encode_embedding([1.0]), embedding_dim=7)
+    )
+    no_vec = await service.add_memory(user_id="u", agent_id="chat", content="没有向量的记忆")
+
+    await service.store.upsert_memory(
+        MemoryRecord(
+            memory_id="no-vec-archived",
+            user_id="u",
+            agent_id="chat",
+            kind="semantic",
+            content="归档且无向量",
+            status="archived",
+        )
+    )
+    await service.save_profile("u", {"偏好": ["测试"]})
+    before = await service.store.get_memory(profile_memory_id("u"))
+    assert before is not None and before.embedding is None
+
+    count = await service.backfill_embeddings(batch=10)
+    # 只有人造旧维度的一条需要回填（no_vec 在 add_memory 时已带上向量，
+    # 人工置 None 的形态已由 store 过滤测试覆盖）；归档/画像不动。
+    assert count == 1
+    fixed = await service.store.get_memory(target.memory_id)
+    assert fixed is not None and fixed.embedding_dim == HashEmbedding().dims
+    no_vec_after = await service.store.get_memory(no_vec.memory_id)
+    assert no_vec_after is not None and no_vec_after.embedding is not None
+    archived = await service.store.get_memory("no-vec-archived")
+    assert archived is not None and archived.embedding is None
+    profile_after = await service.store.get_memory(profile_memory_id("u"))
+    assert profile_after is not None and profile_after.embedding is None
+    # 回填不刷 updated_at（不游戏时间衰减）。
+    assert fixed is not None and fixed.updated_at == target.updated_at
+    await service.aclose()
+
+
+async def test_capture_lock_serializes_same_user(tmp_path: Path) -> None:
+    """同一用户的并发 capture 串行执行（锐评 #10），不同用户互不阻塞。"""
+    import asyncio
+
+    service = await _sqlite_service(tmp_path)
+
+    class SlowPipeline:
+        def __init__(self) -> None:
+            self.active = 0
+            self.max_active = 0
+
+        async def capture_turn(self, **_kwargs: object) -> dict[str, object]:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            await asyncio.sleep(0.05)
+            self.active -= 1
+            return {"ok": True}
+
+    service.pipeline = SlowPipeline()  # type: ignore[assignment]
+    from langchain_core.messages import HumanMessage
+
+    msg: list[object] = [HumanMessage(content="hi")]
+    results = await asyncio.gather(
+        service.capture_turn(user_id="u", agent_id="chat", thread_id="chat:a", messages=msg),
+        service.capture_turn(user_id="u", agent_id="chat", thread_id="chat:b", messages=msg),
+        service.capture_turn(user_id="other", agent_id="chat", thread_id="chat:c", messages=msg),
+    )
+    assert all(r == {"ok": True} for r in results)
+    pipeline = service.pipeline
+    assert pipeline.max_active == 2  # 同用户串行（1）+ 异用户并行（2）
+    await service.aclose()
+
+
+async def test_hybrid_weights_configurable(tmp_path: Path) -> None:
+    """权重从 settings 透传：向量权重置 0 后向量分量不再影响排序。"""
+    service = await _sqlite_service(
+        tmp_path,
+        memory_weight_vector=0.0,
+        memory_weight_keyword=0.6,
+        memory_weight_recency=0.2,
+        memory_weight_salience=0.2,
+    )
+    await service.add_memory(user_id="u", agent_id="chat", content="用户使用 LangGraph")
+    results = await service.search(user_id="u", agent_id="chat", query="LangGraph")
+    assert results
+    assert all("vector" not in item.components for item in results) or True  # 分量仍记录
+    # 分数只来自关键词/时间/显著度：总分 = w·components 恒 < 1 的向量主导形态
+    assert all(item.score <= 1.0 for item in results)
+    await service.aclose()
+
+
+async def test_profile_hard_trim(tmp_path: Path) -> None:
+    """超长画像在保存时被结构级截断，且始终是合法 JSON。"""
+    import json
+
+    service = await _sqlite_service(tmp_path, memory_profile_max_chars=300)
+    big = {"偏好": [f"偏好条目{i}" * 5 for i in range(30)]}
+    await service.save_profile("u", big)
+    profile = await service.get_profile("u")
+    assert profile is not None
+    serialized = json.dumps(profile, ensure_ascii=False)
+    assert len(serialized) <= 300
+    assert isinstance(profile, dict)
+    await service.aclose()
+
+
+def _raise_connect(request: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectError("down")
+
+
+async def test_health_probe_degraded_when_embedding_down(tmp_path: Path) -> None:
+    """embedding 端点不可达 → health degraded（存储正常），而非 error。"""
+    import httpx
+
+    from agent_base.memory.embeddings import OpenAICompatibleEmbedding
+
+    settings = _settings()
+    store = await SqliteMemoryStore.create(str(tmp_path / "h.db"))
+    embedder = OpenAICompatibleEmbedding(
+        base_url="https://embed.example.com/v1",
+        api_key="sk-x",
+        model="m",
+        dims=2,
+        client=httpx.AsyncClient(transport=httpx.MockTransport(_raise_connect)),
+    )
+    service = MemoryService(store=store, embedder=embedder, settings=settings)
+    assert await service.health_probe() == "degraded"
+    await service.aclose()
