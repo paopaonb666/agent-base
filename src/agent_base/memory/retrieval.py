@@ -19,6 +19,7 @@ import logging
 import math
 import re
 import time
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
@@ -147,6 +148,43 @@ class ScoredMemory:
     components: dict[str, float] = field(default_factory=dict)
 
 
+class Bm25Cache:
+    """BM25 索引的进程内 LRU（锐评 #2 的修正实现）。
+
+    与评审建议的"按用户缓存 + 写入失效"不同，这里键是**候选文本元组
+    本身**（内容即身份）：候选集中任何一条内容增删改都会产生不同的
+    键，旧键随之自然淘汰——零失效钩子，不存在忘记失效导致的脏索引。
+
+    命中缓存跳过的是两段 Python 级 O(N) 循环：逐文档分词 + df 统计；
+    键指纹计算是 C 级字符串哈希（~GB/s），量级差两个数量级以上。
+    容量按条目数限制（一条 ≈ 一个作用域的候选集文本 + 分词结果，
+    与 recall 本就要全量加载的记录同量级），默认 64 个作用域。
+    """
+
+    def __init__(self, maxsize: int = 64) -> None:
+        self._maxsize = max(0, maxsize)
+        self._entries: OrderedDict[tuple[str, ...], _Bm25] = OrderedDict()
+
+    def scores(self, texts: Sequence[str], query_tokens: Sequence[str]) -> list[float]:
+        """在 texts 候选集上对 query 打 BM25 分（命中则复用已建索引）。"""
+        if self._maxsize == 0:  # 显式禁用：退回每次构建
+            return _Bm25([tokenize(text) for text in texts]).scores(query_tokens)
+        key = tuple(texts)
+        index = self._entries.get(key)
+        if index is None:
+            index = _Bm25([tokenize(text) for text in texts])
+            self._entries[key] = index
+            while len(self._entries) > self._maxsize:
+                self._entries.popitem(last=False)
+        else:
+            self._entries.move_to_end(key)
+        return index.scores(query_tokens)
+
+
+# 进程级共享缓存：单事件循环内无 await 的纯 dict 操作，无需加锁。
+_BM25_CACHE = Bm25Cache()
+
+
 @dataclass(frozen=True)
 class ScoredChunk:
     """一个带混合分的知识库分块（分量语义同 ScoredMemory，无显著度）。"""
@@ -175,7 +213,7 @@ def _hybrid_scores(
     （≤0.3），检索侧的最低分阈值才能可靠地把纯噪音挡在门外。
     """
     w = weights or _WEIGHTS
-    bm25_raw = _Bm25([tokenize(text) for text in texts]).scores(tokenize(query))
+    bm25_raw = _BM25_CACHE.scores(texts, tokenize(query))
     bm25_max = max(bm25_raw, default=0.0)
     results: list[tuple[float, dict[str, float]]] = []
     for i, keyword_raw in enumerate(bm25_raw):

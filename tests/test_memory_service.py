@@ -160,7 +160,8 @@ async def test_memory_endpoints_validation() -> None:
         assert bad_header.status_code == 400
         assert c.patch("/v1/memory/nope", json={"salience": 0.1}).status_code == 404
         assert c.patch("/v1/memory/nope", json={"status": "bogus"}).status_code == 400
-        assert c.delete("/v1/memory/nope").json() == {"deleted": False}
+        # 属主校验后的语义：不存在的记忆 404（而非 {"deleted": False}）。
+        assert c.delete("/v1/memory/nope").status_code == 404
 
 
 async def test_memory_endpoints_disabled_503() -> None:
@@ -425,3 +426,109 @@ async def test_health_probe_degraded_when_embedding_down(tmp_path: Path) -> None
     service = MemoryService(store=store, embedder=embedder, settings=settings)
     assert await service.health_probe() == "degraded"
     await service.aclose()
+
+
+# ─────────────────────── 版本史（锐评 #7） ───────────────────────
+
+
+async def test_memory_version_history_full_lifecycle(tmp_path: Path) -> None:
+    """add→update→restore→delete 全链路版本记录与恢复。"""
+    service = await _sqlite_service(tmp_path)
+    record = await service.add_memory(user_id="alice", agent_id="chat", content="第一版内容")
+    await service.update_memory(record.memory_id, content="第二版内容")
+
+    versions = await service.list_versions(record.memory_id)
+    assert [v.op for v in versions] == ["update", "create"]  # 最新在前
+    assert versions[0].previous_content == "第一版内容"
+    assert versions[0].content == "第二版内容"
+
+    # 恢复到第一版 → 产生 restore 版本，内容回滚。
+    restored = await service.restore_version(record.memory_id, versions[1].version_id)
+    assert restored is not None and restored.content == "第一版内容"
+    versions = await service.list_versions(record.memory_id)
+    assert versions[0].op == "restore"
+
+    # 删除 → 墓碑记录最后内容。
+    assert await service.delete_memory(record.memory_id) is True
+    versions = await service.list_versions(record.memory_id)
+    assert versions[0].op == "delete" and versions[0].content == ""
+    assert versions[0].previous_content == "第一版内容"
+    # 删除后记忆不可恢复（内容还在版本史里供审计）。
+    assert await service.restore_version(record.memory_id, versions[1].version_id) is None
+    await service.aclose()
+
+
+async def test_version_restore_validates_version(tmp_path: Path) -> None:
+    service = await _sqlite_service(tmp_path)
+    record = await service.add_memory(user_id="u", agent_id="chat", content="内容")
+    assert await service.restore_version(record.memory_id, "ghost-version") is None
+    # 别的记忆的版本不能用于恢复（memory_id 绑定校验）。
+    other = await service.add_memory(user_id="u", agent_id="chat", content="另一条")
+    assert await service.restore_version(record.memory_id, other.memory_id) is None
+    await service.aclose()
+
+
+async def test_profile_changes_are_versioned(tmp_path: Path) -> None:
+    """画像演化也有版本史（save_profile 记 create/update）。"""
+    from agent_base.memory.store import profile_memory_id
+
+    service = await _sqlite_service(tmp_path)
+    await service.save_profile("u", {"偏好": ["深色"]})
+    await service.save_profile("u", {"偏好": ["浅色"]})
+    versions = await service.list_versions(profile_memory_id("u"))
+    assert [v.op for v in versions] == ["update", "create"]
+    assert "深色" in (versions[0].previous_content or "")
+    await service.aclose()
+
+
+def test_memory_version_endpoints_and_ownership() -> None:
+    """版本端点 + 对象级属主校验（bob 不能碰 alice 的记忆）。"""
+    client = _client()
+    with client as c:
+        created = c.post(
+            "/v1/memory", json={"content": "alice 的记忆"}, headers={"X-User-Id": "alice"}
+        )
+        memory_id = created.json()["memory_id"]
+        # alice：PATCH 两次形成版本史。
+        assert (
+            c.patch(
+                f"/v1/memory/{memory_id}",
+                json={"content": "alice 的记忆 v2"},
+                headers={"X-User-Id": "alice"},
+            ).status_code
+            == 200
+        )
+        versions = c.get(
+            f"/v1/memory/{memory_id}/versions", headers={"X-User-Id": "alice"}
+        ).json()["versions"]
+        assert [v["op"] for v in versions] == ["update", "create"]
+        # bob：读版本史 404，恢复 404，PATCH 404，DELETE 404（不泄露存在性）。
+        bob_versions = c.get(
+            f"/v1/memory/{memory_id}/versions", headers={"X-User-Id": "bob"}
+        )
+        assert bob_versions.status_code == 404
+        restore = c.post(
+            f"/v1/memory/{memory_id}/versions/{versions[1]['version_id']}/restore",
+            headers={"X-User-Id": "bob"},
+        )
+        assert restore.status_code == 404
+        assert (
+            c.patch(
+                f"/v1/memory/{memory_id}", json={"salience": 0.1}, headers={"X-User-Id": "bob"}
+            ).status_code
+            == 404
+        )
+        assert c.delete(f"/v1/memory/{memory_id}", headers={"X-User-Id": "bob"}).status_code == 404
+        # alice 恢复成功。
+        ok = c.post(
+            f"/v1/memory/{memory_id}/versions/{versions[1]['version_id']}/restore",
+            headers={"X-User-Id": "alice"},
+        )
+        assert ok.status_code == 200
+        assert ok.json()["content"] == "alice 的记忆"
+        # 不存在的记忆 → 404；无效 version → 400。
+        assert c.get("/v1/memory/ghost/versions", headers={"X-User-Id": "alice"}).status_code == 404
+        bad = c.post(
+            f"/v1/memory/{memory_id}/versions/ghost/restore", headers={"X-User-Id": "alice"}
+        )
+        assert bad.status_code == 400

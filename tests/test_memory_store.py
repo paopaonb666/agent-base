@@ -386,3 +386,52 @@ async def test_list_memories_needing_embedding_filter_sqlite(tmp_path: Path) -> 
         await _check_needing_embedding(store)
     finally:
         await store.aclose()
+
+
+async def _check_versions_semantics(store: MemoryMemoryStore | SqliteMemoryStore) -> None:
+    """版本史跨后端语义：写入、按记忆过滤、最新在前、按 id 取回。"""
+    from agent_base.memory.store import MemoryVersion
+
+    for i, op in enumerate(("create", "update", "delete")):
+        await store.record_version(
+            MemoryVersion(
+                version_id=f"v{i}",
+                memory_id="m1",
+                user_id="alice",
+                op=op,
+                content="" if op == "delete" else f"第{i}版内容",
+                previous_content=f"第{max(0, i - 1)}版内容" if i > 0 else "",
+                created_at=1_000_000.0 + i,
+            )
+        )
+    await store.record_version(
+        MemoryVersion(
+            version_id="v-other",
+            memory_id="m2",
+            user_id="alice",
+            op="create",
+            content="别的记忆",
+            created_at=1_000_000.0,
+        )
+    )
+    versions = await store.list_versions("m1")
+    assert [v.version_id for v in versions] == ["v2", "v1", "v0"]  # 最新在前
+    assert versions[0].op == "delete" and versions[0].content == ""
+    assert versions[0].previous_content == "第1版内容"
+    tombstone = await store.get_version("v2")
+    assert tombstone is not None and tombstone.previous_content == "第1版内容"
+    assert await store.get_version("ghost") is None
+    # user 隔离不做在 store 层（属主校验在 service/server 边界）。
+    assert len(await store.list_versions("m2")) == 1
+
+
+async def test_versions_semantics_in_memory() -> None:
+    await _check_versions_semantics(MemoryMemoryStore())
+
+
+async def test_versions_semantics_sqlite(tmp_path: Path) -> None:
+    store = await SqliteMemoryStore.create(str(tmp_path / "ver.db"))
+    try:
+        await _check_versions_semantics(store)
+    finally:
+        await store.aclose()

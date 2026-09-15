@@ -174,7 +174,13 @@ PUT    /v1/memory/blocks/{label}  # 手工写块（覆盖式，版本递增）
 DELETE /v1/memory/blocks/{label}
 GET    /v1/memory/profile         # 当前用户的结构化画像
 GET    /v1/memory/audit           # 记忆操作审计（抽取/整合/画像/摘要/摄取…）
+GET    /v1/memory/{id}/versions   # 内容版本史（create/update/delete/restore 快照 + 前后差分）
+POST   /v1/memory/{id}/versions/{vid}/restore   # 恢复到指定版本（产生 restore 新版本）
 ```
+
+每次内容变更（写入/更新/删除/恢复，含画像演化）都会写一条版本快照，
+删除留墓碑（保留最后内容供审计）；检索的 BM25 索引按候选内容指纹做
+进程内 LRU 缓存，内容一变键即变，无需失效钩子。
 
 **身份与安全**：`X-User-Id` 是客户端自我声明，生产环境（`ENV=production`）且
 记忆开启时**必须**配置 `MEMORY_AUTH_SECRET`，所有记忆作用域请求需附带

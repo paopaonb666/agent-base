@@ -35,6 +35,7 @@ from agent_base.memory.store import (
     MemoryRecord,
     MemoryStore,
     MemoryStoreError,
+    MemoryVersion,
     build_memory_store,
     encode_embedding,
     profile_memory_id,
@@ -205,6 +206,16 @@ class MemoryService:
             updated_at=now,
         )
         await self.store.upsert_memory(record)
+        await self._record_version_safe(
+            MemoryVersion(
+                version_id=new_memory_id(),
+                memory_id=record.memory_id,
+                user_id=user_id,
+                op="create",
+                content=content,
+                status=record.status,
+            )
+        )
         MEMORY_METRICS.observe("add", "ok", time.perf_counter() - started)
         return record
 
@@ -216,8 +227,13 @@ class MemoryService:
         tags: list[str] | None = None,
         salience: float | None = None,
         status: str | None = None,
+        version_op: str = "update",
     ) -> MemoryRecord | None:
-        """更新一条记忆；内容变化时重新向量化。"""
+        """更新一条记忆；内容变化时重新向量化。
+
+        ``version_op``：版本史里记录的操作类型（update / restore），
+        供 restore_version 复用本方法并留下正确的操作痕迹。
+        """
         existing = await self.store.get_memory(memory_id)
         if existing is None:
             return None
@@ -240,13 +256,70 @@ class MemoryService:
             updated_at=time.time(),
         )
         await self.store.upsert_memory(updated)
+        changed = (
+            updated.content != existing.content
+            or updated.tags != existing.tags
+            or updated.salience != existing.salience
+            or updated.status != existing.status
+        )
+        if changed:
+            await self._record_version_safe(
+                MemoryVersion(
+                    version_id=new_memory_id(),
+                    memory_id=memory_id,
+                    user_id=existing.user_id,
+                    op=version_op,
+                    content=updated.content,
+                    previous_content=existing.content,
+                    status=updated.status,
+                )
+            )
         MEMORY_METRICS.observe("update", "ok", time.perf_counter() - started)
         return updated
 
     async def delete_memory(self, memory_id: str) -> bool:
+        # 先取快照：删除后写墓碑版本（内容差分的终点）。
+        existing = await self.store.get_memory(memory_id)
         deleted = await self.store.delete_memory(memory_id)
+        if deleted and existing is not None:
+            await self._record_version_safe(
+                MemoryVersion(
+                    version_id=new_memory_id(),
+                    memory_id=memory_id,
+                    user_id=existing.user_id,
+                    op="delete",
+                    content="",
+                    previous_content=existing.content,
+                    status=existing.status,
+                )
+            )
         MEMORY_METRICS.observe("delete", "ok", 0.0)
         return deleted
+
+    # -- 版本史（锐评 #7） ---------------------------------------------------------
+    async def _record_version_safe(self, version: MemoryVersion) -> None:
+        """版本史写入失败绝不影响主写入路径（与审计同语义）。"""
+        try:
+            await self.store.record_version(version)
+        except Exception:
+            logger.warning("memory: 版本史写入失败", exc_info=True)
+
+    async def list_versions(self, memory_id: str, limit: int = 50) -> list[MemoryVersion]:
+        return await self.store.list_versions(memory_id, limit)
+
+    async def restore_version(self, memory_id: str, version_id: str) -> MemoryRecord | None:
+        """把记忆内容恢复到指定版本（产生一条 op=restore 的新版本）。
+
+        仅对仍然存在的记忆有效——恢复已删除的记忆需要重建完整记录
+        （tags/salience 等），超出本方法语义，返回 None。
+        """
+        existing = await self.store.get_memory(memory_id)
+        if existing is None:
+            return None
+        version = await self.store.get_version(version_id)
+        if version is None or version.memory_id != memory_id or not version.content:
+            return None
+        return await self.update_memory(memory_id, content=version.content, version_op="restore")
 
     # -- 读路径 -----------------------------------------------------------------
     async def get_memory(self, memory_id: str) -> MemoryRecord | None:
@@ -493,6 +566,16 @@ class MemoryService:
                 updated_at=now,
                 last_accessed_at=existing.last_accessed_at if existing else None,
                 access_count=existing.access_count if existing else 0,
+            )
+        )
+        await self._record_version_safe(
+            MemoryVersion(
+                version_id=new_memory_id(),
+                memory_id=memory_id,
+                user_id=user_id,
+                op="update" if existing else "create",
+                content=json.dumps(profile, ensure_ascii=False),
+                previous_content=existing.content if existing else "",
             )
         )
 

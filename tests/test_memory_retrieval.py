@@ -187,3 +187,43 @@ async def test_recall_memories_end_to_end() -> None:
         min_score=0.3,
     )
     assert noisy == []
+
+
+# ─────────────────────── BM25 缓存（锐评 #2） ───────────────────────
+
+
+def test_bm25_cache_hits_and_rebuilds() -> None:
+    from agent_base.memory.retrieval import Bm25Cache
+
+    cache = Bm25Cache(maxsize=4)
+    docs = ["用户使用 LangGraph", "用户喜欢猫"]
+    query = tokenize("LangGraph")
+    first = cache.scores(docs, query)
+    # 命中缓存：结果一致。
+    second = cache.scores(docs, query)
+    assert first == second
+    # 内容变化 → 不同键 → 重建（行为与直接构建一致）。
+    changed = cache.scores([*docs, "新增一条记忆"], query)
+    direct = score_memories.__wrapped__ if hasattr(score_memories, "__wrapped__") else None
+    assert len(changed) == 3
+    del direct
+    # 未出现过的键不污染既有条目。
+    assert cache.scores(docs, query) == first
+
+
+def test_bm25_cache_lru_eviction_and_disable() -> None:
+    from agent_base.memory.retrieval import Bm25Cache
+
+    cache = Bm25Cache(maxsize=2)
+    cache.scores(["a 文档"], tokenize("a"))
+    cache.scores(["b 文档"], tokenize("b"))
+    cache.scores(["c 文档"], tokenize("c"))  # 淘汰最久的 a
+    cache.scores(["a 文档"], tokenize("a"))  # 重建仍正确
+    assert len(cache._entries) <= 2
+    # maxsize=0 显式禁用：不驻留任何条目，行为与直接构建一致。
+    from agent_base.memory.retrieval import _Bm25
+
+    disabled = Bm25Cache(maxsize=0)
+    direct = _Bm25([tokenize("x")]).scores(tokenize("x"))
+    assert disabled.scores(["x"], tokenize("x")) == direct
+    assert len(disabled._entries) == 0

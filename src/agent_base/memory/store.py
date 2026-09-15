@@ -181,6 +181,25 @@ class MemoryOp:
     created_at: float = field(default_factory=time.time)
 
 
+@dataclass(frozen=True)
+class MemoryVersion:
+    """一条记忆的内容版本快照（版本史，锐评 #7 后半句）。
+
+    op 语义：create（首版）/ update（内容或属性变更，content 为新值、
+    previous_content 为旧值）/ delete（墓碑：content 为空串，
+    previous_content 保留最后内容）/ restore（从历史版本恢复）。
+    """
+
+    version_id: str
+    memory_id: str
+    user_id: str
+    op: str  # create | update | delete | restore
+    content: str
+    previous_content: str = ""
+    status: str = "active"
+    created_at: float = field(default_factory=time.time)
+
+
 @runtime_checkable
 class MemoryStore(Protocol):
     """记忆存储的最小接口；实现必须保证并发安全。"""
@@ -246,6 +265,13 @@ class MemoryStore(Protocol):
     async def record_op(self, op: MemoryOp) -> None: ...
 
     async def list_ops(self, user_id: str | None = None, limit: int = 100) -> list[MemoryOp]: ...
+
+    # -- 版本史（锐评 #7） --------------------------------------------------
+    async def record_version(self, version: MemoryVersion) -> None: ...
+
+    async def list_versions(self, memory_id: str, limit: int = 50) -> list[MemoryVersion]: ...
+
+    async def get_version(self, version_id: str) -> MemoryVersion | None: ...
 
 
 # ─────────────────────────────── DDL ───────────────────────────────
@@ -324,6 +350,18 @@ _SQLITE_DDLS: tuple[str, ...] = (
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS memory_versions (
+      version_id VARCHAR(40) PRIMARY KEY,
+      memory_id VARCHAR(40) NOT NULL,
+      user_id VARCHAR(64) NOT NULL,
+      op VARCHAR(16) NOT NULL,
+      content TEXT NOT NULL,
+      previous_content TEXT,
+      status VARCHAR(16) NOT NULL DEFAULT 'active',
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
 )
 
 _SQLITE_INDEXES: tuple[str, ...] = (
@@ -332,6 +370,7 @@ _SQLITE_INDEXES: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_chunks_user ON doc_chunks (user_id)",
     "CREATE INDEX IF NOT EXISTS idx_chunks_file ON doc_chunks (file_id)",
     "CREATE INDEX IF NOT EXISTS idx_chunks_thread ON doc_chunks (thread_id)",
+    "CREATE INDEX IF NOT EXISTS idx_versions_memory ON memory_versions (memory_id, created_at)",
 )
 
 _MYSQL_DDLS: tuple[str, ...] = (
@@ -412,6 +451,21 @@ _MYSQL_DDLS: tuple[str, ...] = (
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (op_id),
       KEY idx_ops_seq (seq)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS memory_versions (
+      version_id VARCHAR(40) NOT NULL,
+      seq BIGINT NOT NULL AUTO_INCREMENT,
+      memory_id VARCHAR(40) NOT NULL,
+      user_id VARCHAR(64) NOT NULL,
+      op VARCHAR(16) NOT NULL,
+      content LONGTEXT NOT NULL,
+      previous_content LONGTEXT,
+      status VARCHAR(16) NOT NULL DEFAULT 'active',
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (version_id),
+      KEY idx_versions_memory (memory_id, seq)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
 )
@@ -876,6 +930,57 @@ class _SqlMemoryStoreBase:
         rows = await self._fetch_all(sql, params)
         return [self._op_from_row(row) for row in rows]
 
+    # -- 版本史 ---------------------------------------------------------------
+    _VERSIONS_TIEBREAK = "rowid DESC"
+
+    _VERSION_COLUMNS = (
+        "version_id, memory_id, user_id, op, content, previous_content, status, created_at"
+    )
+
+    def _version_from_row(self, row: tuple[Any, ...]) -> MemoryVersion:
+        return MemoryVersion(
+            version_id=row[0],
+            memory_id=row[1],
+            user_id=row[2] or "",
+            op=row[3],
+            content=row[4] or "",
+            previous_content=row[5] or "",
+            status=row[6] or "active",
+            created_at=self._from_sql_ts(row[7]),
+        )
+
+    async def record_version(self, version: MemoryVersion) -> None:
+        await self._execute(
+            f"INSERT INTO memory_versions ({self._VERSION_COLUMNS}) VALUES"
+            " (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                version.version_id,
+                version.memory_id,
+                version.user_id,
+                version.op,
+                version.content,
+                # 空串归一为 NULL：语义上是"没有前值"（create）
+                version.previous_content or None,
+                version.status,
+                self._to_sql_ts(version.created_at),
+            ),
+        )
+
+    async def list_versions(self, memory_id: str, limit: int = 50) -> list[MemoryVersion]:
+        rows = await self._fetch_all(
+            f"SELECT {self._VERSION_COLUMNS} FROM memory_versions WHERE memory_id = ?"
+            f" ORDER BY created_at DESC, {self._VERSIONS_TIEBREAK} LIMIT ?",
+            (memory_id, max(1, limit)),
+        )
+        return [self._version_from_row(row) for row in rows]
+
+    async def get_version(self, version_id: str) -> MemoryVersion | None:
+        rows = await self._fetch_all(
+            f"SELECT {self._VERSION_COLUMNS} FROM memory_versions WHERE version_id = ?",
+            (version_id,),
+        )
+        return self._version_from_row(rows[0]) if rows else None
+
 
 class MemoryMemoryStore:
     """进程内字典实现：memory 后端（重启即丢）与测试用。"""
@@ -887,6 +992,7 @@ class MemoryMemoryStore:
         self._chunks: dict[str, DocChunk] = {}
         # (op, 插入序号) 二元组：同秒并列时按插入顺序稳定排序。
         self._ops: list[tuple[MemoryOp, int]] = []
+        self._versions: list[tuple[MemoryVersion, int]] = []
         self._op_counter = 0
 
     async def upsert_memory(self, record: MemoryRecord) -> None:
@@ -1034,6 +1140,21 @@ class MemoryMemoryStore:
         pairs.sort(key=lambda pair: (pair[0].created_at, pair[1]), reverse=True)
         return [op for op, _ in pairs[: max(1, limit)]]
 
+    async def record_version(self, version: MemoryVersion) -> None:
+        self._op_counter += 1
+        self._versions.append((version, self._op_counter))
+
+    async def list_versions(self, memory_id: str, limit: int = 50) -> list[MemoryVersion]:
+        pairs = [pair for pair in self._versions if pair[0].memory_id == memory_id]
+        pairs.sort(key=lambda pair: (pair[0].created_at, pair[1]), reverse=True)
+        return [version for version, _ in pairs[: max(1, limit)]]
+
+    async def get_version(self, version_id: str) -> MemoryVersion | None:
+        for version, _ in self._versions:
+            if version.version_id == version_id:
+                return version
+        return None
+
 
 class SqliteMemoryStore(_SqlMemoryStoreBase):
     """sqlite 记忆表：与对话状态同一文件，aiosqlite 持久连接。"""
@@ -1087,6 +1208,7 @@ class MysqlMemoryStore(_SqlMemoryStoreBase):
 
     _PLACEHOLDER = "%s"
     _OPS_TIEBREAK = "seq DESC"
+    _VERSIONS_TIEBREAK = "seq DESC"
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -1173,6 +1295,7 @@ __all__ = [
     "MemoryRecord",
     "MemoryStore",
     "MemoryStoreError",
+    "MemoryVersion",
     "MysqlMemoryStore",
     "SessionSummary",
     "SqliteMemoryStore",
