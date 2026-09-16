@@ -819,6 +819,7 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
                 text_len=0,
                 extracted_text="",
                 content=data,
+                user_id=scope,
             )
             await file_store.save(info)
             asyncio.get_running_loop().create_task(file_store.purge_orphans())
@@ -842,6 +843,7 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
             extracted_text=doc.text,
             content=data,
             warning=warning,
+            user_id=scope,
         )
         await file_store.save(info)
         # 知识库摄取（M6e）：文档文本切块 + 向量化入 doc_chunks（用户级
@@ -934,8 +936,11 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
                 status_code=400,
                 detail=f"status 非法：{body.status!r}；允许 {list(KNOWN_MEMORY_STATUSES)}",
             )
+        user_id = _memory_user_id(request, rt.settings)
         existing = await memory.get_memory(memory_id)
-        if existing is None:
+        # 对象级属主校验（P0 鉴权的配套）：身份验通过不代表能碰别人的
+        # 记忆；返回 404 而非 403，避免向第三方泄露记忆 id 的存在性。
+        if existing is None or existing.user_id != user_id:
             raise HTTPException(status_code=404, detail=f"记忆不存在：{memory_id}")
         try:
             updated = await memory.update_memory(
@@ -951,11 +956,60 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
 
     @app.delete("/v1/memory/{memory_id}")
     async def delete_memory(memory_id: str, request: Request) -> dict[str, Any]:
-        """删除一条长期记忆（硬删除；审计仍在 memory_ops）。"""
+        """删除一条长期记忆（硬删除；版本墓碑与审计保留）。"""
         rt: AgentRuntime = request.app.state.runtime
         memory = _require_memory(rt)
+        user_id = _memory_user_id(request, rt.settings)
+        existing = await memory.get_memory(memory_id)
+        if existing is None or existing.user_id != user_id:
+            raise HTTPException(status_code=404, detail=f"记忆不存在：{memory_id}")
         deleted = await memory.delete_memory(memory_id)
         return {"deleted": deleted}
+
+    @app.get("/v1/memory/{memory_id}/versions")
+    async def list_memory_versions(
+        memory_id: str, request: Request, limit: int = 50
+    ) -> dict[str, Any]:
+        """一条记忆的内容版本史（锐评 #7：create/update/delete/restore
+        快照，含变更前后的内容差分），最新在前。"""
+        rt: AgentRuntime = request.app.state.runtime
+        memory = _require_memory(rt)
+        user_id = _memory_user_id(request, rt.settings)
+        existing = await memory.get_memory(memory_id)
+        if existing is None or existing.user_id != user_id:
+            raise HTTPException(status_code=404, detail=f"记忆不存在：{memory_id}")
+        versions = await memory.list_versions(memory_id, limit=max(1, min(limit, 200)))
+        return {
+            "versions": [
+                {
+                    "version_id": v.version_id,
+                    "op": v.op,
+                    "content": v.content,
+                    "previous_content": v.previous_content or None,
+                    "status": v.status,
+                    "created_at": v.created_at,
+                }
+                for v in versions
+            ]
+        }
+
+    @app.post("/v1/memory/{memory_id}/versions/{version_id}/restore")
+    async def restore_memory_version(
+        memory_id: str, version_id: str, request: Request
+    ) -> dict[str, Any]:
+        """把记忆内容恢复到指定版本（产生一条 op=restore 的新版本）。"""
+        rt: AgentRuntime = request.app.state.runtime
+        memory = _require_memory(rt)
+        user_id = _memory_user_id(request, rt.settings)
+        existing = await memory.get_memory(memory_id)
+        if existing is None or existing.user_id != user_id:
+            raise HTTPException(status_code=404, detail=f"记忆不存在：{memory_id}")
+        restored = await memory.restore_version(memory_id, version_id)
+        if restored is None:
+            raise HTTPException(
+                status_code=400, detail="版本不可恢复：version_id 无效或对应删除墓碑"
+            )
+        return restored.meta()
 
     @app.get("/v1/memory/blocks")
     async def list_memory_blocks(request: Request, module: str | None = None) -> dict[str, Any]:
@@ -1050,6 +1104,33 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
                 for op in ops
             ]
         }
+
+    @app.delete("/v1/agents/{module}/files/{file_id}")
+    async def revoke_file(module: str, file_id: str, request: Request) -> dict[str, Any]:
+        """撤销一份上传文件及其知识库分块（边界加固）。
+
+        上传错误文件的显式收回路径：文件原始行 + 该文件的全部知识库
+        分块一并删除。属主校验基于上传时记录的 user_id（旧行为空串，
+        视为无主遗留允许撤销——file_id 本身 48 位随机不可猜）。
+        """
+        rt: AgentRuntime = request.app.state.runtime
+        if not _known_module(rt, module):
+            raise HTTPException(status_code=404, detail=f"unknown module {module!r}")
+        file_store = rt.file_store
+        if file_store is None:
+            raise HTTPException(status_code=503, detail="附件存储未启用（存储后端不可用）")
+        user_id = _memory_user_id(request, rt.settings)
+        infos = await file_store.get_many([file_id])
+        info = infos[0] if infos else None
+        if info is None or info.user_id not in ("", user_id):
+            # 404 而非 403：不向第三方泄露文件 id 的存在性。
+            raise HTTPException(status_code=404, detail=f"文件不存在：{file_id}")
+        deleted = await file_store.delete_file(file_id)
+        chunks_removed = 0
+        if rt.memory is not None:
+            chunks_removed = await rt.memory.revoke_document(file_id=file_id, user_id=user_id)
+        asyncio.get_running_loop().create_task(file_store.purge_orphans())
+        return {"deleted": deleted, "chunks_removed": chunks_removed}
 
     @app.get("/v1/modules")
     async def list_modules(request: Request) -> dict[str, Any]:

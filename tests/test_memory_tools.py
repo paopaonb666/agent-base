@@ -261,3 +261,128 @@ async def test_upload_endpoint_ingests_document(tmp_path) -> None:
             await asyncio.sleep(0.05)
         assert await service.store.count_chunks_for_file(file_id) > 0, "知识库摄取未生效"
         await service.aclose()
+
+
+# ─────────────────── 文档链路边界加固（段落切块/幂等/回填/撤销） ───────────────────
+
+
+def test_chunk_text_paragraph_aware_packing() -> None:
+    """段落感知：块边界落在空行上，段落不被从中间劈开。"""
+    paras = ["第一段" + "内容" * 50, "第二段" + "描述" * 50, "第三段" + "收尾" * 50]
+    text = "\n\n".join(paras)  # 每段 103 字符
+    parts = chunk_text(text, chunk_chars=220, overlap=10)
+    assert all(len(p) <= 220 for p in parts)
+    for para in paras:
+        assert any(para in p for p in parts), "段落被劈开"
+    # 覆盖完整性：去掉拼接分隔符后与原文一致。
+    assert "".join(p.replace("\n\n", "") for p in parts) == text.replace("\n\n", "")
+
+
+def test_chunk_text_oversized_paragraph_window_fallback() -> None:
+    """单段超长：段内退回固定窗口滑动（带重叠），块长不超限。"""
+    para = "表格行。" * 300  # 1200 字符单段
+    text = f"开头说明\n\n{para}"
+    parts = chunk_text(text, chunk_chars=200, overlap=20)
+    assert all(len(p) <= 200 for p in parts)
+    assert sum(len(p) for p in parts) >= 1200  # 全覆盖
+    assert parts[0].startswith("开头说明")
+
+
+async def test_ingest_document_is_idempotent() -> None:
+    """同一 file_id 重复摄取不产生重复分块（重试/重解析场景）。"""
+    service = _service(memory_doc_chunk_chars=50, memory_doc_chunk_overlap=10)
+    text = "LangGraph 框架文档内容。" * 10
+    first = await service.ingest_document(file_id="f1", user_id="u", agent_id="chat", text=text)
+    second = await service.ingest_document(file_id="f1", user_id="u", agent_id="chat", text=text)
+    assert first == second > 1
+    assert await service.store.count_chunks_for_file("f1") == first
+
+
+async def test_backfill_covers_doc_chunks(tmp_path) -> None:
+    """向量回填覆盖知识库分块：旧维度/无向量的分块都被修复。"""
+    from agent_base.memory.store import DocChunk, encode_embedding
+
+    service = _service()
+    await service.store.put_chunks(
+        [
+            DocChunk(
+                chunk_id="c1",
+                file_id="f1",
+                thread_id="",
+                user_id="u",
+                agent_id="chat",
+                ordinal=0,
+                text="旧维度的分块",
+                embedding=encode_embedding([1.0]),
+                embedding_dim=7,
+            ),
+            DocChunk(
+                chunk_id="c2",
+                file_id="f1",
+                thread_id="",
+                user_id="u",
+                agent_id="chat",
+                ordinal=1,
+                text="没有向量的分块",
+            ),
+        ]
+    )
+    count = await service.backfill_embeddings(batch=10)
+    assert count == 2
+    chunks = await service.store.list_chunks("u")
+    assert all(chunk.embedding_dim == HashEmbedding().dims for chunk in chunks)
+    await service.aclose()
+
+
+async def test_revoke_file_endpoint_removes_chunks_and_row() -> None:
+    """撤销端点：属主校验 + 文件行与知识分块级联删除。"""
+    from fastapi.testclient import TestClient
+
+    from agent_base.core.bootstrap import AgentRuntime
+    from agent_base.entrypoints.server import create_app
+    from agent_base.extensions.filestore import MemoryUploadedFileStore
+    from agent_base.modules.chat.module import ChatModule
+    from fakes import ScriptedChatModel
+
+    settings = _settings()
+    runtime = AgentRuntime(
+        settings=settings,
+        llm=ScriptedChatModel([]),
+        modules={"chat": ChatModule()},
+        tools=[],
+        checkpointer=None,
+    )
+    runtime.memory = MemoryService(
+        store=MemoryMemoryStore(), embedder=HashEmbedding(), settings=settings
+    )
+    runtime.file_store = MemoryUploadedFileStore()
+    content = "项目采用 PostgreSQL 15 存储业务数据。" * 20
+    with TestClient(create_app(runtime=runtime)) as client:
+        upload = client.post(
+            "/v1/agents/chat/files",
+            files={"file": ("notes.txt", content.encode("utf-8"), "text/plain")},
+            headers={"X-User-Id": "alice"},
+        )
+        assert upload.status_code == 200
+        file_id = upload.json()["file_id"]
+        service = client.app.state.runtime.memory
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if await service.store.count_chunks_for_file(file_id) > 0:
+                break
+            await asyncio.sleep(0.05)
+        assert await service.store.count_chunks_for_file(file_id) > 0
+
+        # bob 不能撤销 alice 的文件（404，不泄露存在性）。
+        denied = client.delete(
+            f"/v1/agents/chat/files/{file_id}", headers={"X-User-Id": "bob"}
+        )
+        assert denied.status_code == 404
+        # alice 撤销：文件行 + 分块级联删除。
+        ok = client.delete(f"/v1/agents/chat/files/{file_id}", headers={"X-User-Id": "alice"})
+        assert ok.status_code == 200
+        assert ok.json()["deleted"] is True
+        assert ok.json()["chunks_removed"] > 0
+        assert await service.store.count_chunks_for_file(file_id) == 0
+        assert await runtime.file_store.get_many([file_id]) == []
+        await service.aclose()

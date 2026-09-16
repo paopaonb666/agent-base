@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS uploaded_files (
   file_id VARCHAR(32) PRIMARY KEY,
   thread_id VARCHAR(190) NOT NULL DEFAULT '',
   module VARCHAR(64) NOT NULL DEFAULT '',
+  user_id VARCHAR(64) NOT NULL DEFAULT '',
   filename VARCHAR(255) NOT NULL,
   format VARCHAR(16) NOT NULL,
   pages INTEGER,
@@ -54,6 +55,7 @@ CREATE TABLE IF NOT EXISTS uploaded_files (
   file_id VARCHAR(32) PRIMARY KEY,
   thread_id VARCHAR(190) NOT NULL DEFAULT '',
   module VARCHAR(64) NOT NULL DEFAULT '',
+  user_id VARCHAR(64) NOT NULL DEFAULT '',
   filename VARCHAR(255) NOT NULL,
   format VARCHAR(16) NOT NULL,
   pages INT NULL,
@@ -84,6 +86,9 @@ class UploadedFileInfo:
     warning: str = ""
     thread_id: str = ""
     module: str = ""
+    # 上传者的记忆身份（X-User-Id；撤销文件时的属主判定依据）。
+    # 旧库行缺省为空串：视为"无主遗留"，允许任意已验身份用户撤销。
+    user_id: str = ""
     created_at: float = field(default_factory=time.time)
 
     def meta(self) -> dict[str, Any]:
@@ -95,6 +100,7 @@ class UploadedFileInfo:
             "pages": self.pages,
             "text_len": self.text_len,
             "truncated": self.truncated,
+            "user_id": self.user_id,
             **({"warning": self.warning} if self.warning else {}),
         }
 
@@ -110,6 +116,8 @@ class UploadedFileStore(Protocol):
     async def bind_thread(self, file_ids: list[str], thread_id: str) -> None: ...
 
     async def delete_for_thread(self, thread_id: str) -> None: ...
+
+    async def delete_file(self, file_id: str) -> bool: ...
 
     async def purge_orphans(self, max_age_hours: int = ORPHAN_MAX_AGE_HOURS) -> int: ...
 
@@ -139,6 +147,9 @@ class MemoryUploadedFileStore:
             fid: info for fid, info in self._files.items() if info.thread_id != thread_id
         }
 
+    async def delete_file(self, file_id: str) -> bool:
+        return self._files.pop(file_id, None) is not None
+
     async def purge_orphans(self, max_age_hours: int = ORPHAN_MAX_AGE_HOURS) -> int:
         cutoff = time.time() - max_age_hours * 3600
         stale = [
@@ -163,6 +174,14 @@ class SqliteUploadedFileStore:
 
         conn = await aiosqlite.connect(path)
         await conn.execute(_SQLITE_DDL)
+        # 旧库补列（sqlite 无 alembic，运行时自迁移）：user_id 是后加的。
+        cursor = await conn.execute("PRAGMA table_info(uploaded_files)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "user_id" not in columns:
+            await conn.execute(
+                "ALTER TABLE uploaded_files"
+                " ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT ''"
+            )
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_uf_thread ON uploaded_files (thread_id)")
         await conn.commit()
         return cls(conn)
@@ -173,26 +192,29 @@ class SqliteUploadedFileStore:
             file_id=row[0],
             thread_id=row[1],
             module=row[2],
-            filename=row[3],
-            format=row[4],
-            pages=row[5],
-            paragraphs=row[6],
-            truncated=bool(row[7]),
-            text_len=row[8],
-            warning=row[9],
-            extracted_text=row[10] or "",
-            content=bytes(row[11]) if row[11] is not None else b"",
+            user_id=row[3] or "",
+            filename=row[4],
+            format=row[5],
+            pages=row[6],
+            paragraphs=row[7],
+            truncated=bool(row[8]),
+            text_len=row[9],
+            warning=row[10],
+            extracted_text=row[11] or "",
+            content=bytes(row[12]) if row[12] is not None else b"",
         )
 
     async def save(self, info: UploadedFileInfo) -> None:
         await self._conn.execute(
-            "INSERT OR REPLACE INTO uploaded_files (file_id, thread_id, module, filename,"
-            " format, pages, paragraphs, truncated, text_len, warning, extracted_text,"
-            " content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO uploaded_files (file_id, thread_id, module, user_id,"
+            " filename, format, pages, paragraphs, truncated, text_len, warning,"
+            " extracted_text, content, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 info.file_id,
                 info.thread_id,
                 info.module,
+                info.user_id,
                 info.filename,
                 info.format,
                 info.pages,
@@ -210,8 +232,8 @@ class SqliteUploadedFileStore:
     async def get_many(self, file_ids: list[str]) -> list[UploadedFileInfo]:
         placeholders = ",".join("?" for _ in file_ids)
         rows = await self._conn.execute_fetchall(
-            f"SELECT file_id, thread_id, module, filename, format, pages, paragraphs,"
-            f" truncated, text_len, warning, extracted_text, content"
+            f"SELECT file_id, thread_id, module, user_id, filename, format, pages,"
+            f" paragraphs, truncated, text_len, warning, extracted_text, content"
             f" FROM uploaded_files WHERE file_id IN ({placeholders})",
             file_ids,
         )
@@ -242,6 +264,13 @@ class SqliteUploadedFileStore:
         await self._conn.commit()
         return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
 
+    async def delete_file(self, file_id: str) -> bool:
+        cursor = await self._conn.execute(
+            "DELETE FROM uploaded_files WHERE file_id = ?", (file_id,)
+        )
+        await self._conn.commit()
+        return bool(cursor.rowcount and cursor.rowcount > 0)
+
     async def aclose(self) -> None:
         await self._conn.close()
 
@@ -268,20 +297,21 @@ class MysqlUploadedFileStore:
 
     @staticmethod
     def _to_info(row: Any) -> UploadedFileInfo:
-        created = row[12]
+        created = row[13]
         return UploadedFileInfo(
             file_id=row[0],
             thread_id=row[1],
             module=row[2],
-            filename=row[3],
-            format=row[4],
-            pages=row[5],
-            paragraphs=row[6],
-            truncated=bool(row[7]),
-            text_len=row[8],
-            warning=row[9] or "",
-            extracted_text=row[10] or "",
-            content=bytes(row[11]) if row[11] is not None else b"",
+            user_id=row[3] or "",
+            filename=row[4],
+            format=row[5],
+            pages=row[6],
+            paragraphs=row[7],
+            truncated=bool(row[8]),
+            text_len=row[9],
+            warning=row[10] or "",
+            extracted_text=row[11] or "",
+            content=bytes(row[12]) if row[12] is not None else b"",
             created_at=created.timestamp() if isinstance(created, datetime) else time.time(),
         )
 
@@ -293,14 +323,15 @@ class MysqlUploadedFileStore:
                     await cur.execute(_MYSQL_DDL)
                     self._table_ready = True
                 await cur.execute(
-                    "INSERT INTO uploaded_files (file_id, thread_id, module, filename,"
-                    " format, pages, paragraphs, truncated, text_len, warning,"
+                    "INSERT INTO uploaded_files (file_id, thread_id, module, user_id,"
+                    " filename, format, pages, paragraphs, truncated, text_len, warning,"
                     " extracted_text, content) VALUES (%s, %s, %s, %s, %s, %s, %s, %s,"
-                    " %s, %s, %s, %s)",
+                    " %s, %s, %s, %s, %s)",
                     (
                         info.file_id,
                         info.thread_id,
                         info.module,
+                        info.user_id,
                         info.filename,
                         info.format,
                         info.pages,
@@ -316,7 +347,7 @@ class MysqlUploadedFileStore:
             conn.close()
 
     _SELECT = (
-        "SELECT file_id, thread_id, module, filename, format, pages, paragraphs,"
+        "SELECT file_id, thread_id, module, user_id, filename, format, pages, paragraphs,"
         " truncated, text_len, warning, extracted_text, content, created_at"
         " FROM uploaded_files"
     )
@@ -363,6 +394,15 @@ class MysqlUploadedFileStore:
                     (datetime.now() - timedelta(hours=max_age_hours),),
                 )
                 return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        finally:
+            conn.close()
+
+    async def delete_file(self, file_id: str) -> bool:
+        conn = await self._connect()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute("DELETE FROM uploaded_files WHERE file_id = %s", (file_id,))
+                return bool(cur.rowcount and cur.rowcount > 0)
         finally:
             conn.close()
 

@@ -182,6 +182,13 @@ POST   /v1/memory/{id}/versions/{vid}/restore   # 恢复到指定版本（产生
 删除留墓碑（保留最后内容供审计）；检索的 BM25 索引按候选内容指纹做
 进程内 LRU 缓存，内容一变键即变，无需失效钩子。
 
+**文档知识库生命周期**：上传时按段落感知切块（空行对齐，表格/列表
+不被从中间劈开；单段超长退回固定窗口），重复摄取自动幂等；撤销传错
+的文件用 `DELETE /v1/agents/{module}/files/{file_id}`——文件原始行与
+全部知识分块级联删除，属主校验基于上传时记录的 user_id；更换
+embedding 模型后 `python scripts/memory_backfill_embeddings.py` 同时
+回填记忆与知识库分块的向量。
+
 **身份与安全**：`X-User-Id` 是客户端自我声明，生产环境（`ENV=production`）且
 记忆开启时**必须**配置 `MEMORY_AUTH_SECRET`，所有记忆作用域请求需附带
 `X-User-Sig = HMAC-SHA256(X-User-Id, secret)`（缺省用户也不例外），否则 401；

@@ -155,3 +155,52 @@ async def test_build_store_follows_backend(tmp_path: object) -> None:
     )
     assert isinstance(sqlite_store, SqliteUploadedFileStore)
     await sqlite_store.aclose()
+
+
+async def test_user_id_roundtrip_and_delete_file(tmp_path: object) -> None:
+    """user_id 落库读回 + delete_file 单行删除（撤销端点的存储基础）。"""
+    store = MemoryUploadedFileStore()
+    await store.save(_info("f1", user_id="alice"))
+    assert (await store.get_many(["f1"]))[0].user_id == "alice"
+    assert await store.delete_file("f1") is True
+    assert await store.delete_file("f1") is False
+    assert await store.get_many(["f1"]) == []
+
+    sqlite_store = await SqliteUploadedFileStore.create(str(tmp_path / "u.db"))  # type: ignore[arg-type]
+    try:
+        await sqlite_store.save(_info("f1", user_id="bob"))
+        rows = await sqlite_store.get_many(["f1"])
+        assert rows[0].user_id == "bob"
+        assert await sqlite_store.delete_file("f1") is True
+        assert await sqlite_store.get_many(["f1"]) == []
+    finally:
+        await sqlite_store.aclose()
+
+
+async def test_sqlite_legacy_db_gets_user_id_column(tmp_path: object) -> None:
+    """旧库自迁移：无 user_id 列的表在 create 时自动补列。"""
+    import aiosqlite
+
+    db = str(tmp_path / "legacy.db")  # type: ignore[attr-defined]
+    conn = await aiosqlite.connect(db)
+    # 用旧版 DDL 建表（无 user_id）。
+    await conn.execute(
+        "CREATE TABLE uploaded_files ("
+        " file_id VARCHAR(32) PRIMARY KEY, thread_id VARCHAR(190) NOT NULL DEFAULT '',"
+        " module VARCHAR(64) NOT NULL DEFAULT '', filename VARCHAR(255) NOT NULL,"
+        " format VARCHAR(16) NOT NULL, pages INTEGER, paragraphs INTEGER,"
+        " truncated INTEGER NOT NULL DEFAULT 0, text_len INTEGER NOT NULL DEFAULT 0,"
+        " warning VARCHAR(500) NOT NULL DEFAULT '', extracted_text TEXT, content BLOB,"
+        " created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+    )
+    await conn.commit()
+    await conn.close()
+
+    store = await SqliteUploadedFileStore.create(db)  # type: ignore[arg-type]
+    try:
+        # 旧表可写新字段，读回一致。
+        await store.save(_info("f1", user_id="carol"))
+        rows = await store.get_many(["f1"])
+        assert rows[0].user_id == "carol"
+    finally:
+        await store.aclose()

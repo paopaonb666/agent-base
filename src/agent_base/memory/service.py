@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from dataclasses import replace
@@ -95,18 +96,52 @@ def _trim_profile_to_chars(profile: dict[str, Any], max_chars: int) -> dict[str,
 
 
 def chunk_text(text: str, *, chunk_chars: int, overlap: int) -> list[str]:
-    """按字符窗口把文档文本切块（相邻块带重叠，保持跨块语义连续）。
+    """把文档文本切块（边界加固：段落感知优先，固定窗口兜底）。
 
-    刻意用固定窗口而不是段落感知切分：行为可预测、中英文一视同仁，
-    边界毛刺由重叠带兜住。空文本返回空列表。
+    策略：
+    - 优先按空行分段、贪心把**完整段落**打包进 ≤ chunk_chars 的块——
+      切块边界落在段落上，表格/列表/代码块不再被从中间劈开；
+    - 单段超过 chunk_chars 时段内退回固定窗口滑动（带 overlap）；
+    - 全文没有段落分隔（或只有一段）时行为与旧版固定窗口完全一致
+      （向后兼容：纯文本长文切块结果不变）。
+
+    保证：任何块不超过 chunk_chars；非空内容全部覆盖；空文本返回空列表。
     """
     text = text.strip()
     if not text:
         return []
     if len(text) <= chunk_chars:
         return [text]
-    step = max(1, chunk_chars - overlap)
-    return [text[start : start + chunk_chars] for start in range(0, len(text), step)]
+
+    def _window(block: str) -> list[str]:
+        step = max(1, chunk_chars - overlap)
+        return [block[start : start + chunk_chars] for start in range(0, len(block), step)]
+
+    paragraphs = [para.strip() for para in re.split(r"\n\s*\n", text) if para.strip()]
+    if len(paragraphs) <= 1:
+        return _window(text)
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0  # 已装段落总长（含段间空行分隔符）
+    for para in paragraphs:
+        if len(para) > chunk_chars:
+            # 超长段落：先结算已打包内容，段内固定窗口切。
+            if current:
+                chunks.append("\n\n".join(current))
+                current, current_len = [], 0
+            chunks.extend(_window(para))
+            continue
+        extra = len(para) + (2 if current else 0)
+        if current_len + extra <= chunk_chars:
+            current.append(para)
+            current_len += extra
+        else:
+            chunks.append("\n\n".join(current))
+            current, current_len = [para], len(para)
+    if current:
+        chunks.append("\n\n".join(current))
+    return chunks
 
 
 class MemoryService:
@@ -392,6 +427,9 @@ class MemoryService:
                 chunk_chars=self._settings.memory_doc_chunk_chars,
                 overlap=self._settings.memory_doc_chunk_overlap,
             )
+            # 幂等：同一 file_id 重复摄取（重试/重解析场景）先清旧分块，
+            # 防止 chunk_id 随机生成导致的重复堆积。
+            await self.store.delete_chunks_for_file(file_id)
             vectors = await self.embedder.embed(parts)
             chunks = [
                 DocChunk(
@@ -472,6 +510,19 @@ class MemoryService:
             "salience": self._settings.memory_weight_salience,
         }
 
+    async def revoke_document(self, *, file_id: str, user_id: str) -> int:
+        """撤销一份文档的知识库分块（用户级知识资产的显式收回路径，
+        修复"传错文件无法撤回"的边界：DELETE /v1/agents/{module}/files/{id}）。
+        """
+        deleted = await self.store.delete_chunks_for_file(file_id)
+        MEMORY_METRICS.observe("revoke", "ok", 0.0)
+        await self.record_op(
+            op="revoke",
+            user_id=user_id,
+            detail={"file_id": file_id, "chunks": deleted},
+        )
+        return deleted
+
     # -- 生命周期 -----------------------------------------------------------------
     async def health_probe(self) -> str:
         """对 /health 的探针（锐评 #19）：存储可读 + embedding 可达。
@@ -524,7 +575,31 @@ class MemoryService:
                 total += 1
             if len(records) < batch:
                 break
-        logger.info("memory: 向量回填完成，共 %s 条", total)
+        # doc_chunks 同样回填：换 embedding 模型后知识库向量失效的修复路径。
+        while True:
+            chunks = await self.store.list_chunks_needing_embedding(self.embedder.dims, batch)
+            if not chunks:
+                break
+            vectors = await self.embedder.embed([chunk.text for chunk in chunks])
+            if vectors is None:
+                logger.warning(
+                    "memory: embedding 服务不可用，分块回填中断（已回填 %s 条）", total
+                )
+                break
+            for chunk, vector in zip(chunks, vectors, strict=True):
+                await self.store.put_chunks(
+                    [
+                        replace(
+                            chunk,
+                            embedding=encode_embedding(vector),
+                            embedding_dim=self.embedder.dims,
+                        )
+                    ]
+                )
+                total += 1
+            if len(chunks) < batch:
+                break
+        logger.info("memory: 向量回填完成，共 %s 条（含知识库分块）", total)
         return total
 
     # -- 用户画像（M6c；memories 表里的确定性记录） -------------------------------

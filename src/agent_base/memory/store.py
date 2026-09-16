@@ -258,6 +258,10 @@ class MemoryStore(Protocol):
 
     async def delete_chunks_for_file(self, file_id: str) -> int: ...
 
+    async def list_chunks_needing_embedding(
+        self, dims: int, limit: int = 100
+    ) -> list[DocChunk]: ...
+
     # -- 线程级联 -------------------------------------------------------------
     async def delete_for_thread(self, thread_id: str) -> None: ...
 
@@ -981,6 +985,19 @@ class _SqlMemoryStoreBase:
         )
         return self._version_from_row(rows[0]) if rows else None
 
+    async def list_chunks_needing_embedding(
+        self, dims: int, limit: int = 100
+    ) -> list[DocChunk]:
+        """回填查询：向量缺失或维度不符的知识库分块（换 embedding
+        模型后 doc_chunks 的修复路径，与 memories 的回填同语义）。"""
+        rows = await self._fetch_all(
+            f"SELECT {self._CHUNK_COLUMNS} FROM doc_chunks"
+            " WHERE embedding IS NULL OR embedding_dim IS NULL OR embedding_dim != ?"
+            " ORDER BY created_at DESC LIMIT ?",
+            (dims, max(1, limit)),
+        )
+        return [self._chunk_from_row(row) for row in rows]
+
 
 class MemoryMemoryStore:
     """进程内字典实现：memory 后端（重启即丢）与测试用。"""
@@ -1154,6 +1171,19 @@ class MemoryMemoryStore:
             if version.version_id == version_id:
                 return version
         return None
+
+    async def list_chunks_needing_embedding(
+        self, dims: int, limit: int = 100
+    ) -> list[DocChunk]:
+        matched = [
+            chunk
+            for chunk in self._chunks.values()
+            if chunk.embedding is None
+            or chunk.embedding_dim is None
+            or chunk.embedding_dim != dims
+        ]
+        matched.sort(key=lambda chunk: chunk.created_at, reverse=True)
+        return matched[: max(1, limit)]
 
 
 class SqliteMemoryStore(_SqlMemoryStoreBase):
