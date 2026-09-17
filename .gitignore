@@ -24,8 +24,9 @@ drafts/
 notes/
 working/
 
-# Workbuddy memory + skills (workspace-level, not project source)
+# Workbuddy / ZCode workspace metadata (workspace-level, not project source)
 .workbuddy/
+.zcode/
 
 # Editor / OS temp + backup files
 *.bak
@@ -66,9 +67,13 @@ docs/
 .idea/
 .trae/
 
-# Local state (checkpointer db)
+# Local state (checkpointer db) + runtime logs + local test artifacts
 *.db
+*.db-shm
+*.db-wal
 *.sqlite3
+*.log
+gui-test-screenshots/
 
 # OS
 .DS_Store

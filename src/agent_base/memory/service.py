@@ -313,6 +313,7 @@ class MemoryService:
         return updated
 
     async def delete_memory(self, memory_id: str) -> bool:
+        started = time.perf_counter()
         # 先取快照：删除后写墓碑版本（内容差分的终点）。
         existing = await self.store.get_memory(memory_id)
         deleted = await self.store.delete_memory(memory_id)
@@ -328,7 +329,7 @@ class MemoryService:
                     status=existing.status,
                 )
             )
-        MEMORY_METRICS.observe("delete", "ok", 0.0)
+        MEMORY_METRICS.observe("delete", "ok", time.perf_counter() - started)
         return deleted
 
     # -- 版本史（锐评 #7） ---------------------------------------------------------
@@ -514,8 +515,9 @@ class MemoryService:
         """撤销一份文档的知识库分块（用户级知识资产的显式收回路径，
         修复"传错文件无法撤回"的边界：DELETE /v1/agents/{module}/files/{id}）。
         """
+        started = time.perf_counter()
         deleted = await self.store.delete_chunks_for_file(file_id)
-        MEMORY_METRICS.observe("revoke", "ok", 0.0)
+        MEMORY_METRICS.observe("revoke", "ok", time.perf_counter() - started)
         await self.record_op(
             op="revoke",
             user_id=user_id,
