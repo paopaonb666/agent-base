@@ -182,6 +182,10 @@ class Settings(BaseSettings):
     memory_time_decay_half_life_days: float = 14.0
     # 抽取管线的单次输入字符上限（防止长会话把 prompt 撑爆）。
     memory_extraction_max_input_chars: int = 8000
+    # 抽取转写的消息条数窗口（与字符上限共同约束）：超长会话只取最近
+    # N 条消息渲染转写——中段更早的事实靠滚动摘要承载。调大窗口换取
+    # 更全的抽取覆盖，代价是每次形成管线的 token 成本线性增长。
+    memory_extraction_max_messages: int = 24
     # 文档知识库分块（M6e）：按字符数分块 + 相邻块重叠。
     memory_doc_chunk_chars: int = 800
     memory_doc_chunk_overlap: int = 100
@@ -333,6 +337,7 @@ class Settings(BaseSettings):
         "memory_doc_chunk_chars",
         "memory_mysql_pool_size",
         "memory_profile_max_chars",
+        "memory_extraction_max_messages",
     )
     @classmethod
     def _validate_memory_positive_ints(cls, value: int, info: ValidationInfo) -> int:

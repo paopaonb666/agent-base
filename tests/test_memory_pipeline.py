@@ -340,3 +340,30 @@ def test_tool_message_rendering_in_transcript() -> None:
     tool_msg = ToolMessage(content="工具结果", tool_call_id="x", name="web_search")
     transcript = render_transcript([tool_msg], max_chars=8000)
     assert "web_search" in transcript and "工具结果" in transcript
+
+
+async def test_capture_transcript_window_configurable() -> None:
+    """抽取窗口走配置：窗口外的更早消息不进转写（中段事实靠摘要承载）。"""
+    from langchain_core.messages import HumanMessage
+
+    service = _service([], memory_extraction_max_messages=2)
+    seen: dict[str, str] = {}
+
+    class RecordingPipeline:
+        async def capture_turn(self, **kwargs: object) -> dict[str, object]:
+            seen["transcript"] = kwargs.get("transcript", "")
+            return {}
+
+    service.pipeline = RecordingPipeline()  # type: ignore[assignment]
+    messages = [
+        HumanMessage(content="最早的问题"),
+        HumanMessage(content="中间的问题"),
+        HumanMessage(content="最新的问题"),
+    ]
+    await service.capture_turn(
+        user_id="u", agent_id="chat", thread_id="chat:t", messages=messages
+    )
+    transcript = seen["transcript"]
+    assert "最新的问题" in transcript
+    assert "中间的问题" in transcript
+    assert "最早的问题" not in transcript  # 窗口外被裁掉

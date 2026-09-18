@@ -669,7 +669,8 @@ class MemoryService:
             return None
         human_count = sum(1 for m in messages if getattr(m, "type", "") == "human")
         transcript = render_transcript(
-            messages[-24:], self._settings.memory_extraction_max_input_chars
+            messages[-self._settings.memory_extraction_max_messages :],
+            self._settings.memory_extraction_max_input_chars,
         )
         if not transcript.strip():
             return None
