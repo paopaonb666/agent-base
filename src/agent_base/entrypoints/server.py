@@ -896,13 +896,17 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         q: str | None = None,
         module: str | None = None,
         kind: str | None = None,
+        status: str | None = None,
         limit: int = 20,
     ) -> dict[str, Any]:
-        """检索/浏览长期记忆。
+        """检索/浏览长期记忆（M8 人工复核扩展）。
 
         ``q`` 存在 → 混合检索（向量 + BM25 + 时间衰减 + 显著度），按相关
-        度降序；不存在 → 按更新时间浏览。``module`` 限定 agent 作用域
-        （该模块 + 全局共享；缺省查全部）。``kind`` 在两种模式下都生效。
+        度降序（只搜启用中的记忆）；不存在 → 按更新时间浏览全部状态。
+        ``module`` 限定 agent 作用域（该模块 + 全局共享；缺省查全部）。
+        ``kind`` / ``status``（active/archived/superseded，缺省全部）在
+        浏览模式下生效。每条记忆附带 ``expired`` 标志：episodic 记忆
+        超过 TTL 即为已过期（召回时自动失效，是否保留由人工判断）。
         """
         rt: AgentRuntime = request.app.state.runtime
         memory = _require_memory(rt)
@@ -911,19 +915,48 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
             raise HTTPException(
                 status_code=400, detail=f"kind 非法：{kind!r}；允许 {list(KNOWN_MEMORY_KINDS)}"
             )
+        status_filter = {
+            name: (name,) for name in KNOWN_MEMORY_STATUSES if name != "expired"
+        }.get(status or "", ())
+        if status is not None and not status_filter:
+            raise HTTPException(
+                status_code=400,
+                detail=f"status 非法：{status!r}；允许 {list(KNOWN_MEMORY_STATUSES)}",
+            )
         limit = max(1, min(limit, 100))
+        ttl_days = rt.settings.memory_episodic_ttl_days
+
+        def _expired(record: Any) -> bool:
+            return (
+                record.kind == "episodic"
+                and ttl_days > 0
+                and record.updated_at < time.time() - ttl_days * 86400
+            )
+
         if q:
             scored = await memory.search(user_id=user_id, agent_id=module, query=q, top_k=limit)
             results = [
-                {"score": round(item.score, 4), **item.record.meta()}
+                {
+                    "score": round(item.score, 4),
+                    **item.record.meta(),
+                    "expired": _expired(item.record),
+                }
                 for item in scored
                 if kind is None or item.record.kind == kind
             ]
             return {"query": q, "memories": results}
         records = await memory.list_memories(
-            user_id, agent_id=module, kinds=[kind] if kind else None, limit=limit
+            user_id,
+            agent_id=module,
+            kinds=[kind] if kind else None,
+            statuses=status_filter,
+            limit=limit,
         )
-        return {"memories": [record.meta() for record in records]}
+        return {
+            "memories": [
+                {**record.meta(), "expired": _expired(record)} for record in records
+            ]
+        }
 
     @app.patch("/v1/memory/{memory_id}")
     async def patch_memory(

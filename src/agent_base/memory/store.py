@@ -1093,7 +1093,7 @@ class MemoryMemoryStore:
             record
             for record in self._memories.values()
             if record.user_id == user_id
-            and record.status in statuses
+            and (not statuses or record.status in statuses)
             and (kinds is None or record.kind in kinds)
             and (not exclude_profile or not record.memory_id.startswith(PROFILE_ID_PREFIX))
             and (

@@ -20,6 +20,7 @@ import logging
 import re
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
@@ -414,16 +415,22 @@ class MemoryService:
         agent_id: str | None = None,
         include_global: bool = True,
         kinds: list[str] | None = None,
+        statuses: Sequence[str] | None = None,
         limit: int = 50,
         exclude_profile: bool = True,
     ) -> list[MemoryRecord]:
         """浏览列表（管理端点用）：默认排除画像记录——画像有专属页签，
-        JSON dump 混进记忆列表是实现细节泄漏。"""
+        JSON dump 混进记忆列表是实现细节泄漏。
+
+        ``statuses``：状态过滤；None/空 = 全部状态（管理界面要能看到
+        已归档/已废弃的记忆才能人工复核——召回路径仍只用 active）。
+        """
         return await self.store.list_memories(
             user_id,
             agent_id=agent_id,
             include_global=include_global,
             kinds=kinds,
+            statuses=statuses or (),
             limit=limit,
             exclude_profile=exclude_profile,
         )

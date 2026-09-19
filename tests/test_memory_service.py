@@ -573,3 +573,71 @@ async def test_browse_list_excludes_profile_records(tmp_path: Path) -> None:
         assert all(not m["memory_id"].startswith("profile:") for m in memories)
         assert len(memories) == 1
     await service.aclose()
+
+
+async def test_browse_lists_all_statuses_with_expired_flag(tmp_path: Path) -> None:
+    """人工复核（M8 扩展）：浏览返回全部状态 + episodic 过期标志。"""
+    import time
+
+    from fastapi.testclient import TestClient
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from agent_base.core.bootstrap import AgentRuntime
+    from agent_base.entrypoints.server import create_app
+    from agent_base.memory.store import MemoryMemoryStore
+    from fakes import HashEmbedding, ScriptedChatModel
+
+    rt = AgentRuntime(
+        settings=_settings(memory_episodic_ttl_days=30),
+        llm=ScriptedChatModel([]),
+        modules={},
+        tools=[],
+        checkpointer=InMemorySaver(),
+    )
+    rt.memory = MemoryService(
+        store=MemoryMemoryStore(), embedder=HashEmbedding(), settings=rt.settings
+    )
+    now = time.time()
+    store = rt.memory.store
+    # 四种形态：active 语义 / active 但已过期的 episodic / archived / superseded。
+    for mid, kind, status, updated in (
+        ("m-live", "semantic", "active", now),
+        ("m-expired", "episodic", "active", now - 40 * 86400),
+        ("m-archived", "semantic", "archived", now),
+        ("m-superseded", "semantic", "superseded", now),
+    ):
+        from agent_base.memory.store import MemoryRecord
+
+        await store.upsert_memory(
+            MemoryRecord(
+                memory_id=mid,
+                user_id="u3",
+                agent_id="chat",
+                kind=kind,
+                content=f"内容 {mid}",
+                status=status,
+                updated_at=updated,
+                created_at=updated,
+            )
+        )
+    with TestClient(create_app(runtime=rt)) as c:
+        body = c.get("/v1/memory", headers={"X-User-Id": "u3"}).json()
+        by_id = {m["memory_id"]: m for m in body["memories"]}
+        # 全部状态可见（人工复核的前提）。
+        assert set(by_id) == {"m-live", "m-expired", "m-archived", "m-superseded"}
+        assert by_id["m-live"]["expired"] is False
+        assert by_id["m-expired"]["expired"] is True  # 40 天 > 30 天 TTL
+        assert by_id["m-archived"]["expired"] is False  # semantic 不过期
+        # 状态过滤。
+        archived = c.get(
+            "/v1/memory", params={"status": "archived"}, headers={"X-User-Id": "u3"}
+        ).json()["memories"]
+        assert [m["memory_id"] for m in archived] == ["m-archived"]
+        # 非法 status → 400。
+        assert (
+            c.get("/v1/memory", params={"status": "bogus"}, headers={"X-User-Id": "u3"}).status_code
+            == 400
+        )
+        # 检索路径仍只返回启用中的记忆。
+        found = c.get("/v1/memory", params={"q": "内容"}, headers={"X-User-Id": "u3"}).json()
+        assert all(m["status"] == "active" for m in found["memories"])
