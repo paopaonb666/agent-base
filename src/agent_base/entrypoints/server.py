@@ -1234,6 +1234,34 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
             )
         return Response(content=info.content, media_type=media_type, headers=headers)
 
+    @app.get("/v1/knowledge/files")
+    async def list_knowledge_files(request: Request) -> dict[str, Any]:
+        """知识库文件列表（M8：独立知识库页面的数据源）。
+
+        用户级视图：该用户上传的全部文件 + 每个文件的切片数（切片
+        归属由 user_id 天然隔离）。记忆系统未启用时切片数降级为 0
+        （文件列表仍可用——文件是附件链路的基础设施）。
+        """
+        rt: AgentRuntime = request.app.state.runtime
+        file_store = rt.file_store
+        if file_store is None:
+            raise HTTPException(status_code=503, detail="附件存储未启用（存储后端不可用）")
+        user_id = _memory_user_id(request, rt.settings)
+        files = await file_store.list_for_user(user_id)
+        counts: dict[str, int] = {}
+        if rt.memory is not None:
+            counts = await rt.memory.store.chunk_counts_by_file(user_id)
+        return {
+            "files": [
+                {
+                    **info.meta(),
+                    "chunks": counts.get(info.file_id, 0),
+                    "created_at": info.created_at,
+                }
+                for info in files
+            ]
+        }
+
     @app.get("/v1/modules")
     async def list_modules(request: Request) -> dict[str, Any]:
         """列出已注册的模块（供前端配置面板选择，免去试错模块名）。"""

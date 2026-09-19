@@ -554,3 +554,65 @@ async def test_legacy_chunks_without_offsets_degrade(tmp_path=None) -> None:
     chunks = await service.store.list_chunks("u", file_id="f-old")
     assert chunks[0].offsets is None
     del MemoryMemoryStore  # 导入占位避免误删
+
+
+# ─────────────────── 知识库列表端点（M8） ───────────────────
+
+
+async def test_knowledge_files_endpoint() -> None:
+    """GET /v1/knowledge/files：用户级列表 + 每文件切片数 + 隔离。"""
+    from fastapi.testclient import TestClient
+
+    from agent_base.core.bootstrap import AgentRuntime
+    from agent_base.entrypoints.server import create_app
+    from agent_base.extensions.filestore import MemoryUploadedFileStore
+    from agent_base.modules.chat.module import ChatModule
+    from fakes import ScriptedChatModel
+
+    settings = _settings()
+    runtime = AgentRuntime(
+        settings=settings,
+        llm=ScriptedChatModel([]),
+        modules={"chat": ChatModule()},
+        tools=[],
+        checkpointer=None,
+    )
+    runtime.memory = MemoryService(
+        store=MemoryMemoryStore(), embedder=HashEmbedding(), settings=settings
+    )
+    runtime.file_store = MemoryUploadedFileStore()
+    with TestClient(create_app(runtime=runtime)) as client:
+        # alice 上传两个文档（各摄取若干分块）
+        file_ids = []
+        for name, text in (("a.txt", "alpha 内容。" * 30), ("b.txt", "beta 内容。" * 20)):
+            upload = client.post(
+                "/v1/agents/chat/files",
+                files={"file": (name, text.encode("utf-8"), "text/plain")},
+                headers={"X-User-Id": "alice"},
+            )
+            file_ids.append(upload.json()["file_id"])
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            counts = await runtime.memory.store.chunk_counts_by_file("alice")
+            if len(counts) == 2:
+                break
+            await asyncio.sleep(0.05)
+
+        listing = client.get("/v1/knowledge/files", headers={"X-User-Id": "alice"})
+        assert listing.status_code == 200
+        files = listing.json()["files"]
+        assert len(files) == 2
+        by_id = {f["file_id"]: f for f in files}
+        assert all(by_id[fid]["chunks"] > 0 for fid in file_ids)
+        assert all(f["user_id"] == "alice" for f in files)
+
+        # bob 的列表为空（用户隔离）。
+        bob_listing = client.get("/v1/knowledge/files", headers={"X-User-Id": "bob"})
+        assert bob_listing.status_code == 200
+        assert bob_listing.json()["files"] == []
+
+        # 记忆系统禁用时端点仍可用（chunks 降级为 0）。
+        runtime.memory = None
+        degraded = client.get("/v1/knowledge/files", headers={"X-User-Id": "alice"})
+        assert degraded.status_code == 200
+        assert all(f["chunks"] == 0 for f in degraded.json()["files"])

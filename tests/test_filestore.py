@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import time
 import types
+from pathlib import Path
 
 import pytest
 
@@ -204,3 +205,37 @@ async def test_sqlite_legacy_db_gets_user_id_column(tmp_path: object) -> None:
         assert rows[0].user_id == "carol"
     finally:
         await store.aclose()
+
+
+async def test_list_for_user_scopes_and_order() -> None:
+    """list_for_user：用户精确匹配 + module 过滤 + 时间倒序。"""
+    store = MemoryUploadedFileStore()
+    base = time.time()
+    await store.save(_info("a1", user_id="alice", created_at=base - 100))
+    await store.save(_info("a2", user_id="alice", module="writer", created_at=base - 50))
+    await store.save(_info("a3", user_id="alice", created_at=base))  # 最新
+    await store.save(_info("b1", user_id="bob"))
+    await store.save(_info("legacy"))  # 旧行空属主：不进任何人的列表
+
+    all_alice = await store.list_for_user("alice")
+    assert [r.file_id for r in all_alice] == ["a3", "a2", "a1"]  # created_at DESC
+    writer_only = await store.list_for_user("alice", module="writer")
+    assert [r.file_id for r in writer_only] == ["a2"]
+    bob_rows = await store.list_for_user("bob")
+    assert bob_rows[0].file_id == "b1"
+    assert await store.list_for_user("carol") == []
+    limited = await store.list_for_user("alice", limit=1)
+    assert [r.file_id for r in limited] == ["a3"]
+
+    import tempfile
+
+    sqlite_store = await SqliteUploadedFileStore.create(
+        str(Path(tempfile.mkdtemp()) / "lu.db")
+    )  # type: ignore[arg-type]
+    try:
+        for info in await store.list_for_user("alice"):
+            await sqlite_store.save(info)
+        rows = await sqlite_store.list_for_user("alice")
+        assert [r.file_id for r in rows] == ["a3", "a2", "a1"]
+    finally:
+        await sqlite_store.aclose()

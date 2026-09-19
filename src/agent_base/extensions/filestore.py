@@ -113,6 +113,10 @@ class UploadedFileStore(Protocol):
 
     async def get_many(self, file_ids: list[str]) -> list[UploadedFileInfo]: ...
 
+    async def list_for_user(
+        self, user_id: str, *, module: str | None = None, limit: int = 200
+    ) -> list[UploadedFileInfo]: ...
+
     async def bind_thread(self, file_ids: list[str], thread_id: str) -> None: ...
 
     async def delete_for_thread(self, thread_id: str) -> None: ...
@@ -141,6 +145,17 @@ class MemoryUploadedFileStore:
         for fid in file_ids:
             if fid in self._files:
                 self._files[fid] = replace(self._files[fid], thread_id=thread_id)
+
+    async def list_for_user(
+        self, user_id: str, *, module: str | None = None, limit: int = 200
+    ) -> list[UploadedFileInfo]:
+        matched = [
+            info
+            for info in self._files.values()
+            if info.user_id == user_id and (module is None or info.module == module)
+        ]
+        matched.sort(key=lambda info: info.created_at, reverse=True)
+        return matched[: max(1, limit)]
 
     async def delete_for_thread(self, thread_id: str) -> None:
         self._files = {
@@ -270,6 +285,23 @@ class SqliteUploadedFileStore:
         )
         await self._conn.commit()
         return bool(cursor.rowcount and cursor.rowcount > 0)
+
+    async def list_for_user(
+        self, user_id: str, *, module: str | None = None, limit: int = 200
+    ) -> list[UploadedFileInfo]:
+        sql = (
+            "SELECT file_id, thread_id, module, user_id, filename, format, pages,"
+            " paragraphs, truncated, text_len, warning, extracted_text, content"
+            " FROM uploaded_files WHERE user_id = ?"
+        )
+        params: list[Any] = [user_id]
+        if module is not None:
+            sql += " AND module = ?"
+            params.append(module)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(max(1, limit))
+        rows = await self._conn.execute_fetchall(sql, tuple(params))
+        return [self._to_info(row) for row in rows]
 
     async def aclose(self) -> None:
         await self._conn.close()
@@ -403,6 +435,28 @@ class MysqlUploadedFileStore:
             async with conn.cursor() as cur:
                 await cur.execute("DELETE FROM uploaded_files WHERE file_id = %s", (file_id,))
                 return bool(cur.rowcount and cur.rowcount > 0)
+        finally:
+            conn.close()
+
+    async def list_for_user(
+        self, user_id: str, *, module: str | None = None, limit: int = 200
+    ) -> list[UploadedFileInfo]:
+        sql = (
+            "SELECT file_id, thread_id, module, user_id, filename, format, pages,"
+            " paragraphs, truncated, text_len, warning, extracted_text, content, created_at"
+            " FROM uploaded_files WHERE user_id = %s"
+        )
+        params: list[Any] = [user_id]
+        if module is not None:
+            sql += " AND module = %s"
+            params.append(module)
+        sql += " ORDER BY created_at DESC LIMIT %s"
+        params.append(max(1, limit))
+        conn = await self._connect()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(sql, tuple(params))
+                return [self._to_info(row) for row in await cur.fetchall()]
         finally:
             conn.close()
 

@@ -262,6 +262,8 @@ class MemoryStore(Protocol):
 
     async def count_chunks_for_file(self, file_id: str) -> int: ...
 
+    async def chunk_counts_by_file(self, user_id: str) -> dict[str, int]: ...
+
     async def delete_chunks_for_file(self, file_id: str) -> int: ...
 
     async def list_chunks_needing_embedding(
@@ -930,6 +932,13 @@ class _SqlMemoryStoreBase:
     async def delete_chunks_for_file(self, file_id: str) -> int:
         return await self._execute("DELETE FROM doc_chunks WHERE file_id = ?", (file_id,))
 
+    async def chunk_counts_by_file(self, user_id: str) -> dict[str, int]:
+        rows = await self._fetch_all(
+            "SELECT file_id, COUNT(*) FROM doc_chunks WHERE user_id = ? GROUP BY file_id",
+            (user_id,),
+        )
+        return {str(row[0]): int(row[1]) for row in rows}
+
     # -- 线程级联 --------------------------------------------------------------------
     async def delete_for_thread(self, thread_id: str) -> None:
         # memories 刻意不删：跨会话记忆独立于线程存活（出处仍在
@@ -1165,6 +1174,13 @@ class MemoryMemoryStore:
 
     async def count_chunks_for_file(self, file_id: str) -> int:
         return sum(1 for chunk in self._chunks.values() if chunk.file_id == file_id)
+
+    async def chunk_counts_by_file(self, user_id: str) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for chunk in self._chunks.values():
+            if chunk.user_id == user_id:
+                counts[chunk.file_id] = counts.get(chunk.file_id, 0) + 1
+        return counts
 
     async def delete_chunks_for_file(self, file_id: str) -> int:
         stale = [cid for cid, chunk in self._chunks.items() if chunk.file_id == file_id]
