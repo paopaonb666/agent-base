@@ -314,13 +314,13 @@ class MySqlToolCallRecorder:
 
 def build_tool_call_recorder(settings: Settings) -> ToolCallRecorder | None:
     """按 settings 装配审计记录器；总开关关闭或后端未知时返回 None。"""
-    if not settings.tool_call_log_enabled:
+    if not settings.toolkit.call_log_enabled:
         return None
-    backend = settings.checkpointer_backend
+    backend = settings.checkpointer.backend
     if backend == "memory":
         return MemoryToolCallRecorder()
     if backend == "sqlite":
-        return SqliteToolCallRecorder(settings.checkpointer_sqlite_path)
+        return SqliteToolCallRecorder(settings.checkpointer.sqlite_path)
     if backend == "mysql":
         return MySqlToolCallRecorder(settings)
     logger.warning("toollog: unknown checkpointer backend %r; tool call audit disabled", backend)

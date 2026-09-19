@@ -52,7 +52,7 @@ def test_chunk_text_boundaries() -> None:
     assert rebuilt == text
     # 无段落文本：每块单区间 span，坐标能切回原文。
     for span in parts:
-        (start, end), = span.segments
+        ((start, end),) = span.segments
         assert text[start:end] == span.text
 
 
@@ -69,9 +69,7 @@ def test_chunk_text_overlap_must_be_smaller_than_chunk() -> None:
 async def test_ingest_and_search_knowledge() -> None:
     service = _service(memory_doc_chunk_chars=50, memory_doc_chunk_overlap=10)
     text = "LangGraph 是一个用于构建有状态 Agent 的框架。" * 5
-    count = await service.ingest_document(
-        file_id="f1", user_id="alice", agent_id="chat", text=text
-    )
+    count = await service.ingest_document(file_id="f1", user_id="alice", agent_id="chat", text=text)
     assert count > 1
     assert await service.store.count_chunks_for_file("f1") == count
     hits = await service.search_knowledge(user_id="alice", agent_id="chat", query="LangGraph 框架")
@@ -300,7 +298,7 @@ def test_chunk_text_oversized_paragraph_window_fallback() -> None:
     tail_spans = [p for p in parts if p.text.startswith("表格行")]
     assert tail_spans
     for span in tail_spans:
-        (start, end), = span.segments
+        ((start, end),) = span.segments
         assert text[start:end] == span.text
 
 
@@ -402,9 +400,7 @@ async def test_revoke_file_endpoint_removes_chunks_and_row() -> None:
         assert await service.store.count_chunks_for_file(file_id) > 0
 
         # bob 不能撤销 alice 的文件（404，不泄露存在性）。
-        denied = client.delete(
-            f"/v1/agents/chat/files/{file_id}", headers={"X-User-Id": "bob"}
-        )
+        denied = client.delete(f"/v1/agents/chat/files/{file_id}", headers={"X-User-Id": "bob"})
         assert denied.status_code == 404
         # alice 撤销：文件行 + 分块级联删除。
         ok = client.delete(f"/v1/agents/chat/files/{file_id}", headers={"X-User-Id": "alice"})

@@ -136,9 +136,12 @@ class MemoryUploadedFileStore:
         self._files[info.file_id] = info
 
     async def get_many(self, file_ids: list[str]) -> list[UploadedFileInfo]:
-        found = [self._files[fid] for fid in file_ids if fid in self._files]
         # 按 get_many 的请求顺序返回，注入顺序与前端附件列表一致。
-        found.sort(key=lambda info: file_ids.index(info.file_id))
+        rank = {fid: idx for idx, fid in enumerate(file_ids)}
+        found = sorted(
+            (self._files[fid] for fid in file_ids if fid in self._files),
+            key=lambda info: rank[info.file_id],
+        )
         return found
 
     async def bind_thread(self, file_ids: list[str], thread_id: str) -> None:
@@ -194,8 +197,7 @@ class SqliteUploadedFileStore:
         columns = {row[1] for row in await cursor.fetchall()}
         if "user_id" not in columns:
             await conn.execute(
-                "ALTER TABLE uploaded_files"
-                " ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT ''"
+                "ALTER TABLE uploaded_files ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT ''"
             )
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_uf_thread ON uploaded_files (thread_id)")
         await conn.commit()
@@ -463,11 +465,11 @@ class MysqlUploadedFileStore:
 
 async def build_uploaded_file_store(settings: Settings) -> UploadedFileStore | None:
     """按 settings 装配附件存储（跟随 checkpointer 后端）。"""
-    backend = settings.checkpointer_backend
+    backend = settings.checkpointer.backend
     if backend == "memory":
         return MemoryUploadedFileStore()
     if backend == "sqlite":
-        return await SqliteUploadedFileStore.create(settings.checkpointer_sqlite_path)
+        return await SqliteUploadedFileStore.create(settings.checkpointer.sqlite_path)
     if backend == "mysql":
         return MysqlUploadedFileStore(settings)
     logger.warning("filestore: unknown checkpointer backend %r; attachments disabled", backend)

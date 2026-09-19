@@ -42,13 +42,13 @@ TOOLKIT: dict[str, ToolSpec] = {
 
 
 def build_toolkit_tools(settings: Settings) -> list[BaseTool]:
-    """按 ``settings.toolkit_enabled`` 装配启用的内置工具。
+    """按 ``settings.toolkit.enabled`` 装配启用的内置工具。
 
     启用但不可用 → ``ToolkitError``（快速失败 + 修复指引）；未启用 →
     工厂根本不会被调用（依赖缺失完全无感）。
     """
     tools: list[BaseTool] = []
-    for name in settings.toolkit_enabled:
+    for name in settings.toolkit.enabled:
         spec = TOOLKIT.get(name)
         if spec is None:
             raise ToolkitError(
@@ -67,7 +67,7 @@ def toolkit_timeouts(settings: Settings) -> dict[str, float]:
     return {
         name: spec.timeout
         for name, spec in TOOLKIT.items()
-        if name in settings.toolkit_enabled and spec.timeout is not None
+        if name in settings.toolkit.enabled and spec.timeout is not None
     }
 
 

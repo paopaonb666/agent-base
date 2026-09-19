@@ -24,6 +24,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from langchain_core.runnables.config import ensure_config
 from langchain_core.tools import BaseTool
 from langgraph.config import get_config
 
@@ -164,10 +165,13 @@ class _TimeoutTool(BaseTool):
             result: list[Any] = []
             error: list[Exception] = []
             done = threading.Event()
+            # config 在调用方上下文取出后随参数进工作线程——ContextVar
+            # 不会跨线程传播，必须在 start 之前固化（与 _arun 同语义）。
+            config = ensure_config()
 
             def _target() -> None:
                 try:
-                    result.append(self.inner.invoke(kwargs))
+                    result.append(self.inner.invoke(kwargs, config))
                 except Exception as exc:
                     error.append(exc)
                 finally:
@@ -197,8 +201,14 @@ class _TimeoutTool(BaseTool):
         result_text = ""
         error_text = ""
         try:
+            # RunnableConfig 透传（M4 修复）：ensure_config 从当前运行上下文
+            # 取出调用方传入的 config——此前 _TimeoutTool 不转发 config，
+            # callbacks/metadata/configurable 在包装层被静默丢弃。
+            config = ensure_config()
             try:
-                value = await asyncio.wait_for(self.inner.ainvoke(kwargs), timeout=self.timeout)
+                value = await asyncio.wait_for(
+                    self.inner.ainvoke(kwargs, config), timeout=self.timeout
+                )
                 result_text = str(value)
                 return value
             # 3.10 上 asyncio.TimeoutError 与内置 TimeoutError 是不同类型，两者都要接住。

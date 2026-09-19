@@ -1,18 +1,16 @@
 """writer 模块的图构建。
 
-一个带写作取向系统提示词的 LLM 节点。结构上与 chat 模块完全相同
-（流式累积 + checkpointer + 具名编译）——唯一的区别就是提示词，而这
-正是要点所在：模块的区别在于行为，而不在于接线。
+一个带写作取向系统提示词的 LLM 节点，经基座共享图工厂装配
+（``core/graphs.py``）——结构与 chat 完全一致，唯一的区别就是提示词，
+而这正是要点所在：模块的区别在于行为，而不在于接线。工厂同时带来
+基座级的上下文保护（注入去重 + token 预算修剪），注入块不再随轮次
+无界累积（H3）。
 """
 
 from __future__ import annotations
 
-from typing import Any
-
-from langchain_core.messages import AIMessageChunk, SystemMessage
-from langgraph.graph import END, START, MessagesState, StateGraph
-
 from agent_base.core.contracts import Graph, ModuleContext
+from agent_base.core.graphs import build_single_agent_graph
 
 MODULE_NAME = "writer"
 
@@ -25,18 +23,4 @@ WRITER_PROMPT = (
 
 def build_writer_graph(ctx: ModuleContext) -> Graph:
     """构建并编译 writer 图。"""
-
-    async def call_model(state: MessagesState) -> dict[str, Any]:
-        final: AIMessageChunk | None = None
-        messages = [SystemMessage(content=WRITER_PROMPT), *state["messages"]]
-        async for chunk in ctx.llm.astream(messages):
-            final = chunk if final is None else final + chunk
-        if final is None:
-            return {"messages": []}
-        return {"messages": [final]}
-
-    graph = StateGraph(MessagesState)
-    graph.add_node("agent", call_model)
-    graph.add_edge(START, "agent")
-    graph.add_edge("agent", END)
-    return graph.compile(checkpointer=ctx.checkpointer, name=MODULE_NAME)
+    return build_single_agent_graph(ctx, name=MODULE_NAME, system_prompt=WRITER_PROMPT)

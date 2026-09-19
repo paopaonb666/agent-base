@@ -18,6 +18,7 @@ M1（工具库）新增：``TOOLKIT_ENABLED`` 选中的基座内置工具在装�
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -26,19 +27,21 @@ from langchain_core.tools import BaseTool
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from agent_base.core.config import Settings
-from agent_base.core.contracts import AgentModule, Graph, ModuleContext
+from agent_base.core.contracts import AgentModule, Graph, MemoryPort, ModuleContext
 from agent_base.core.llm import build_llm
 from agent_base.core.registry import RegistryError, load_modules
 from agent_base.core.tools import build_tool_pool
 from agent_base.extensions.filestore import UploadedFileStore, build_uploaded_file_store
 from agent_base.extensions.memory import build_checkpointer, close_checkpointer
 from agent_base.extensions.toollog import ToolCallRecorder, build_tool_call_recorder
-from agent_base.memory.service import MemoryService, build_memory_service
+from agent_base.memory.store import MemoryStore
 from agent_base.tools.registry import build_toolkit_tools, toolkit_timeouts
 
 # 保留的模块名：不构建单个模块的图，而是在所有已加载模块之上构建
 # supervisor 图（阶段 4）。
 SUPERVISOR_MODULE = "supervisor"
+
+logger = logging.getLogger(__name__)
 
 
 class UnknownModuleError(KeyError):
@@ -65,8 +68,12 @@ class AgentRuntime:
     checkpointer: BaseCheckpointSaver[Any] | None = None
     tool_recorder: ToolCallRecorder | None = None
     file_store: UploadedFileStore | None = None
-    # 记忆服务（M6）：None = 未启用；模块通过 ModuleContext.memory 取用。
-    memory: MemoryService | None = None
+    # 记忆服务端口（M6）：None = 未启用；模块通过 ModuleContext.memory 取用。
+    memory: MemoryPort | None = None
+    # 会话索引存储（S1）：thread_index 表的后端（跟随 checkpointer 后端）。
+    # 与 memory 服务独立——MEMORY_ENABLED=false 时仍提供线程属主数据面；
+    # memory 启用时它就是 memory.store 同一实例（随 memory.aclose 关闭）。
+    thread_index: MemoryStore | None = None
     _graphs: dict[str, Graph] = field(default_factory=dict, repr=False)
     _supervisor: Graph | None = field(default=None, repr=False)
 
@@ -124,6 +131,10 @@ class AgentRuntime:
             await self.file_store.aclose()
         if self.memory is not None:
             await self.memory.aclose()
+        elif self.thread_index is not None:
+            closer = getattr(self.thread_index, "aclose", None)
+            if closer is not None:
+                await closer()
 
 
 async def create_runtime(settings: Settings | None = None) -> AgentRuntime:
@@ -138,10 +149,26 @@ async def create_runtime(settings: Settings | None = None) -> AgentRuntime:
     modules = load_modules(resolved.agent_modules)
     validate_module_names(modules)
     # 记忆服务（M6）先于工具池装配：记忆工具（M6e）作为 extra_tools 进
-    # 池，与模块工具/工具库工具同样受超时包装与审计收口。
+    # 池，与模块工具/工具库工具同样受超时包装与审计收口。延迟导入：
+    # core 装配层不在模块加载时依赖 memory 子系统的导入图（依赖倒置——
+    # 契约只认 MemoryPort）。
     checkpointer = await build_checkpointer(resolved)
     file_store = await build_uploaded_file_store(resolved)
-    memory_service = await build_memory_service(resolved, llm)
+    from agent_base.memory.service import build_memory_service
+    from agent_base.memory.store import build_memory_store
+
+    # 存储后端常备（S1）：thread_index 的线程属主数据面不随
+    # MEMORY_ENABLED 关闭；记忆服务启用时复用同一 store 实例。
+    try:
+        memory_store = await build_memory_store(resolved)
+    except Exception:
+        if resolved.memory_enabled:
+            raise
+        logger.warning("memory: 存储后端装配失败（记忆已禁用，仅线程索引降级）", exc_info=True)
+        memory_store = None
+    memory_service = None
+    if memory_store is not None:
+        memory_service = await build_memory_service(resolved, llm, store=memory_store)
     # 工具库的内置工具按 TOOLKIT_ENABLED 装配后并入共享池（模块工具在
     # 前，工具库在后）；重名在任何一侧发生都会快速失败。注册表声明的
     # per-tool 超时在这里下发给池；审计记录器挂上收口，全量落库。
@@ -168,4 +195,5 @@ async def create_runtime(settings: Settings | None = None) -> AgentRuntime:
         tool_recorder=recorder,
         file_store=file_store,
         memory=memory_service,
+        thread_index=memory_store,
     )

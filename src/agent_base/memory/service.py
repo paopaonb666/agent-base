@@ -17,11 +17,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import time
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from agent_base.extensions.metrics import MEMORY_METRICS
@@ -42,6 +41,12 @@ from agent_base.memory.store import (
     encode_embedding,
     profile_memory_id,
 )
+from agent_base.memory.textkit import (  # noqa: F401  # re-export（历史 API 路径）
+    ChunkSpan,
+    _join_spans,
+    _trim_profile_to_chars,
+    chunk_text,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - import avoided at runtime
     from agent_base.core.config import Settings
@@ -52,143 +57,6 @@ logger = logging.getLogger(__name__)
 def new_memory_id() -> str:
     """新生成的记忆 id（uuid hex 截断，与 file_id 同风格）。"""
     return uuid.uuid4().hex[:32]
-
-
-def _trim_profile_to_chars(profile: dict[str, Any], max_chars: int) -> dict[str, Any]:
-    """画像结构级硬截断：从最后一个分节倒序逐条丢弃条目直到序列化
-    长度达标；仍超长（存在巨型单条）则截断字符串值。输出永远是合法
-    JSON——绝不让画像把注入预算缓慢撑爆。"""
-    trimmed: dict[str, Any] = {}
-    for key, value in profile.items():
-        if isinstance(value, list):
-            trimmed[key] = list(value)
-        elif isinstance(value, dict):
-            trimmed[key] = dict(value)
-        else:
-            trimmed[key] = value
-
-    def _length() -> int:
-        return len(json.dumps(trimmed, ensure_ascii=False))
-
-    while _length() > max_chars:
-        last_key = next(
-            (
-                key
-                for key in reversed(list(trimmed))
-                if isinstance(trimmed[key], list) and trimmed[key]
-            ),
-            None,
-        )
-        if last_key is None:
-            break
-        trimmed[last_key].pop()
-        if not trimmed[last_key]:
-            del trimmed[last_key]
-    while _length() > max_chars:
-        str_key: str | None = next(
-            (k for k, v in trimmed.items() if isinstance(v, str) and v),
-            None,
-        )
-        if str_key is None:
-            # 只剩数字/空结构的极端兜底：几乎不可达，但绝不抛错。
-            return {"truncated": True}
-        trimmed[str_key] = trimmed[str_key][: max(1, max_chars // 2)]
-    return trimmed
-
-
-@dataclass(frozen=True)
-class ChunkSpan:
-    """一个切片：内容文本 + 在原文中的字符区间（前端高亮边界的依据）。
-
-    ``segments`` 是 ``((start, end), …)`` 元组，坐标相对**调用方传入的
-    原文**（含 strip 偏移补偿）。段落打包块的文本由多段拼成，单一
-    (start, end) 不成立，因此是区间列表；固定窗口切片是单区间。
-    """
-
-    text: str
-    segments: tuple[tuple[int, int], ...]
-
-    @property
-    def char_len(self) -> int:
-        return len(self.text)
-
-
-def chunk_text(text: str, *, chunk_chars: int, overlap: int) -> list[ChunkSpan]:
-    """把文档文本切块（边界加固：段落感知优先，固定窗口兜底）。
-
-    策略：
-    - 优先按空行分段、贪心把**完整段落**打包进 ≤ chunk_chars 的块——
-      切块边界落在段落上，表格/列表/代码块不再被从中间劈开；
-    - 单段超过 chunk_chars 时段内退回固定窗口滑动（带 overlap）；
-    - 全文没有段落分隔（或只有一段）时行为与旧版固定窗口完全一致
-      （向后兼容：纯文本长文切块结果不变）。
-
-    返回 span：除块文本外还带原文坐标，供前端把切片边界高亮回原文
-    （切片可视化）；坐标相对传入的 text 原始串（strip 前的完整范围）。
-
-    保证：任何块不超过 chunk_chars；非空内容全部覆盖；空文本返回空列表。
-    """
-    leading = len(text) - len(text.lstrip())
-    text = text.strip()
-    if not text:
-        return []
-    if len(text) <= chunk_chars:
-        return [ChunkSpan(text, ((leading, leading + len(text)),))]
-
-    def _window(block: str, base: int) -> list[ChunkSpan]:
-        step = max(1, chunk_chars - overlap)
-        return [
-            ChunkSpan(
-                block[start : start + chunk_chars],
-                ((base + start, base + min(start + chunk_chars, len(block))),),
-            )
-            for start in range(0, len(block), step)
-        ]
-
-    # 段落切分带坐标：finditer 拿每段在 stripped 文本中的位置。
-    paragraphs: list[tuple[str, int]] = []
-    last = 0
-    for match in re.finditer(r"\n\s*\n", text):
-        segment = text[last : match.start()]
-        if segment.strip():
-            paragraphs.append((segment.strip(), last + (len(segment) - len(segment.lstrip()))))
-        last = match.end()
-    tail = text[last:]
-    if tail.strip():
-        paragraphs.append((tail.strip(), last + (len(tail) - len(tail.lstrip()))))
-
-    if len(paragraphs) <= 1:
-        return _window(text, leading)
-
-    chunks: list[ChunkSpan] = []
-    current: list[tuple[str, int]] = []
-    current_len = 0  # 已装段落总长（含段间空行分隔符）
-    for para, pos in paragraphs:
-        if len(para) > chunk_chars:
-            # 超长段落：先结算已打包内容，段内固定窗口切。
-            if current:
-                chunks.append(_join_spans(current, leading))
-                current, current_len = [], 0
-            chunks.extend(_window(para, leading + pos))
-            continue
-        extra = len(para) + (2 if current else 0)
-        if current_len + extra <= chunk_chars:
-            current.append((para, pos))
-            current_len += extra
-        else:
-            chunks.append(_join_spans(current, leading))
-            current, current_len = [(para, pos)], len(para)
-    if current:
-        chunks.append(_join_spans(current, leading))
-    return chunks
-
-
-def _join_spans(paragraphs: list[tuple[str, int]], leading: int) -> ChunkSpan:
-    """把打包进同一块的若干段落合成一个 span：文本以 \\n\\n 相接，
-    segments 保留各段在原文中的真实区间（高亮时按段渲染）。"""
-    joined = "\n\n".join(para for para, _ in paragraphs)
-    segments = tuple((leading + pos, leading + pos + len(para)) for para, pos in paragraphs)
-    return ChunkSpan(joined, segments)
 
 
 class MemoryService:
@@ -451,10 +319,10 @@ class MemoryService:
             agent_id=agent_id,
             query=query,
             embedder=self.embedder if not isinstance(self.embedder, NullEmbedding) else None,
-            top_k=top_k or self._settings.memory_recall_top_k,
-            episodic_ttl_days=self._settings.memory_episodic_ttl_days,
-            half_life_days=self._settings.memory_time_decay_half_life_days,
-            min_score=self._settings.memory_recall_min_score,
+            top_k=top_k or self._settings.memory.recall_top_k,
+            episodic_ttl_days=self._settings.memory.episodic_ttl_days,
+            half_life_days=self._settings.memory.time_decay_half_life_days,
+            min_score=self._settings.memory.recall_min_score,
             weights=self._hybrid_weights(),
         )
         MEMORY_METRICS.observe("search", "ok", time.perf_counter() - started)
@@ -482,8 +350,8 @@ class MemoryService:
         try:
             parts = chunk_text(
                 text,
-                chunk_chars=self._settings.memory_doc_chunk_chars,
-                overlap=self._settings.memory_doc_chunk_overlap,
+                chunk_chars=self._settings.memory.doc_chunk_chars,
+                overlap=self._settings.memory.doc_chunk_overlap,
             )
             # 幂等：同一 file_id 重复摄取（重试/重解析场景）先清旧分块，
             # 防止 chunk_id 随机生成导致的重复堆积。
@@ -536,6 +404,13 @@ class MemoryService:
     ) -> list[ScoredChunk]:
         """知识库混合检索（向量 + BM25 + 时间衰减）。"""
         chunks = await self.store.list_chunks(user_id, agent_id=agent_id)
+        if len(chunks) >= 2000:
+            # 容量契约（H2）：同召回候选——静默截断会让"检索质量莫名
+            # 下降"，这里显式告警。
+            logger.warning(
+                "memory: 知识库候选分块达到上限 2000（user=%r）——更早的文件不参与本轮检索",
+                user_id,
+            )
         if not chunks:
             return []
         vectors = await self.embedder.embed([query])
@@ -545,28 +420,29 @@ class MemoryService:
             query,
             query_embedding,
             now=time.time(),
-            half_life_days=self._settings.memory_time_decay_half_life_days,
+            half_life_days=self._settings.memory.time_decay_half_life_days,
             weights=self._hybrid_weights(),
         )
         scored.sort(key=lambda item: item.score, reverse=True)
-        min_score = self._settings.memory_recall_min_score
+        min_score = self._settings.memory.recall_min_score
         if min_score > 0:
 
             def _has_evidence(item: ScoredChunk) -> bool:
-                return item.components.get("keyword", 0.0) > 0 or item.components.get(
-                    "vector", 0.0
-                ) > 0
+                return (
+                    item.components.get("keyword", 0.0) > 0
+                    or item.components.get("vector", 0.0) > 0
+                )
 
             scored = [item for item in scored if item.score >= min_score and _has_evidence(item)]
-        return scored[: max(1, top_k or self._settings.memory_recall_top_k)]
+        return scored[: max(1, top_k or self._settings.memory.recall_top_k)]
 
     def _hybrid_weights(self) -> dict[str, float]:
         """从 settings 读混合权重（锐评 #4：可配置化，默认与 M6b 一致）。"""
         return {
-            "vector": self._settings.memory_weight_vector,
-            "keyword": self._settings.memory_weight_keyword,
-            "recency": self._settings.memory_weight_recency,
-            "salience": self._settings.memory_weight_salience,
+            "vector": self._settings.memory.weight_vector,
+            "keyword": self._settings.memory.weight_keyword,
+            "recency": self._settings.memory.weight_recency,
+            "salience": self._settings.memory.weight_salience,
         }
 
     async def revoke_document(self, *, file_id: str, user_id: str) -> int:
@@ -613,16 +489,12 @@ class MemoryService:
             return 0
         total = 0
         while True:
-            records = await self.store.list_memories_needing_embedding(
-                self.embedder.dims, batch
-            )
+            records = await self.store.list_memories_needing_embedding(self.embedder.dims, batch)
             if not records:
                 break
             vectors = await self.embedder.embed([record.content for record in records])
             if vectors is None:
-                logger.warning(
-                    "memory: embedding 服务不可用，回填中断（已回填 %s 条）", total
-                )
+                logger.warning("memory: embedding 服务不可用，回填中断（已回填 %s 条）", total)
                 break
             for record, vector in zip(records, vectors, strict=True):
                 await self.store.upsert_memory(
@@ -642,9 +514,7 @@ class MemoryService:
                 break
             vectors = await self.embedder.embed([chunk.text for chunk in chunks])
             if vectors is None:
-                logger.warning(
-                    "memory: embedding 服务不可用，分块回填中断（已回填 %s 条）", total
-                )
+                logger.warning("memory: embedding 服务不可用，分块回填中断（已回填 %s 条）", total)
                 break
             for chunk, vector in zip(chunks, vectors, strict=True):
                 await self.store.put_chunks(
@@ -686,7 +556,7 @@ class MemoryService:
         memory_id = profile_memory_id(user_id)
         existing = await self.store.get_memory(memory_id)
         now = time.time()
-        profile = _trim_profile_to_chars(profile, self._settings.memory_profile_max_chars)
+        profile = _trim_profile_to_chars(profile, self._settings.memory.profile_max_chars)
         await self.store.upsert_memory(
             MemoryRecord(
                 memory_id=memory_id,
@@ -727,8 +597,8 @@ class MemoryService:
             return None
         human_count = sum(1 for m in messages if getattr(m, "type", "") == "human")
         transcript = render_transcript(
-            messages[-self._settings.memory_extraction_max_messages :],
-            self._settings.memory_extraction_max_input_chars,
+            messages[-self._settings.memory.extraction_max_messages :],
+            self._settings.memory.extraction_max_input_chars,
         )
         if not transcript.strip():
             return None
@@ -759,7 +629,7 @@ class MemoryService:
             agent_blocks = await self.store.list_blocks(user_id, agent_id)
             blocks = [*global_blocks, *agent_blocks]
             profile = (
-                await self.get_profile(user_id) if self._settings.memory_profile_enabled else None
+                await self.get_profile(user_id) if self._settings.memory.profile_enabled else None
             )
             summary_record = await self.store.get_summary(user_id, thread_id)
             recalled = await self.search(user_id=user_id, agent_id=agent_id, query=query)
@@ -768,7 +638,7 @@ class MemoryService:
                 blocks=blocks,
                 summary=summary_record.summary if summary_record else None,
                 recalled=recalled,
-                max_chars=self._settings.memory_context_max_chars,
+                max_chars=self._settings.memory.context_max_chars,
             )
         except Exception:
             logger.warning("memory: 注入块组装失败（本轮不注入）", exc_info=True)
@@ -787,16 +657,21 @@ class MemoryService:
             await embedder_close()
 
 
-async def build_memory_service(settings: Settings, llm: Any | None = None) -> MemoryService | None:
+async def build_memory_service(
+    settings: Settings, llm: Any | None = None, *, store: MemoryStore | None = None
+) -> MemoryService | None:
     """按 settings 装配记忆服务；未启用或后端不可用时返回 None。
 
     ``llm`` 是运行时的对话模型（形成管线复用它）；测试可以不传——
-    检索与手工管理照常工作，仅形成管线缺席。
+    检索与手工管理照常工作，仅形成管线缺席。``store`` 允许调用方注入
+    已装配的存储（bootstrap 复用同一实例作为 thread_index 数据面）；
+    缺省时按 settings 自建。
     """
-    if not settings.memory_enabled:
+    if not settings.memory.enabled:
         logger.info("memory: 记忆系统已禁用（MEMORY_ENABLED=false）")
         return None
-    store = await build_memory_store(settings)
+    if store is None:
+        store = await build_memory_store(settings)
     if store is None:
         return None
     embedder = build_embedding_client(settings)

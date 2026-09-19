@@ -105,6 +105,7 @@ async def test_threads_are_isolated() -> None:
     assert [m.content for m in r2["messages"]] == ["two", "b"]
 
 
+@pytest.mark.integration
 async def test_mysql_backend_builds_and_probes() -> None:
     """MySQL 后端装配测试（本机无 MySQL 时自动跳过）。
 

@@ -45,6 +45,7 @@ def _service(responses: list[AIMessage], **overrides: object) -> MemoryService:
 def _json_msg(payload: Any) -> AIMessage:
     return AIMessage(content=json.dumps(payload, ensure_ascii=False))
 
+
 def _rearm(service: MemoryService, responses: list[AIMessage]) -> None:
     """替换脚本模型并同步重建管线（pipeline 持有 llm 引用）。"""
     service._llm = ScriptedChatModel(responses)  # type: ignore[attr-defined]
@@ -158,9 +159,7 @@ async def test_consolidate_all_ops() -> None:
 
 
 async def test_consolidate_add_creates_memory_with_provenance() -> None:
-    service = _service(
-        [_json_msg({"op": "ADD", "content": "用户在开发记忆系统"})]
-    )
+    service = _service([_json_msg({"op": "ADD", "content": "用户在开发记忆系统"})])
     assert service.pipeline is not None
     from agent_base.memory.pipeline import Candidate
 
@@ -306,9 +305,7 @@ def test_invoke_triggers_background_capture() -> None:
         deadline = time.time() + 5.0
         found = False
         while time.time() < deadline and not found:
-            records = asyncio.run(
-                service.store.list_memories("hook-user", agent_id="chat")
-            )
+            records = asyncio.run(service.store.list_memories("hook-user", agent_id="chat"))
             found = any(r.content == "用户正在测试记忆钩子" for r in records)
             if not found:
                 time.sleep(0.05)
@@ -360,9 +357,7 @@ async def test_capture_transcript_window_configurable() -> None:
         HumanMessage(content="中间的问题"),
         HumanMessage(content="最新的问题"),
     ]
-    await service.capture_turn(
-        user_id="u", agent_id="chat", thread_id="chat:t", messages=messages
-    )
+    await service.capture_turn(user_id="u", agent_id="chat", thread_id="chat:t", messages=messages)
     transcript = seen["transcript"]
     assert "最新的问题" in transcript
     assert "中间的问题" in transcript

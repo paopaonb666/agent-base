@@ -139,7 +139,7 @@ async def _run(args: argparse.Namespace) -> int:
         print(f"configuration error: {exc}", file=sys.stderr)
         return 2
 
-    setup_logging(json_lines=runtime.settings.log_json)
+    setup_logging(json_lines=runtime.settings.observability.log_json)
     log_tracing_config()
     thread_id = args.thread_id or uuid.uuid4().hex[:12]
     try:

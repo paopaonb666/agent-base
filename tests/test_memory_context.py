@@ -236,13 +236,10 @@ async def test_chat_graph_trims_model_input() -> None:
         messages.extend(
             [HumanMessage(content=f"历史问题{i}" + "很长" * 60), AIMessage(content="历史回答" * 60)]
         )
-    await graph.ainvoke(
-        {"messages": messages}, {"configurable": {"thread_id": "chat:trim-test"}}
-    )
+    await graph.ainvoke({"messages": messages}, {"configurable": {"thread_id": "chat:trim-test"}})
     assert llm.received, "模型未被调用"
     seen = llm.received[0]
     assert len(seen) < len(messages)
     # 最新一轮（问题 11 与它的回答）保留在尾部。
     assert seen[-1].content == "历史回答" * 60
     assert seen[-2].content.startswith("历史问题11")
-

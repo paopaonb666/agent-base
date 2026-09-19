@@ -88,7 +88,8 @@ async def test_build_memory_store_backend_selection(tmp_path: Path) -> None:
     # 的防御分支——未知后端返回 None 而不是崩溃。
     from types import SimpleNamespace
 
-    stub = SimpleNamespace(checkpointer_backend="nonsense")
+    # 存储装配读取的是嵌套配置节（Settings.checkpointer.backend）。
+    stub = SimpleNamespace(checkpointer=SimpleNamespace(backend="nonsense"))
     assert await build_memory_store(stub) is None  # type: ignore[arg-type]
 
 
@@ -301,6 +302,7 @@ async def test_sqlite_store_create_is_idempotent(tmp_path: Path) -> None:
         await store2.aclose()
 
 
+@pytest.mark.integration
 async def test_mysql_store_semantics() -> None:
     """MySQL 后端语义一致性（本机无 MySQL 时自动跳过）。"""
     pytest.importorskip("aiomysql")
@@ -346,9 +348,7 @@ async def test_mysql_store_semantics() -> None:
 
 async def _check_needing_embedding(store: MemoryMemoryStore | SqliteMemoryStore) -> None:
     """回填查询只返回 active、非画像、向量缺失或维度不符的记录。"""
-    stale = _record(
-        memory_id="stale-dim", embedding=encode_embedding([1.0]), embedding_dim=1
-    )
+    stale = _record(memory_id="stale-dim", embedding=encode_embedding([1.0]), embedding_dim=1)
     missing = _record(memory_id="no-vec", embedding=None, embedding_dim=None)
     fresh = _record(
         memory_id="ok-vec",

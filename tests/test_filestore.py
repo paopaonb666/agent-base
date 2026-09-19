@@ -229,9 +229,7 @@ async def test_list_for_user_scopes_and_order() -> None:
 
     import tempfile
 
-    sqlite_store = await SqliteUploadedFileStore.create(
-        str(Path(tempfile.mkdtemp()) / "lu.db")
-    )  # type: ignore[arg-type]
+    sqlite_store = await SqliteUploadedFileStore.create(str(Path(tempfile.mkdtemp()) / "lu.db"))  # type: ignore[arg-type]
     try:
         for info in await store.list_for_user("alice"):
             await sqlite_store.save(info)

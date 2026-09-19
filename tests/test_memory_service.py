@@ -31,9 +31,7 @@ async def _sqlite_service(tmp_path: Path, **overrides: object) -> MemoryService:
 
 async def test_add_memory_embeds_content(tmp_path: Path) -> None:
     service = await _sqlite_service(tmp_path)
-    record = await service.add_memory(
-        user_id="alice", agent_id="chat", content="用户偏好简洁回答"
-    )
+    record = await service.add_memory(user_id="alice", agent_id="chat", content="用户偏好简洁回答")
     assert record.embedding is not None
     assert record.embedding_dim == HashEmbedding().dims
     fetched = await service.get_memory(record.memory_id)
@@ -153,9 +151,7 @@ async def test_memory_endpoints_validation() -> None:
     with client as c:
         assert c.post("/v1/memory", json={"content": "x", "kind": "gossip"}).status_code == 400
         assert c.post("/v1/memory", json={"content": ""}).status_code == 422
-        assert (
-            c.get("/v1/memory", params={"kind": "gossip"}).status_code == 400
-        )
+        assert c.get("/v1/memory", params={"kind": "gossip"}).status_code == 400
         bad_header = c.get("/v1/memory", headers={"X-User-Id": "bad user id!"})
         assert bad_header.status_code == 400
         assert c.patch("/v1/memory/nope", json={"salience": 0.1}).status_code == 404
@@ -254,9 +250,7 @@ def test_memory_user_sig_enforced_when_secret_configured() -> None:
         )
         assert good.status_code == 200
         # default 用户用自己的签名也能通过。
-        default_ok = c.get(
-            "/v1/memory", headers={"X-User-Sig": _user_sig("default", "s3cret-key")}
-        )
+        default_ok = c.get("/v1/memory", headers={"X-User-Sig": _user_sig("default", "s3cret-key")})
         assert default_ok.status_code == 200
 
 
@@ -498,14 +492,12 @@ def test_memory_version_endpoints_and_ownership() -> None:
             ).status_code
             == 200
         )
-        versions = c.get(
-            f"/v1/memory/{memory_id}/versions", headers={"X-User-Id": "alice"}
-        ).json()["versions"]
+        versions = c.get(f"/v1/memory/{memory_id}/versions", headers={"X-User-Id": "alice"}).json()[
+            "versions"
+        ]
         assert [v["op"] for v in versions] == ["update", "create"]
         # bob：读版本史 404，恢复 404，PATCH 404，DELETE 404（不泄露存在性）。
-        bob_versions = c.get(
-            f"/v1/memory/{memory_id}/versions", headers={"X-User-Id": "bob"}
-        )
+        bob_versions = c.get(f"/v1/memory/{memory_id}/versions", headers={"X-User-Id": "bob"})
         assert bob_versions.status_code == 404
         restore = c.post(
             f"/v1/memory/{memory_id}/versions/{versions[1]['version_id']}/restore",

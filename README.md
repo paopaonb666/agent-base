@@ -32,7 +32,7 @@ Agent 软件基座——所有 agent 模块扩展的统一起点。
   CLI / SSE 服务 ───────▶ │  entrypoints   core                extensions│
   (python -m / uvicorn)   │  ┌──────────┐  ┌────────────────┐  ┌───────┐ │
                           │  │ cli.py   │─▶│ bootstrap      │◀─│memory │ │ ◀─ 对话状态
-                          │  │ server.py│  │ （装配中枢）    │  │collab │ │ ◀─ supervisor
+                          │  │ server/  │  │ （装配中枢）    │  │collab │ │ ◀─ supervisor
                           │  └──────────┘  └──┬──┬──┬──┬────┘  │events │ │ ◀─ SSE 契约
                           │                   │  │  │  │       │metrics│ │ ◀─ 指标
                           │                   ▼  ▼  ▼  ▼       │observ.│ │ ◀─ request_id
@@ -149,7 +149,7 @@ curl -N -X POST http://localhost:8000/v1/agents/chat/invoke \
 
 `src/agent_base/memory/` 是一套自研的混合式记忆系统（调研 mem0 / Letta / Memobase /
 Zep / LangMem 后的落地形态），存储跟随 `CHECKPOINTER_BACKEND`（memory/sqlite/mysql），
-五张自管表由 alembic 0004（MySQL）与运行时自举（sqlite）幂等建表：
+六张自管表（含 thread_index 会话索引）由 alembic 迁移（MySQL，0004–0008）与运行时自举（sqlite，DDL 单一来源 `memory/store/ddl.py`）幂等建表：
 
 | 能力 | 说明 |
 | --- | --- |
@@ -159,7 +159,7 @@ Zep / LangMem 后的落地形态），存储跟随 `CHECKPOINTER_BACKEND`（memo
 | 会话滚动摘要 | 消息数超阈值后后台合并更新，供短期压缩替换超预算旧历史 |
 | 文档知识库 | 上传的 PDF/DOCX/TXT 自动切块 + 向量化入 `doc_chunks`（用户级知识资产，独立于会话存活），`knowledge_search` 工具检索 |
 | 混合检索 | 向量余弦（默认硅基流动 BAAI/bge-m3，1024 维）+ BM25（中文二元组）+ 时间半衰期 + 显著度；embedding 不可用自动降级为关键词路径 |
-| 上下文工程 | 每轮注入「画像 + 记忆块 + 摘要 + 相关记忆」注入块；chat 图对模型输入做注入去重与 token 预算修剪（工具配对不拆散），checkpointer 全量历史保留（recall 语义） |
+| 上下文工程 | 每轮注入「画像 + 记忆块 + 摘要 + 相关记忆」注入块；基座级上下文引擎（`core/context.py` + `core/graphs.py`）对**所有模块**的模型输入做注入去重与 token 预算修剪（工具配对不拆散），checkpointer 全量历史保留（recall 语义） |
 | Agent 工具 | `memory_search` / `memory_save` / `memory_update_block` / `knowledge_search` 进共享工具池（超时 + 审计自动生效） |
 
 管理端点（均以 `X-User-Id` 头为作用域，缺省 `default`）：
@@ -201,14 +201,33 @@ offsets/是否已向量化；段落打包块是多区间，旧数据 null 前端
 embedding 模型后 `python scripts/memory_backfill_embeddings.py` 同时
 回填记忆与知识库分块的向量。
 
-**身份与安全**：`X-User-Id` 是客户端自我声明，生产环境（`ENV=production`）且
-记忆开启时**必须**配置 `MEMORY_AUTH_SECRET`，所有记忆作用域请求需附带
-`X-User-Sig = HMAC-SHA256(X-User-Id, secret)`（缺省用户也不例外），否则 401；
-签名生成：`python scripts/memory_user_sig.py --user-id alice --secret <密钥>`。
+**身份与安全（S1/P0-5）**：身份解析只有一条路径——可插拔的 `AuthBackend`
+（默认 `HmacHeaderAuth`：`X-User-Id` 头 + 可选 `X-User-Sig` HMAC 校验），
+`create_app(auth_backend=...)` 可替换为网关层的真实身份体系。生产环境
+（`ENV=production`）且记忆开启时**必须**配置 `MEMORY_AUTH_SECRET`，所有
+用户作用域请求需附带 `X-User-Sig = HMAC-SHA256(X-User-Id, secret)`（缺省
+用户也不例外），否则 401；签名生成：
+`python scripts/memory_user_sig.py --user-id alice --secret <密钥>`。
 浏览器不持有密钥——公网多用户部署请走服务端代理或真实身份体系。
+已知局限：HMAC 签名只覆盖 user_id、无时间戳/nonce，截获的请求头可重放。
+
+**会话线程作用域（S1）**：invoke 时把线程属主写入 `thread_index` 表
+（存储跟随 `CHECKPOINTER_BACKEND`，alembic 0008；`MEMORY_ENABLED=false`
+时索引仍然在位）。线程列表只返回**当前用户**的线程；历史 / 删除 /
+工具审计端点做属主校验（404 掩蔽）。升级前的历史线程（无索引行）
+视为不可访问；附件引用他人 file_id 在 invoke 即被拒绝（400）。
 记忆删除为软/硬两级：`PATCH /v1/memory/{id}` 置 `status=archived` 是软删除
 （保留数据、退出召回），`DELETE` 是硬删除；更换 embedding 模型/维度后运行
 `python scripts/memory_backfill_embeddings.py` 为历史记忆回填向量。
+
+**容量契约（H2）**：当前检索实现是"全量拉取候选 + 内存混合打分"，单用户
+记忆候选上限 2000 条（知识库分块同量级）——达到上限会记 WARNING，更早的
+记忆不参与召回而非静默截断。更大规模需要分片或引入候选下推索引
+（sqlite-vec / FTS5 / 服务端向量库），见 `docs/design-review.md` H2。
+
+**CLI 与 server 的能力差异**：CLI（`python -m agent_base`）面向单机自用，
+不注入记忆上下文、不跑形成管线、不支持附件与多用户作用域；这些能力
+仅在 HTTP 入口提供。指标为单进程口径，多 worker 部署需在采集侧聚合。
 
 关键配置（完整清单见 `.env.example` 的「记忆系统」节）：`MEMORY_ENABLED` 总开关；
 `MEMORY_EMBEDDING_API_KEY`（openai 兼容 `/embeddings`，留空降级关键词检索）；
@@ -269,17 +288,21 @@ agent-base/
 ├── pyproject.toml            # 依赖 + 工具链配置（ruff / mypy / pytest + coverage 门槛 ≥85%）
 ├── .env.example             # 配置契约（由 core/config.py 消费）
 ├── src/agent_base/
-│   ├── core/                # config / contracts / registry / llm / bootstrap / tools（工具池）
-│   ├── memory/              # 记忆系统（M6）：store / embeddings / retrieval / pipeline
-│   │                        #           · context / tools / service
+│   ├── core/                # config（嵌套配置节）/ contracts（含 MemoryPort）/ registry / llm
+│   │                        #           · bootstrap / tools（工具池）/ context（上下文引擎）/ graphs
+│   ├── memory/              # 记忆系统（M6）：store/（包：models/protocol/ddl/三后端）
+│   │                        #           · embeddings / retrieval / pipeline / textkit
+│   │                        #           · context（注入组装）/ tools / service
 │   ├── extensions/          # 扩展点：observability（request_id + 日志）· memory（checkpointer）
 │   │                        #           · collab（supervisor）· events（SSE 契约）· metrics
+│   │                        #           · toollog（工具审计）· filestore（附件存储）· mysql57
 │   ├── modules/chat/        # 样板模块（graph + module + tools，兼作接入模板）
 │   ├── modules/writer/      # 第二样板模块（供 supervisor 编排演示）
 │   ├── modules/hello/       # 五步手册的真实落地实例（tests/test_hello_module.py 验证）
 │   └── entrypoints/
 │       ├── cli.py           # CLI 入口（--module / --message / --thread-id / --version）
-│       └── server.py        # FastAPI + SSE 服务入口（/invoke · /health · /metrics）
+│       └── server/          # FastAPI + SSE 服务包（H1 拆分）：app 装配 + auth/deps/
+│                            #           serializers/sse/background + routes/{agents,memory,files,system}
 ├── alembic/                 # 数据库迁移（alembic.ini + env.py + versions/）
 ├── tests/                   # config / registry / llm / chat / cli / smoke / observability
 │                            # / memory / tools / events / server / collab / hello

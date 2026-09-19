@@ -24,10 +24,10 @@ def build_llm(settings: Settings) -> ChatOpenAI:
     ``SettingsError``，而不是泄漏原始的 ``openai.OpenAIError``。
     """
     kwargs: dict[str, Any] = {
-        "model": settings.llm_model,
-        "base_url": settings.llm_base_url,
+        "model": settings.llm.model,
+        "base_url": settings.llm.base_url,
     }
-    api_key = settings.llm_api_key.get_secret_value().strip()
+    api_key = settings.llm.api_key.get_secret_value().strip()
     if api_key:
         kwargs["api_key"] = api_key
     try:

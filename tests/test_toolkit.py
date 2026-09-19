@@ -144,7 +144,7 @@ def test_pool_applies_per_tool_timeouts() -> None:
 
 
 def _count(name: str, outcome: str) -> int:
-    return TOOL_METRICS._executions.get((name, outcome), 0)
+    return TOOL_METRICS._counts.get((name, outcome), 0)  # M1 治理后计数统一在基类 _counts
 
 
 def test_metrics_record_success_and_error() -> None:

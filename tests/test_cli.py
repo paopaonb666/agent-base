@@ -33,7 +33,7 @@ class _FakeGraph:
 class _FakeRuntime:
     """最小化的运行时替身，覆盖 CLI 的各个触点。"""
 
-    settings = SimpleNamespace(log_json=False)
+    settings = SimpleNamespace(observability=SimpleNamespace(log_json=False))
     closed = False
 
     def __init__(self, graph: _FakeGraph | None = None) -> None:

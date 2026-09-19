@@ -126,9 +126,7 @@ class OpenAICompatibleEmbedding:
         except httpx.HTTPError as exc:
             raise EmbeddingError(f"网络错误：{type(exc).__name__}") from exc
         if response.status_code != 200:
-            raise EmbeddingError(
-                f"HTTP {response.status_code}：{response.text[:_LOG_BODY_LIMIT]}"
-            )
+            raise EmbeddingError(f"HTTP {response.status_code}：{response.text[:_LOG_BODY_LIMIT]}")
         try:
             payload: dict[str, Any] = response.json()
             data = payload["data"]
@@ -192,20 +190,20 @@ class OpenAICompatibleEmbedding:
 
 def build_embedding_client(settings: Settings) -> EmbeddingClient:
     """按 settings 装配 embedding 客户端：未启用/未配 key 一律降级。"""
-    if not settings.memory_embedding_enabled:
+    if not settings.memory.embedding_enabled:
         logger.info("memory: 语义检索已禁用（MEMORY_EMBEDDING_ENABLED=false）")
         return NullEmbedding()
-    api_key = settings.memory_embedding_api_key.get_secret_value().strip()
+    api_key = settings.memory.embedding_api_key.get_secret_value().strip()
     if not api_key:
         logger.info("memory: 未配置 MEMORY_EMBEDDING_API_KEY，检索走关键词降级")
         return NullEmbedding()
     return OpenAICompatibleEmbedding(
-        base_url=settings.memory_embedding_base_url,
+        base_url=settings.memory.embedding_base_url,
         api_key=api_key,
-        model=settings.memory_embedding_model,
-        dims=settings.memory_embedding_dims,
-        batch_size=settings.memory_embedding_batch_size,
-        timeout_seconds=settings.memory_embedding_timeout_seconds,
+        model=settings.memory.embedding_model,
+        dims=settings.memory.embedding_dims,
+        batch_size=settings.memory.embedding_batch_size,
+        timeout_seconds=settings.memory.embedding_timeout_seconds,
     )
 
 

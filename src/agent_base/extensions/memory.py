@@ -2,8 +2,8 @@
 
 仅包含**短期**对话状态——thread 级别的持久化，让一次对话在轮次之间得以
 保留（使用 sqlite 后端时，还能跨进程重启保留）。长期记忆（跨对话、
-向量库、抽取）按设计不属于基座的范围（范围红线），未来会以模块的形式
-到来。
+向量库、抽取）在 ``agent_base.memory`` 子系统落地（M6），其存储后端
+同样跟随这里选择的 ``CHECKPOINTER_BACKEND``。
 
 后端（``CHECKPOINTER_BACKEND``）：
 - ``memory``  —— ``InMemorySaver``，零依赖，仅进程生命周期内有效。
@@ -32,19 +32,19 @@ if TYPE_CHECKING:  # pragma: no cover - import avoided at runtime
 
 
 async def build_checkpointer(settings: Settings) -> BaseCheckpointSaver[Any]:
-    """装配由 ``settings.checkpointer_backend`` 选定的 checkpointer。
+    """装配由 ``settings.checkpointer.backend`` 选定的 checkpointer。
 
     必须在将要运行这些图的事件循环中被 await——sqlite / mysql 后端会把
     连接绑定到调用它的循环，因此在一个临时循环中构造它会导致后续使用
     出错。``create_runtime`` 之所以是异步的，正是因为这个原因。
     """
-    if settings.checkpointer_backend == "memory":
+    if settings.checkpointer.backend == "memory":
         return InMemorySaver()
-    if settings.checkpointer_backend == "sqlite":
+    if settings.checkpointer.backend == "sqlite":
         return await _build_sqlite_checkpointer(settings)
-    if settings.checkpointer_backend == "mysql":
+    if settings.checkpointer.backend == "mysql":
         return await _build_mysql_checkpointer(settings)
-    raise ValueError(f"unknown CHECKPOINTER_BACKEND {settings.checkpointer_backend!r}")
+    raise ValueError(f"unknown CHECKPOINTER_BACKEND {settings.checkpointer.backend!r}")
 
 
 async def _build_sqlite_checkpointer(settings: Settings) -> BaseCheckpointSaver[Any]:
@@ -56,11 +56,11 @@ async def _build_sqlite_checkpointer(settings: Settings) -> BaseCheckpointSaver[
     # 在会话中途爆出，而不是启动时一条可读的配置错误。
     from agent_base.core.config import SettingsError
 
-    path = Path(settings.checkpointer_sqlite_path)
+    path = Path(settings.checkpointer.sqlite_path)
     parent = path.parent if str(path.parent) else Path(".")
     if not parent.is_dir() or not os.access(parent, os.W_OK):
         raise SettingsError(
-            f"CHECKPOINTER_SQLITE_PATH {settings.checkpointer_sqlite_path!r} is not "
+            f"CHECKPOINTER_SQLITE_PATH {settings.checkpointer.sqlite_path!r} is not "
             "writable: the parent directory does not exist or denies write access"
         )
 
@@ -68,7 +68,7 @@ async def _build_sqlite_checkpointer(settings: Settings) -> BaseCheckpointSaver[
     # 管理器在连接被垃圾回收时会立即关闭连接，这会在会话中途悄无声息地
     # 杀死 saver。一个直接 await 的连接会一直存活到
     # close_checkpointer()（或进程退出）。
-    conn = await aiosqlite.connect(settings.checkpointer_sqlite_path)
+    conn = await aiosqlite.connect(settings.checkpointer.sqlite_path)
     saver = AsyncSqliteSaver(conn)
     await saver.setup()
     return saver
@@ -117,11 +117,11 @@ async def _build_mysql_checkpointer(settings: Settings) -> BaseCheckpointSaver[A
     from agent_base.extensions.mysql57 import MySQL57Saver, probe_mysql_major_version
 
     conn = await aiomysql.connect(
-        host=settings.checkpointer_mysql_host,
-        port=settings.checkpointer_mysql_port,
-        user=settings.checkpointer_mysql_user,
-        password=settings.checkpointer_mysql_password.get_secret_value(),
-        db=settings.checkpointer_mysql_database,
+        host=settings.checkpointer.mysql_host,
+        port=settings.checkpointer.mysql_port,
+        user=settings.checkpointer.mysql_user,
+        password=settings.checkpointer.mysql_password.get_secret_value(),
+        db=settings.checkpointer.mysql_database,
         autocommit=True,
     )
     saver: BaseCheckpointSaver[Any]

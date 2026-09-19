@@ -22,12 +22,35 @@ from langgraph.graph.state import CompiledStateGraph
 
 if TYPE_CHECKING:  # pragma: no cover - import avoided at runtime
     from agent_base.core.config import Settings
-    from agent_base.memory.service import MemoryService
 
 # CompiledStateGraph 对 (StateT, ContextT, InputT, OutputT) 是泛型的。
 # 基座把编译后的图当作不透明对象处理——它只会把图回传给入口——
 # 因此四个参数都绑定为 Any。
 Graph: TypeAlias = CompiledStateGraph[Any, Any, Any, Any]
+
+
+@runtime_checkable
+class MemoryPort(Protocol):
+    """记忆子系统暴露给模块的最小面（依赖倒置，P0-4）。
+
+    core 契约只认这个端口，不 import ``memory.service`` 的具体类——
+    替换记忆实现（mem0/Letta/自研）时，模块与基座契约都不用动。
+    实现方（MemoryService）是这个协议的超集。
+    """
+
+    async def search(
+        self, *, user_id: str, agent_id: str | None, query: str, top_k: int | None = None
+    ) -> Any: ...
+
+    async def compose_context(
+        self, *, user_id: str, agent_id: str, thread_id: str, query: str
+    ) -> str | None: ...
+
+    async def capture_turn(
+        self, *, user_id: str, agent_id: str, thread_id: str, messages: list[Any]
+    ) -> Any: ...
+
+    async def aclose(self) -> None: ...
 
 
 @dataclass
@@ -47,9 +70,9 @@ class ModuleContext:
     llm: BaseChatModel
     checkpointer: BaseCheckpointSaver[Any] | None = None
     tools: list[BaseTool] = field(default_factory=list)
-    # 记忆服务（M6）：None = 未启用（MEMORY_ENABLED=false 或后端不可用）。
-    # 模块按需取用；不关心记忆的模块可以完全忽略它。
-    memory: MemoryService | None = None
+    # 记忆服务端口（M6）：None = 未启用（MEMORY_ENABLED=false 或后端
+    # 不可用）。模块按需取用；不关心记忆的模块可以完全忽略它。
+    memory: MemoryPort | None = None
 
 
 @runtime_checkable

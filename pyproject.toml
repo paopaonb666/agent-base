@@ -123,6 +123,10 @@ disable_error_code = ["attr-defined"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-# 覆盖率门（阶段 5）：每次 `pytest` 运行——无论本地还是 CI——都会对
-# 整个包测量分支覆盖率，低于 85% 即失败。
-addopts = "-q --strict-markers --cov=agent_base --cov-branch --cov-report=term-missing --cov-fail-under=85"
+markers = [
+  "integration: 需要外部服务（MySQL 等）的集成测试；默认本地运行被排除，CI（带 MySQL 服务容器）用 `-m \"integration or not integration\"` 全量执行",
+]
+# 覆盖率门（阶段 5）：每次 `pytest` 运行都会对整个包测量分支覆盖率，
+# 低于 85% 即失败。集成测试（integration 标记）默认不在本地运行，
+# 也不进入覆盖率分母——本地与 CI 的"测试通过"语义一致（P2-2）。
+addopts = "-q --strict-markers -m \"not integration\" --cov=agent_base --cov-branch --cov-report=term-missing --cov-fail-under=85"

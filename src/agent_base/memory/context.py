@@ -1,69 +1,31 @@
-"""上下文组装与短期压缩（M6d）。
+"""记忆侧的注入块组装（M6d）。
 
-两个职责：
+模型输入修剪等**通用上下文保护**已提升为基座级设施
+（``agent_base.core.context``）——所有模块的图都经由 ``core/graphs.py``
+使用它；本模块只保留记忆语义的部分：
 
 - **注入组装**（``compose_context``）：把画像、记忆块、会话摘要与按当
   前消息召回的相关记忆打包成一个系统注入块（mem0/Letta/Memobase 三家
   的注入面合一），有字符预算——召回条目按得分从低到高先丢，摘要再截断。
-- **模型输入修剪**（``build_model_input``）：chat 图发给模型的输入 =
-  全量历史去"注入型系统消息"（只保留本轮最新一条）+ token 预算修剪
-  （保尾部、工具调用序列不拆散）。checkpointer 里的全量历史刻意不动
-  ——它是 recall 语义的载体，修剪只影响"本轮给模型看什么"。
 
-注入标记（``MEMORY_CONTEXT_PREFIX`` / ``ATTACHMENT_CONTEXT_PREFIX``）
-同时是识别"注入型系统消息"的依据：没有标记的 system 消息（如 writer
-模板的临时拼装不落库，普通历史里根本没有 system）不受去重影响。
+历史兼容：``build_model_input`` / ``estimate_tokens`` / 注入标记等名字
+从这里 re-export（真实实现位于 ``core.context``），既有调用方不受影响。
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+from agent_base.core.context import (  # re-export（历史 API 路径）
+    ATTACHMENT_CONTEXT_PREFIX,
+    MEMORY_CONTEXT_PREFIX,
+    build_model_input,
+    estimate_tokens,
+    injected_kind,
+    is_injected_system,
+)
 from agent_base.memory.retrieval import ScoredMemory
 from agent_base.memory.store import MemoryBlock
-
-# 注入型系统消息的标记前缀。server 层注入时必须以它开头；修剪逻辑靠
-# 它区分"轮轮累积的注入块"与真实历史。
-MEMORY_CONTEXT_PREFIX = "【长期记忆上下文】"
-ATTACHMENT_CONTEXT_PREFIX = "以下是用户上传的附件内容"
-
-# token 近似估算系数（DeepSeek 系 tokenizer 的经验值：中文约 0.6 token/字，
-# ASCII 约 0.25 token/字符，即 ~4 字符/token）。估算宁大勿小——宁可早
-# 修剪也不要静默撑爆上下文。
-_CJK_TOKEN_PER_CHAR = 0.6
-_ASCII_TOKEN_PER_CHAR = 0.25
-
-
-def estimate_tokens(text: str) -> int:
-    """CJK 感知的粗略 token 估算（不引入分词器依赖）。"""
-    if not text:
-        return 0
-    cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
-    return int(cjk * _CJK_TOKEN_PER_CHAR + (len(text) - cjk) * _ASCII_TOKEN_PER_CHAR)
-
-
-def injected_kind(message: Any) -> str | None:
-    """返回消息的注入类型（匹配的标记前缀）；非注入消息返回 None。"""
-    if getattr(message, "type", "") != "system":
-        return None
-    content = message.content
-    if isinstance(content, list):  # 多段 content：取 text 段
-        content = "".join(
-            str(part.get("text", "")) if isinstance(part, dict) else str(part)
-            for part in content
-        )
-    if not isinstance(content, str):
-        return None
-    if content.startswith(MEMORY_CONTEXT_PREFIX):
-        return MEMORY_CONTEXT_PREFIX
-    if content.startswith(ATTACHMENT_CONTEXT_PREFIX):
-        return ATTACHMENT_CONTEXT_PREFIX
-    return None
-
-
-def is_injected_system(message: Any) -> bool:
-    """判断一条消息是否是"注入型"系统消息（记忆上下文 / 附件全文）。"""
-    return injected_kind(message) is not None
 
 
 def render_profile(profile: dict[str, Any]) -> str:
@@ -111,9 +73,7 @@ def compose_context(
         sections.append(("会话摘要", summary.strip()))
 
     if recalled:
-        sections.append(("相关记忆", "\n".join(
-            f"- {item.record.content}" for item in recalled
-        )))
+        sections.append(("相关记忆", "\n".join(f"- {item.record.content}" for item in recalled)))
 
     if not sections:
         return None
@@ -124,18 +84,14 @@ def compose_context(
     )
 
     def render(sel: list[tuple[str, str]]) -> str:
-        return header + "\n\n".join(
-            f"## {title}\n{body}" for title, body in sel
-        )
+        return header + "\n\n".join(f"## {title}\n{body}" for title, body in sel)
 
     rendered_all = render(sections)
     if len(rendered_all) <= max_chars:
         return rendered_all
 
     # 预算超限：先丢相关记忆（得分最低的先丢），再截摘要。
-    recalled_idx = next(
-        (i for i, (title, _) in enumerate(sections) if title == "相关记忆"), None
-    )
+    recalled_idx = next((i for i, (title, _) in enumerate(sections) if title == "相关记忆"), None)
     if recalled_idx is not None:
         head = sections[:recalled_idx]
         tail = sections[recalled_idx + 1 :]
@@ -166,80 +122,13 @@ def compose_context(
     return rendered_all[:max_chars]
 
 
-def build_model_input(messages: list[Any], *, max_tokens: int) -> list[Any]:
-    """构造发给模型的输入：注入去重 + 预算修剪（不修改原列表）。
-
-    - 注入型系统消息只保留**最后一条**（本轮注入的），历史里的全部剔除
-      ——否则附件全文/记忆块会随 checkpoint 轮轮累积，把上下文撑爆；
-    - 从尾部按 token 预算保留近期消息；修剪边界不得落在工具调用序列
-      中间（ToolMessage 的开头），保证 AIMessage(tool_calls) 与其
-      ToolMessage 成对出现；
-    - 至少保留最后一条消息（单条超预算的极端情况原样保留，交给模型
-      的上下文上限兜底）。
-    """
-    if not messages:
-        return []
-
-    # 1) 注入去重：只保留"本轮"的注入块——最后一条 human 消息之前的
-    #    连续注入段（记忆块 + 附件全文都可能在本轮注入，必须同时保留；
-    #    UI 实测缺陷 F1）。历史轮次的注入块一律剔除：其内容已随当轮
-    #    消费，留着只会让模型输入轮轮膨胀。
-    last_human = max(
-        (i for i, message in enumerate(messages) if getattr(message, "type", "") == "human"),
-        default=None,
-    )
-    current_injections: set[int] = set()
-    if last_human is not None:
-        i = last_human - 1
-        while i >= 0 and injected_kind(messages[i]) is not None:
-            current_injections.add(i)
-            i -= 1
-    kept_indices = [
-        i
-        for i, message in enumerate(messages)
-        if injected_kind(message) is None or i in current_injections
-    ]
-
-    # 2) token 预算：从尾部向前累积。
-    def token_of(index: int) -> int:
-        message = messages[index]
-        content = message.content
-        if isinstance(content, list):
-            content = "".join(
-                str(part.get("text", "")) if isinstance(part, dict) else str(part)
-                for part in content
-            )
-        return estimate_tokens(str(content)) + 4  # 每条消息的固定开销
-
-    total = 0
-    cut = 0  # kept_indices 里保留的起点
-    for run in range(len(kept_indices) - 1, -1, -1):
-        index = kept_indices[run]
-        total += token_of(index)
-        if total > max_tokens and run < len(kept_indices) - 1:
-            # 超预算且至少保住最后一条；从这个更早的消息开始丢弃。
-            cut = run + 1
-            break
-
-    kept = kept_indices[cut:]
-
-    # 3) 修剪边界安全：起点不得是 ToolMessage（会拆散工具配对）。
-    while (
-        len(kept) > 1
-        and cut > 0  # 只在真的发生修剪时才牺牲边界消息
-        and getattr(messages[kept[0]], "type", "") == "tool"
-    ):
-        kept.pop(0)
-
-    return [messages[i] for i in kept]
-
-
 __all__ = [
     "ATTACHMENT_CONTEXT_PREFIX",
     "MEMORY_CONTEXT_PREFIX",
     "build_model_input",
     "compose_context",
     "estimate_tokens",
+    "injected_kind",
     "is_injected_system",
     "render_profile",
 ]

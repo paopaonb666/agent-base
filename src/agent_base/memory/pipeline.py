@@ -157,8 +157,7 @@ def _content_text(response: Any) -> str:
         return content
     if isinstance(content, (list, tuple)):
         return "".join(
-            str(part.get("text", "")) if isinstance(part, dict) else str(part)
-            for part in content
+            str(part.get("text", "")) if isinstance(part, dict) else str(part) for part in content
         )
     return str(content)
 
@@ -327,9 +326,7 @@ class MemoryPipeline:
                 thread_id=thread_id,
                 agent_id=agent_id,
                 summary=text[:1000],
-                covered_message_count=prior_summary.covered_message_count
-                if prior_summary
-                else 0,
+                covered_message_count=prior_summary.covered_message_count if prior_summary else 0,
             )
         )
         return True
@@ -345,8 +342,12 @@ class MemoryPipeline:
         human_count: int,
     ) -> dict[str, Any]:
         """一轮对话结束后的完整形成流程；每步独立审计、失败安全。"""
-        detail: dict[str, Any] = {"candidates": 0, "ops": {}, "profile_updated": False,
-                                  "summary_updated": False}
+        detail: dict[str, Any] = {
+            "candidates": 0,
+            "ops": {},
+            "profile_updated": False,
+            "summary_updated": False,
+        }
 
         async def _run(op: str, coro: Any) -> Any:
             started = time.perf_counter()
@@ -372,11 +373,7 @@ class MemoryPipeline:
                 detail = result
             elif isinstance(result, list):
                 # 候选记忆等数据类列表：取可读摘要（Candidate.content 等）。
-                detail = {
-                    "result": [
-                        getattr(item, "content", str(item))[:120] for item in result
-                    ]
-                }
+                detail = {"result": [getattr(item, "content", str(item))[:120] for item in result]}
             else:
                 detail = {"result": result}
             await self._service.record_op(
@@ -391,7 +388,7 @@ class MemoryPipeline:
             return result
 
         # 1) 抽取 + 逐条整合（合并计为一次 extract 审计 + 各 consolidate）。
-        if self._settings.memory_capture_enabled:
+        if self._settings.memory.capture_enabled:
             extracted = await _run("extract", self.extract_candidates(transcript))
             if extracted:
                 detail["candidates"] = len(extracted)
@@ -408,14 +405,14 @@ class MemoryPipeline:
                         if op in ("ADD", "UPDATE"):
                             accepted.append(candidate.content)
                 # 2) 画像合并（用被接受的记忆作为事实源）。
-                if self._settings.memory_profile_enabled and accepted:
+                if self._settings.memory.profile_enabled and accepted:
                     updated = await _run("profile", self.merge_profile(user_id, accepted))
                     detail["profile_updated"] = bool(updated)
 
         # 3) 滚动摘要（独立于抽取：即使本轮不抽取，长会话也需要摘要）。
         if (
-            self._settings.memory_summary_enabled
-            and human_count >= self._settings.memory_summary_trigger_messages
+            self._settings.memory.summary_enabled
+            and human_count >= self._settings.memory.summary_trigger_messages
         ):
             summary_updated = await _run(
                 "summary", self.update_summary(user_id, agent_id, thread_id, transcript)

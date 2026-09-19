@@ -36,7 +36,7 @@ from agent_base.tools.streaming import emit_sources, emit_step
 
 logger = logging.getLogger(__name__)
 
-# 引擎调用的硬超时来自 settings.search_timeout_seconds；这里是工具层
+# 引擎调用的硬超时来自 settings.search.timeout_seconds；这里是工具层
 # 的 max_results 上下界——模型传 0 或负数应得到可读的错误。
 MAX_RESULTS_BOUNDS = (1, 20)
 
@@ -78,12 +78,12 @@ def build_web_search_tool(
     """
     manager = FallbackSearchManager(
         engine_factory(
-            [e.strip().lower() for e in settings.search_engine_priority.split(",") if e.strip()],
-            tavily_api_key=settings.tavily_api_key.get_secret_value(),
-            ddgs_backend=settings.search_ddgs_backend,
+            [e.strip().lower() for e in settings.search.engine_priority.split(",") if e.strip()],
+            tavily_api_key=settings.search.tavily_api_key.get_secret_value(),
+            ddgs_backend=settings.search.ddgs_backend,
         )
     )
-    cache = SearchCache(ttl_seconds=settings.search_cache_ttl_seconds)
+    cache = SearchCache(ttl_seconds=settings.search.cache_ttl_seconds)
 
     @tool
     async def web_search(query: str, max_results: int = 8) -> str:
@@ -108,7 +108,7 @@ def build_web_search_tool(
 
         emit_step("web_search", "running", f"搜索：{query[:40]}")
         results = await _run_search(
-            manager, cache, query, max_results, settings.search_timeout_seconds
+            manager, cache, query, max_results, settings.search.timeout_seconds
         )
         emit_step("web_search", "completed", f"找到 {len(results)} 条结果")
         emit_sources([{"title": r.title, "url": r.url} for r in results])
@@ -124,10 +124,10 @@ def _web_search_available(settings: Settings) -> bool:
     """至少一个配置的引擎可用（ddgs 已安装 / tavily 有 key）。"""
     from agent_base.tools.search.engines import ddgs_available
 
-    priority = [e.strip().lower() for e in settings.search_engine_priority.split(",") if e.strip()]
+    priority = [e.strip().lower() for e in settings.search.engine_priority.split(",") if e.strip()]
     if "duckduckgo" in priority and ddgs_available():
         return True
-    return "tavily" in priority and bool(settings.tavily_api_key.get_secret_value())
+    return "tavily" in priority and bool(settings.search.tavily_api_key.get_secret_value())
 
 
 _UNAVAILABLE_REASON = (

@@ -26,6 +26,9 @@ from typing import Any, Protocol, runtime_checkable
 
 from agent_base.memory.store import PROFILE_ID_PREFIX, DocChunk, MemoryRecord, decode_embedding
 
+# 召回候选集上限（H2 容量契约）：与 store.list_memories 的默认上限一致。
+_CANDIDATE_LIMIT = 2000
+
 logger = logging.getLogger(__name__)
 
 # 混合权重默认值（和为 1）。向量是语义召回的主力，BM25 兜关键词，
@@ -96,9 +99,7 @@ def filter_expired(
         return list(records)
     cutoff = now - episodic_ttl_days * 86400.0
     return [
-        record
-        for record in records
-        if record.kind != "episodic" or record.updated_at >= cutoff
+        record for record in records if record.kind != "episodic" or record.updated_at >= cutoff
     ]
 
 
@@ -316,7 +317,18 @@ async def recall_memories(
     weights: Mapping[str, float] | None = None,
 ) -> list[ScoredMemory]:
     """一次完整召回：取候选 → TTL 过滤 → 混合打分 → top-k + 访问记账。"""
-    records = await store.list_memories(user_id, agent_id=agent_id)
+    # 容量契约（H2）：候选集上限与 store 的列表上限一致。达到上限说明
+    # 用户记忆量已超出当前"全量拉取 + 内存打分"实现的设计容量——更早
+    # 的记忆本轮永远召不回，必须显式告警而不是静默截断。
+    records = await store.list_memories(user_id, agent_id=agent_id, limit=_CANDIDATE_LIMIT)
+    if len(records) >= _CANDIDATE_LIMIT:
+        logger.warning(
+            "memory: 召回候选达到上限 %d（user=%r, agent=%r）——更早的记忆不参与本轮检索；"
+            "请考虑分片或引入候选下推索引（见 README 容量契约）",
+            _CANDIDATE_LIMIT,
+            user_id,
+            agent_id,
+        )
     timestamp = time.time() if now is None else now
     records = filter_expired(records, episodic_ttl_days, now=timestamp)
     # 用户画像不是可召回记忆：它由上下文组装单独、整体注入（M6d）。

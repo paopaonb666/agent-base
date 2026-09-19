@@ -98,18 +98,14 @@ class _MemoryDeleteArgs(BaseModel):
 
 
 class _KnowledgeSearchArgs(BaseModel):
-    query: str = Field(
-        description="要在用户上传的文档里检索的内容", min_length=1, max_length=2000
-    )
+    query: str = Field(description="要在用户上传的文档里检索的内容", min_length=1, max_length=2000)
     limit: int = Field(default=5, ge=1, le=20, description="最多返回的分块数")
 
 
 def build_memory_tools(memory: MemoryService) -> list[BaseTool]:
     """构建记忆工具集（绑定到运行时的 MemoryService 实例）。"""
 
-    async def memory_search(
-        query: str, limit: int = 5, **_kwargs: Any
-    ) -> str:
+    async def memory_search(query: str, limit: int = 5, **_kwargs: Any) -> str:
         user_id, agent_id, _ = _scope()
         agent_scope = agent_id if agent_id != "*" else None
         scored = await memory.search(

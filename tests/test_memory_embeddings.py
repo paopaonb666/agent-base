@@ -41,9 +41,7 @@ async def test_null_embedding_returns_none() -> None:
 def test_build_embedding_client_selection() -> None:
     disabled = build_embedding_client(_settings(memory_embedding_enabled=False))
     assert isinstance(disabled, NullEmbedding)
-    assert isinstance(
-        build_embedding_client(_settings(memory_embedding_api_key="")), NullEmbedding
-    )
+    assert isinstance(build_embedding_client(_settings(memory_embedding_api_key="")), NullEmbedding)
     client = build_embedding_client(_settings())
     assert isinstance(client, OpenAICompatibleEmbedding)
     assert client.dims == 1024
@@ -84,9 +82,7 @@ async def test_embed_batches_split_requests() -> None:
         return httpx.Response(
             200,
             json={
-                "data": [
-                    {"index": i, "embedding": [1.0, 0.0]} for i in range(len(body["input"]))
-                ]
+                "data": [{"index": i, "embedding": [1.0, 0.0]} for i in range(len(body["input"]))]
             },
         )
 
