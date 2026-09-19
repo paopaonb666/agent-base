@@ -226,6 +226,7 @@ class MemoryStore(Protocol):
         kinds: Sequence[str] | None = None,
         statuses: Sequence[str] = ("active",),
         limit: int = 2000,
+        exclude_profile: bool = False,
     ) -> list[MemoryRecord]: ...
 
     async def touch_memories(self, memory_ids: Sequence[str]) -> None: ...
@@ -755,9 +756,14 @@ class _SqlMemoryStoreBase:
         kinds: Sequence[str] | None = None,
         statuses: Sequence[str] = ("active",),
         limit: int = 2000,
+        exclude_profile: bool = False,
     ) -> list[MemoryRecord]:
         sql = f"SELECT {self._MEMORY_COLUMNS} FROM memories WHERE user_id = ?"
         params: list[Any] = [user_id]
+        # 浏览/检索列表默认排除画像：画像由上下文组装与画像页签单独
+        # 呈现，混进记忆列表既是实现细节泄漏也是重复展示。
+        if exclude_profile:
+            sql += " AND memory_id NOT LIKE 'profile:%'"
         if statuses:
             sql += f" AND status IN ({', '.join('?' for _ in statuses)})"
             params.extend(statuses)
@@ -1081,6 +1087,7 @@ class MemoryMemoryStore:
         kinds: Sequence[str] | None = None,
         statuses: Sequence[str] = ("active",),
         limit: int = 2000,
+        exclude_profile: bool = False,
     ) -> list[MemoryRecord]:
         matched = [
             record
@@ -1088,6 +1095,7 @@ class MemoryMemoryStore:
             if record.user_id == user_id
             and record.status in statuses
             and (kinds is None or record.kind in kinds)
+            and (not exclude_profile or not record.memory_id.startswith(PROFILE_ID_PREFIX))
             and (
                 agent_id is None
                 or record.agent_id == agent_id

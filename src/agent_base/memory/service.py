@@ -415,13 +415,17 @@ class MemoryService:
         include_global: bool = True,
         kinds: list[str] | None = None,
         limit: int = 50,
+        exclude_profile: bool = True,
     ) -> list[MemoryRecord]:
+        """浏览列表（管理端点用）：默认排除画像记录——画像有专属页签，
+        JSON dump 混进记忆列表是实现细节泄漏。"""
         return await self.store.list_memories(
             user_id,
             agent_id=agent_id,
             include_global=include_global,
             kinds=kinds,
             limit=limit,
+            exclude_profile=exclude_profile,
         )
 
     async def search(

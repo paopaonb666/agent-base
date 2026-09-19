@@ -532,3 +532,44 @@ def test_memory_version_endpoints_and_ownership() -> None:
             f"/v1/memory/{memory_id}/versions/ghost/restore", headers={"X-User-Id": "alice"}
         )
         assert bad.status_code == 400
+
+
+async def test_browse_list_excludes_profile_records(tmp_path: Path) -> None:
+    """浏览/检索列表不泄漏画像记录（JSON dump 有专属页签呈现）。"""
+    service = await _sqlite_service(tmp_path)
+    await service.add_memory(user_id="u", agent_id="chat", content="普通记忆")
+    await service.save_profile("u", {"偏好": ["简洁回答"]})
+    from agent_base.memory.store import profile_memory_id
+
+    browsed = await service.list_memories("u")
+    assert all(not r.memory_id.startswith("profile:") for r in browsed)
+    assert len(browsed) == 1
+    # 显式关闭排除（内部路径）时可见。
+    with_profile = await service.list_memories("u", exclude_profile=False)
+    assert any(r.memory_id == profile_memory_id("u") for r in with_profile)
+    # 管理端点同样不返回画像。
+    from fastapi.testclient import TestClient
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from agent_base.core.bootstrap import AgentRuntime
+    from agent_base.entrypoints.server import create_app
+    from agent_base.memory.store import MemoryMemoryStore
+    from fakes import HashEmbedding, ScriptedChatModel
+
+    rt = AgentRuntime(
+        settings=_settings(),
+        llm=ScriptedChatModel([]),
+        modules={},
+        tools=[],
+        checkpointer=InMemorySaver(),
+    )
+    rt.memory = MemoryService(
+        store=MemoryMemoryStore(), embedder=HashEmbedding(), settings=rt.settings
+    )
+    await rt.memory.add_memory(user_id="u2", agent_id="chat", content="普通")
+    await rt.memory.save_profile("u2", {"偏好": ["x"]})
+    with TestClient(create_app(runtime=rt)) as c:
+        memories = c.get("/v1/memory", headers={"X-User-Id": "u2"}).json()["memories"]
+        assert all(not m["memory_id"].startswith("profile:") for m in memories)
+        assert len(memories) == 1
+    await service.aclose()
