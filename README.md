@@ -182,6 +182,14 @@ POST   /v1/memory/{id}/versions/{vid}/restore   # 恢复到指定版本（产生
 删除留墓碑（保留最后内容供审计）；检索的 BM25 索引按候选内容指纹做
 进程内 LRU 缓存，内容一变键即变，无需失效钩子。
 
+**文档预览与切片可视化（M7）**：三个只读端点支撑前端"点开附件看预览与
+切片方式"——`GET …/files/{id}/preview`（元信息 + 提取正文，与注入给模型
+的内容同源）、`GET …/files/{id}/chunks`（切片列表：序号/正文/原文区间
+offsets/是否已向量化；段落打包块是多区间，旧数据 null 前端降级）、
+`GET …/files/{id}/raw`（原始字节：图片按存储 mime 直出，文档 attachment
+下载）。切片边界来自 `chunk_text` 返回的 ChunkSpan（各段在原文中的字符
+区间），落库于 `doc_chunks.offsets_json`。
+
 **文档知识库生命周期**：上传时按段落感知切块（空行对齐，表格/列表
 不被从中间劈开；单段超长退回固定窗口），重复摄取自动幂等；撤销传错
 的文件用 `DELETE /v1/agents/{module}/files/{file_id}`——文件原始行与

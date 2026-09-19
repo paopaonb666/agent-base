@@ -20,7 +20,7 @@ import logging
 import re
 import time
 import uuid
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from agent_base.extensions.metrics import MEMORY_METRICS
@@ -95,7 +95,24 @@ def _trim_profile_to_chars(profile: dict[str, Any], max_chars: int) -> dict[str,
     return trimmed
 
 
-def chunk_text(text: str, *, chunk_chars: int, overlap: int) -> list[str]:
+@dataclass(frozen=True)
+class ChunkSpan:
+    """一个切片：内容文本 + 在原文中的字符区间（前端高亮边界的依据）。
+
+    ``segments`` 是 ``((start, end), …)`` 元组，坐标相对**调用方传入的
+    原文**（含 strip 偏移补偿）。段落打包块的文本由多段拼成，单一
+    (start, end) 不成立，因此是区间列表；固定窗口切片是单区间。
+    """
+
+    text: str
+    segments: tuple[tuple[int, int], ...]
+
+    @property
+    def char_len(self) -> int:
+        return len(self.text)
+
+
+def chunk_text(text: str, *, chunk_chars: int, overlap: int) -> list[ChunkSpan]:
     """把文档文本切块（边界加固：段落感知优先，固定窗口兜底）。
 
     策略：
@@ -105,43 +122,72 @@ def chunk_text(text: str, *, chunk_chars: int, overlap: int) -> list[str]:
     - 全文没有段落分隔（或只有一段）时行为与旧版固定窗口完全一致
       （向后兼容：纯文本长文切块结果不变）。
 
+    返回 span：除块文本外还带原文坐标，供前端把切片边界高亮回原文
+    （切片可视化）；坐标相对传入的 text 原始串（strip 前的完整范围）。
+
     保证：任何块不超过 chunk_chars；非空内容全部覆盖；空文本返回空列表。
     """
+    leading = len(text) - len(text.lstrip())
     text = text.strip()
     if not text:
         return []
     if len(text) <= chunk_chars:
-        return [text]
+        return [ChunkSpan(text, ((leading, leading + len(text)),))]
 
-    def _window(block: str) -> list[str]:
+    def _window(block: str, base: int) -> list[ChunkSpan]:
         step = max(1, chunk_chars - overlap)
-        return [block[start : start + chunk_chars] for start in range(0, len(block), step)]
+        return [
+            ChunkSpan(
+                block[start : start + chunk_chars],
+                ((base + start, base + min(start + chunk_chars, len(block))),),
+            )
+            for start in range(0, len(block), step)
+        ]
 
-    paragraphs = [para.strip() for para in re.split(r"\n\s*\n", text) if para.strip()]
+    # 段落切分带坐标：finditer 拿每段在 stripped 文本中的位置。
+    paragraphs: list[tuple[str, int]] = []
+    last = 0
+    for match in re.finditer(r"\n\s*\n", text):
+        segment = text[last : match.start()]
+        if segment.strip():
+            paragraphs.append((segment.strip(), last + (len(segment) - len(segment.lstrip()))))
+        last = match.end()
+    tail = text[last:]
+    if tail.strip():
+        paragraphs.append((tail.strip(), last + (len(tail) - len(tail.lstrip()))))
+
     if len(paragraphs) <= 1:
-        return _window(text)
+        return _window(text, leading)
 
-    chunks: list[str] = []
-    current: list[str] = []
+    chunks: list[ChunkSpan] = []
+    current: list[tuple[str, int]] = []
     current_len = 0  # 已装段落总长（含段间空行分隔符）
-    for para in paragraphs:
+    for para, pos in paragraphs:
         if len(para) > chunk_chars:
             # 超长段落：先结算已打包内容，段内固定窗口切。
             if current:
-                chunks.append("\n\n".join(current))
+                chunks.append(_join_spans(current, leading))
                 current, current_len = [], 0
-            chunks.extend(_window(para))
+            chunks.extend(_window(para, leading + pos))
             continue
         extra = len(para) + (2 if current else 0)
         if current_len + extra <= chunk_chars:
-            current.append(para)
+            current.append((para, pos))
             current_len += extra
         else:
-            chunks.append("\n\n".join(current))
-            current, current_len = [para], len(para)
+            chunks.append(_join_spans(current, leading))
+            current, current_len = [(para, pos)], len(para)
     if current:
-        chunks.append("\n\n".join(current))
+        chunks.append(_join_spans(current, leading))
     return chunks
+
+
+def _join_spans(paragraphs: list[tuple[str, int]], leading: int) -> ChunkSpan:
+    """把打包进同一块的若干段落合成一个 span：文本以 \\n\\n 相接，
+    segments 保留各段在原文中的真实区间（高亮时按段渲染）。"""
+    joined = "\n\n".join(para for para, _ in paragraphs)
+    segments = tuple((leading + pos, leading + pos + len(para)) for para, pos in paragraphs)
+    return ChunkSpan(joined, segments)
 
 
 class MemoryService:
@@ -431,7 +477,7 @@ class MemoryService:
             # 幂等：同一 file_id 重复摄取（重试/重解析场景）先清旧分块，
             # 防止 chunk_id 随机生成导致的重复堆积。
             await self.store.delete_chunks_for_file(file_id)
-            vectors = await self.embedder.embed(parts)
+            vectors = await self.embedder.embed([span.text for span in parts])
             chunks = [
                 DocChunk(
                     chunk_id=new_memory_id(),
@@ -440,11 +486,12 @@ class MemoryService:
                     user_id=user_id,
                     agent_id=agent_id,
                     ordinal=ordinal,
-                    text=part,
+                    text=span.text,
+                    offsets=span.segments,
                     embedding=encode_embedding(vectors[ordinal]) if vectors is not None else None,
                     embedding_dim=self.embedder.dims if vectors is not None else None,
                 )
-                for ordinal, part in enumerate(parts)
+                for ordinal, span in enumerate(parts)
             ]
             await self.store.put_chunks(chunks)
             duration_ms = int((time.perf_counter() - started) * 1000)

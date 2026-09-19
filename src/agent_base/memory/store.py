@@ -151,7 +151,12 @@ class SessionSummary:
 
 @dataclass(frozen=True)
 class DocChunk:
-    """文档知识库的一个分块（上传文件的文本切片 + 可选 embedding）。"""
+    """文档知识库的一个分块（上传文件的文本切片 + 可选 embedding）。
+
+    ``offsets`` 是 ``((start, end), …)``——各段在原文（extracted_text）
+    中的字符区间，切片可视化高亮边界用；段落打包块是多区间，固定窗口
+    切片是单区间。旧数据为 None（前端降级为纯卡片视图）。
+    """
 
     chunk_id: str
     file_id: str
@@ -160,6 +165,7 @@ class DocChunk:
     agent_id: str
     ordinal: int
     text: str
+    offsets: tuple[tuple[int, int], ...] | None = None
     embedding: bytes | None = None
     embedding_dim: int | None = None
     created_at: float = field(default_factory=time.time)
@@ -335,6 +341,7 @@ _SQLITE_DDLS: tuple[str, ...] = (
       agent_id VARCHAR(64) NOT NULL DEFAULT '',
       ordinal INTEGER NOT NULL DEFAULT 0,
       text TEXT NOT NULL,
+      offsets_json TEXT,
       embedding BLOB,
       embedding_dim INTEGER,
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -432,6 +439,7 @@ _MYSQL_DDLS: tuple[str, ...] = (
       agent_id VARCHAR(64) NOT NULL DEFAULT '',
       ordinal INT NOT NULL DEFAULT 0,
       text LONGTEXT NOT NULL,
+      offsets_json LONGTEXT,
       embedding BLOB,
       embedding_dim INT NULL,
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -617,9 +625,31 @@ class _SqlMemoryStoreBase:
         )
 
     _CHUNK_COLUMNS = (
-        "chunk_id, file_id, thread_id, user_id, agent_id, ordinal, text, embedding,"
-        " embedding_dim, created_at"
+        "chunk_id, file_id, thread_id, user_id, agent_id, ordinal, text, offsets_json,"
+        " embedding, embedding_dim, created_at"
     )
+
+    @staticmethod
+    def _encode_offsets(offsets: tuple[tuple[int, int], ...] | None) -> str | None:
+        if not offsets:
+            return None
+        return json.dumps([list(pair) for pair in offsets])
+
+    @staticmethod
+    def _decode_offsets(value: Any) -> tuple[tuple[int, int], ...] | None:
+        if not value:
+            return None
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(parsed, list):
+            return None
+        return tuple(
+            (int(seg[0]), int(seg[1]))
+            for seg in parsed
+            if isinstance(seg, list) and len(seg) == 2
+        ) or None
 
     def _chunk_from_row(self, row: tuple[Any, ...]) -> DocChunk:
         return DocChunk(
@@ -630,9 +660,10 @@ class _SqlMemoryStoreBase:
             agent_id=row[4] or "",
             ordinal=int(row[5] or 0),
             text=row[6],
-            embedding=bytes(row[7]) if row[7] is not None else None,
-            embedding_dim=row[8],
-            created_at=self._from_sql_ts(row[9]),
+            offsets=self._decode_offsets(row[7]),
+            embedding=bytes(row[8]) if row[8] is not None else None,
+            embedding_dim=row[9],
+            created_at=self._from_sql_ts(row[10]),
         )
 
     _OP_COLUMNS = (
@@ -848,6 +879,7 @@ class _SqlMemoryStoreBase:
                         "agent_id",
                         "ordinal",
                         "text",
+                        "offsets_json",
                         "embedding",
                         "embedding_dim",
                         "created_at",
@@ -861,6 +893,7 @@ class _SqlMemoryStoreBase:
                     chunk.agent_id,
                     chunk.ordinal,
                     chunk.text,
+                    self._encode_offsets(chunk.offsets),
                     chunk.embedding,
                     chunk.embedding_dim,
                     self._to_sql_ts(chunk.created_at),
@@ -1201,6 +1234,12 @@ class SqliteMemoryStore(_SqlMemoryStoreBase):
         conn = await aiosqlite.connect(path)
         for ddl in _SQLITE_DDLS:
             await conn.execute(ddl)
+        # 旧库补列（sqlite 无 alembic，运行时自迁移）：offsets_json 是
+        # 切片可视化（M7）后加的。
+        cursor = await conn.execute("PRAGMA table_info(doc_chunks)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "offsets_json" not in columns:
+            await conn.execute("ALTER TABLE doc_chunks ADD COLUMN offsets_json TEXT")
         for index in _SQLITE_INDEXES:
             await conn.execute(index)
         await conn.commit()

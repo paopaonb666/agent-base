@@ -39,11 +39,12 @@ from collections.abc import AsyncIterator, Coroutine
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
@@ -1131,6 +1132,107 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
             chunks_removed = await rt.memory.revoke_document(file_id=file_id, user_id=user_id)
         asyncio.get_running_loop().create_task(file_store.purge_orphans())
         return {"deleted": deleted, "chunks_removed": chunks_removed}
+
+    @app.get("/v1/agents/{module}/files/{file_id}/preview")
+    async def preview_file(module: str, file_id: str, request: Request) -> dict[str, Any]:
+        """文档预览数据：元信息 + 提取正文（M7 前端预览的数据源）。
+
+        ``extracted_text`` 与附件注入给模型的内容同源（M4b），前端展示
+        的即系统"记得"的内容。属主校验同 revoke（404 掩蔽）。
+        """
+        rt: AgentRuntime = request.app.state.runtime
+        if not _known_module(rt, module):
+            raise HTTPException(status_code=404, detail=f"unknown module {module!r}")
+        file_store = rt.file_store
+        if file_store is None:
+            raise HTTPException(status_code=503, detail="附件存储未启用（存储后端不可用）")
+        user_id = _memory_user_id(request, rt.settings)
+        infos = await file_store.get_many([file_id])
+        info = infos[0] if infos else None
+        if info is None or info.user_id not in ("", user_id):
+            raise HTTPException(status_code=404, detail=f"文件不存在：{file_id}")
+        return {
+            "file_id": info.file_id,
+            "filename": info.filename,
+            "format": info.format,
+            "pages": info.pages,
+            "text_len": info.text_len,
+            "truncated": info.truncated,
+            **({"warning": info.warning} if info.warning else {}),
+            "extracted_text": info.extracted_text,
+        }
+
+    @app.get("/v1/agents/{module}/files/{file_id}/chunks")
+    async def list_file_chunks(
+        module: str, file_id: str, request: Request, limit: int = 200
+    ) -> dict[str, Any]:
+        """文档的切片存储视图：序号/原文区间/向量化状态（M7 可视化）。
+
+        ``offsets`` 是各段在原文（extracted_text）中的字符区间列表——
+        段落打包块是多区间，固定窗口切片是单区间；旧数据为 null，前端
+        降级为纯卡片视图。按请求方 user_id 过滤，天然用户隔离。
+        """
+        rt: AgentRuntime = request.app.state.runtime
+        if not _known_module(rt, module):
+            raise HTTPException(status_code=404, detail=f"unknown module {module!r}")
+        file_store = rt.file_store
+        if file_store is None:
+            raise HTTPException(status_code=503, detail="附件存储未启用（存储后端不可用）")
+        user_id = _memory_user_id(request, rt.settings)
+        infos = await file_store.get_many([file_id])
+        info = infos[0] if infos else None
+        if info is None or info.user_id not in ("", user_id):
+            raise HTTPException(status_code=404, detail=f"文件不存在：{file_id}")
+        chunks = []
+        if rt.memory is not None:
+            chunks = await rt.memory.store.list_chunks(
+                user_id, file_id=file_id, limit=max(1, min(limit, 2000))
+            )
+        return {
+            "chunks": [
+                {
+                    "chunk_id": chunk.chunk_id,
+                    "ordinal": chunk.ordinal,
+                    "text": chunk.text,
+                    "offsets": [list(seg) for seg in chunk.offsets]
+                    if chunk.offsets
+                    else None,
+                    "char_len": len(chunk.text),
+                    "has_embedding": chunk.embedding is not None,
+                    "embedding_dim": chunk.embedding_dim,
+                }
+                for chunk in chunks
+            ]
+        }
+
+    @app.get("/v1/agents/{module}/files/{file_id}/raw")
+    async def download_file_raw(
+        module: str, file_id: str, request: Request
+    ) -> Response:
+        """原始文件字节：图片按存储 mime 直出（前端 <img> 预览），
+        文档以 attachment 下载（RFC 5987 编码中文文件名）。"""
+        rt: AgentRuntime = request.app.state.runtime
+        if not _known_module(rt, module):
+            raise HTTPException(status_code=404, detail=f"unknown module {module!r}")
+        file_store = rt.file_store
+        if file_store is None:
+            raise HTTPException(status_code=503, detail="附件存储未启用（存储后端不可用）")
+        user_id = _memory_user_id(request, rt.settings)
+        infos = await file_store.get_many([file_id])
+        info = infos[0] if infos else None
+        if info is None or info.user_id not in ("", user_id):
+            raise HTTPException(status_code=404, detail=f"文件不存在：{file_id}")
+        if not info.content:
+            raise HTTPException(status_code=404, detail="文件内容不可用")
+        headers: dict[str, str] = {}
+        if info.format in IMAGE_STORED_FORMATS:
+            media_type = f"image/{info.format}"
+        else:
+            media_type = "application/octet-stream"
+            headers["Content-Disposition"] = (
+                f"attachment; filename*=UTF-8''{quote(info.filename)}"
+            )
+        return Response(content=info.content, media_type=media_type, headers=headers)
 
     @app.get("/v1/modules")
     async def list_modules(request: Request) -> dict[str, Any]:

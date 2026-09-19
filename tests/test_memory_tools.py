@@ -38,17 +38,22 @@ def _service(**overrides: object) -> MemoryService:
 
 def test_chunk_text_boundaries() -> None:
     assert chunk_text("", chunk_chars=10, overlap=2) == []
-    assert chunk_text("短文本", chunk_chars=10, overlap=2) == ["短文本"]
+    short = chunk_text("短文本", chunk_chars=10, overlap=2)
+    assert len(short) == 1 and short[0].text == "短文本"
     text = "abcdefghij" * 3  # 30 字符
     parts = chunk_text(text, chunk_chars=10, overlap=2)
     # 末块可以更短，其余块满窗口。
-    assert all(len(p) <= 10 for p in parts)
-    assert len(parts[0]) == 10
+    assert all(p.char_len <= 10 for p in parts)
+    assert parts[0].char_len == 10
     # 相邻块重叠 2 字符。
-    assert parts[0][-2:] == parts[1][:2]
+    assert parts[0].text[-2:] == parts[1].text[:2]
     # 覆盖完整：拼接首块 + 各块非重叠尾巴能还原原文。
-    rebuilt = parts[0] + "".join(p[2:] for p in parts[1:])
+    rebuilt = parts[0].text + "".join(p.text[2:] for p in parts[1:])
     assert rebuilt == text
+    # 无段落文本：每块单区间 span，坐标能切回原文。
+    for span in parts:
+        (start, end), = span.segments
+        assert text[start:end] == span.text
 
 
 def test_chunk_text_overlap_must_be_smaller_than_chunk() -> None:
@@ -267,15 +272,20 @@ async def test_upload_endpoint_ingests_document(tmp_path) -> None:
 
 
 def test_chunk_text_paragraph_aware_packing() -> None:
-    """段落感知：块边界落在空行上，段落不被从中间劈开。"""
+    """段落感知：块边界落在空行上，段落不被从中间劈开；span 坐标正确。"""
     paras = ["第一段" + "内容" * 50, "第二段" + "描述" * 50, "第三段" + "收尾" * 50]
     text = "\n\n".join(paras)  # 每段 103 字符
     parts = chunk_text(text, chunk_chars=220, overlap=10)
-    assert all(len(p) <= 220 for p in parts)
+    assert all(p.char_len <= 220 for p in parts)
     for para in paras:
-        assert any(para in p for p in parts), "段落被劈开"
+        assert any(para in p.text for p in parts), "段落被劈开"
     # 覆盖完整性：去掉拼接分隔符后与原文一致。
-    assert "".join(p.replace("\n\n", "") for p in parts) == text.replace("\n\n", "")
+    assert "".join(p.text.replace("\n\n", "") for p in parts) == text.replace("\n\n", "")
+    # span 坐标：segments 逐段映射回原文，slice 结果等于段落本身。
+    for span in parts:
+        for start, end in span.segments:
+            assert text[start:end] in paras
+            assert span.text.count(text[start:end]) == 1
 
 
 def test_chunk_text_oversized_paragraph_window_fallback() -> None:
@@ -283,9 +293,27 @@ def test_chunk_text_oversized_paragraph_window_fallback() -> None:
     para = "表格行。" * 300  # 1200 字符单段
     text = f"开头说明\n\n{para}"
     parts = chunk_text(text, chunk_chars=200, overlap=20)
-    assert all(len(p) <= 200 for p in parts)
-    assert sum(len(p) for p in parts) >= 1200  # 全覆盖
-    assert parts[0].startswith("开头说明")
+    assert all(p.char_len <= 200 for p in parts)
+    assert sum(p.char_len for p in parts) >= 1200  # 全覆盖
+    assert parts[0].text.startswith("开头说明")
+    # 超长段的窗口 span 是单区间，坐标能切回原文。
+    tail_spans = [p for p in parts if p.text.startswith("表格行")]
+    assert tail_spans
+    for span in tail_spans:
+        (start, end), = span.segments
+        assert text[start:end] == span.text
+
+
+def test_chunk_text_span_offsets_relative_to_original() -> None:
+    """坐标相对调用方传入的原文（含 strip 偏移补偿）。"""
+    text = "  \n 首段内容 \n\n 次段内容 \n  "
+    parts = chunk_text(text, chunk_chars=200, overlap=10)
+    # strip 后首段是"首段内容"：坐标切回原文应正好落在该段上。
+    first = parts[0]
+    start, end = first.segments[0]
+    assert text[start:end].strip() in text
+    joined = "".join(text[s:e] for span in parts for s, e in span.segments)
+    assert "首段内容" in joined and "次段内容" in joined
 
 
 async def test_ingest_document_is_idempotent() -> None:
@@ -386,3 +414,143 @@ async def test_revoke_file_endpoint_removes_chunks_and_row() -> None:
         assert await service.store.count_chunks_for_file(file_id) == 0
         assert await runtime.file_store.get_many([file_id]) == []
         await service.aclose()
+
+
+# ─────────────────── 文档预览与切片可视化端点（M7） ───────────────────
+
+
+async def test_file_preview_chunks_raw_endpoints() -> None:
+    """预览返回提取正文；切片带偏移量；raw 按类型回字节；属主 404 掩蔽。"""
+    from fastapi.testclient import TestClient
+
+    from agent_base.core.bootstrap import AgentRuntime
+    from agent_base.entrypoints.server import create_app
+    from agent_base.extensions.filestore import MemoryUploadedFileStore
+    from agent_base.modules.chat.module import ChatModule
+    from fakes import ScriptedChatModel
+
+    settings = _settings()
+    runtime = AgentRuntime(
+        settings=settings,
+        llm=ScriptedChatModel([]),
+        modules={"chat": ChatModule()},
+        tools=[],
+        checkpointer=None,
+    )
+    runtime.memory = MemoryService(
+        store=MemoryMemoryStore(), embedder=HashEmbedding(), settings=settings
+    )
+    runtime.file_store = MemoryUploadedFileStore()
+    doc_text = "第一段的内容。\n\n第二段的内容。\n\n第三段的内容。"
+    with TestClient(create_app(runtime=runtime)) as client:
+        upload = client.post(
+            "/v1/agents/chat/files",
+            files={"file": ("报告.txt", doc_text.encode("utf-8"), "text/plain")},
+            headers={"X-User-Id": "alice"},
+        )
+        file_id = upload.json()["file_id"]
+        service = client.app.state.runtime.memory
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if await service.store.count_chunks_for_file(file_id) > 0:
+                break
+            await asyncio.sleep(0.05)
+
+        # 预览：正文与注入同源（extracted_text）。
+        preview = client.get(
+            f"/v1/agents/chat/files/{file_id}/preview", headers={"X-User-Id": "alice"}
+        )
+        assert preview.status_code == 200
+        assert preview.json()["extracted_text"] == doc_text
+        assert preview.json()["filename"] == "报告.txt"
+
+        # 切片：带 offsets，且逐段切回原文成立。
+        chunks = client.get(
+            f"/v1/agents/chat/files/{file_id}/chunks", headers={"X-User-Id": "alice"}
+        ).json()["chunks"]
+        assert len(chunks) >= 1
+        for chunk in chunks:
+            assert chunk["has_embedding"] is True
+            assert chunk["embedding_dim"] == HashEmbedding().dims
+            if chunk["offsets"]:
+                for start, end in chunk["offsets"]:
+                    assert doc_text[start:end] in doc_text
+
+        # raw：文档字节 + 下载头（RFC5987 编码文件名）。
+        raw = client.get(f"/v1/agents/chat/files/{file_id}/raw", headers={"X-User-Id": "alice"})
+        assert raw.status_code == 200
+        assert raw.content == doc_text.encode("utf-8")
+        assert "attachment" in raw.headers["content-disposition"]
+
+        # bob：三个端点全部 404（不泄露存在性）。
+        for suffix in ("preview", "chunks", "raw"):
+            response = client.get(
+                f"/v1/agents/chat/files/{file_id}/{suffix}", headers={"X-User-Id": "bob"}
+            )
+            assert response.status_code == 404, suffix
+        await service.aclose()
+
+
+async def test_raw_endpoint_serves_image_bytes() -> None:
+    """图片 raw：magic 校验入库后按存储 mime 直出。"""
+    from fastapi.testclient import TestClient
+
+    from agent_base.core.bootstrap import AgentRuntime
+    from agent_base.entrypoints.server import create_app
+    from agent_base.extensions.filestore import MemoryUploadedFileStore
+    from agent_base.modules.chat.module import ChatModule
+    from fakes import ScriptedChatModel
+
+    settings = _settings()
+    runtime = AgentRuntime(
+        settings=settings,
+        llm=ScriptedChatModel([]),
+        modules={"chat": ChatModule()},
+        tools=[],
+        checkpointer=None,
+    )
+    runtime.memory = MemoryService(
+        store=MemoryMemoryStore(), embedder=HashEmbedding(), settings=settings
+    )
+    runtime.file_store = MemoryUploadedFileStore()
+    png = b"\x89PNG\r\n\x1a\n" + b"0" * 64
+    with TestClient(create_app(runtime=runtime)) as client:
+        upload = client.post(
+            "/v1/agents/chat/files",
+            files={"file": ("色块.png", png, "image/png")},
+            headers={"X-User-Id": "alice"},
+        )
+        assert upload.status_code == 200
+        file_id = upload.json()["file_id"]
+        # 图片无正文：预览 extracted_text 为空串（前端走 raw 显示原图）。
+        preview = client.get(
+            f"/v1/agents/chat/files/{file_id}/preview", headers={"X-User-Id": "alice"}
+        )
+        assert preview.json()["extracted_text"] == ""
+        raw = client.get(f"/v1/agents/chat/files/{file_id}/raw", headers={"X-User-Id": "alice"})
+        assert raw.status_code == 200
+        assert raw.headers["content-type"].startswith("image/png")
+        assert raw.content == png
+
+
+async def test_legacy_chunks_without_offsets_degrade(tmp_path=None) -> None:
+    """旧数据 offsets=None：chunks 端点原样返回 null（前端降级卡片视图）。"""
+    from agent_base.memory.store import DocChunk, MemoryMemoryStore
+
+    service = _service()
+    await service.store.put_chunks(
+        [
+            DocChunk(
+                chunk_id="legacy-1",
+                file_id="f-old",
+                thread_id="",
+                user_id="u",
+                agent_id="chat",
+                ordinal=0,
+                text="旧数据分块（无偏移量）",
+            )
+        ]
+    )
+    chunks = await service.store.list_chunks("u", file_id="f-old")
+    assert chunks[0].offsets is None
+    del MemoryMemoryStore  # 导入占位避免误删
