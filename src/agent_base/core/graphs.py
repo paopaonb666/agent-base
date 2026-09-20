@@ -20,7 +20,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any, cast
 
-from langchain_core.messages import AIMessageChunk, SystemMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, MessagesState, StateGraph
@@ -31,15 +31,29 @@ from agent_base.core.contracts import Graph, ModuleContext
 from agent_base.core.tools import handle_tool_error
 
 
-async def _stream_and_accumulate(model: Any, model_input: list[Any]) -> AIMessageChunk | None:
-    """流式调用模型并累积分块（取消传播依赖 astream 不被吞掉）。"""
+async def _stream_and_accumulate(model: Any, model_input: list[Any]) -> AIMessage | None:
+    """流式调用模型并累积分块；显式归一为 AIMessage。
+
+    AIMessageChunk 的 tool_calls 由 tool_call_chunks 惰性聚合，分块
+    不一致时 ToolNode 解析失败、循环提前终止（症状：工具只调一次）。
+    累积完成后显式构造 AIMessage，让 tool_calls 完成聚合校验，图状态
+    （checkpointer 历史 / 序列化 / ToolNode）只见到完整消息。
+    """
     final: AIMessageChunk | None = None
     async for chunk in model.astream(model_input):
         # astream 声明的产出类型是消息联合体；运行时的分块是
         # AIMessageChunk（仅对话模型）。
         piece = cast(AIMessageChunk, chunk)
         final = piece if final is None else final + piece
-    return final
+    if final is None:
+        return None
+    return AIMessage(
+        content=final.content,
+        tool_calls=final.tool_calls,
+        id=final.id,
+        response_metadata=final.response_metadata,
+        usage_metadata=final.usage_metadata,
+    )
 
 
 def build_single_agent_graph(

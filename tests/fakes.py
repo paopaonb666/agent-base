@@ -118,6 +118,57 @@ class ScriptedChatModel(BaseChatModel):
         return self
 
 
+class ChunkedChatModel(BaseChatModel):
+    """按"分块序列"流式输出每条脚本回复（A1/工具循环测试替身）。
+
+    ``GenericFakeChatModel`` 对空 content 直接抛错且不携带
+    tool_call_chunks，构造不出"一条回复分多块到达"的真实流式场景
+    （OpenAI 兼容 provider 的 tool_call 参数就是跨块拆分的）。每个
+    条目是一段 ``AIMessageChunk`` 序列，按序产出、整体算一次模型调用。
+    """
+
+    _batches: list[list[AIMessageChunk]] = PrivateAttr(default_factory=list)
+
+    def __init__(self, batches: list[list[AIMessageChunk]] | None = None, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._batches = [list(batch) for batch in (batches or [])]
+
+    @property
+    def _llm_type(self) -> str:
+        return "chunked-fake"
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        batch = self._batches.pop(0) if self._batches else [AIMessageChunk(content="")]
+        final: AIMessageChunk | None = None
+        for chunk in batch:
+            final = chunk if final is None else final + chunk
+        # 空批次（模型无产出）也必须返回一条消息：ainvoke 契约不允许
+        # 空结果；调用方用 content 判断即可。
+        return ChatResult(generations=[ChatGeneration(message=final or AIMessage(content=""))])
+
+    async def _astream(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        batch = self._batches.pop(0) if self._batches else [AIMessageChunk(content="")]
+        for chunk in batch:
+            yield ChatGenerationChunk(message=chunk)
+
+    def bind_tools(  # type: ignore[override]
+        self, tools: list[BaseTool], **kwargs: Any
+    ) -> ChunkedChatModel:
+        return self
+
+
 class CancellableChatModel(BaseChatModel):
     """挂起直到被取消；记录取消是否到达了模型。
 
