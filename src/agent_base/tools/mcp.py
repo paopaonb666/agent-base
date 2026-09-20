@@ -78,6 +78,17 @@ def _parse_servers(servers_json: str) -> dict[str, Any]:
     return data
 
 
+def _import_client() -> Any:
+    """延迟导入适配器（延迟到 ``MCP_ENABLED=true`` 的装配时刻）。
+
+    单独成函数是为了可测性：测试对它打桩即可模拟 extras 缺失 / 适配器
+    行为，不必操纵 ``sys.modules`` 的导入机制细节。
+    """
+    from langchain_mcp_adapters.client import MultiServerMCPClient
+
+    return MultiServerMCPClient
+
+
 async def load_mcp_tools(settings: Settings) -> list[BaseTool]:
     """按 ``MCP_*`` 配置加载 MCP Server 的工具（供共享池并入）。
 
@@ -87,11 +98,11 @@ async def load_mcp_tools(settings: Settings) -> list[BaseTool]:
     if not settings.mcp.enabled:
         return []
     try:
-        from langchain_mcp_adapters.client import MultiServerMCPClient
+        client_cls = _import_client()
     except ImportError as exc:
         raise McpError('MCP_ENABLED=true 但未安装 [mcp] extras：pip install -e ".[mcp]"') from exc
     connections = _parse_servers(settings.mcp.servers_json)
-    client = MultiServerMCPClient(connections, tool_name_prefix=True)
+    client = client_cls(connections, tool_name_prefix=True)
     try:
         return list(await client.get_tools())
     except Exception as exc:

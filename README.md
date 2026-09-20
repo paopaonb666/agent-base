@@ -15,7 +15,7 @@ LangGraph 解决"怎么把 Agent 编排起来"，本仓库解决"编排起来之
 | 成本治理 | usage 散落各处，超支靠月底账单发现 | 全部 LLM 调用计量（含流式），日/月预算熔断（429），`/metrics`·`/health` 暴露 | [成本治理（T4）](#成本治理t4) |
 | 事件可观测 | 黑箱运行，出错无从追踪 | SSE 事件契约（step / delta / plan / tool），request_id 贯穿 | [事件契约（SSE）](#事件契约sse) |
 | 模块接入 | 业务与框架互相渗透 | `AGENT_MODULES` 显式清单 + fail-fast 校验，五步接入手册 | 见下文「项目结构」 |
-| 工具治理 | 裸函数直连模型 | 共享工具池：超时包装 + 全量审计 + 重名快速失败 | 见下文「配置说明」 |
+| 工具治理 | 裸函数直连模型 | 共享工具池：超时包装 + 全量审计 + 重名快速失败；MCP Server 即插为外部工具来源 | 见下文「配置说明」 |
 
 工程纪律是上述主张的前提：四道质量门（lint / mypy strict / pytest 覆盖率 ≥85% /
 pip-audit）本地与 CI 完全一致，依赖地板锁定（langgraph ≥1.2.6，修复三个 CVE）。
@@ -134,6 +134,7 @@ pytest                         # 覆盖率门（≥85%）依赖 MySQL 集成测�
 >（png/jpg/webp/gif）按 magic bytes 校验后整字节入库，以多模态
 > content blocks 直达 vision 模型（需搭配视觉模型使用）。
 | `TOOLKIT_ENABLED` | 装配进共享池的基座内置工具清单（默认 `current_time,calculator,json_query`）；`web_search` 需配 `SEARCH_*`，`python_repl` 为 exec 级默认关 |
+| `MCP_ENABLED` / `MCP_SERVERS_JSON` | MCP 工具来源（需 `pip install -e ".[mcp]"`）：开启即承诺——配置非法或 server 连不上在**启动时**快速失败；工具名自动加 `{server}_` 前缀并入共享池，超时 / 审计 / 重名检查与基座工具同规 |
 | `LOG_JSON` | `true` 输出结构化 JSON 日志（生产建议开启） |
 
 运行一个对话（阶段 1 起可用）：
