@@ -6,11 +6,14 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
+from agent_base.core.context import MEMORY_CONTEXT_FROZEN_PREFIX
 from agent_base.memory.context import (
     ATTACHMENT_CONTEXT_PREFIX,
     MEMORY_CONTEXT_PREFIX,
     build_model_input,
     compose_context,
+    compose_frozen_context,
+    compose_recall_context,
     estimate_tokens,
     is_injected_system,
     render_profile,
@@ -189,6 +192,7 @@ def test_build_model_input_single_oversized_message_kept() -> None:
 
 
 async def test_service_compose_context_end_to_end() -> None:
+    """冻结段（画像/记忆块/摘要）与召回段分离：各自只含自己的内容。"""
     service = MemoryService(
         store=MemoryMemoryStore(), embedder=HashEmbedding(), settings=_settings()
     )
@@ -197,14 +201,20 @@ async def test_service_compose_context_end_to_end() -> None:
     await service.store.upsert_block(
         MemoryBlock(user_id="alice", agent_id="chat", label="human", content="在开发记忆系统")
     )
-    block = await service.compose_context(
+    frozen = await service.compose_context(
         user_id="alice",
         agent_id="chat",
         thread_id="chat:t1",
         query="我该用什么主题？",
     )
-    assert block is not None
-    assert "深色主题" in block and "简洁回答" in block and "记忆系统" in block
+    recall = await service.recall_context(user_id="alice", query="我该用什么主题？")
+    assert frozen is not None and recall is not None
+    # 冻结段：画像 + 记忆块；不含逐轮召回。
+    assert "简洁回答" in frozen and "记忆系统" in frozen
+    assert frozen.startswith(MEMORY_CONTEXT_FROZEN_PREFIX)
+    assert "深色主题" not in frozen
+    # 召回段：查询相关记忆，不含画像。
+    assert "深色主题" in recall and "简洁回答" not in recall
     await service.aclose()
 
 
@@ -214,12 +224,7 @@ async def test_service_compose_context_recall_is_user_level() -> None:
         store=MemoryMemoryStore(), embedder=HashEmbedding(), settings=_settings()
     )
     await service.add_memory(user_id="alice", agent_id="chat", content="用户的项目代号是雨燕")
-    block = await service.compose_context(
-        user_id="alice",
-        agent_id="supervisor",
-        thread_id="supervisor:t1",
-        query="项目代号",
-    )
+    block = await service.recall_context(user_id="alice", query="项目代号")
     assert block is not None and "雨燕" in block
     await service.aclose()
 
@@ -259,3 +264,146 @@ async def test_chat_graph_trims_model_input() -> None:
     # 最新一轮（问题 11 与它的回答）保留在尾部。
     assert seen[-1].content == "历史回答" * 60
     assert seen[-2].content.startswith("历史问题11")
+
+
+# ─────────────────── 冻结/召回分离与快照（T2.1 成本治理） ───────────────────
+
+
+def test_compose_frozen_and_recall_split() -> None:
+    """冻结段=画像+记忆块+摘要；召回段=相关记忆——互不混入。"""
+    frozen = compose_frozen_context(
+        profile={"偏好": ["简洁回答"]},
+        blocks=[MemoryBlock(user_id="u", agent_id="chat", label="human", content="在写小说")],
+        summary="聊过写作进度",
+        max_chars=10_000,
+    )
+    assert frozen is not None
+    assert frozen.startswith(MEMORY_CONTEXT_FROZEN_PREFIX)
+    assert "简洁回答" in frozen and "写小说" in frozen and "写作进度" in frozen
+    assert "混不进来" not in frozen
+
+    recall = compose_recall_context(recalled=[_scored("查询相关的记忆", 0.9)], max_chars=10_000)
+    assert recall is not None
+    assert recall.startswith(MEMORY_CONTEXT_PREFIX)
+    assert "查询相关" in recall
+    assert "简洁回答" not in recall
+
+    # 空内容语义与 compose_context 一致：None = 本轮不注入。
+    assert compose_frozen_context(profile=None, blocks=[], summary=None, max_chars=100) is None
+    assert compose_recall_context(recalled=[], max_chars=100) is None
+
+
+async def test_service_snapshot_frozen_within_thread() -> None:
+    """同线程第二次 compose 逐字节相同——即使画像/记忆块/摘要中途已变。"""
+    service = MemoryService(
+        store=MemoryMemoryStore(), embedder=HashEmbedding(), settings=_settings()
+    )
+    await service.save_profile("alice", {"偏好": ["旧偏好"]})
+    first = await service.compose_context(
+        user_id="alice", agent_id="chat", thread_id="chat:t1", query="q"
+    )
+    assert first is not None
+    # 中途变更：数据层照常更新。
+    await service.save_profile("alice", {"偏好": ["新偏好"]})
+    await service.store.upsert_block(
+        MemoryBlock(user_id="alice", agent_id="chat", label="human", content="中途改的块")
+    )
+    second = await service.compose_context(
+        user_id="alice", agent_id="chat", thread_id="chat:t1", query="q"
+    )
+    assert second == first
+    assert "旧偏好" in second and "新偏好" not in second and "中途改的块" not in second
+    # 新线程不共享快照：反映最新数据。
+    fresh = await service.compose_context(
+        user_id="alice", agent_id="chat", thread_id="chat:t2", query="q"
+    )
+    assert fresh is not None and "新偏好" in fresh and "中途改的块" in fresh
+    await service.aclose()
+
+
+async def test_service_snapshot_lru_eviction() -> None:
+    """快照缓存按 LRU 上限逐出：被逐出的线程重新定型。"""
+    service = MemoryService(
+        store=MemoryMemoryStore(),
+        embedder=HashEmbedding(),
+        settings=_settings(memory_context_snapshot_max=1),
+    )
+    await service.save_profile("alice", {"偏好": ["v1"]})
+    first = await service.compose_context(
+        user_id="alice", agent_id="chat", thread_id="chat:t1", query="q"
+    )
+    # t2 进缓存 → t1 被逐出。
+    await service.compose_context(user_id="alice", agent_id="chat", thread_id="chat:t2", query="q")
+    await service.save_profile("alice", {"偏好": ["v2"]})
+    recomputed = await service.compose_context(
+        user_id="alice", agent_id="chat", thread_id="chat:t1", query="q"
+    )
+    assert first is not None and recomputed is not None
+    assert recomputed != first
+    assert "v2" in recomputed
+    await service.aclose()
+
+
+async def test_service_purge_thread_drops_snapshot() -> None:
+    """线程删除的级联清理包括注入快照：删除后重建反映空数据。"""
+    service = MemoryService(
+        store=MemoryMemoryStore(), embedder=HashEmbedding(), settings=_settings()
+    )
+    await service.save_profile("alice", {"偏好": ["x"]})
+    before = await service.compose_context(
+        user_id="alice", agent_id="chat", thread_id="chat:t1", query="q"
+    )
+    assert before is not None and "x" in before
+    # 数据层改为 y 后 purge：快照被级联清理 → 重新组装反映 y（而非缓存的 x）。
+    await service.save_profile("alice", {"偏好": ["y"]})
+    await service.purge_thread("chat:t1")
+    after = await service.compose_context(
+        user_id="alice", agent_id="chat", thread_id="chat:t1", query="q"
+    )
+    assert after is not None and "y" in after and "x" not in after
+    await service.aclose()
+
+
+def test_build_model_input_hoists_frozen_head() -> None:
+    """冻结段提升到模型输入头部且只出现一次；本轮召回贴尾保留。"""
+    messages = [
+        SystemMessage(content=MEMORY_CONTEXT_FROZEN_PREFIX + "会话固定段"),
+        SystemMessage(content=MEMORY_CONTEXT_PREFIX + "第一轮召回"),
+        HumanMessage(content="第一问"),
+        AIMessage(content="第一答"),
+        SystemMessage(content=MEMORY_CONTEXT_FROZEN_PREFIX + "会话固定段"),
+        SystemMessage(content=MEMORY_CONTEXT_PREFIX + "本轮召回"),
+        HumanMessage(content="第二问"),
+    ]
+    model_input = build_model_input(messages, max_tokens=10**9)
+    # 冻结段在头部且只出现一次（历史副本剔除）。
+    assert str(model_input[0].content).startswith(MEMORY_CONTEXT_FROZEN_PREFIX)
+    assert (
+        sum(1 for m in model_input if str(m.content).startswith(MEMORY_CONTEXT_FROZEN_PREFIX)) == 1
+    )
+    # 第一轮召回（历史注入）剔除；本轮召回保留在 human 之前。
+    assert not any("第一轮召回" in str(m.content) for m in model_input)
+    assert any("本轮召回" in str(m.content) for m in model_input)
+    assert model_input.index(
+        next(m for m in model_input if "本轮召回" in str(m.content))
+    ) < model_input.index(messages[-1])
+    # 非注入消息一个不少、顺序不乱。
+    assert [m for m in model_input if not is_injected_system(m)] == [
+        HumanMessage(content="第一问"),
+        AIMessage(content="第一答"),
+        HumanMessage(content="第二问"),
+    ]
+
+
+def test_build_model_input_frozen_head_survives_budget() -> None:
+    """预算修剪只作用于历史体；冻结头部始终保留。"""
+    messages = [
+        SystemMessage(content=MEMORY_CONTEXT_FROZEN_PREFIX + "会话固定段"),
+        HumanMessage(content="旧" * 500),
+        AIMessage(content="答" * 500),
+        HumanMessage(content="新问题"),
+    ]
+    model_input = build_model_input(messages, max_tokens=100)
+    assert str(model_input[0].content).startswith(MEMORY_CONTEXT_FROZEN_PREFIX)
+    assert model_input[-1] == messages[-1]
+    assert len(model_input) < len(messages)  # 历史体确实被修剪

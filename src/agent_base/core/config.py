@@ -324,6 +324,8 @@ class MemorySettings(BaseModel):
     # 模型侧 token 预算（M6d 上下文工程）：超过预算的旧历史被修剪出
     # "发给模型"的输入（checkpointer 全量历史不动）。
     context_max_tokens: int = 12_000
+    # 注入快照缓存上限（成本治理 T2.1）：线程级冻结注入段的 LRU 容量。
+    context_snapshot_max: int = 256
     # 记忆形成管线（M6c）：每 N 轮对话跑一次抽取+整合（后台异步）。
     capture_enabled: bool = True
     capture_every_turns: int = 1
@@ -375,6 +377,7 @@ class MemorySettings(BaseModel):
         "recall_top_k",
         "context_max_chars",
         "context_max_tokens",
+        "context_snapshot_max",
         "extraction_max_input_chars",
         "doc_chunk_chars",
         "mysql_pool_size",

@@ -19,12 +19,16 @@ import json
 import logging
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from agent_base.extensions.metrics import MEMORY_METRICS
-from agent_base.memory.context import compose_context
+from agent_base.memory.context import (
+    compose_frozen_context,
+    compose_recall_context,
+)
 from agent_base.memory.embeddings import EmbeddingClient, NullEmbedding, build_embedding_client
 from agent_base.memory.pipeline import MemoryPipeline, render_transcript
 from agent_base.memory.retrieval import ScoredChunk, ScoredMemory, recall_memories, score_chunks
@@ -82,6 +86,9 @@ class MemoryService:
         # 每用户的整合锁（锐评 #10）：同一用户并发轮次的后台捕获会互相
         # 看不到对方未写入的记忆，导致重复 ADD——串行化同一用户的捕获。
         self._capture_locks: dict[str, asyncio.Lock] = {}
+        # 注入快照缓存（成本治理 T2.1）：键 (user_id, agent_id, thread_id)，
+        # LRU 逐出。单进程口径（与 /metrics 同款局限，多 worker 不保证）。
+        self._context_snapshots: OrderedDict[tuple[str, str, str], str] = OrderedDict()
 
     async def record_op(
         self,
@@ -629,36 +636,66 @@ class MemoryService:
     async def compose_context(
         self, *, user_id: str, agent_id: str, thread_id: str, query: str
     ) -> str | None:
-        """组装本轮的注入块（M6d）：画像 + 记忆块 + 会话摘要 + 相关记忆。
+        """线程级**冻结**注入段（M6d + T2.1）：画像 + 记忆块 + 会话摘要。
 
+        快照在线程首轮定型并缓存（LRU 上限 ``context_snapshot_max``）：
+        同线程后续调用返回逐字节相同的内容，即使画像/记忆块/摘要中途
+        已更新——供应商前缀缓存按最长公共前缀命中，冻结头部是输入缓存
+        的地基；数据变更在**下个会话**进入注入（接受的行为权衡，见
+        ``compose_frozen_context``）。``purge_thread`` 会级联清理。
+
+        逐轮变化的查询相关召回走 ``recall_context``（贴尾注入）。
         任何一步失败都降级为"缺那一节"；整体无内容时返回 None。
         """
+        key = (user_id, agent_id, thread_id)
+        cached = self._context_snapshots.get(key)
+        if cached is not None:
+            self._context_snapshots.move_to_end(key)
+            return cached
         try:
             global_blocks = await self.store.list_blocks(user_id, "*")
             agent_blocks = await self.store.list_blocks(user_id, agent_id)
-            blocks = [*global_blocks, *agent_blocks]
             profile = (
                 await self.get_profile(user_id) if self._settings.memory.profile_enabled else None
             )
             summary_record = await self.store.get_summary(user_id, thread_id)
-            # 召回是用户级的（与 memory_search 工具同契约）：跨模块可见，
-            # 否则 supervisor 编排的子 agent 永远看不到其他模块写下的记忆；
-            # 记忆块仍按「全局 + 本模块」注入。
-            recalled = await self.search(user_id=user_id, agent_id=None, query=query)
-            return compose_context(
+            frozen = compose_frozen_context(
                 profile=profile,
-                blocks=blocks,
+                blocks=[*global_blocks, *agent_blocks],
                 summary=summary_record.summary if summary_record else None,
+                max_chars=self._settings.memory.context_max_chars,
+            )
+        except Exception:
+            logger.warning("memory: 冻结注入段组装失败（本轮不注入）", exc_info=True)
+            return None
+        if frozen is not None:
+            self._context_snapshots[key] = frozen
+            while len(self._context_snapshots) > self._settings.memory.context_snapshot_max:
+                self._context_snapshots.popitem(last=False)
+        return frozen
+
+    async def recall_context(self, *, user_id: str, query: str) -> str | None:
+        """本轮**召回**注入段（M6d + T2.1）：按查询召回的相关记忆。
+
+        用户级召回（与 memory_search 工具同契约：跨模块可见）。逐轮
+        变化，由 server 紧贴本轮 human 注入——尾部变化只牺牲自身之后
+        的缓存，不动冻结头部与历史体。失败降级为 None。
+        """
+        try:
+            recalled = await self.search(user_id=user_id, agent_id=None, query=query)
+            return compose_recall_context(
                 recalled=recalled,
                 max_chars=self._settings.memory.context_max_chars,
             )
         except Exception:
-            logger.warning("memory: 注入块组装失败（本轮不注入）", exc_info=True)
+            logger.warning("memory: 召回注入段组装失败（本轮不注入召回）", exc_info=True)
             return None
 
     async def purge_thread(self, thread_id: str) -> None:
-        """线程删除的级联清理（滚动摘要 + 知识库分块；跨会话记忆保留）。"""
+        """线程删除的级联清理（滚动摘要 + 知识库分块 + 注入快照；跨会话记忆保留）。"""
         await self.store.delete_for_thread(thread_id)
+        for key in [k for k in self._context_snapshots if k[2] == thread_id]:
+            self._context_snapshots.pop(key, None)
 
     async def aclose(self) -> None:
         closer = getattr(self.store, "aclose", None)

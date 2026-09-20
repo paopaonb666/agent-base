@@ -125,8 +125,10 @@ async def invoke(module: str, body: InvokeRequest, request: Request) -> Streamin
         "configurable": {"thread_id": full_thread_id, "user_id": user_id},
     }
     messages_input: list[Any] = []
-    # 记忆上下文注入（M6d）：画像/记忆块/摘要/相关记忆打包成注入块，
-    # 置于全部消息之前（attachments 注入块在其后）。失败静默降级。
+    # 记忆上下文注入（M6d + T2.1）：冻结段（画像/记忆块/摘要，线程内
+    # 快照）在前，召回段（查询相关，逐轮变化）紧随其后、贴着附件与
+    # 本轮 human——头部稳定保前缀缓存，尾部变化不伤历史缓存。
+    # 任何一段失败都静默降级。
     memory = memory_or_none(rt)
     if memory is not None:
         context_block = await memory.compose_context(
@@ -135,8 +137,10 @@ async def invoke(module: str, body: InvokeRequest, request: Request) -> Streamin
             thread_id=full_thread_id,
             query=body.message,
         )
-        if context_block:
-            messages_input.append(SystemMessage(content=context_block))
+        recall_block = await memory.recall_context(user_id=user_id, query=body.message)
+        for block in (context_block, recall_block):
+            if block:
+                messages_input.append(SystemMessage(content=block))
     # 附件（M4b）：解析引用的 file_id → 取记录 → 校验属主（S1：可用的
     # file_id 不能是别人的——IDOR 组合链的入口）→ 绑定线程 → 注入。
     if body.attachments:

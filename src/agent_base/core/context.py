@@ -24,6 +24,10 @@ from typing import Any
 # 注入型系统消息的标记前缀。server 层注入时必须以它开头；修剪逻辑靠
 # 它区分"轮轮累积的注入块"与真实历史。
 MEMORY_CONTEXT_PREFIX = "【长期记忆上下文】"
+# 冻结注入段（成本治理 T2.1）：画像/记忆块/摘要线程内快照，逐轮逐字节
+# 相同。build_model_input 把它提升到模型输入头部——供应商前缀缓存按
+# 最长公共前缀命中，稳定的头部让历史体的缓存跨轮持续增长。
+MEMORY_CONTEXT_FROZEN_PREFIX = "【长期记忆上下文·固定】"
 ATTACHMENT_CONTEXT_PREFIX = "以下是用户上传的附件内容"
 
 # token 近似估算系数（DeepSeek 系 tokenizer 的经验值：中文约 0.6 token/字，
@@ -55,6 +59,8 @@ def injected_kind(message: Any) -> str | None:
     if getattr(message, "type", "") != "system":
         return None
     content = _content_text(message.content)
+    if content.startswith(MEMORY_CONTEXT_FROZEN_PREFIX):
+        return MEMORY_CONTEXT_FROZEN_PREFIX
     if content.startswith(MEMORY_CONTEXT_PREFIX):
         return MEMORY_CONTEXT_PREFIX
     if content.startswith(ATTACHMENT_CONTEXT_PREFIX):
@@ -68,23 +74,37 @@ def is_injected_system(message: Any) -> bool:
 
 
 def build_model_input(messages: list[Any], *, max_tokens: int) -> list[Any]:
-    """构造发给模型的输入：注入去重 + 预算修剪（不修改原列表）。
+    """构造发给模型的输入：冻结提升 + 注入去重 + 预算修剪（不改原列表）。
 
-    - 注入型系统消息只保留**最后一条**（本轮注入的），历史里的全部剔除
-      ——否则附件全文/记忆块会随 checkpoint 轮轮累积，把上下文撑爆；
-    - 从尾部按 token 预算保留近期消息；修剪边界不得落在工具调用序列
-      中间（ToolMessage 的开头），保证 AIMessage(tool_calls) 与其
-      ToolMessage 成对出现；
-    - 至少保留最后一条消息（单条超预算的极端情况原样保留，交给模型
-      的上下文上限兜底）。
+    - **冻结段提升**（T2.1）：冻结注入段（画像/记忆块/摘要快照）取最后
+      一条（本轮的）提升到输入**头部**，历史副本全部剔除——头部逐轮
+      逐字节稳定，供应商前缀缓存从第二轮起覆盖全部历史；
+    - 其余注入型系统消息（本轮召回/附件全文）只保留**最后一条 human
+      之前的连续段**（贴尾注入：它们逐轮变化，放在尾部只牺牲自己之后
+      的缓存，不动历史），历史里的全部剔除——否则会随 checkpoint 轮轮
+      累积，把上下文撑爆；
+    - 从尾部按 token 预算保留近期消息（冻结头部不计入预算——它受组装
+      期预算约束）；修剪边界不得落在工具调用序列中间，保证
+      AIMessage(tool_calls) 与其 ToolMessage 成对出现；
+    - 至少保留最后一条消息（单条超预算的极端情况原样保留）。
     """
     if not messages:
         return []
 
-    # 1) 注入去重：只保留"本轮"的注入块——最后一条 human 消息之前的
-    #    连续注入段（记忆块 + 附件全文都可能在本轮注入，必须同时保留；
-    #    UI 实测缺陷 F1）。历史轮次的注入块一律剔除：其内容已随当轮
-    #    消费，留着只会让模型输入轮轮膨胀。
+    # 0) 冻结段提升：最后一条冻结注入是"本轮的"，历史副本不进模型输入。
+    frozen_index = next(
+        (
+            i
+            for i in range(len(messages) - 1, -1, -1)
+            if injected_kind(messages[i]) == MEMORY_CONTEXT_FROZEN_PREFIX
+        ),
+        None,
+    )
+    frozen_message = messages[frozen_index] if frozen_index is not None else None
+
+    # 1) 注入去重：只保留"本轮"的贴尾注入段——最后一条 human 消息之前
+    #    的连续**非冻结**注入段（召回块 + 附件全文都可能在本轮注入，必须
+    #    同时保留；UI 实测缺陷 F1）。历史轮次的注入块一律剔除。
     last_human = max(
         (i for i, message in enumerate(messages) if getattr(message, "type", "") == "human"),
         default=None,
@@ -92,7 +112,11 @@ def build_model_input(messages: list[Any], *, max_tokens: int) -> list[Any]:
     current_injections: set[int] = set()
     if last_human is not None:
         i = last_human - 1
-        while i >= 0 and injected_kind(messages[i]) is not None:
+        while (
+            i >= 0
+            and injected_kind(messages[i]) is not None
+            and injected_kind(messages[i]) != MEMORY_CONTEXT_FROZEN_PREFIX
+        ):
             current_injections.add(i)
             i -= 1
     kept_indices = [
@@ -125,7 +149,9 @@ def build_model_input(messages: list[Any], *, max_tokens: int) -> list[Any]:
     ):
         kept.pop(0)
 
-    return [messages[i] for i in kept]
+    body = [messages[i] for i in kept]
+    # 冻结段置顶：与本轮贴尾注入互不干扰，二者合计构成完整注入面。
+    return ([frozen_message] if frozen_message is not None else []) + body
 
 
 # 多段 content 的文本提取的公开别名（planner 等模块复用）。
@@ -134,6 +160,7 @@ content_text = _content_text
 
 __all__ = [
     "ATTACHMENT_CONTEXT_PREFIX",
+    "MEMORY_CONTEXT_FROZEN_PREFIX",
     "MEMORY_CONTEXT_PREFIX",
     "build_model_input",
     "content_text",
