@@ -104,6 +104,11 @@ async def health(request: Request) -> dict[str, Any]:
     memory = memory_or_none(rt)
     if memory is not None:
         components["memory"] = await memory.health_probe()
+    # 成本治理（T4.2）：仅在 COST_ENABLED=true 时出现；warn/blocked 都
+    # 会把整体状态推到 degraded（预算见底与依赖损坏同级可见）。
+    governor = getattr(request.app.state, "cost_governor", None)
+    if governor is not None:
+        components["cost"] = governor.status()
     status = "ok" if all(v == "ok" for v in components.values()) else "degraded"
     return {"status": status, "components": components}
 

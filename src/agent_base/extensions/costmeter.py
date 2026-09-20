@@ -213,8 +213,17 @@ class CostMeter:
         )
 
     def restore_day(self, day: str, cost: float) -> None:
-        """进程重启后从账本恢复当日累计（叠加，不清零内存值）。"""
+        """进程重启后从账本恢复累计（叠加语义：当日 + 当月各加一次）。"""
         self._day_totals[day] = self._day_totals.get(day, 0.0) + cost
+        month = day[:7]
+        self._month_totals[month] = self._month_totals.get(month, 0.0) + cost
+
+    def reset(self) -> None:
+        """清空全部累计与队列（测试隔离用）。"""
+        self._day_totals.clear()
+        self._month_totals.clear()
+        self._pending.clear()
+        self._warned_models.clear()
 
 
 class CostMeterHandler(BaseCallbackHandler):
@@ -241,11 +250,13 @@ class CostMeterHandler(BaseCallbackHandler):
 
 
 class CostLedger(Protocol):
-    """账本协议：批量落库 + 按时间点累计（重启恢复用）。"""
+    """账本协议：批量落库 + 按时间点累计 + 按日聚合（重启恢复用）。"""
 
     async def insert(self, rows: list[UsageRecord]) -> None: ...
 
     async def totals_since(self, ts: float) -> float: ...
+
+    async def totals_by_day(self) -> dict[str, float]: ...
 
 
 class MemoryCostLedger:
@@ -259,6 +270,13 @@ class MemoryCostLedger:
 
     async def totals_since(self, ts: float) -> float:
         return sum(row.cost_cny for row in self._rows if row.ts >= ts)
+
+    async def totals_by_day(self) -> dict[str, float]:
+        totals: dict[str, float] = {}
+        for row in self._rows:
+            day = datetime.fromtimestamp(row.ts).date().isoformat()
+            totals[day] = totals.get(day, 0.0) + row.cost_cny
+        return totals
 
 
 class SqliteCostLedger:
@@ -307,9 +325,78 @@ class SqliteCostLedger:
             row = await cursor.fetchone()
             return float(row[0]) if row else 0.0
 
+    async def totals_by_day(self) -> dict[str, float]:
+        async with self._db.execute(
+            "SELECT date(ts, 'unixepoch', 'localtime'), SUM(cost_cny) FROM cost_usage GROUP BY 1"
+        ) as cursor:
+            return {str(day): float(cost or 0.0) for day, cost in await cursor.fetchall()}
+
     async def aclose(self) -> None:
         await self._db.close()
 
 
 # 进程级单例：与 TOOL_METRICS 同理，全部模型客户端共享一份累计。
 COST_METER = CostMeter()
+
+
+class CostBudgetExceeded(Exception):
+    """预算熔断（``action="block"``）时抛出；调用方转 429。"""
+
+
+class CostGovernor:
+    """预算门（T4.2）：日/月阈值 + warn/block 两档行为。
+
+    - ``block``（默认）：超限后 ``check()`` 抛 ``CostBudgetExceeded``——
+      invoke 路由转 429，只挡**新的 LLM 消耗**；检索、历史、记忆管理等
+      非 LLM 端点照常（熔断的是电表，不是整个房子）；
+    - ``warn``：只告警放行，``status()`` 报 ``warn``；
+    - 阈值为 0 表示对应周期不限额。
+    """
+
+    def __init__(
+        self, *, daily_cny: float, monthly_cny: float, action: str, meter: CostMeter
+    ) -> None:
+        self._daily = daily_cny
+        self._monthly = monthly_cny
+        self._action = action
+        self._meter = meter
+        self._warned_day = ""
+
+    def _exceeded(self) -> bool:
+        return (self._daily > 0 and self._meter.day_total_cny() >= self._daily) or (
+            self._monthly > 0 and self._meter.month_total_cny() >= self._monthly
+        )
+
+    def check(self) -> None:
+        """预算门前置检查；超限且 action=block 时抛出。"""
+        if self._exceeded():
+            if self._action == "block":
+                raise CostBudgetExceeded(
+                    f"cost budget exceeded: 今日 {self._meter.day_total_cny():.4f} 元 /"
+                    f" 本月 {self._meter.month_total_cny():.4f} 元"
+                    f"（阈值 {self._daily}/{self._monthly}）"
+                )
+            logger.warning(
+                "cost: 超出预算阈值仍在运行（action=warn）：今日 %.4f / 本月 %.4f 元",
+                self._meter.day_total_cny(),
+                self._meter.month_total_cny(),
+            )
+            return
+        # 80% 预警（每日至多提醒一次）：让"快没钱了"先于"没钱"出现。
+        day = datetime.fromtimestamp(time.time()).date().isoformat()
+        near = (self._daily > 0 and self._meter.day_total_cny() >= self._daily * 0.8) or (
+            self._monthly > 0 and self._meter.month_total_cny() >= self._monthly * 0.8
+        )
+        if near and self._warned_day != day:
+            self._warned_day = day
+            logger.warning(
+                "cost: 已达预算阈值的 80%%（今日 %.4f / 本月 %.4f 元）",
+                self._meter.day_total_cny(),
+                self._meter.month_total_cny(),
+            )
+
+    def status(self) -> str:
+        """health 组件状态：ok | warn | blocked。"""
+        if self._exceeded():
+            return "blocked" if self._action == "block" else "warn"
+        return "ok"

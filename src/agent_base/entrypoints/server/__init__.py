@@ -21,6 +21,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -56,6 +58,12 @@ from agent_base.extensions.observability import (
     request_id,
     setup_logging,
 )
+
+logger = logging.getLogger(__name__)
+
+# 成本账本的周期落库间隔（秒）：进程被杀最多丢这个窗口的明细行，
+# 预算门读的是内存聚合值，不受影响。
+_COST_FLUSH_INTERVAL_SECONDS = 5.0
 
 __all__ = [
     "IMAGE_EXTENSIONS",
@@ -95,11 +103,63 @@ def create_app(
         # 而不是只在 CLI——否则生产日志既非结构化也无法端到端追踪（A1）。
         setup_logging(json_lines=rt.settings.observability.log_json)
         app.state.runtime = rt
+
+        # 成本治理（T4.1/T4.2）：装配账本 + 预算门 + 周期落库。仅在
+        # COST_ENABLED=true 时激活；app.state.cost_governor 恒存在（None
+        # = 未启用），路由据此跳过预算检查。
+        cost = rt.settings.cost
+        ledger: Any = None
+        flush_task: Any = None
+        if cost.enabled:
+            from agent_base.extensions.costmeter import (
+                COST_METER,
+                CostGovernor,
+                MemoryCostLedger,
+                SqliteCostLedger,
+            )
+
+            COST_METER.configure(cost.prices_json)
+            backend = rt.settings.checkpointer.backend
+            if backend == "sqlite":
+                ledger = await SqliteCostLedger.create(rt.settings.checkpointer.sqlite_path)
+            else:
+                # mysql 账本暂未接入：回退内存账本（重启清零，方向安全
+                # ——只会少记不会误熔断），表结构已随 sqlite DDL 预留。
+                ledger = MemoryCostLedger()
+                if backend == "mysql":
+                    logging.getLogger(__name__).warning(
+                        "cost: mysql 账本暂未接入，预算累计在重启后清零（内存账本）"
+                    )
+            # 重启恢复：账本按日聚合回放进预算累计。
+            for day, day_cost in await ledger.totals_by_day():
+                COST_METER.restore_day(day, day_cost)
+            app.state.cost_governor = CostGovernor(
+                daily_cny=cost.daily_cny,
+                monthly_cny=cost.monthly_cny,
+                action=cost.action,
+                meter=COST_METER,
+            )
+
+            async def _flush_cost_ledger() -> None:
+                while True:
+                    await asyncio.sleep(_COST_FLUSH_INTERVAL_SECONDS)
+                    await ledger.insert(COST_METER.take_pending())
+
+            flush_task = asyncio.create_task(_flush_cost_ledger())
+        else:
+            app.state.cost_governor = None
         try:
             yield
         finally:
             # H4：优雅关闭必须释放运行时资源（MySQL 池、httpx client、
             # sqlite 连接、toollog 写线程），否则全部泄漏到进程退出。
+            if flush_task is not None:
+                flush_task.cancel()
+            if ledger is not None:
+                await ledger.insert(COST_METER.take_pending())
+                aclose = getattr(ledger, "aclose", None)
+                if aclose is not None:
+                    await aclose()
             await rt.close()
 
     app = FastAPI(title="agent-base", version=__version__, lifespan=lifespan)

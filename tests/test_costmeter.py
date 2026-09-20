@@ -294,3 +294,146 @@ def test_metrics_render_includes_cost_lines() -> None:
     rendered = metrics.render_cost_metrics()
     assert 'llm_tokens_total{model="deepseek-chat",profile="main",kind="input"} 42' in rendered
     assert "llm_cost_cny_total 0.001500" in rendered
+
+
+# ─────────────────────── 预算熔断 CostGovernor（T4.2） ───────────────────────
+
+
+def _governor(**cost: object):
+    from agent_base.extensions.costmeter import CostGovernor
+
+    defaults: dict[str, object] = {
+        "cost_enabled": True,
+        "cost_daily_cny": 0.01,
+        "cost_monthly_cny": 0,
+        "cost_action": "block",
+        "cost_prices_json": '{"m": {"input_miss": 1, "input_hit": 0, "output": 0}}',
+    }
+    defaults.update(cost)
+    settings = _settings(**defaults)
+    meter = _fresh_meter(prices_json=settings.cost.prices_json)
+    governor = CostGovernor(
+        daily_cny=settings.cost.daily_cny,
+        monthly_cny=settings.cost.monthly_cny,
+        action=settings.cost.action,
+        meter=meter,
+    )
+    return governor, meter
+
+
+def _spend(meter, cost_cny: float) -> None:
+    meter.observe(
+        model="m", profile="main", prompt=int(cost_cny * 1_000_000), completion=0, cache_read=0
+    )
+
+
+def test_governor_blocks_at_daily_limit() -> None:
+    governor, meter = _governor()
+    governor.check()  # 未消费：放行
+    _spend(meter, 1.0)
+    with pytest.raises(Exception, match="cost budget exceeded"):
+        governor.check()
+    assert governor.status() == "blocked"
+
+
+def test_governor_warn_action_allows_but_flags() -> None:
+    governor, meter = _governor(cost_action="warn")
+    _spend(meter, 1.0)
+    governor.check()  # warn：放行不抛
+    assert governor.status() == "warn"
+
+
+def test_governor_monthly_limit_only() -> None:
+    governor, meter = _governor(cost_daily_cny=0, cost_monthly_cny=2.0)
+    _spend(meter, 1.0)
+    governor.check()  # 月内未超
+    _spend(meter, 1.0)
+    with pytest.raises(Exception, match="cost budget exceeded"):
+        governor.check()
+
+
+def test_governor_status_ok_under_limit() -> None:
+    governor, meter = _governor()
+    _spend(meter, 0.001)
+    assert governor.status() == "ok"
+
+
+async def test_ledger_recovery_restores_day_totals() -> None:
+    """重启恢复：账本按日聚合 → meter.restore_day 还原当日/当月累计。"""
+    ledger = MemoryCostLedger()
+    meter = _fresh_meter(prices_json='{"m": {"input_miss": 1, "input_hit": 0, "output": 0}}')
+    handler = CostMeterHandler(model="m", profile="main", meter=meter)
+    handler.on_llm_end(
+        _response({"input_tokens": 1_000_000, "output_tokens": 0, "total_tokens": 1_000_000})
+    )
+    await ledger.insert(meter.take_pending())
+
+    fresh_meter = _fresh_meter()
+    for day, cost in (await ledger.totals_by_day()).items():
+        fresh_meter.restore_day(day, cost)
+    assert fresh_meter.day_total_cny() == pytest.approx(1.0)
+    assert fresh_meter.month_total_cny() == pytest.approx(1.0)
+
+
+def test_governor_unlimited_when_zero() -> None:
+    """阈值为 0 = 不限额：超大量消费也不熔断。"""
+    governor, meter = _governor(cost_daily_cny=0, cost_monthly_cny=0)
+    _spend(meter, 999.0)
+    governor.check()
+    assert governor.status() == "ok"
+
+
+def test_server_invoke_blocked_with_429_and_health_cost() -> None:
+    """server 集成：预算超限 → invoke 429、/health 出现 cost=blocked、
+    非端点（线程列表）不受影响。"""
+    from fastapi.testclient import TestClient
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from agent_base.core.bootstrap import AgentRuntime
+    from agent_base.entrypoints.server import create_app
+    from agent_base.extensions.costmeter import COST_METER
+    from agent_base.modules.chat.module import ChatModule
+    from fakes import ScriptedChatModel
+
+    settings = Settings(
+        _env_file=None,
+        llm_api_key="sk-test",
+        cost_enabled=True,
+        cost_daily_cny=0.01,
+        cost_prices_json='{"deepseek-chat": {"input_miss": 3, "input_hit": 0.25, "output": 6}}',
+    )
+    rt = AgentRuntime(
+        settings=settings,
+        llm=ScriptedChatModel([]),
+        modules={"chat": ChatModule()},
+        tools=[],
+        checkpointer=InMemorySaver(),
+    )
+    COST_METER.reset()
+    try:
+        with TestClient(create_app(runtime=rt)) as client:
+            # lifespan 已 configure 价目表：直接注入超额消费。
+            COST_METER.observe(
+                model="deepseek-chat",
+                profile="main",
+                prompt=1_000_000,
+                completion=0,
+                cache_read=0,
+            )
+            response = client.post(
+                "/v1/agents/chat/invoke",
+                json={"message": "hi"},
+                headers={"X-User-Id": "u1"},
+            )
+            assert response.status_code == 429
+            assert "cost budget" in response.json()["detail"]
+
+            body = client.get("/health").json()
+            assert body["components"]["cost"] == "blocked"
+            assert body["status"] == "degraded"
+
+            # 非 LLM 端点不受熔断影响。
+            threads = client.get("/v1/agents/chat/threads", headers={"X-User-Id": "u1"})
+            assert threads.status_code == 200
+    finally:
+        COST_METER.reset()

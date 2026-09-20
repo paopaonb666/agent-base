@@ -29,6 +29,7 @@ from agent_base.entrypoints.server.deps import (
 )
 from agent_base.entrypoints.server.serializers import IMAGE_STORED_FORMATS, _serialize_message
 from agent_base.entrypoints.server.sse import _SSE_HEADERS, _build_capture_hook, _event_stream
+from agent_base.extensions.costmeter import CostBudgetExceeded
 from agent_base.extensions.filestore import UploadedFileInfo
 from agent_base.extensions.observability import new_request_id
 from agent_base.memory.context import ATTACHMENT_CONTEXT_PREFIX
@@ -92,6 +93,14 @@ async def _thread_owner_or_404(rt: Any, module: str, thread_id: str, user_id: st
 async def invoke(module: str, body: InvokeRequest, request: Request) -> StreamingResponse:
     """一次对话轮：SSE 流输出契约事件（ping/step/delta/sources/done/error）。"""
     rt = get_runtime(request)
+    # 预算熔断（T4.2）：在建流之前检查——429 优先于半截 SSE。只挡新的
+    # LLM 消耗；非 LLM 端点不经过这里，不受熔断影响。
+    governor = getattr(request.app.state, "cost_governor", None)
+    if governor is not None:
+        try:
+            governor.check()
+        except CostBudgetExceeded as exc:
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
     # 难度分流（M9）：mode 只决定调哪张图——thread 前缀、记忆 agent_id、
     # thread_index 属主、附件绑定、记忆形成钩子全部维持请求模块不变
     # （决策 5：图选择与线程命名空间解耦）。
