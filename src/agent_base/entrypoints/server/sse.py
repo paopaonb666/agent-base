@@ -24,6 +24,7 @@ from agent_base.extensions.events import (
     DoneEvent,
     ErrorEvent,
     PingEvent,
+    PlanEvent,
     SourcesEvent,
     StepEvent,
     ToolCallEvent,
@@ -55,11 +56,11 @@ def _safe_error_text(exc: Exception) -> str:
     return text[:300]
 
 
-def _decode_tool_event(payload: Any) -> AgentEvent | None:
-    """把工具经 custom stream 发来的载荷校验成契约事件。
+def _decode_custom_event(payload: Any) -> AgentEvent | None:
+    """把模块/工具经 custom stream 发来的载荷校验成契约事件。
 
-    工具与前端之间的每一个事件都必须经过封闭的 Pydantic 模型（M3.5
-    的安全前提：坏掉/恶意的工具不能把未校验数据直接透给浏览器）。
+    模块与前端之间的每一个事件都必须经过封闭的 Pydantic 模型（M3.5
+    的安全前提：坏掉/恶意的模块不能把未校验数据直接透给浏览器）。
     未知类型或畸形载荷被丢弃并记日志——事件是尽力而为的旁路信号，
     绝不让它打断对话流。
     """
@@ -74,6 +75,8 @@ def _decode_tool_event(payload: Any) -> AgentEvent | None:
             return SourcesEvent.model_validate(payload)
         if kind == "tool_call":
             return ToolCallEvent.model_validate(payload)
+        if kind == "plan":
+            return PlanEvent.model_validate(payload)
     except ValueError as exc:
         logger.warning("sse: dropping malformed %r event: %s", kind, exc)
         return None
@@ -171,7 +174,7 @@ async def _produce(
                 if isinstance(chunk, AIMessage) and chunk.content:
                     await queue.put(DeltaEvent(content=_extract_text(chunk.content)))
             elif mode == "custom":
-                event = _decode_tool_event(payload)
+                event = _decode_custom_event(payload)
                 if event is not None:
                     await queue.put(event)
             elif mode == "updates":

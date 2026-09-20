@@ -47,7 +47,7 @@ from agent_base.entrypoints.server.serializers import (
 )
 from agent_base.entrypoints.server.sse import (
     _SSE_HEADERS,
-    _decode_tool_event,
+    _decode_custom_event,
     _event_stream,
 )
 from agent_base.extensions.metrics import Metrics
@@ -65,7 +65,7 @@ __all__ = [
     "_SSE_HEADERS",
     "AuthBackend",
     "HmacHeaderAuth",
-    "_decode_tool_event",
+    "_decode_custom_event",
     "_event_stream",
     "_extract_text",
     "_probe_model",

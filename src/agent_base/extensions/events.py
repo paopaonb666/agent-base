@@ -88,8 +88,37 @@ class ToolCallEvent(BaseModel):
     error: str | None = None
 
 
+class PlanTask(BaseModel):
+    """计划清单里的一条子任务（前端渲染任务列表）。"""
+
+    id: int
+    goal: str
+    status: str  # pending | running | done | failed
+
+
+class PlanEvent(BaseModel):
+    """planner 的计划级进展（M9）：任务清单 + 阶段状态。
+
+    ``created``（拆解完成）/ ``progress``（子任务状态变化）/
+    ``replanned``（重规划） / ``done``（执行结束）。每次携带**全量**
+    清单，前端整表替换即可，无需做增量合并。
+    """
+
+    type: Literal["plan"] = "plan"
+    status: Literal["created", "progress", "replanned", "done"] = "created"
+    plan: list[PlanTask] = Field(default_factory=list)
+    detail: str | None = None
+
+
 AgentEvent = (
-    StepEvent | DeltaEvent | SourcesEvent | DoneEvent | ErrorEvent | PingEvent | ToolCallEvent
+    StepEvent
+    | DeltaEvent
+    | SourcesEvent
+    | DoneEvent
+    | ErrorEvent
+    | PingEvent
+    | ToolCallEvent
+    | PlanEvent
 )
 
 

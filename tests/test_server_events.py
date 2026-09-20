@@ -1,6 +1,6 @@
 """M3.5 的测试：工具经 custom stream 发的 UI 事件到达 SSE 契约层。
 
-覆盖两端：服务器侧 `_decode_tool_event` 的封闭校验（畸形载荷丢弃、
+覆盖两端：服务器侧 `_decode_custom_event` 的封闭校验（畸形载荷丢弃、
 绝不透传未校验数据），以及"chat 图里执行工具 → 事件出现在 SSE 流"
 的端到端往返。
 """
@@ -22,14 +22,15 @@ from langgraph.config import get_stream_writer
 from agent_base.core.bootstrap import AgentRuntime
 from agent_base.core.config import Settings
 from agent_base.entrypoints.server import (
-    _decode_tool_event,
+    _decode_custom_event,
     _serialize_message,
     create_app,
 )
-from agent_base.extensions.events import SourcesEvent, StepEvent
+from agent_base.extensions.events import PlanEvent, SourcesEvent, StepEvent
 from agent_base.extensions.filestore import MemoryUploadedFileStore, UploadedFileInfo
 from agent_base.extensions.toollog import MemoryToolCallRecorder, ToolCallRecord
 from agent_base.modules.chat.module import ChatModule
+from agent_base.modules.planner.streaming import emit_plan
 from agent_base.tools.streaming import emit_sources, emit_step
 from fakes import ScriptedChatModel
 
@@ -96,24 +97,45 @@ def test_tool_events_reach_sse_stream() -> None:
 
 
 def test_decode_accepts_contract_events() -> None:
-    step = _decode_tool_event({"type": "step", "name": "web_search", "status": "running"})
+    step = _decode_custom_event({"type": "step", "name": "web_search", "status": "running"})
     assert isinstance(step, StepEvent)
-    sources = _decode_tool_event({"type": "sources", "sources": [{"title": "T"}]})
+    sources = _decode_custom_event({"type": "sources", "sources": [{"title": "T"}]})
     assert isinstance(sources, SourcesEvent)
 
 
 def test_decode_drops_malformed_and_unknown() -> None:
-    assert _decode_tool_event({"type": "step", "name": "x", "status": "bogus"}) is None
-    assert _decode_tool_event({"type": "sources", "sources": [{"url": 42}]}) is None
-    assert _decode_tool_event({"type": "mystery"}) is None
-    assert _decode_tool_event("not a dict") is None
-    assert _decode_tool_event(None) is None
+    assert _decode_custom_event({"type": "step", "name": "x", "status": "bogus"}) is None
+    assert _decode_custom_event({"type": "sources", "sources": [{"url": 42}]}) is None
+    assert _decode_custom_event({"type": "mystery"}) is None
+    assert _decode_custom_event("not a dict") is None
+    assert _decode_custom_event(None) is None
+
+
+def test_plan_event_passes_contract() -> None:
+    event = _decode_custom_event(
+        {
+            "type": "plan",
+            "status": "created",
+            "plan": [{"id": 1, "goal": "做 A", "status": "pending"}],
+        }
+    )
+    assert isinstance(event, PlanEvent) and event.plan[0].goal == "做 A"
+    # 畸形 plan 载荷（status 越界 / plan 类型错误）被丢弃。
+    assert _decode_custom_event({"type": "plan", "status": "bogus"}) is None
+    assert _decode_custom_event({"type": "plan", "status": "created", "plan": "nope"}) is None
 
 
 def test_emit_helpers_outside_graph_are_noop() -> None:
     # 不在图执行上下文（直调工具、单测）：事件静默丢弃，绝不抛错。
     assert emit_step("web_search", "running") is None
     assert emit_sources([{"title": "T"}]) is None
+    assert (
+        emit_plan(
+            [{"id": 1, "goal": "g", "status": "pending", "summary": "", "attempts": 0}],
+            "created",
+        )
+        is None
+    )
 
 
 def test_emit_helpers_forward_contract_payloads(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -128,11 +150,36 @@ def test_emit_helpers_forward_contract_payloads(monkeypatch: pytest.MonkeyPatch)
     assert {"type": "step", "name": "s2", "status": "error"} in sent
 
 
+def test_emit_plan_forwards_full_task_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "agent_base.modules.planner.streaming.get_stream_writer", lambda: sent.append
+    )
+    tasks = [
+        {"id": 1, "goal": "查天气", "status": "done", "summary": "晴", "attempts": 1},
+        {"id": 2, "goal": "写邮件", "status": "pending", "summary": "", "attempts": 0},
+    ]
+    emit_plan(tasks, "progress", detail="1/2 完成")
+    assert sent == [
+        {
+            "type": "plan",
+            "status": "progress",
+            "plan": [
+                {"id": 1, "goal": "查天气", "status": "done"},
+                {"id": 2, "goal": "写邮件", "status": "pending"},
+            ],
+            "detail": "1/2 完成",
+        }
+    ]
+    # 载荷经服务器侧契约校验后成为 PlanEvent（端到端一致）。
+    assert isinstance(_decode_custom_event(sent[0]), PlanEvent)
+
+
 # ── 工具调用事件契约 + 历史序列化（M5） ─────────────────────────────
 
 
 def test_decode_accepts_tool_call_events() -> None:
-    start = _decode_tool_event(
+    start = _decode_custom_event(
         {
             "type": "tool_call",
             "call_id": "abc",
@@ -142,7 +189,7 @@ def test_decode_accepts_tool_call_events() -> None:
         }
     )
     assert start is not None and start.phase == "start" and start.args == {"query": "hi"}
-    end = _decode_tool_event(
+    end = _decode_custom_event(
         {
             "type": "tool_call",
             "call_id": "abc",
@@ -154,7 +201,7 @@ def test_decode_accepts_tool_call_events() -> None:
         }
     )
     assert end is not None and end.status == "ok" and end.duration_ms == 12
-    bad = _decode_tool_event(
+    bad = _decode_custom_event(
         {"type": "tool_call", "call_id": "abc", "name": "x", "phase": "middle"}
     )
     assert bad is None  # phase 不在契约内 → 丢弃
