@@ -68,14 +68,16 @@ class MemoryService:
         embedder: EmbeddingClient,
         settings: Settings,
         llm: Any | None = None,
+        fast_llm: Any | None = None,
     ) -> None:
         self.store = store
         self.embedder = embedder
         self._settings = settings
         self._llm = llm
         # 形成管线（M6c）：仅在拿到对话模型时可用；测试与禁用场景下为 None。
+        # fast_llm 是快档侧（组合根装配的限流回退包装），管线内部分派。
         self.pipeline: MemoryPipeline | None = (
-            MemoryPipeline(llm, settings, self) if llm is not None else None
+            MemoryPipeline(llm, settings, self, fast_llm=fast_llm) if llm is not None else None
         )
         # 每用户的整合锁（锐评 #10）：同一用户并发轮次的后台捕获会互相
         # 看不到对方未写入的记忆，导致重复 ADD——串行化同一用户的捕获。
@@ -668,13 +670,19 @@ class MemoryService:
 
 
 async def build_memory_service(
-    settings: Settings, llm: Any | None = None, *, store: MemoryStore | None = None
+    settings: Settings,
+    llm: Any | None = None,
+    fast_llm: Any | None = None,
+    *,
+    store: MemoryStore | None = None,
 ) -> MemoryService | None:
     """按 settings 装配记忆服务；未启用或后端不可用时返回 None。
 
-    ``llm`` 是运行时的对话模型（形成管线复用它）；测试可以不传——
-    检索与手工管理照常工作，仅形成管线缺席。``store`` 允许调用方注入
-    已装配的存储（bootstrap 复用同一实例作为 thread_index 数据面）；
+    ``llm`` 是运行时的对话模型（形成管线复用它）；``fast_llm`` 是快档侧
+    （组合根按 ``LLM_FAST_*`` 装配的限流回退包装，管线内部分派——抽取/
+    画像/摘要走它，整合裁决按 ``MEMORY_PIPELINE_PROFILE`` 决定）。测试可以
+    都不传——检索与手工管理照常工作，仅形成管线缺席。``store`` 允许调用
+    方注入已装配的存储（bootstrap 复用同一实例作为 thread_index 数据面）；
     缺省时按 settings 自建。
     """
     if not settings.memory.enabled:
@@ -685,7 +693,9 @@ async def build_memory_service(
     if store is None:
         return None
     embedder = build_embedding_client(settings)
-    return MemoryService(store=store, embedder=embedder, settings=settings, llm=llm)
+    return MemoryService(
+        store=store, embedder=embedder, settings=settings, llm=llm, fast_llm=fast_llm
+    )
 
 
 __all__ = [

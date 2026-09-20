@@ -28,7 +28,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from agent_base.core.config import Settings
 from agent_base.core.contracts import AgentModule, Graph, MemoryPort, ModuleContext
-from agent_base.core.llm import build_llm
+from agent_base.core.llm import ResilientLLM, build_llm
 from agent_base.core.registry import RegistryError, load_modules
 from agent_base.core.tools import build_tool_pool
 from agent_base.extensions.filestore import UploadedFileStore, build_uploaded_file_store
@@ -168,7 +168,23 @@ async def create_runtime(settings: Settings | None = None) -> AgentRuntime:
         memory_store = None
     memory_service = None
     if memory_store is not None:
-        memory_service = await build_memory_service(resolved, llm, store=memory_store)
+        # 快档侧（成本治理）：LLM_FAST_* 已配置且非 all_main 时，为形成管线
+        # 装配限流回退包装（抽取/画像/摘要走它，整合裁决按 profile 决定）。
+        # 组合根接线而非 memory 自建——memory 不在运行时依赖 core.llm。
+        fast_llm = None
+        if (
+            llm is not None
+            and resolved.memory.pipeline_profile != "all_main"
+            and resolved.llm_fast.is_configured
+        ):
+            fast_llm = ResilientLLM(
+                primary=build_llm(resolved, profile="fast"),
+                fallback=llm,
+                max_concurrency=resolved.llm_fast.concurrency,
+            )
+        memory_service = await build_memory_service(
+            resolved, llm, fast_llm=fast_llm, store=memory_store
+        )
     # 工具库的内置工具按 TOOLKIT_ENABLED 装配后并入共享池（模块工具在
     # 前，工具库在后）；重名在任何一侧发生都会快速失败。注册表声明的
     # per-tool 超时在这里下发给池；审计记录器挂上收口，全量落库。

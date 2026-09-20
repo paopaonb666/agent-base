@@ -185,20 +185,48 @@ def render_transcript(messages: list[Any], max_chars: int) -> str:
 
 
 class MemoryPipeline:
-    """LLM 驱动的记忆形成管线；所有步骤失败安全（绝不打断主对话）。"""
+    """LLM 驱动的记忆形成管线；所有步骤失败安全（绝不打断主对话）。
 
-    def __init__(self, llm: Any, settings: Settings, service: MemoryService) -> None:
+    模型分派（成本治理）：抽取/画像合并/摘要属于"简单、大量、重复"的
+    批量工作，走快档（``fast_llm``——``LLM_FAST_*`` 装配的限流回退包装）；
+    整合裁决是唯一会不可逆改动记忆库的破坏性决策步，默认永远走主力
+    模型（``pipeline_profile="split"``）。``fast_llm`` 未装配时一切回落
+    主力模型——快档是优化不是依赖。
+    """
+
+    def __init__(
+        self, llm: Any, settings: Settings, service: MemoryService, fast_llm: Any | None = None
+    ) -> None:
         self._llm = llm
+        self._fast_llm = fast_llm
         self._settings = settings
         self._service = service
 
-    async def _complete(self, prompt: str) -> str:
-        response = await self._llm.ainvoke([HumanMessage(content=prompt)])
+    def _llm_for(self, profile: str) -> Any:
+        """按档位取模型；快档缺席时回落主力（不报错）。"""
+        if profile == "fast":
+            return self._fast_llm if self._fast_llm is not None else self._llm
+        return self._llm
+
+    @property
+    def _bulk_profile(self) -> str:
+        """抽取/画像/摘要的档位：split 与 all_fast 都交给快档侧。"""
+        return "main" if self._settings.memory.pipeline_profile == "all_main" else "fast"
+
+    @property
+    def _decision_profile(self) -> str:
+        """整合裁决的档位：只有显式 all_fast 才交给快档侧。"""
+        return "fast" if self._settings.memory.pipeline_profile == "all_fast" else "main"
+
+    async def _complete(self, prompt: str, *, profile: str = "main") -> str:
+        response = await self._llm_for(profile).ainvoke([HumanMessage(content=prompt)])
         return _content_text(response)
 
     # -- 抽取 -----------------------------------------------------------------
     async def extract_candidates(self, transcript: str) -> list[Candidate]:
-        raw = await self._complete(EXTRACTION_PROMPT.format(transcript=transcript))
+        raw = await self._complete(
+            EXTRACTION_PROMPT.format(transcript=transcript), profile=self._bulk_profile
+        )
         parsed = _parse_json_block(raw)
         if not isinstance(parsed, list):
             raise ValueError("抽取输出不是 JSON 数组")
@@ -245,7 +273,8 @@ class MemoryPipeline:
                     {"content": candidate.content, "kind": candidate.kind}, ensure_ascii=False
                 ),
                 existing=existing_block,
-            )
+            ),
+            profile=self._decision_profile,
         )
         parsed = _parse_json_block(raw)
         if not isinstance(parsed, dict):
@@ -295,7 +324,8 @@ class MemoryPipeline:
             PROFILE_MERGE_PROMPT.format(
                 profile=json.dumps(profile, ensure_ascii=False, indent=1),
                 facts="\n".join(f"- {fact}" for fact in facts),
-            )
+            ),
+            profile=self._bulk_profile,
         )
         merged = _parse_json_block(raw)
         if not isinstance(merged, dict) or not merged:
@@ -313,7 +343,8 @@ class MemoryPipeline:
             SUMMARY_PROMPT.format(
                 prior=prior_summary.summary if prior_summary else "（空）",
                 transcript=transcript,
-            )
+            ),
+            profile=self._bulk_profile,
         )
         text = raw.strip()
         if not text:

@@ -6,7 +6,12 @@ from typing import Any
 
 import pytest
 
-from agent_base.core.bootstrap import SUPERVISOR_MODULE, AgentRuntime, validate_module_names
+from agent_base.core.bootstrap import (
+    SUPERVISOR_MODULE,
+    AgentRuntime,
+    create_runtime,
+    validate_module_names,
+)
 from agent_base.core.config import Settings
 from agent_base.core.registry import RegistryError
 
@@ -43,3 +48,53 @@ def test_reserved_supervisor_name_rejected() -> None:
     modules: dict[str, Any] = {SUPERVISOR_MODULE: impostor}
     with pytest.raises(RegistryError, match="reserved"):
         validate_module_names(modules)
+
+
+# -- 快档装配（T0.2：形成管线的 fast 侧在组合根接线） -----------------------
+
+
+def _fast_settings(**overrides: object) -> Settings:
+    defaults: dict[str, object] = {
+        "llm_api_key": "sk-test",
+        "checkpointer_backend": "memory",
+        "llm_fast_base_url": "https://fast.example.com/v1",
+        "llm_fast_model": "glm-4.5-flash",
+    }
+    defaults.update(overrides)
+    return Settings(_env_file=None, **defaults)
+
+
+async def test_create_runtime_wires_resilient_fast_side() -> None:
+    """LLM_FAST_* 已配置且非 all_main：管线拿到 ResilientLLM，回退主力。"""
+    from agent_base.core.llm import ResilientLLM
+
+    rt = await create_runtime(_fast_settings())
+    try:
+        assert rt.memory is not None and rt.memory.pipeline is not None
+        fast = rt.memory.pipeline._fast_llm
+        assert isinstance(fast, ResilientLLM)
+        assert fast._fallback is rt.memory.pipeline._llm
+    finally:
+        await rt.close()
+
+
+async def test_create_runtime_all_main_has_no_fast_side() -> None:
+    """all_main 档：即使 LLM_FAST_* 已配置也不装配快档（历史行为）。"""
+    rt = await create_runtime(_fast_settings(memory_pipeline_profile="all_main"))
+    try:
+        assert rt.memory is not None and rt.memory.pipeline is not None
+        assert rt.memory.pipeline._fast_llm is None
+    finally:
+        await rt.close()
+
+
+async def test_create_runtime_unconfigured_fast_has_no_fast_side() -> None:
+    """LLM_FAST_* 未配置：不装配快档。"""
+    rt = await create_runtime(
+        Settings(_env_file=None, llm_api_key="sk-test", checkpointer_backend="memory")
+    )
+    try:
+        assert rt.memory is not None and rt.memory.pipeline is not None
+        assert rt.memory.pipeline._fast_llm is None
+    finally:
+        await rt.close()

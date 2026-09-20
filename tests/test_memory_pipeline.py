@@ -52,6 +52,26 @@ def _rearm(service: MemoryService, responses: list[AIMessage]) -> None:
     service.pipeline = MemoryPipeline(service._llm, service._settings, service)
 
 
+def _split_pipeline(
+    main_responses: list[AIMessage],
+    fast_responses: list[AIMessage],
+    **overrides: object,
+) -> tuple[MemoryPipeline, ScriptedChatModel, ScriptedChatModel, MemoryService]:
+    """构建双档管线：主力与快档各持一个可录制的脚本模型。"""
+    settings = _settings(**overrides)
+    main = ScriptedChatModel(main_responses)
+    fast = ScriptedChatModel(fast_responses)
+    service = MemoryService(
+        store=MemoryMemoryStore(),
+        embedder=HashEmbedding(),
+        settings=settings,
+        llm=main,
+        fast_llm=fast,
+    )
+    pipeline = MemoryPipeline(main, settings, service, fast_llm=fast)
+    return pipeline, main, fast, service
+
+
 # ─────────────────────────── JSON 解析 ───────────────────────────
 
 
@@ -119,6 +139,107 @@ async def test_extract_failure_records_error_op() -> None:
     assert detail is not None and detail["candidates"] == 0
     ops = await service.store.list_ops()
     assert any(op.op == "extract" and op.status == "error" for op in ops)
+
+
+# ─────────────────────────── 双档分派（T0.2） ───────────────────────────
+
+
+def _extraction_json() -> AIMessage:
+    return _json_msg([{"content": "用户在写小说", "kind": "semantic", "salience": 0.8}])
+
+
+async def test_pipeline_routes_bulk_to_fast_and_decision_to_main() -> None:
+    """split 档：抽取/画像/摘要打快档，整合裁决打主力——快档不被裁决消费。"""
+    pipeline, main, fast, service = _split_pipeline(
+        # main：仅整合裁决应答
+        [_json_msg({"op": "ADD", "content": "用户在写小说"})],
+        # fast：抽取 → 画像 → 摘要
+        [
+            _extraction_json(),
+            _json_msg({"基本信息": [], "偏好": ["写小说"]}),
+            AIMessage(content="本会话聊了写作。"),
+        ],
+    )
+    candidates = await pipeline.extract_candidates("用户：我在写小说")
+    assert [c.content for c in candidates] == ["用户在写小说"]
+    assert main.received == []  # 抽取没碰主力
+    assert len(fast.received) == 1
+
+    op = await pipeline.consolidate(candidates[0], user_id="u", agent_id="chat", thread_id="chat:t")
+    assert op == "ADD"
+    assert len(main.received) == 1  # 裁决在主力
+    assert len(fast.received) == 1  # 快档未被裁决消费
+
+    assert await pipeline.merge_profile("u", ["用户在写小说"]) is True
+    assert len(main.received) == 1
+    assert len(fast.received) == 2
+
+    assert await pipeline.update_summary("u", "chat", "chat:t", "用户：写小说") is True
+    assert len(main.received) == 1
+    assert len(fast.received) == 3
+    _ = service  # service 参与检索装配，显式消费避免未用告警
+
+
+async def test_pipeline_all_main_ignores_fast_side() -> None:
+    """all_main 档：全部走主力（历史行为），快档一次都不被调用。"""
+    pipeline, main, fast, _service = _split_pipeline(
+        [_extraction_json()],
+        [_json_msg([{"content": "不应被消费"}])],
+        memory_pipeline_profile="all_main",
+    )
+    candidates = await pipeline.extract_candidates("用户：我在写小说")
+    assert candidates
+    assert len(main.received) == 1
+    assert fast.received == []
+
+
+async def test_pipeline_all_fast_sends_decision_to_fast() -> None:
+    """all_fast 档（显式覆盖）：裁决也走快档。"""
+    pipeline, main, fast, _service = _split_pipeline(
+        [],  # main：一次都不应被调用
+        [
+            _extraction_json(),
+            _json_msg({"op": "ADD", "content": "用户在写小说"}),
+        ],
+        memory_pipeline_profile="all_fast",
+    )
+    candidates = await pipeline.extract_candidates("用户：我在写小说")
+    op = await pipeline.consolidate(candidates[0], user_id="u", agent_id="chat", thread_id="chat:t")
+    assert op == "ADD"
+    assert main.received == []
+    assert len(fast.received) == 2
+
+
+async def test_pipeline_fast_unconfigured_degrades_to_main() -> None:
+    """fast_llm 未装配（LLM_FAST_* 未配置）时 split 行为等同 all_main。"""
+    settings = _settings()
+    main = ScriptedChatModel([_extraction_json()])
+    service = MemoryService(
+        store=MemoryMemoryStore(),
+        embedder=HashEmbedding(),
+        settings=settings,
+        llm=main,
+    )
+    pipeline = MemoryPipeline(main, settings, service)  # fast_llm 缺省 None
+    candidates = await pipeline.extract_candidates("用户：我在写小说")
+    assert candidates
+    assert len(main.received) == 1
+
+
+async def test_build_memory_service_passes_fast_llm_through(tmp_path: Any) -> None:
+    """组合根传入的 fast_llm 必须原样到达管线。"""
+    from agent_base.memory.service import build_memory_service
+
+    settings = _settings(
+        checkpointer_backend="memory",
+        memory_mysql_pool_size=1,
+    )
+    svc = await build_memory_service(
+        settings, ScriptedChatModel([]), fast_llm=object(), store=MemoryMemoryStore()
+    )
+    assert svc is not None and svc.pipeline is not None
+    assert svc.pipeline._fast_llm is not None
+    await svc.aclose()
 
 
 # ─────────────────────────── 整合 ───────────────────────────

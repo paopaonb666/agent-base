@@ -55,6 +55,9 @@ KNOWN_SEARCH_ENGINES: frozenset[str] = frozenset({"tavily", "duckduckgo"})
 
 KNOWN_ENVIRONMENTS: frozenset[str] = frozenset({"development", "production"})
 
+# 记忆形成管线的模型分派档位（MEMORY_PIPELINE_PROFILE 的合法取值）。
+KNOWN_PIPELINE_PROFILES: frozenset[str] = frozenset({"split", "all_main", "all_fast"})
+
 
 class SettingsError(ValueError):
     """当配置校验失败时抛出（快速失败）。"""
@@ -324,6 +327,11 @@ class MemorySettings(BaseModel):
     # 记忆形成管线（M6c）：每 N 轮对话跑一次抽取+整合（后台异步）。
     capture_enabled: bool = True
     capture_every_turns: int = 1
+    # 形成管线的模型分派（成本治理）：split=抽取/画像/摘要走快档
+    # （LLM_FAST_*，未配置时自动回落主力）、整合裁决走主力（破坏性决策步
+    # 不降级）；all_main=全部主力（历史行为）；all_fast=全部走快档
+    # （显式覆盖：仅在接受快档做裁决质量时使用）。
+    pipeline_profile: str = "split"
     # 会话滚动摘要（M6c/M6d）：线程内消息数超过阈值后触发摘要更新。
     summary_enabled: bool = True
     summary_trigger_messages: int = 12
@@ -350,6 +358,16 @@ class MemorySettings(BaseModel):
     # 否则 401。留空时 development 接受裸 X-User-Id；production 且
     # memory_enabled 时强制要求配置（快速失败）。
     auth_secret: SecretStr = SecretStr("")
+
+    @field_validator("pipeline_profile")
+    @classmethod
+    def _validate_pipeline_profile(cls, value: str) -> str:
+        if value not in KNOWN_PIPELINE_PROFILES:
+            raise ValueError(
+                f"unknown MEMORY_PIPELINE_PROFILE {value!r}; "
+                f"expected one of {sorted(KNOWN_PIPELINE_PROFILES)}"
+            )
+        return value
 
     @field_validator(
         "embedding_dims",
