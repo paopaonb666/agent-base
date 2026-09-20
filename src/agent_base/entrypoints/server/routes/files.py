@@ -268,6 +268,58 @@ async def download_file_raw(
     return Response(content=info.content, media_type=media_type, headers=headers)
 
 
+@router.get("/knowledge/search")
+async def search_knowledge(
+    request: Request,
+    q: str,
+    user_id: str = Depends(get_current_user),
+    file_id: str | None = None,
+    limit: int = 5,
+) -> dict[str, Any]:
+    """知识库检索直出（成本治理 T1.1：Tier 0 零 LLM 分诊档）。
+
+    查找类问题（"那份保单的等待期"）是检索不是推理——本端点把混合检索
+    结果原样返回，全程不调用任何模型；只有需要综合/解释的查询才走
+    invoke。字段命名与 M7 切片视图一致（``ordinal`` / ``offsets`` /
+    ``has_embedding``），前端切片卡片可直接复用。空结果返回空列表而非
+    404（没有命中是合法答案）。
+    """
+    rt = get_runtime(request)
+    memory = memory_or_none(rt)
+    if memory is None:
+        raise HTTPException(status_code=503, detail="记忆系统未启用（MEMORY_ENABLED=false）")
+    query = q.strip()
+    if not query:
+        raise HTTPException(status_code=422, detail="q 不能为空")
+    scored = await memory.search_knowledge(
+        user_id=user_id, agent_id=None, query=query, top_k=max(1, min(limit, 20))
+    )
+    if file_id is not None:
+        scored = [item for item in scored if item.chunk.file_id == file_id]
+    # 文件名补全（尽力而为）：分块已按 user_id 隔离，名字只做展示。
+    names: dict[str, str] = {}
+    if rt.file_store is not None and scored:
+        infos = await rt.file_store.get_many(sorted({item.chunk.file_id for item in scored}))
+        names = {info.file_id: info.filename for info in infos}
+    return {
+        "results": [
+            {
+                "score": round(item.score, 4),
+                "file_id": item.chunk.file_id,
+                "file_name": names.get(item.chunk.file_id, ""),
+                "chunk_id": item.chunk.chunk_id,
+                "ordinal": item.chunk.ordinal,
+                "text": item.chunk.text,
+                "offsets": (
+                    [list(seg) for seg in item.chunk.offsets] if item.chunk.offsets else None
+                ),
+                "has_embedding": item.chunk.embedding is not None,
+            }
+            for item in scored
+        ]
+    }
+
+
 @router.get("/knowledge/files")
 async def list_knowledge_files(
     request: Request, user_id: str = Depends(get_current_user)

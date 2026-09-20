@@ -407,3 +407,111 @@ def test_delete_thread_unknown_module_404() -> None:
     with _client() as client:
         response = client.delete("/v1/agents/nonexist/threads/t1")
     assert response.status_code == 404
+
+
+# ─────────────────── Tier 0：零 LLM 知识库检索（T1.1） ───────────────────
+
+
+def _memory_runtime() -> AgentRuntime:
+    """带记忆服务的运行时：HashEmbedding 确定性向量，ScriptedChatModel 空
+    队列——检索端点若碰了 LLM 会以 500 暴露，通过即证明零 LLM。"""
+    from agent_base.memory.service import MemoryService
+    from agent_base.memory.store import MemoryMemoryStore
+    from fakes import HashEmbedding
+
+    rt = _runtime()
+    settings = Settings(_env_file=None, llm_api_key="sk-test")
+    service = MemoryService(
+        store=MemoryMemoryStore(),
+        embedder=HashEmbedding(),
+        settings=settings,
+        llm=rt.llm,
+    )
+    rt.memory = service
+    rt.thread_index = service.store
+    return rt
+
+
+def _seed_knowledge(rt: AgentRuntime) -> None:
+    assert rt.memory is not None
+    asyncio.run(
+        rt.memory.ingest_document(
+            file_id="f1",
+            user_id="alice",
+            agent_id="chat",
+            text="本保险的等待期为 90 天，等待期内出险不予赔付。\n\n第二条讲续保规则与宽限期。",
+        )
+    )
+
+
+def test_knowledge_search_returns_chunks_without_llm() -> None:
+    runtime = _memory_runtime()
+    _seed_knowledge(runtime)
+    with TestClient(create_app(runtime=runtime)) as client:
+        response = client.get(
+            "/v1/knowledge/search", params={"q": "等待期"}, headers={"X-User-Id": "alice"}
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["results"], "关键词命中的切片必须出现在结果里"
+    top = body["results"][0]
+    assert top["file_id"] == "f1"
+    assert "等待期" in top["text"]
+    assert top["ordinal"] == 0
+    assert isinstance(top["offsets"], list)
+    assert top["has_embedding"] is True
+    assert top["score"] > 0
+
+
+def test_knowledge_search_scopes_by_user() -> None:
+    """用户作用域：bob 检索不到 alice 的知识分块（空结果而非 404）。"""
+    runtime = _memory_runtime()
+    _seed_knowledge(runtime)
+    with TestClient(create_app(runtime=runtime)) as client:
+        response = client.get(
+            "/v1/knowledge/search", params={"q": "等待期"}, headers={"X-User-Id": "bob"}
+        )
+    assert response.status_code == 200
+    assert response.json() == {"results": []}
+
+
+def test_knowledge_search_file_filter_and_limit() -> None:
+    runtime = _memory_runtime()
+    _seed_knowledge(runtime)
+    assert runtime.memory is not None
+    asyncio.run(
+        runtime.memory.ingest_document(
+            file_id="f2",
+            user_id="alice",
+            agent_id="chat",
+            text="等待期条款的补充说明：意外医疗无等待期。",
+        )
+    )
+    with TestClient(create_app(runtime=runtime)) as client:
+        single = client.get(
+            "/v1/knowledge/search",
+            params={"q": "等待期", "file_id": "f2"},
+            headers={"X-User-Id": "alice"},
+        )
+        capped = client.get(
+            "/v1/knowledge/search",
+            params={"q": "等待期", "limit": 1},
+            headers={"X-User-Id": "alice"},
+        )
+    assert single.status_code == 200
+    assert {r["file_id"] for r in single.json()["results"]} == {"f2"}
+    assert len(capped.json()["results"]) == 1
+
+
+def test_knowledge_search_requires_query_and_memory() -> None:
+    runtime = _memory_runtime()
+    with TestClient(create_app(runtime=runtime)) as client:
+        missing_q = client.get("/v1/knowledge/search", headers={"X-User-Id": "alice"})
+    assert missing_q.status_code == 422
+
+    bare = _runtime()  # 无记忆服务
+    with TestClient(create_app(runtime=bare)) as client:
+        no_memory = client.get(
+            "/v1/knowledge/search", params={"q": "x"}, headers={"X-User-Id": "alice"}
+        )
+    assert no_memory.status_code == 503
