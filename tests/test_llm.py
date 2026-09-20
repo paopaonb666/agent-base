@@ -1,12 +1,14 @@
-"""core.llm 的测试（openai 兼容客户端装配）。"""
+"""core.llm 的测试（openai 兼容客户端装配 + 双档位 + 弹性包装）。"""
 
 from __future__ import annotations
+
+import asyncio
 
 import pytest
 from openai import OpenAIError
 
 from agent_base.core.config import Settings, SettingsError
-from agent_base.core.llm import build_llm
+from agent_base.core.llm import ResilientLLM, build_llm
 
 
 def test_build_llm_with_key_sets_model() -> None:
@@ -26,3 +28,120 @@ def test_build_llm_construction_failure_becomes_settings_error(
     monkeypatch.setattr("agent_base.core.llm.ChatOpenAI", _fail)
     with pytest.raises(SettingsError, match="LLM_API_KEY"):
         build_llm(Settings(_env_file=None, llm_api_key=""))
+
+
+# -- fast 档（LLM_FAST_*） -------------------------------------------------
+
+
+def test_fast_profile_degrades_to_main_when_unconfigured() -> None:
+    """LLM_FAST_* 未配置时 fast 档返回主力配置——免费档是优化不是依赖。"""
+    settings = Settings(
+        _env_file=None,
+        llm_api_key="sk-test",
+        llm_model="deepseek-chat",
+        llm_base_url="https://api.deepseek.com/v1",
+    )
+    main_llm = build_llm(settings, profile="main")
+    fast_llm = build_llm(settings, profile="fast")
+    assert fast_llm.model_name == main_llm.model_name
+    assert fast_llm.openai_api_base == main_llm.openai_api_base
+
+
+def test_fast_profile_uses_fast_settings_when_configured() -> None:
+    settings = Settings(
+        _env_file=None,
+        llm_api_key="sk-main",
+        llm_fast_api_key="sk-fast",
+        llm_fast_base_url="https://open.bigmodel.cn/api/paas/v4",
+        llm_fast_model="glm-4.5-flash",
+    )
+    fast_llm = build_llm(settings, profile="fast")
+    assert fast_llm.model_name == "glm-4.5-flash"
+    assert fast_llm.openai_api_base == "https://open.bigmodel.cn/api/paas/v4"
+    # fast 档未配 key 时回落主力 key（同一 provider 双档的常见形态）。
+    settings_shared_key = Settings(
+        _env_file=None,
+        llm_api_key="sk-main",
+        llm_fast_base_url="https://open.bigmodel.cn/api/paas/v4",
+        llm_fast_model="glm-4.5-flash",
+    )
+    assert (
+        build_llm(settings_shared_key, profile="fast").openai_api_key.get_secret_value()
+        == "sk-main"
+    )
+
+
+def test_main_profile_ignores_fast_settings() -> None:
+    settings = Settings(
+        _env_file=None,
+        llm_api_key="sk-main",
+        llm_fast_base_url="https://fast.example.com/v1",
+        llm_fast_model="glm-4.5-flash",
+    )
+    assert build_llm(settings, profile="main").model_name == "deepseek-chat"
+
+
+# -- ResilientLLM（免费档限流 + 回退） --------------------------------------
+
+
+class _Flaky:
+    """按脚本次序抛错/应答的假 primary。"""
+
+    def __init__(self, outcomes: list[object]) -> None:
+        self._outcomes = list(outcomes)
+        self.calls = 0
+
+    async def ainvoke(self, messages: object) -> str:
+        outcome = self._outcomes.pop(0)
+        self.calls += 1
+        if isinstance(outcome, Exception):
+            raise outcome
+        return str(outcome)
+
+
+class _Steady:
+    async def ainvoke(self, messages: object) -> str:
+        self.calls = getattr(self, "calls", 0) + 1  # type: ignore[attr-defined]
+        return "fallback-ok"
+
+
+async def test_resilient_llm_retries_transient_error_then_succeeds() -> None:
+    primary = _Flaky([RuntimeError("429 rate limited"), "primary-ok"])
+    llm = ResilientLLM(primary=primary, max_retries=2, base_delay=0.0)
+    assert await llm.ainvoke([("human", "hi")]) == "primary-ok"
+    assert primary.calls == 2
+
+
+async def test_resilient_llm_falls_back_after_retries_exhausted() -> None:
+    primary = _Flaky([RuntimeError("boom"), RuntimeError("boom"), RuntimeError("boom")])
+    fallback = _Steady()
+    llm = ResilientLLM(primary=primary, fallback=fallback, max_retries=2, base_delay=0.0)
+    assert await llm.ainvoke([("human", "hi")]) == "fallback-ok"
+    assert primary.calls == 3  # 1 次原始尝试 + 2 次重试
+    assert fallback.calls == 1
+
+
+async def test_resilient_llm_reraises_without_fallback() -> None:
+    primary = _Flaky([RuntimeError("boom"), RuntimeError("boom"), RuntimeError("boom")])
+    llm = ResilientLLM(primary=primary, max_retries=2, base_delay=0.0)
+    with pytest.raises(RuntimeError, match="boom"):
+        await llm.ainvoke([("human", "hi")])
+
+
+async def test_resilient_llm_semaphore_serializes_concurrency() -> None:
+    live = 0
+    peak = 0
+
+    class _Slow:
+        async def ainvoke(self, messages: object) -> str:
+            nonlocal live, peak
+            live += 1
+            peak = max(peak, live)
+            await asyncio.sleep(0.01)
+            live -= 1
+            return "ok"
+
+    llm = ResilientLLM(primary=_Slow(), max_concurrency=1, base_delay=0.0)
+    results = await asyncio.gather(*[llm.ainvoke([("human", "q")]) for _ in range(3)])
+    assert results == ["ok", "ok", "ok"]
+    assert peak == 1

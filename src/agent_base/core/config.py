@@ -113,6 +113,36 @@ class LlmSettings(BaseModel):
         return value
 
 
+class LlmFastSettings(BaseModel):
+    """LLM 快速档配置节：env 前缀 ``LLM_FAST_``（免费/低价模型吃批量任务）。
+
+    快速档服务"简单、大量、重复"的调用（记忆抽取/画像合并/摘要/夜间批）。
+    它是优化不是依赖：``base_url`` 与 ``model`` 两者皆非空才算已配置，
+    未配置时使用 fast 档的调用方应回落主力模型。
+    """
+
+    model_config = SettingsConfigDict(extra="ignore", validate_default=True)
+
+    api_key: SecretStr = SecretStr("")
+    base_url: str = ""
+    model: str = ""
+
+    # 免费档普遍按并发数限速（如智谱 flash 免费档仅 1 并发）：包装层用它
+    # 做信号量限流，串行慢慢跑对批处理场景无所谓。
+    concurrency: int = 2
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.base_url.strip()) and bool(self.model.strip())
+
+    @field_validator("concurrency")
+    @classmethod
+    def _validate_concurrency(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError(f"LLM_FAST_CONCURRENCY must be >= 1, got {value}")
+        return value
+
+
 class CheckpointerSettings(BaseModel):
     """对话状态（checkpointer）配置节：env 前缀 ``CHECKPOINTER_``。"""
 
@@ -562,6 +592,7 @@ class Settings(BaseSettings):
 
     # -- 按域配置节 --------------------------------------------------------
     llm: LlmSettings = Field(default_factory=LlmSettings)
+    llm_fast: LlmFastSettings = Field(default_factory=LlmFastSettings)
     checkpointer: CheckpointerSettings = Field(default_factory=CheckpointerSettings)
     toolkit: ToolkitSettings = Field(default_factory=ToolkitSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
@@ -604,6 +635,8 @@ class Settings(BaseSettings):
         lifted: dict[str, dict[str, Any]] = {}
         out: dict[str, Any] = {}
         sections = {
+            # llm_fast_ 必须排在 llm_ 之前，否则会被更短的前缀先吞掉。
+            "llm_fast_": "llm_fast",
             "llm_": "llm",
             "checkpointer_": "checkpointer",
             "toolkit_": "toolkit",
@@ -670,6 +703,8 @@ class Settings(BaseSettings):
                 section_name, inner = "checkpointer", name[len("checkpointer_") :]
             else:
                 section_name, inner = "doc_parse", name[len("doc_parse_") :]
+        elif name.startswith("llm_fast_"):
+            return getattr(self.llm_fast, name[len("llm_fast_") :])
         elif name.startswith(("memory_", "llm_", "search_", "toolkit_", "planner_")):
             section_name, inner = name.split("_", 1)
             if section_name == "toolkit" and name in (

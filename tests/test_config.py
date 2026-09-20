@@ -50,6 +50,40 @@ def test_malformed_json_array_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
         Settings(_env_file=None)
 
 
+# -- LLM 快速档（llm_fast 节） ----------------------------------------------
+
+
+def test_llm_fast_defaults_to_unconfigured() -> None:
+    fast = Settings(_env_file=None).llm_fast
+    assert fast.base_url == ""
+    assert fast.model == ""
+    assert fast.concurrency == 2
+    assert not fast.is_configured
+
+
+def test_llm_fast_env_prefix_wired(monkeypatch: pytest.MonkeyPatch) -> None:
+    """LLM_FAST_* 平铺键必须落进 llm_fast 节（而非被 llm_ 前缀吞掉）。"""
+    monkeypatch.setenv("LLM_FAST_MODEL", "glm-4.5-flash")
+    monkeypatch.setenv("LLM_FAST_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
+    monkeypatch.setenv("LLM_FAST_CONCURRENCY", "1")
+    fast = Settings(_env_file=None).llm_fast
+    assert fast.model == "glm-4.5-flash"
+    assert fast.base_url == "https://open.bigmodel.cn/api/paas/v4"
+    assert fast.concurrency == 1
+    assert fast.is_configured
+
+
+def test_llm_fast_requires_both_base_url_and_model() -> None:
+    """只配一半不算"已配置"——半配置静默启用快档比不用它更糟。"""
+    fast = Settings(_env_file=None, llm_fast_model="glm-4.5-flash").llm_fast
+    assert not fast.is_configured
+
+
+def test_llm_fast_concurrency_must_be_positive() -> None:
+    with pytest.raises(ValidationError, match="LLM_FAST_CONCURRENCY"):
+        Settings(_env_file=None, llm_fast_concurrency=0)
+
+
 def test_json_array_of_wrong_type_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     """防御性分支：以 '[' 开头的 JSON 却不是列表。"""
     monkeypatch.setenv("AGENT_MODULES", "[1,2]")
