@@ -239,3 +239,32 @@ def test_recursion_limit_default_and_validation() -> None:
 def test_recursion_limit_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AGENT_RECURSION_LIMIT", "40")
     assert Settings(_env_file=None).agent_recursion_limit == 40
+
+
+def test_planner_settings_section() -> None:
+    s = Settings(_env_file=None, llm_api_key="k")
+    assert s.planner.max_subtasks == 5
+    assert s.planner.subtask_tool_rounds == 8
+    assert s.planner.max_replans == 2
+    assert s.planner.min_summary_chars == 0
+    with pytest.raises(ValidationError, match="must be >= 1"):
+        Settings(_env_file=None, llm_api_key="k", planner_max_subtasks=0)
+    with pytest.raises(ValidationError, match="must be >= 1"):
+        Settings(_env_file=None, llm_api_key="k", planner_subtask_tool_rounds=0)
+    with pytest.raises(ValidationError, match="must be >= 1"):
+        Settings(_env_file=None, llm_api_key="k", planner_max_replans=0)
+    with pytest.raises(ValidationError, match="must be >= 0"):
+        Settings(_env_file=None, llm_api_key="k", planner_min_summary_chars=-1)
+
+
+def test_planner_settings_env_lift(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 平铺 env 契约：PLANNER_* 归位到 planner 节。
+    monkeypatch.setenv("PLANNER_MAX_SUBTASKS", "7")
+    monkeypatch.setenv("PLANNER_SUBTASK_TOOL_ROUNDS", "4")
+    monkeypatch.setenv("PLANNER_MAX_REPLANS", "1")
+    monkeypatch.setenv("PLANNER_MIN_SUMMARY_CHARS", "10")
+    s = Settings(_env_file=None)
+    assert s.planner.max_subtasks == 7
+    assert s.planner.subtask_tool_rounds == 4
+    assert s.planner.max_replans == 1
+    assert s.planner.min_summary_chars == 10

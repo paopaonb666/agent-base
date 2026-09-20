@@ -402,6 +402,42 @@ class MemorySettings(BaseModel):
         return value
 
 
+class PlannerSettings(BaseModel):
+    """planner 模块的预算与防护（M9）：env 前缀 ``PLANNER_``。
+
+    recursion_limit 交互（A2）：外层图最坏步数 ≈ 1(plan) + 2×执行子任务数
+    （含重排后新增的） + max_replans + 1(synthesize)。默认预算下的病态
+    最坏约 34 步，超出默认 AGENT_RECURSION_LIMIT=25——plan 重度使用场景
+    应在 .env 调高 AGENT_RECURSION_LIMIT。
+    """
+
+    model_config = SettingsConfigDict(extra="ignore", validate_default=True)
+
+    # 单次拆解的子任务上限（含重排后的总量，防止计划无界膨胀）。
+    max_subtasks: int = 5
+    # 单个子任务的工具轮数上限：耗尽即该子任务 failed（交给 replan）。
+    subtask_tool_rounds: int = 8
+    # 重规划预算：failed 子任务触发的 replan 次数上限，耗尽后走
+    # best-effort synthesize（如实汇报未完成项）。
+    max_replans: int = 2
+    # 空输出门的最小摘要长度门槛；0 = 只拦空白输出。
+    min_summary_chars: int = 0
+
+    @field_validator("max_subtasks", "subtask_tool_rounds", "max_replans")
+    @classmethod
+    def _validate_positive_ints(cls, value: int, info: ValidationInfo) -> int:
+        if value < 1:
+            raise ValueError(f"{info.field_name} must be >= 1, got {value}")
+        return value
+
+    @field_validator("min_summary_chars")
+    @classmethod
+    def _validate_min_summary_chars(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError(f"PLANNER_MIN_SUMMARY_CHARS must be >= 0, got {value}")
+        return value
+
+
 class ObservabilitySettings(BaseModel):
     """可观测性配置节：env ``LOG_JSON`` / ``HEALTH_PROBE_MODEL``。"""
 
@@ -531,6 +567,7 @@ class Settings(BaseSettings):
     search: SearchSettings = Field(default_factory=SearchSettings)
     doc_parse: DocParseSettings = Field(default_factory=DocParseSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
+    planner: PlannerSettings = Field(default_factory=PlannerSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
 
     @field_validator("agent_modules", "cors_origins", mode="before")
@@ -576,6 +613,7 @@ class Settings(BaseSettings):
             "tavily_api_key": "search",
             "doc_parse_": "doc_parse",
             "memory_": "memory",
+            "planner_": "planner",
             "log_json": "observability",
             "health_probe_model": "observability",
         }
@@ -632,7 +670,7 @@ class Settings(BaseSettings):
                 section_name, inner = "checkpointer", name[len("checkpointer_") :]
             else:
                 section_name, inner = "doc_parse", name[len("doc_parse_") :]
-        elif name.startswith(("memory_", "llm_", "search_", "toolkit_")):
+        elif name.startswith(("memory_", "llm_", "search_", "toolkit_", "planner_")):
             section_name, inner = name.split("_", 1)
             if section_name == "toolkit" and name in (
                 "tool_timeout_seconds",
