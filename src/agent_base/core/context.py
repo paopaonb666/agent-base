@@ -128,10 +128,15 @@ def build_model_input(messages: list[Any], *, max_tokens: int) -> list[Any]:
     return [messages[i] for i in kept]
 
 
+# 多段 content 的文本提取的公开别名（planner 等模块复用）。
+content_text = _content_text
+
+
 __all__ = [
     "ATTACHMENT_CONTEXT_PREFIX",
     "MEMORY_CONTEXT_PREFIX",
     "build_model_input",
+    "content_text",
     "estimate_tokens",
     "injected_kind",
     "is_injected_system",
