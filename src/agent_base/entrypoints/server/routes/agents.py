@@ -58,6 +58,10 @@ class InvokeRequest(BaseModel):
     # 难度分流（M9）：chat=普通对话；plan=强制走 planner；auto=启发式
     # （消息 >200 字或带附件 → plan，planner 缺席时静默降级 chat）。
     mode: Literal["chat", "plan", "auto"] = "chat"
+    # 模型档位（成本治理 T1.2）：main=主力模型；fast=LLM_FAST_* 快档
+    # （Tier 1 轻综合）。与 mode 正交——mode 决定图，profile 决定图的
+    # 模型。快档未配置时显式 400，不静默降级。
+    profile: Literal["main", "fast"] = "main"
 
 
 def _graph_or_404(rt: Any, module: str) -> Any:
@@ -101,7 +105,15 @@ async def invoke(module: str, body: InvokeRequest, request: Request) -> Streamin
                 detail="planner 模块未启用（AGENT_MODULES 不含 planner）",
             )
         use_plan = False  # auto：静默降级
-    graph = _graph_or_404(rt, "planner" if use_plan else module)
+    # 模型档位（T1.2）：profile 决定图用哪个模型——快档视图共享
+    # checkpointer/memory，线程历史跨档连续；未配置显式 400。
+    view = rt.profile_view(body.profile)
+    if view is None:
+        raise HTTPException(
+            status_code=400,
+            detail='LLM_FAST_* 未配置：profile="fast" 不可用（配置快速档或使用默认档）',
+        )
+    graph = _graph_or_404(view, "planner" if use_plan else module)
     user_thread_id = body.thread_id or new_request_id()
     user_id = get_current_user(request)
     # 按模块划分的 thread id：图共用一个 checkpointer；未划分命名空间

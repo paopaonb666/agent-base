@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
@@ -133,3 +134,98 @@ def test_default_mode_chat_unchanged() -> None:
         )
         assert response.status_code == 200
         assert "普通回复" in "".join(response.iter_text())
+
+
+# ─────────────────── profile 档位分流（T1.2：Tier 1/2） ───────────────────
+
+
+def test_profile_fast_routes_to_fast_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """profile="fast"：请求由快档模型应答，主力模型零消耗。"""
+    from agent_base.core import bootstrap as bootstrap_module
+
+    main_model = ScriptedChatModel([AIMessage(content="主力回复")])
+    fast_model = ScriptedChatModel([AIMessage(content="快速回复")])
+    settings = Settings(
+        _env_file=None,
+        llm_api_key="sk-test",
+        llm_fast_base_url="https://fast.example.com/v1",
+        llm_fast_model="glm-4.5-flash",
+    )
+    rt = AgentRuntime(
+        settings=settings,
+        llm=main_model,
+        modules={"chat": ChatModule()},
+        tools=[],
+        checkpointer=InMemorySaver(),
+    )
+    monkeypatch.setattr(
+        bootstrap_module,
+        "build_llm",
+        lambda s, profile="main": fast_model if profile == "fast" else main_model,
+    )
+    with TestClient(create_app(runtime=rt)) as client:
+        raw = _invoke(client, "chat", {"message": "hi", "thread_id": "t1", "profile": "fast"})
+    assert "快速回复" in raw
+    assert main_model.received == []  # 主力模型零消耗
+
+
+def test_profile_fast_unconfigured_400() -> None:
+    """LLM_FAST_* 未配置时 profile="fast" 必须显式 400，不静默降级。"""
+    rt = _runtime(with_planner=False)
+    with TestClient(create_app(runtime=rt)) as client:
+        response = client.post(
+            "/v1/agents/chat/invoke",
+            json={"message": "hi", "profile": "fast"},
+            headers={"X-User-Id": "u1"},
+        )
+    assert response.status_code == 400
+    assert "LLM_FAST" in response.json()["detail"]
+
+
+def test_profile_default_main_unchanged() -> None:
+    """profile 缺省 = main：行为与历史完全一致。"""
+    model = ScriptedChatModel([AIMessage(content="主力回复")])
+    with TestClient(create_app(runtime=_runtime(model, with_planner=False))) as client:
+        raw = _invoke(client, "chat", {"message": "你好"})
+    assert "主力回复" in raw
+
+
+def test_profile_views_share_checkpointer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """快档视图与主力共享 checkpointer：线程历史跨档连续。"""
+    from agent_base.core import bootstrap as bootstrap_module
+
+    main_model = ScriptedChatModel([AIMessage(content="主力回复"), AIMessage(content="主力第二轮")])
+    fast_model = ScriptedChatModel([AIMessage(content="快速回复")])
+    settings = Settings(
+        _env_file=None,
+        llm_api_key="sk-test",
+        llm_fast_base_url="https://fast.example.com/v1",
+        llm_fast_model="glm-4.5-flash",
+    )
+    rt = AgentRuntime(
+        settings=settings,
+        llm=main_model,
+        modules={"chat": ChatModule()},
+        tools=[],
+        checkpointer=InMemorySaver(),
+    )
+    monkeypatch.setattr(
+        bootstrap_module,
+        "build_llm",
+        lambda s, profile="main": fast_model if profile == "fast" else main_model,
+    )
+    with TestClient(create_app(runtime=rt)) as client:
+        assert "主力回复" in _invoke(client, "chat", {"message": "q1", "thread_id": "t1"})
+        assert "快速回复" in _invoke(
+            client, "chat", {"message": "q2", "thread_id": "t1", "profile": "fast"}
+        )
+
+    import asyncio
+
+    async def read() -> list[str]:
+        graph = rt.graph("chat")
+        snap = await graph.aget_state({"configurable": {"thread_id": "chat:t1"}})
+        return [str(getattr(m, "content", "")) for m in (snap.values or {}).get("messages", [])]
+
+    contents = asyncio.run(read())
+    assert any("q1" in c for c in contents) and any("q2" in c for c in contents)

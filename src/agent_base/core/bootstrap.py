@@ -76,6 +76,39 @@ class AgentRuntime:
     thread_index: MemoryStore | None = None
     _graphs: dict[str, Graph] = field(default_factory=dict, repr=False)
     _supervisor: Graph | None = field(default=None, repr=False)
+    # 快档视图缓存（成本治理 T1.2）：profile -> 共享状态的运行时副本。
+    _profile_views: dict[str, AgentRuntime] = field(default_factory=dict, repr=False)
+
+    def profile_view(self, profile: str) -> AgentRuntime | None:
+        """同状态、不同模型的运行时视图（成本治理 T1.2：Tier 1/2 分流）。
+
+        ``profile="main"`` 返回自身；``"fast"`` 在 ``LLM_FAST_*`` 已配置时
+        返回共享 checkpointer/memory/tools 的轻量副本（仅 llm 与图缓存
+        独立——线程历史跨档连续，同一 checkpointer 键空间）；未配置返回
+        None（调用方显式 400，不静默降级——对齐 planner 503 的哲学）。
+        """
+        if profile == "main":
+            return self
+        if profile != "fast":
+            raise ValueError(f"unknown llm profile {profile!r}; expected 'main' or 'fast'")
+        cached = self._profile_views.get(profile)
+        if cached is not None:
+            return cached
+        if not self.settings.llm_fast.is_configured:
+            return None
+        view = AgentRuntime(
+            settings=self.settings,
+            llm=build_llm(self.settings, profile="fast"),
+            modules=self.modules,
+            tools=self.tools,
+            checkpointer=self.checkpointer,
+            tool_recorder=self.tool_recorder,
+            file_store=self.file_store,
+            memory=self.memory,
+            thread_index=self.thread_index,
+        )
+        self._profile_views[profile] = view
+        return view
 
     def context(self) -> ModuleContext:
         """交给每个模块的 ``build_graph`` 的 ``ModuleContext``。"""
