@@ -208,6 +208,22 @@ async def test_service_compose_context_end_to_end() -> None:
     await service.aclose()
 
 
+async def test_service_compose_context_recall_is_user_level() -> None:
+    """注入召回为用户级：chat 写入的记忆在 supervisor 线程的注入块可见。"""
+    service = MemoryService(
+        store=MemoryMemoryStore(), embedder=HashEmbedding(), settings=_settings()
+    )
+    await service.add_memory(user_id="alice", agent_id="chat", content="用户的项目代号是雨燕")
+    block = await service.compose_context(
+        user_id="alice",
+        agent_id="supervisor",
+        thread_id="supervisor:t1",
+        query="项目代号",
+    )
+    assert block is not None and "雨燕" in block
+    await service.aclose()
+
+
 def _settings(**overrides: object):
     from agent_base.core.config import Settings
 

@@ -313,16 +313,23 @@ class MemoryService:
     ) -> list[ScoredMemory]:
         """混合检索（注入路径与搜索端点共用）。"""
         started = time.perf_counter()
+        embedder = self.embedder if not isinstance(self.embedder, NullEmbedding) else None
+        min_score = self._settings.memory.recall_min_score
+        if embedder is None and min_score > 0:
+            # 降级关键词路径：混合分缺向量主力分量（权重 0.4），硬门槛会
+            # 误杀老而准的关键词命中（如 14 天前的一条精确匹配只剩 ~0.45）
+            # ——阈值放宽一半，宁可多给几条弱序结果也不静默丢相关记忆。
+            min_score = min_score / 2
         results = await recall_memories(
             self.store,
             user_id=user_id,
             agent_id=agent_id,
             query=query,
-            embedder=self.embedder if not isinstance(self.embedder, NullEmbedding) else None,
+            embedder=embedder,
             top_k=top_k or self._settings.memory.recall_top_k,
             episodic_ttl_days=self._settings.memory.episodic_ttl_days,
             half_life_days=self._settings.memory.time_decay_half_life_days,
-            min_score=self._settings.memory.recall_min_score,
+            min_score=min_score,
             weights=self._hybrid_weights(),
         )
         MEMORY_METRICS.observe("search", "ok", time.perf_counter() - started)
@@ -632,7 +639,10 @@ class MemoryService:
                 await self.get_profile(user_id) if self._settings.memory.profile_enabled else None
             )
             summary_record = await self.store.get_summary(user_id, thread_id)
-            recalled = await self.search(user_id=user_id, agent_id=agent_id, query=query)
+            # 召回是用户级的（与 memory_search 工具同契约）：跨模块可见，
+            # 否则 supervisor 编排的子 agent 永远看不到其他模块写下的记忆；
+            # 记忆块仍按「全局 + 本模块」注入。
+            recalled = await self.search(user_id=user_id, agent_id=None, query=query)
             return compose_context(
                 profile=profile,
                 blocks=blocks,

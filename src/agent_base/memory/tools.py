@@ -13,6 +13,10 @@
 用 ContextVar：server 的 ``_produce`` 在拉起图之前设置，随 asyncio 任务
 上下文自然传播到每个工具调用；CLI 等未设置的场景优雅回退到
 ``default`` / 全局作用域。
+
+**检索作用域**：``memory_search`` / ``knowledge_search`` 是**用户级**
+（跨模块可见，user 隔离是唯一边界）；``memory_save`` / 常驻块写入继续
+带模块归属（agent_id），供管理端按模块溯源与过滤。
 """
 
 from __future__ import annotations
@@ -106,11 +110,12 @@ def build_memory_tools(memory: MemoryService) -> list[BaseTool]:
     """构建记忆工具集（绑定到运行时的 MemoryService 实例）。"""
 
     async def memory_search(query: str, limit: int = 5, **_kwargs: Any) -> str:
-        user_id, agent_id, _ = _scope()
-        agent_scope = agent_id if agent_id != "*" else None
-        scored = await memory.search(
-            user_id=user_id, agent_id=agent_scope, query=query, top_k=limit
-        )
+        # 检索是用户级的（S1 复杂任务评审）：跨模块可见——chat 写入的
+        # 记忆在 supervisor 等其他模块的会话里同样要能召回，否则多 agent
+        # 编排下长期记忆形同虚设。user 隔离仍是硬边界；写入路径
+        # （memory_save / 形成管线）继续带模块归属，便于按模块溯源。
+        user_id, _, _ = _scope()
+        scored = await memory.search(user_id=user_id, agent_id=None, query=query, top_k=limit)
         if not scored:
             return "（没有找到相关记忆）"
         # 带 memory_id：agent 可据此调用 memory_delete 更正过时记忆。
@@ -178,10 +183,12 @@ def build_memory_tools(memory: MemoryService) -> list[BaseTool]:
         return f"已删除：{record.content[:60]}" if deleted else "删除失败（记录已不存在）"
 
     async def knowledge_search(query: str, limit: int = 5, **_kwargs: Any) -> str:
-        user_id, agent_id, _ = _scope()
-        agent_scope = agent_id if agent_id != "*" else None
+        # 同 memory_search：知识库检索为用户级——文档是用户的知识资产
+        # （README），上传时记录的模块归属只用于溯源/管理列表，不限制
+        # 其他模块的会话引用它。
+        user_id, _, _ = _scope()
         scored = await memory.search_knowledge(
-            user_id=user_id, agent_id=agent_scope, query=query, top_k=limit
+            user_id=user_id, agent_id=None, query=query, top_k=limit
         )
         if not scored:
             return "（知识库中没有相关内容）"

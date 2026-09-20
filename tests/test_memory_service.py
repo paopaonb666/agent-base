@@ -12,6 +12,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from agent_base.core.bootstrap import AgentRuntime
 from agent_base.core.config import Settings
 from agent_base.entrypoints.server import create_app
+from agent_base.memory.embeddings import NullEmbedding
 from agent_base.memory.service import MemoryService, build_memory_service
 from agent_base.memory.store import MemoryStoreError, SqliteMemoryStore
 from fakes import HashEmbedding, ScriptedChatModel
@@ -69,6 +70,32 @@ async def test_search_and_user_isolation(tmp_path: Path) -> None:
     assert results
     assert all(item.record.user_id == "alice" for item in results)
     assert results[0].record.content == "用户使用 LangGraph"
+    await service.aclose()
+
+
+async def test_search_min_score_filters_noise(tmp_path: Path) -> None:
+    """默认阈值 0.5：无关查询不靠 recency/salience 凑数，相关查询照常召回。"""
+    service = await _sqlite_service(tmp_path)
+    await service.add_memory(user_id="alice", agent_id="chat", content="用户的项目代号是雨燕")
+    related = await service.search(user_id="alice", agent_id=None, query="项目代号")
+    assert [item.record.content for item in related] == ["用户的项目代号是雨燕"]
+    # 毫无关联的提问：候选没有相关性证据，不再按时间/显著度凑满 top_k。
+    noise = await service.search(user_id="alice", agent_id=None, query="量子纠缠的实验装置")
+    assert noise == []
+    await service.aclose()
+
+
+async def test_search_degraded_path_relaxes_threshold(tmp_path: Path) -> None:
+    """embedding 不可用时阈值放宽一半：老而准的关键词命中不被硬门槛误杀。"""
+    service = MemoryService(
+        store=await SqliteMemoryStore.create(str(tmp_path / "memory.db")),
+        embedder=NullEmbedding(),
+        settings=_settings(),
+    )
+    await service.add_memory(user_id="alice", agent_id="chat", content="用户使用 LangGraph 框架")
+    # NullEmbedding 下 add_memory 不产向量 → 检索走纯关键词路径。
+    results = await service.search(user_id="alice", agent_id=None, query="LangGraph")
+    assert results, "降级路径的精确关键词命中不应被默认阈值过滤"
     await service.aclose()
 
 

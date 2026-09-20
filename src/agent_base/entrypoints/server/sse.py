@@ -13,7 +13,7 @@ import re
 from collections.abc import AsyncIterator, Coroutine
 from typing import Any
 
-from langchain_core.messages import AIMessageChunk
+from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 
 from agent_base.entrypoints.server.background import spawn_background
@@ -162,7 +162,13 @@ async def _produce(
                 if node and node not in running:
                     running.add(node)
                     await queue.put(StepEvent(name=node, status="running"))
-                if isinstance(chunk, AIMessageChunk) and chunk.content:
+                # supervisor 模板（react agent）的模型节点是非流式调用，
+                # 回复以完整 AIMessage（非逐 token 的 AIMessageChunk）经
+                # messages 模式的节点输出路径到达——必须一并接收，否则
+                # supervisor 对话一个 delta 都发不出去（前端只能靠事后
+                # 对账补内容，短回复会整条丢失）。chunk 是 AIMessage 的
+                # 子类；同一消息的完整发射已被按 id 去重，不会双发。
+                if isinstance(chunk, AIMessage) and chunk.content:
                     await queue.put(DeltaEvent(content=_extract_text(chunk.content)))
             elif mode == "custom":
                 event = _decode_tool_event(payload)

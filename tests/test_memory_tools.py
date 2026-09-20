@@ -153,6 +153,25 @@ async def test_memory_save_and_search_with_scope() -> None:
     assert "没有找到相关记忆" in missing
 
 
+async def test_memory_search_is_user_level_across_modules() -> None:
+    """检索为用户级：chat 写入的记忆在 supervisor 会话同样可召回。
+
+    写入仍带模块归属（溯源），user 隔离不放松——bob 依旧看不到 alice。
+    """
+    service = _service()
+    (search, save, _block, _delete, _knowledge) = build_memory_tools(service)
+    set_memory_scope("alice", "chat:t1")
+    await save.ainvoke({"content": "用户的项目代号是雨燕"})
+    # 同一用户切到 supervisor 模块的会话：跨模块可见。
+    set_memory_scope("alice", "supervisor:t9")
+    found = await search.ainvoke({"query": "项目代号"})
+    assert "雨燕" in found
+    # 其他用户依旧隔离。
+    set_memory_scope("bob", "supervisor:t9")
+    missing = await search.ainvoke({"query": "项目代号"})
+    assert "没有找到相关记忆" in missing
+
+
 async def test_memory_update_block_append_replace_and_truncation() -> None:
     service = _service()
     (_search, _save, block, _delete, _knowledge) = build_memory_tools(service)
@@ -202,6 +221,21 @@ async def test_knowledge_search_tool() -> None:
     set_memory_scope("bob", "chat:t2")
     out = await knowledge.ainvoke({"query": "PostgreSQL"})
     assert "没有相关内容" in out
+
+
+async def test_knowledge_search_is_user_level_across_modules() -> None:
+    """知识库检索为用户级：chat 上传的文档在 writer 会话同样可检索。"""
+    service = _service()
+    await service.ingest_document(
+        file_id="f1",
+        user_id="alice",
+        agent_id="chat",
+        text="项目采用 PostgreSQL 15 存储业务数据。",
+    )
+    (_search, _save, _block, _delete, knowledge) = build_memory_tools(service)
+    set_memory_scope("alice", "writer:w1")
+    out = await knowledge.ainvoke({"query": "PostgreSQL"})
+    assert "PostgreSQL 15" in out
 
 
 # ─────────────────────── bootstrap 装配与上传摄取 ───────────────────────

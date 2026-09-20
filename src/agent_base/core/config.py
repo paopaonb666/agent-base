@@ -275,7 +275,12 @@ class MemorySettings(BaseModel):
     recall_top_k: int = 6
     # 召回最低分阈值（0..1）：低于该分数的候选不召回——没有它，毫无
     # 关联的提问也会按时间/显著度凑满 top_k，弱相关记忆噪音很大。
-    recall_min_score: float = 0.12
+    # 0.5 的依据：混合分里纯噪音（无关键词/语义证据）的天花板只有
+    # recency+salience ≈ 0.3，加向量余弦噪音实测 ≤0.47；而真实相关
+    # （含改写）≥0.59（bge-m3 与测试替身双双验证）。降级关键词路径
+    # 由 service.search 自动放宽一半（缺向量主力分量，硬门槛会误杀
+    # 老而准的关键词命中）。
+    recall_min_score: float = 0.5
     # 混合检索权重（锐评 #4）：四分量分别对应向量余弦/BM25/时间衰减/
     # 显著度，和必须为 1（误差 0.01）。
     weight_vector: float = 0.40
