@@ -279,6 +279,59 @@ SSE 事件新增 `plan`（全量任务清单，前端整表替换）：
 - planner 重度使用的最坏图步数约 34，超出默认
   `AGENT_RECURSION_LIMIT=25`——按需在 .env 调高。
 
+## 成本治理（T4）
+
+自用全盘文档问答场景的 token 成本地基：查询分诊 + 模型分档 + 夜间批 +
+预算熔断。目标形态下（Tier 0 吃六成、快档吃三成、主力只管裁决与门面），
+月账单可压到个位数元（2026 年国产模型价格口径）。
+
+**查询分诊（三档）**：
+
+| 档 | 路径 | LLM | 何时用 |
+| --- | --- | --- | --- |
+| Tier 0 | `GET /v1/knowledge/search?q=` | 零 | 查找类问题（"那份保单的等待期"）——直接返回命中切片，字段与 M7 切片视图一致 |
+| Tier 1 | invoke + `"profile": "fast"` | 快档 | 有切片为据的轻综合 |
+| Tier 2 | invoke（默认） | 主力 | 深挖/综合/裁决 |
+
+`profile` 与 `mode` 正交（mode 决定图，profile 决定图的模型）；`LLM_FAST_*`
+未配置时传 `profile: "fast"` 显式 400，不静默降级。快档视图与主力共享
+checkpointer——线程历史跨档连续。
+
+**模型分档**：`LLM_FAST_*`（免费/低价模型，如智谱 glm 系列 flash——长期
+免费但并发极低）吃"简单、大量、重复"的调用；`MEMORY_PIPELINE_PROFILE=split`
+（默认）让形成管线的抽取/画像/摘要走快档（`ResilientLLM` 信号量限流 +
+重试耗尽回退主力），整合裁决永远走主力（破坏性决策步不降级）；
+`all_fast` 为显式覆盖。
+
+**夜间批**：`MEMORY_CAPTURE_ENABLED=false` + `MEMORY_SUMMARY_ENABLED=false`
+关掉每轮管线的 LLM 消耗，用 cron/计划任务每天跑一次：
+
+```bash
+python scripts/memory_nightly_capture.py            # force 旁路门控，批量抽取+整合
+python scripts/kb_ingest.py --dir D:/my/docs --module chat --user-id alice --watch
+```
+
+`kb_ingest.py` 把本地目录（递归，pdf/docx/txt/md）批量摄取进知识库：
+走既有上传端点（解析/切块/向量化/属主全复用），sha256 状态文件幂等
+（重复运行 skip），`--watch` 轮询增量。注意服务端摄取是上传后的后台
+任务，检索可见性滞后一两秒。
+
+**计量与预算**：`COST_ENABLED=true` 后，`build_llm` 给全部客户端挂
+usage 采集 callback（含流式 `stream_usage`），按 `COST_PRICES_JSON`
+价目表计价（元/百万 tokens，手工维护）；累计落 `cost_usage` 表（跟随
+checkpointer 后端；sqlite 为独立 sqlite 账本），进程重启后从账本恢复
+当日/当月累计。`COST_DAILY_CNY` / `COST_MONTHLY_CNY` 任一超限：
+`COST_ACTION=block` 时 invoke 返回 429（只挡新的 LLM 消耗，检索/历史/
+记忆管理端点不受影响），`warn` 只告警放行；达阈值 80% 时告警一次。
+可观测：`/metrics` 的 `llm_tokens_total{model,profile,kind}` 与
+`llm_cost_cny_total`；`/health` 的 `cost` 组件（`ok|warn|blocked`，
+未启用时缺席不算降级）。
+
+**已知局限**：计量与预算为单进程口径（多 worker 需采集侧聚合，同
+/metrics）；价目手工维护；mysql 后端的成本账本暂回退内存账本（重启
+清零，方向安全：只会少记不会误熔断）；CLI 不受益（CLI 本就不注入
+记忆与多用户）。
+
 ## 数据库迁移（mysql 后端）
 
 对话状态（checkpointer）表由 **Alembic** 版本化管理，初迁移复用 langgraph 内置迁移：
