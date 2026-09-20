@@ -35,6 +35,7 @@ from agent_base.extensions.filestore import UploadedFileStore, build_uploaded_fi
 from agent_base.extensions.memory import build_checkpointer, close_checkpointer
 from agent_base.extensions.toollog import ToolCallRecorder, build_tool_call_recorder
 from agent_base.memory.store import MemoryStore
+from agent_base.tools.mcp import load_mcp_tools
 from agent_base.tools.registry import build_toolkit_tools, toolkit_timeouts
 
 # 保留的模块名：不构建单个模块的图，而是在所有已加载模块之上构建
@@ -228,6 +229,10 @@ async def create_runtime(settings: Settings | None = None) -> AgentRuntime:
         from agent_base.memory.tools import build_memory_tools
 
         extra_tools.extend(build_memory_tools(memory_service))
+    # MCP 工具来源（可选 extras）：MCP_ENABLED=true 时把外部 MCP Server
+    # 的工具并入池——超时包装 / 审计收口 / 重名快速失败与基座工具同规。
+    # 未启用时返回空列表（零解析零导入），装配路径保持不变。
+    extra_tools.extend(await load_mcp_tools(resolved))
     tools = build_tool_pool(
         modules,
         timeout=resolved.tool_timeout_seconds,

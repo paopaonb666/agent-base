@@ -21,7 +21,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install
-        run: pip install -e ".[dev,doc,search]"
+        run: pip install -e ".[dev,doc,search,mcp]"
       - name: Ruff lint
         run: ruff check src tests examples
       - name: Ruff format check
@@ -38,7 +38,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install
-        run: pip install -e ".[dev,doc,search]"
+        run: pip install -e ".[dev,doc,search,mcp]"
       - name: Mypy (strict)
         run: mypy
 
@@ -69,7 +69,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install
-        run: pip install -e ".[dev,doc,search]"
+        run: pip install -e ".[dev,doc,search,mcp]"
       - name: Pytest
         # CLI 参数的 -m 覆盖 ini addopts 里的 "not integration"：
         # 本 job 挂了 MySQL 服务容器，跑全量集（含 integration）。
@@ -92,7 +92,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install
-        run: pip install -e ".[dev,doc,search]"
+        run: pip install -e ".[dev,doc,search,mcp]"
       - name: Pytest
         run: pytest
 
@@ -106,7 +106,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev,doc,search]"
+          pip install -e ".[dev,doc,search,mcp]"
       - name: pip-audit (ubuntu)
         # --skip-editable：本地 agent-base 包本身不是 PyPI 依赖；
         # 它所依赖的一切仍会被审计。

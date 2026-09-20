@@ -561,6 +561,25 @@ class CostSettings(BaseModel):
         }
 
 
+class McpSettings(BaseModel):
+    """MCP 工具来源配置节：env 前缀 ``MCP_``。
+
+    ``enabled`` 是承诺语义的开关（对齐 ``TOOLKIT_ENABLED``）：开启后
+    ``[mcp]`` extras 缺失、``servers_json`` 非法或 server 连不上都是
+    **启动时**的 ``McpError``（见 ``tools/mcp.py``），不是运行时静默
+    缺席；关闭时零解析、零导入，装配路径与没有本节完全一致。
+
+    ``servers_json`` 形如 ``{"server-name": {"transport": "stdio",
+    "command": "uvx", "args": ["mcp-server-fetch"]}}``；server 名会成为
+    工具名前缀（``{server}_{tool}``），须匹配小写标识符白名单。
+    """
+
+    model_config = SettingsConfigDict(extra="ignore", validate_default=True)
+
+    enabled: bool = False
+    servers_json: str = ""
+
+
 class _FlatMappingSource(PydanticBaseSettingsSource):
     """平铺键值 source：把环境变量 / .env 的键**原样**放进输入字典。
 
@@ -681,6 +700,7 @@ class Settings(BaseSettings):
     planner: PlannerSettings = Field(default_factory=PlannerSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
     cost: CostSettings = Field(default_factory=CostSettings)
+    mcp: McpSettings = Field(default_factory=McpSettings)
 
     @field_validator("agent_modules", "cors_origins", mode="before")
     @classmethod
@@ -720,6 +740,7 @@ class Settings(BaseSettings):
             "llm_fast_": "llm_fast",
             "llm_": "llm",
             "cost_": "cost",
+            "mcp_": "mcp",
             "checkpointer_": "checkpointer",
             "toolkit_": "toolkit",
             "tool_timeout_seconds": "toolkit",

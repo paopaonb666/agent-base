@@ -64,6 +64,11 @@ search = [
 doc = [
     "python-docx>=1.1",
 ]
+# MCP 工具来源扩展。未安装且 MCP_ENABLED=true 时启动即报错（启用即
+# 承诺，见 src/agent_base/tools/mcp.py）；默认依赖不增重。
+mcp = [
+    "langchain-mcp-adapters>=0.3",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -119,6 +124,12 @@ pretty = true
 # 的 unused-ignore 抖动。
 module = ["agent_base.tools.repl"]
 disable_error_code = ["attr-defined"]
+
+[[tool.mypy.overrides]]
+# [mcp] extras 的延迟导入：本地未装 extras 时按 Any 处理；CI 装 extras，
+# 以真实类型参与 strict 检查。
+module = ["langchain_mcp_adapters.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
