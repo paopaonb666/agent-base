@@ -158,6 +158,16 @@ curl -N -X POST http://localhost:8000/v1/agents/chat/invoke \
 # 其他端点：GET /health（分项健康，degraded 不崩溃）；GET /metrics（Prometheus 文本，路由模板 label）
 ```
 
+### 快速体验：治理三件套各一分钟
+
+上表前三行的主张各有一个可复现的最小演示（源码在 [`examples/`](examples/)）：
+
+| 想看什么 | 怎么跑 | 对应主张 |
+| --- | --- | --- |
+| 记忆后端整体替换 | `python examples/custom_memory_port.py`（无需 API key） | [长期记忆](#记忆系统m6)——模块只认 `MemoryPort` 协议，实现在组合根替换 |
+| 预算熔断 | `python examples/budget_gate_demo.py`（无需 API key） | [成本治理](#成本治理t4)——80% 预警 → 超限 429 → health `blocked` |
+| 事件流逐帧打印 | 起服务后 `python examples/sse_stream_demo.py` | [事件契约（SSE）](#事件契约sse)——契约即前后端解耦面 |
+
 ## 事件契约（SSE）
 
 SSE 是前后端之间唯一的实时通道，也是解耦面：前端（agent-base-ui）只依赖
