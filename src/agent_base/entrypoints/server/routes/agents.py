@@ -12,7 +12,7 @@ import base64
 import time
 from dataclasses import replace
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -55,6 +55,9 @@ class InvokeRequest(BaseModel):
     # 附件对话（M4b）：本条消息引用的上传文件 id（≤5 个），服务端把解析
     # 文本作为 SystemMessage 注入上下文——用户气泡保持干净。
     attachments: list[str] = Field(default_factory=list, max_length=5)
+    # 难度分流（M9）：chat=普通对话；plan=强制走 planner；auto=启发式
+    # （消息 >200 字或带附件 → plan，planner 缺席时静默降级 chat）。
+    mode: Literal["chat", "plan", "auto"] = "chat"
 
 
 def _graph_or_404(rt: Any, module: str) -> Any:
@@ -85,7 +88,20 @@ async def _thread_owner_or_404(rt: Any, module: str, thread_id: str, user_id: st
 async def invoke(module: str, body: InvokeRequest, request: Request) -> StreamingResponse:
     """一次对话轮：SSE 流输出契约事件（ping/step/delta/sources/done/error）。"""
     rt = get_runtime(request)
-    graph = _graph_or_404(rt, module)
+    # 难度分流（M9）：mode 只决定调哪张图——thread 前缀、记忆 agent_id、
+    # thread_index 属主、附件绑定、记忆形成钩子全部维持请求模块不变
+    # （决策 5：图选择与线程命名空间解耦）。
+    use_plan = body.mode == "plan" or (
+        body.mode == "auto" and (len(body.message) > 200 or bool(body.attachments))
+    )
+    if use_plan and "planner" not in rt.modules:
+        if body.mode == "plan":
+            raise HTTPException(
+                status_code=503,
+                detail="planner 模块未启用（AGENT_MODULES 不含 planner）",
+            )
+        use_plan = False  # auto：静默降级
+    graph = _graph_or_404(rt, "planner" if use_plan else module)
     user_thread_id = body.thread_id or new_request_id()
     user_id = get_current_user(request)
     # 按模块划分的 thread id：图共用一个 checkpointer；未划分命名空间
