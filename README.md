@@ -153,10 +153,40 @@ uvicorn agent_base.entrypoints.server:app --reload
 
 curl -N -X POST http://localhost:8000/v1/agents/chat/invoke \
   -H "Content-Type: application/json" -d '{"message": "你好"}'
-# SSE 事件：ping → step(running/completed) → delta... → done(thread_id)
+# SSE 事件：ping → step(running/completed) → delta... → done(thread_id)，完整契约见下文「事件契约（SSE）」
 # 复杂任务加 mode："plan"（强制）/ "auto"（启发式），见「任务模式」节
 # 其他端点：GET /health（分项健康，degraded 不崩溃）；GET /metrics（Prometheus 文本，路由模板 label）
 ```
+
+## 事件契约（SSE）
+
+SSE 是前后端之间唯一的实时通道，也是解耦面：前端（agent-base-ui）只依赖
+事件格式，不依赖后端实现。契约定义在 `extensions/events.py`——一组封闭的
+Pydantic 模型，线上格式经过校验、可版本化，而不是临时字符串：
+
+```
+event: delta
+data: {"type":"delta","content":"he"}
+```
+
+一次 invoke 的典型时序：`ping`（心跳保活）→ `step`（节点 running/completed）
+→ `delta`...（增量 token，穿插 `tool_call` 与 `plan`）→ `done(thread_id)`；
+失败以 `error` 终止。全部事件类型：
+
+| type | 何时发出 | 载荷要点 |
+| --- | --- | --- |
+| `ping` | 空闲心跳，防止中间环节断流 | 无 |
+| `step` | 图节点开始 / 结束 | `name`、`status`（running/completed/error）、`detail` |
+| `delta` | 流式回复的每段 token | `content` |
+| `tool_call` | 每次工具执行前后各一条，按 `call_id` 配对成完整调用面板 | `name`、`phase`（start/end）、`args`、`result`、`status`（ok/timeout/error）、`duration_ms` |
+| `plan` | planner 拆解 / 推进 / 重规划 / 完成 | `status`（created/progress/replanned/done）、`plan` **全量**任务清单（前端整表替换，无需增量合并） |
+| `sources` | 契约预留，基座从不发出 | `sources[]`（title/url）——未来 RAG 模块发布引用而不必改编码器 |
+| `done` | 终止性成功 | `thread_id`（恢复会话的句柄） |
+| `error` | 终止性失败 | `message`（人类可读的可行动摘要） |
+
+错误排查路径：`error` 事件只带摘要；完整链路已带 `request_id` 落服务端
+结构化日志（贯穿入口 / 模块 / 节点），凭摘要定位到 request_id 即可在日志
+还原全过程；工具调用明细另有 `TOOL_CALL_LOG_ENABLED` 全量落库。
 
 ## 记忆系统（M6）
 
