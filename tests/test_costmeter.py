@@ -437,3 +437,55 @@ def test_server_invoke_blocked_with_429_and_health_cost() -> None:
             assert threads.status_code == 200
     finally:
         COST_METER.reset()
+
+
+async def _seed_sqlite_ledger(db_path: str) -> None:
+    """预置一个"上一个进程留下数据"的 sqlite 账本（1 元，当日）。"""
+    ledger = await SqliteCostLedger.create(db_path)
+    meter = _fresh_meter(prices_json='{"m": {"input_miss": 1, "input_hit": 0, "output": 0}}')
+    handler = CostMeterHandler(model="m", profile="main", meter=meter)
+    handler.on_llm_end(
+        _response({"input_tokens": 1_000_000, "output_tokens": 0, "total_tokens": 1_000_000})
+    )
+    await ledger.insert(meter.take_pending())
+    await ledger.aclose()
+
+
+def test_server_startup_recovers_seeded_sqlite_ledger(tmp_path: Path) -> None:
+    """回归（2026-09-20）：账本有数据时进程重启即崩溃——lifespan 恢复把
+    totals_by_day 的 dict 当 (day, cost) 元组流解包，空表时循环体不执行
+    所以测试与首次启动都没暴露。本测试用带数据的真实 sqlite 账本走一遍
+    server lifespan：启动必须成功，且累计恢复到当日/当月。"""
+    import asyncio
+
+    from fastapi.testclient import TestClient
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from agent_base.core.bootstrap import AgentRuntime
+    from agent_base.entrypoints.server import create_app
+    from agent_base.modules.chat.module import ChatModule
+    from fakes import ScriptedChatModel
+
+    db_path = str(tmp_path / "cost_ledger.db")
+    asyncio.run(_seed_sqlite_ledger(db_path))
+
+    rt = AgentRuntime(
+        settings=_settings(
+            cost_enabled=True,
+            cost_prices_json='{"m": {"input_miss": 1, "input_hit": 0, "output": 0}}',
+            checkpointer={"backend": "sqlite", "sqlite_path": db_path},
+        ),
+        llm=ScriptedChatModel([]),
+        modules={"chat": ChatModule()},
+        tools=[],
+        checkpointer=InMemorySaver(),
+    )
+    COST_METER.reset()
+    try:
+        with TestClient(create_app(runtime=rt)) as client:
+            assert client.get("/health").status_code == 200
+            # 上一个进程的 1.0 元回到当日与当月累计。
+            assert COST_METER.day_total_cny() == pytest.approx(1.0)
+            assert COST_METER.month_total_cny() == pytest.approx(1.0)
+    finally:
+        COST_METER.reset()

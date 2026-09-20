@@ -130,8 +130,10 @@ def create_app(
                     logging.getLogger(__name__).warning(
                         "cost: mysql 账本暂未接入，预算累计在重启后清零（内存账本）"
                     )
-            # 重启恢复：账本按日聚合回放进预算累计。
-            for day, day_cost in await ledger.totals_by_day():
+            # 重启恢复：账本按日聚合回放进预算累计（totals_by_day 返回 dict，
+            # 直接遍历只会拿到 key——这里是 2026-09-20 修复的启动崩溃点：
+            # 账本一旦有数据，进程重启即 ValueError）。
+            for day, day_cost in (await ledger.totals_by_day()).items():
                 COST_METER.restore_day(day, day_cost)
             app.state.cost_governor = CostGovernor(
                 daily_cny=cost.daily_cny,
