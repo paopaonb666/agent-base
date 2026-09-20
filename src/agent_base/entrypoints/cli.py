@@ -91,7 +91,10 @@ async def _invoke(
     graph = runtime.graph(module_name)
     # thread id 按模块划分命名空间：不同的图共用一个 checkpointer，
     # 未划分命名空间的 id 会把它们的状态混在一起。
-    config: RunnableConfig = {"configurable": {"thread_id": f"{module_name}:{thread_id}"}}
+    config: RunnableConfig = {
+        "recursion_limit": runtime.settings.agent_recursion_limit,
+        "configurable": {"thread_id": f"{module_name}:{thread_id}"},
+    }
     result: Any = await graph.ainvoke({"messages": [HumanMessage(content=text)]}, config)
     return cast(list[BaseMessage], result["messages"])
 

@@ -227,3 +227,15 @@ def test_toolkit_enabled_csv_and_json(monkeypatch: pytest.MonkeyPatch) -> None:
     assert Settings(_env_file=None).toolkit_enabled == ["calculator"]
     monkeypatch.setenv("TOOLKIT_ENABLED", "")
     assert Settings(_env_file=None).toolkit_enabled == []
+
+
+def test_recursion_limit_default_and_validation() -> None:
+    s = Settings(_env_file=None, llm_api_key="k")
+    assert s.agent_recursion_limit == 25
+    with pytest.raises(ValidationError, match="must be >= 1"):
+        Settings(_env_file=None, llm_api_key="k", agent_recursion_limit=0)
+
+
+def test_recursion_limit_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AGENT_RECURSION_LIMIT", "40")
+    assert Settings(_env_file=None).agent_recursion_limit == 40

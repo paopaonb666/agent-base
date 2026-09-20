@@ -509,6 +509,12 @@ class Settings(BaseSettings):
     # agent_base.modules.<name>。
     agent_modules: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["chat"])
 
+    # -- Agent 循环 ------------------------------------------------------
+    # 单轮 invoke 的图步数上限（含工具往返）：防止工具循环失控空转。
+    # planner 场景的步数估算见 PlannerSettings 的 docstring，重度使用
+    # 可调高。
+    agent_recursion_limit: int = 25
+
     # -- 服务 ------------------------------------------------------------
     # 允许跨域调用本服务的来源（浏览器客户端，如 agent-base-ui）。
     cors_origins: Annotated[list[str], NoDecode] = Field(
@@ -531,6 +537,13 @@ class Settings(BaseSettings):
     @classmethod
     def _parse_root_lists(cls, value: object, info: ValidationInfo) -> object:
         return _parse_csv_or_json_list(value, info.field_name or "value")
+
+    @field_validator("agent_recursion_limit")
+    @classmethod
+    def _validate_recursion_limit(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError(f"AGENT_RECURSION_LIMIT must be >= 1, got {value}")
+        return value
 
     @field_validator("env")
     @classmethod
@@ -585,7 +598,8 @@ class Settings(BaseSettings):
         for key in [
             k
             for k in out
-            if k != k.lower() and k.lower() in ("agent_modules", "cors_origins", "env")
+            if k != k.lower()
+            and k.lower() in ("agent_modules", "cors_origins", "env", "agent_recursion_limit")
         ]:
             # init kwargs（已是小写）优先：只补缺，不覆盖。
             out.setdefault(key.lower(), out.pop(key))

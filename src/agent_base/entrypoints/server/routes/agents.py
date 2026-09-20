@@ -92,7 +92,10 @@ async def invoke(module: str, body: InvokeRequest, request: Request) -> Streamin
     # 的 id 会把它们的状态混在一起。user_id（M6）进 configurable：
     # 记忆工具经 RunnableConfig 注入读取（M6e）。
     full_thread_id = f"{module}:{user_thread_id}"
-    config: RunnableConfig = {"configurable": {"thread_id": full_thread_id, "user_id": user_id}}
+    config: RunnableConfig = {
+        "recursion_limit": rt.settings.agent_recursion_limit,
+        "configurable": {"thread_id": full_thread_id, "user_id": user_id},
+    }
     messages_input: list[Any] = []
     # 记忆上下文注入（M6d）：画像/记忆块/摘要/相关记忆打包成注入块，
     # 置于全部消息之前（attachments 注入块在其后）。失败静默降级。

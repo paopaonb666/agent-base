@@ -33,7 +33,9 @@ class _FakeGraph:
 class _FakeRuntime:
     """最小化的运行时替身，覆盖 CLI 的各个触点。"""
 
-    settings = SimpleNamespace(observability=SimpleNamespace(log_json=False))
+    settings = SimpleNamespace(
+        observability=SimpleNamespace(log_json=False), agent_recursion_limit=25
+    )
     closed = False
 
     def __init__(self, graph: _FakeGraph | None = None) -> None:
@@ -94,7 +96,10 @@ async def test_invoke_namespaces_thread_per_module(monkeypatch: pytest.MonkeyPat
     runtime = _FakeRuntime()
     graph = runtime._graph
     messages = await cli._invoke(runtime, "chat", "thread-1", "hi")
-    assert graph.config == {"configurable": {"thread_id": "chat:thread-1"}}
+    assert graph.config == {
+        "recursion_limit": 25,
+        "configurable": {"thread_id": "chat:thread-1"},
+    }
     assert [m.content for m in messages] == ["hi", "hello to: hi"]
 
 
