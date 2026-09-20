@@ -437,6 +437,7 @@ agent-base/
 │   ├── modules/chat/        # 样板模块（graph + module + tools，兼作接入模板）
 │   ├── modules/writer/      # 第二样板模块（供 supervisor 编排演示）
 │   ├── modules/hello/       # 五步手册的真实落地实例（tests/test_hello_module.py 验证）
+│   │                        # 五步接入手册见 docs/module-guide.md（本地文档，不入库）
 │   └── entrypoints/
 │       ├── cli.py           # CLI 入口（--module / --message / --thread-id / --version）
 │       └── server/          # FastAPI + SSE 服务包（H1 拆分）：app 装配 + auth/deps/
@@ -459,3 +460,6 @@ agent-base/
 - ADR-001：LangGraph 作为基座运行时（`docs/adr/001-langgraph-as-runtime.md`）
 - ADR-002：显式清单模块注册（`docs/adr/002-module-contract.md`）
 - module-guide：五步接入新模块 + 应用层规范（`docs/module-guide.md`）
+
+定位与边界依据见 ADR-001/002；对外叙事（本 README 开头的差异化表）与其
+保持一致——基座不做编排，做编排之上的治理。
