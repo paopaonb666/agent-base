@@ -413,7 +413,7 @@ pnpm dev        # http://localhost:3000
 ## 质量门（四道，本地与 CI 完全一致）
 
 ```bash
-ruff check src tests && ruff format --check src tests   # 1. lint + format
+ruff check src tests examples && ruff format --check src tests examples   # 1. lint + format
 mypy                                                     # 2. 类型检查（strict）
 pytest                                                   # 3. 测试（内置 branch coverage ≥85% 门槛）
 pip-audit --skip-editable                               # 4. 依赖安全审计

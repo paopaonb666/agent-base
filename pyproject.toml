@@ -88,7 +88,7 @@ packages = ["src/agent_base"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
-src = ["src", "tests", "alembic"]
+src = ["src", "tests", "alembic", "examples"]
 extend-exclude = ["alembic/script.py.mako"]
 
 [tool.ruff.lint]
