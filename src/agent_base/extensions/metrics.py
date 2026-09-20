@@ -183,3 +183,34 @@ class MemoryMetrics(_LabeledHistogram):
 
 
 MEMORY_METRICS = MemoryMetrics()
+
+
+class CostMetrics:
+    """进程内的 LLM 用量计数器（T4.1 成本治理），事件循环安全。
+
+    token 按 (model, profile, kind) 计数——模型名来自配置而非用户输入，
+    基数有界；费用是标量累计。口径声明同模块 docstring：单进程。
+    """
+
+    def __init__(self) -> None:
+        self._tokens: dict[tuple[str, str, str], int] = {}
+        self.cost_cny_total = 0.0
+
+    def observe_tokens(self, model: str, profile: str, kind: str, amount: int) -> None:
+        key = (model, profile, kind)
+        self._tokens[key] = self._tokens.get(key, 0) + amount
+
+    def observe_cost(self, cost_cny: float) -> None:
+        self.cost_cny_total += cost_cny
+
+    def render_cost_metrics(self) -> str:
+        lines: list[str] = []
+        for (model, profile, kind), count in sorted(self._tokens.items()):
+            lines.append(
+                f'llm_tokens_total{{model="{model}",profile="{profile}",kind="{kind}"}} {count}'
+            )
+        lines.append(f"llm_cost_cny_total {self.cost_cny_total:.6f}")
+        return ("\n".join(lines) + "\n") if lines else ""
+
+
+COST_METRICS = CostMetrics()

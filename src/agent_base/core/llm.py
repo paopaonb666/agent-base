@@ -52,6 +52,16 @@ def build_llm(settings: Settings, profile: str = "main") -> ChatOpenAI:
     kwargs: dict[str, Any] = {"model": model, "base_url": base_url}
     if api_key:
         kwargs["api_key"] = api_key
+    # 成本计量（T4.1）：enabled 时挂模型级 usage 采集 callback，并请求
+    # 流式路径回报 usage（OpenAI 兼容 provider 的 stream_options；
+    # 关闭时完全不发该参数，兼容不支持它的 provider）。
+    if settings.cost.enabled:
+        from agent_base.extensions.costmeter import COST_METER, CostMeterHandler
+
+        kwargs["stream_usage"] = True
+        kwargs["callbacks"] = [CostMeterHandler(model=model, profile=profile, meter=COST_METER)]
+    else:
+        kwargs["stream_usage"] = False
     try:
         return ChatOpenAI(**kwargs)
     except OpenAIError as exc:

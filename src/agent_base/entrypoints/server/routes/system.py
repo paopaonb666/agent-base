@@ -110,7 +110,11 @@ async def health(request: Request) -> dict[str, Any]:
 
 @router.get("/metrics")
 async def metrics_endpoint(request: Request) -> PlainTextResponse:
-    from agent_base.extensions.metrics import MEMORY_METRICS, TOOL_METRICS
+    from agent_base.extensions.metrics import (
+        COST_METRICS,
+        MEMORY_METRICS,
+        TOOL_METRICS,
+    )
     from agent_base.extensions.metrics import Metrics as MetricsCls
 
     metrics: MetricsCls = request.app.state.metrics
@@ -118,5 +122,6 @@ async def metrics_endpoint(request: Request) -> PlainTextResponse:
         metrics.render()
         + TOOL_METRICS.render_tool_metrics()
         + MEMORY_METRICS.render_memory_metrics()
+        + COST_METRICS.render_cost_metrics()
     )
     return PlainTextResponse(body, media_type="text/plain; version=0.0.4; charset=utf-8")

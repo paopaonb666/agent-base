@@ -58,6 +58,9 @@ KNOWN_ENVIRONMENTS: frozenset[str] = frozenset({"development", "production"})
 # 记忆形成管线的模型分派档位（MEMORY_PIPELINE_PROFILE 的合法取值）。
 KNOWN_PIPELINE_PROFILES: frozenset[str] = frozenset({"split", "all_main", "all_fast"})
 
+# 预算超限行为（COST_ACTION 的合法取值）。
+KNOWN_COST_ACTIONS: frozenset[str] = frozenset({"warn", "block"})
+
 
 class SettingsError(ValueError):
     """当配置校验失败时抛出（快速失败）。"""
@@ -502,6 +505,62 @@ class ObservabilitySettings(BaseModel):
     health_probe_model: bool = False
 
 
+class CostSettings(BaseModel):
+    """成本治理配置节：env 前缀 ``COST_``（T4.1/T4.2）。
+
+    ``daily_cny`` / ``monthly_cny`` 为 0 表示对应周期不限额；超限行为由
+    ``action`` 决定（warn 只告警，block 熔断新的 LLM 调用——检索、历史、
+    记忆管理等非 LLM 端点不受影响）。
+    """
+
+    model_config = SettingsConfigDict(extra="ignore", validate_default=True)
+
+    enabled: bool = False
+    daily_cny: float = 0.0
+    monthly_cny: float = 0.0
+    action: str = "block"
+    # 价目表 JSON：{"model": {"input_miss": 元/百万, "input_hit": …, "output": …}}。
+    # 手工维护——以各 provider 控制台实时价为准（2026 年价格波动频繁）。
+    prices_json: str = ""
+
+    @field_validator("action")
+    @classmethod
+    def _validate_action(cls, value: str) -> str:
+        if value not in KNOWN_COST_ACTIONS:
+            raise ValueError(
+                f"unknown COST_ACTION {value!r}; expected one of {sorted(KNOWN_COST_ACTIONS)}"
+            )
+        return value
+
+    @field_validator("prices_json")
+    @classmethod
+    def _validate_prices_json(cls, value: str) -> str:
+        if not value.strip():
+            return value
+        try:
+            data = json.loads(value)
+        except ValueError as exc:
+            raise ValueError(f"COST_PRICES_JSON is not valid JSON: {exc}") from exc
+        if not isinstance(data, dict) or not all(
+            isinstance(model, str) and isinstance(table, dict) for model, table in data.items()
+        ):
+            raise ValueError(
+                "COST_PRICES_JSON must be a JSON object of "
+                '{"model": {"input_miss": …, "input_hit": …, "output": …}}'
+            )
+        return value
+
+    @property
+    def prices(self) -> dict[str, dict[str, float]]:
+        """解析后的价目表（``prices_json`` 已由 validator 保证合法）。"""
+        if not self.prices_json.strip():
+            return {}
+        data = json.loads(self.prices_json)
+        return {
+            str(k): {str(kk): float(vv) for kk, vv in table.items()} for k, table in data.items()
+        }
+
+
 class _FlatMappingSource(PydanticBaseSettingsSource):
     """平铺键值 source：把环境变量 / .env 的键**原样**放进输入字典。
 
@@ -621,6 +680,7 @@ class Settings(BaseSettings):
     memory: MemorySettings = Field(default_factory=MemorySettings)
     planner: PlannerSettings = Field(default_factory=PlannerSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
+    cost: CostSettings = Field(default_factory=CostSettings)
 
     @field_validator("agent_modules", "cors_origins", mode="before")
     @classmethod
@@ -659,6 +719,7 @@ class Settings(BaseSettings):
             # llm_fast_ 必须排在 llm_ 之前，否则会被更短的前缀先吞掉。
             "llm_fast_": "llm_fast",
             "llm_": "llm",
+            "cost_": "cost",
             "checkpointer_": "checkpointer",
             "toolkit_": "toolkit",
             "tool_timeout_seconds": "toolkit",
@@ -726,6 +787,8 @@ class Settings(BaseSettings):
                 section_name, inner = "doc_parse", name[len("doc_parse_") :]
         elif name.startswith("llm_fast_"):
             return getattr(self.llm_fast, name[len("llm_fast_") :])
+        elif name.startswith("cost_"):
+            return getattr(self.cost, name[len("cost_") :])
         elif name.startswith(("memory_", "llm_", "search_", "toolkit_", "planner_")):
             section_name, inner = name.split("_", 1)
             if section_name == "toolkit" and name in (
