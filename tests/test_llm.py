@@ -145,3 +145,48 @@ async def test_resilient_llm_semaphore_serializes_concurrency() -> None:
     results = await asyncio.gather(*[llm.ainvoke([("human", "q")]) for _ in range(3)])
     assert results == ["ok", "ok", "ok"]
     assert peak == 1
+
+
+async def test_tool_safe_stream_falls_back_to_generate_when_tools_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """快档客户端：绑定工具时 _astream 退回非流式聚合（SiliconFlow
+    GLM-4-9B 流式工具调用违反 OpenAI 协议——工具名被拆进 arguments delta）；
+    未绑工具时保持原生流式。"""
+    from langchain_core.messages import AIMessage, AIMessageChunk
+    from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+
+    from agent_base.core.llm import _ToolSafeStreamChatOpenAI
+
+    model = _ToolSafeStreamChatOpenAI(model="m", api_key="sk-test")
+    calls: list[str] = []
+
+    def _fake_generate(
+        messages: object, stop: object = None, run_manager: object = None, **kw: object
+    ) -> ChatResult:
+        calls.append("generate")
+        assert kw.get("tools")  # 非流式路径必须带上工具定义
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content="ok"))])
+
+    monkeypatch.setattr(model, "_generate", _fake_generate)
+
+    # 绑定工具 → 退回 _generate，聚合出分块。
+    chunks = [c async for c in model._astream("hi", tools=[{"type": "function"}])]
+    assert calls == ["generate"]
+    assert chunks and chunks[0].message.content == "ok"
+
+    # 未绑工具 → 不走 _generate，交回原生流式。
+    async def _fake_astream(
+        self: object,
+        messages: object,
+        stop: object = None,
+        run_manager: object = None,
+        **kw: object,
+    ):
+        calls.append("astream")
+        yield ChatGenerationChunk(message=AIMessageChunk(content="s"))
+
+    monkeypatch.setattr(_ToolSafeStreamChatOpenAI, "_astream", _fake_astream)
+    chunks2 = [c async for c in model._astream("hi")]
+    assert "astream" in calls
+    assert chunks2[0].message.content == "s"

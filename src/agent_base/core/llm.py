@@ -16,12 +16,46 @@ import asyncio
 import logging
 from typing import Any
 
+from langchain_core.messages import AIMessageChunk
+from langchain_core.outputs import ChatGenerationChunk
 from langchain_openai import ChatOpenAI
 from openai import OpenAIError
 
 from agent_base.core.config import Settings, SettingsError
 
 logger = logging.getLogger(__name__)
+
+
+class _ToolSafeStreamChatOpenAI(ChatOpenAI):
+    """快档专用客户端：绑定工具时退回非流式，纯聊天仍流式。
+
+    背景（2026-09-20 实测）：SiliconFlow 的 GLM-4-9B 在流式模式下把
+    工具名拆进 ``arguments`` delta（``function.name`` 为空、id 为 null），
+    违反 OpenAI 流式协议——langchain 聚合不出合法的 tool_calls，图执行
+    静默拿到空工具调用与空回答（同请求非流式则完全正常）。因此该模型
+    一旦作为快档进入图执行路径（Tier 1 / planner fast 都会 bind_tools），
+    工具轮必须走非流式让服务端聚合出正确格式；不绑工具的对话仍流式，
+    SSE delta 体验不变。
+    """
+
+    async def _astream(
+        self, messages: Any, stop: Any = None, run_manager: Any = None, **kwargs: Any
+    ) -> Any:
+        if kwargs.get("tools"):
+            result = self._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+            for generation in result.generations:
+                message = generation.message
+                yield ChatGenerationChunk(
+                    message=AIMessageChunk(
+                        content=message.content,
+                        tool_calls=getattr(message, "tool_calls", []) or [],
+                        additional_kwargs=message.additional_kwargs,
+                        response_metadata=message.response_metadata,
+                    )
+                )
+            return
+        async for chunk in super()._astream(messages, stop=stop, run_manager=run_manager, **kwargs):
+            yield chunk
 
 
 def build_llm(settings: Settings, profile: str = "main") -> ChatOpenAI:
@@ -62,8 +96,11 @@ def build_llm(settings: Settings, profile: str = "main") -> ChatOpenAI:
         kwargs["callbacks"] = [CostMeterHandler(model=model, profile=profile, meter=COST_METER)]
     else:
         kwargs["stream_usage"] = False
+    # 快档走工具安全子类（见类 docstring：SiliconFlow 流式工具调用的
+    # 协议违规）；主档保持原生客户端，行为零变化。
+    client_cls: type[ChatOpenAI] = _ToolSafeStreamChatOpenAI if profile == "fast" else ChatOpenAI
     try:
-        return ChatOpenAI(**kwargs)
+        return client_cls(**kwargs)
     except OpenAIError as exc:
         raise SettingsError(
             "LLM_API_KEY is not configured and no ambient OPENAI_API_KEY is set; "
