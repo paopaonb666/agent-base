@@ -483,3 +483,112 @@ async def test_capture_transcript_window_configurable() -> None:
     assert "最新的问题" in transcript
     assert "中间的问题" in transcript
     assert "最早的问题" not in transcript  # 窗口外被裁掉
+
+
+# ─────────────────── 夜间批 force 旁路（T3.2） ───────────────────
+
+
+async def test_capture_turn_force_bypasses_capture_enabled() -> None:
+    """MEMORY_CAPTURE_ENABLED=false 时每轮路径跳过抽取；force=True 照常抽取。"""
+    service = _service([], memory_capture_enabled=False)
+
+    # 每轮路径（force 缺省 False）：管线在门控处跳过，无抽取发生。
+    service.pipeline = MemoryPipeline(service._llm, service._settings, service)  # type: ignore[arg-type]
+    detail = await service.pipeline.capture_turn(
+        user_id="u",
+        agent_id="chat",
+        thread_id="chat:t",
+        transcript="用户：记住我姓李",
+        human_count=1,
+    )
+    assert detail is not None and detail["candidates"] == 0
+
+    # 夜间批（force=True）：门控被旁路，抽取照常执行。
+    _rearm(
+        service,
+        [
+            _json_msg([{"content": "用户姓李", "kind": "semantic", "salience": 0.8}]),
+            _json_msg({"op": "ADD", "content": "用户姓李"}),
+        ],
+    )
+    assert service.pipeline is not None
+    detail = await service.pipeline.capture_turn(
+        user_id="u",
+        agent_id="chat",
+        thread_id="chat:t",
+        transcript="用户：记住我姓李",
+        human_count=1,
+        force=True,
+    )
+    assert detail is not None and detail["candidates"] == 1
+    memories = await service.list_memories(user_id="u")
+    assert any("李" in m.content for m in memories)
+
+
+async def test_nightly_capture_since_processes_active_threads() -> None:
+    """capture_since：只处理 updated_at 在起点之后的线程，force 写入记忆。"""
+    import importlib.util
+    import time as _time
+    from pathlib import Path as _Path
+
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from agent_base.core.bootstrap import AgentRuntime
+
+    spec = importlib.util.spec_from_file_location(
+        "memory_nightly_capture",
+        _Path(__file__).resolve().parents[1] / "scripts" / "memory_nightly_capture.py",
+    )
+    assert spec is not None and spec.loader is not None
+    nightly = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(nightly)
+
+    settings = Settings(_env_file=None, llm_api_key="sk-test", memory_capture_enabled=False)
+    model = ScriptedChatModel(
+        [
+            AIMessage(content="收到"),  # 线程创建（graph.ainvoke）的应答
+            _json_msg([{"content": "用户的项目代号是雨燕", "kind": "semantic", "salience": 0.9}]),
+            _json_msg({"op": "ADD", "content": "用户的项目代号是雨燕"}),
+        ]
+    )
+    store = MemoryMemoryStore()
+    service = MemoryService(store=store, embedder=HashEmbedding(), settings=settings, llm=model)
+    rt = AgentRuntime(
+        settings=settings,
+        llm=model,
+        modules={"chat": ChatModule()},
+        tools=[],
+        checkpointer=InMemorySaver(),
+        memory=service,
+        thread_index=store,
+    )
+    # 造一个活跃线程：写索引 + checkpointer 状态。
+    from agent_base.memory.store import ThreadIndex
+
+    now = _time.time()
+    await store.upsert_thread_index(
+        ThreadIndex(thread_id="chat:t1", user_id="u1", module="chat", updated_at=now)
+    )
+    graph = rt.graph("chat")
+    await graph.ainvoke(
+        {"messages": [HumanMessage(content="记住：我的项目代号是雨燕")]},
+        {"configurable": {"thread_id": "chat:t1"}},
+    )
+
+    # 起点 = 现在 → 线程已活跃但 dry-run 只列不调 LLM。
+    calls_before = len(model.received)  # 线程创建已消耗的模型调用不计
+    processed, skipped = await nightly.capture_since(
+        rt, user_ids=["u1"], since_ts=now - 10, dry_run=True
+    )
+    assert processed == 1 and skipped == 0
+    assert len(model.received) == calls_before  # dry-run 零新增 LLM
+
+    # 正式处理（force 旁路 capture_enabled=false）→ 记忆落库。
+    processed, _ = await nightly.capture_since(rt, user_ids=["u1"], since_ts=now - 10)
+    assert processed == 1
+    memories = await service.list_memories(user_id="u1")
+    assert any("雨燕" in m.content for m in memories)
+
+    # 更晚的起点 → 线程被跳过。
+    processed, skipped = await nightly.capture_since(rt, user_ids=["u1"], since_ts=now + 10)
+    assert processed == 0 and skipped == 1

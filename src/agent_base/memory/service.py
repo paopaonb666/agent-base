@@ -607,12 +607,19 @@ class MemoryService:
 
     # -- 形成管线编排（M6c） ------------------------------------------------------
     async def capture_turn(
-        self, *, user_id: str, agent_id: str, thread_id: str, messages: list[Any]
+        self,
+        *,
+        user_id: str,
+        agent_id: str,
+        thread_id: str,
+        messages: list[Any],
+        force: bool = False,
     ) -> dict[str, Any] | None:
         """一轮对话结束后的记忆形成（后台调用；绝不抛异常）。
 
         ``messages`` 是该线程的全部持久化消息（来自 checkpointer 快照）：
-        转写渲染、轮次计数与触发阈值都在这里统一处理。
+        转写渲染、轮次计数与触发阈值都在这里统一处理。``force=True``
+        旁路 ``MEMORY_CAPTURE_ENABLED`` 门控（夜间批脚本 T3.2）。
         """
         if self.pipeline is None:
             return None
@@ -632,6 +639,7 @@ class MemoryService:
                     thread_id=thread_id,
                     transcript=transcript,
                     human_count=human_count,
+                    force=force,
                 )
             except Exception:
                 # 管线内部已逐步失败安全；这里兜底防任何漏网异常干扰调用方。

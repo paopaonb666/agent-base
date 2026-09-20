@@ -371,13 +371,20 @@ class MemoryPipeline:
         thread_id: str,
         transcript: str,
         human_count: int,
+        force: bool = False,
     ) -> dict[str, Any]:
-        """一轮对话结束后的完整形成流程；每步独立审计、失败安全。"""
+        """一轮对话结束后的完整形成流程；每步独立审计、失败安全。
+
+        ``force=True`` 旁路 ``MEMORY_CAPTURE_ENABLED`` 门控（夜间批脚本
+        T3.2 的替代形成路径：每轮管线关闭时，一天一次批量抽取+整合）；
+        服务端每轮路径永远用默认 False。
+        """
         detail: dict[str, Any] = {
             "candidates": 0,
             "ops": {},
             "profile_updated": False,
             "summary_updated": False,
+            "forced": force,
         }
 
         async def _run(op: str, coro: Any) -> Any:
@@ -419,7 +426,7 @@ class MemoryPipeline:
             return result
 
         # 1) 抽取 + 逐条整合（合并计为一次 extract 审计 + 各 consolidate）。
-        if self._settings.memory.capture_enabled:
+        if force or self._settings.memory.capture_enabled:
             extracted = await _run("extract", self.extract_candidates(transcript))
             if extracted:
                 detail["candidates"] = len(extracted)
