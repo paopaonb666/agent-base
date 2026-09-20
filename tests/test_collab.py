@@ -76,3 +76,13 @@ def test_supervisor_requires_modules() -> None:
     )
     with pytest.raises(ValueError, match="at least one module"):
         build_supervisor_graph(ctx, {})
+
+
+def test_supervisor_prompt_allows_multi_step_dispatch() -> None:
+    """D1：prompt 必须允许多步顺序派发，不再含"不要多调"的束缚。"""
+    from agent_base.extensions.collab import DEFAULT_PROMPT
+
+    assert "steps" in DEFAULT_PROMPT
+    assert "sequence" in DEFAULT_PROMPT
+    assert "as many agents as the task requires" in DEFAULT_PROMPT
+    assert "Do not call an agent more than necessary" not in DEFAULT_PROMPT
