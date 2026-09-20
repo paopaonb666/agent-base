@@ -441,6 +441,11 @@ class MemoryService:
         )
         scored.sort(key=lambda item: item.score, reverse=True)
         min_score = self._settings.memory.recall_min_score
+        if isinstance(self.embedder, NullEmbedding) and min_score > 0:
+            # 降级关键词路径与 search 同规则：混合分缺向量主力分量，硬门槛
+            # 会把关键词命中整体清零（天花板 ~0.45 < 0.5，Tier 3.1 验收
+            # 发现）——放宽一半，宁可多给弱序结果也不静默丢命中。
+            min_score = min_score / 2
         if min_score > 0:
 
             def _has_evidence(item: ScoredChunk) -> bool:

@@ -660,3 +660,25 @@ async def test_browse_lists_all_statuses_with_expired_flag(tmp_path: Path) -> No
         # 检索路径仍只返回启用中的记忆。
         found = c.get("/v1/memory", params={"q": "内容"}, headers={"X-User-Id": "u3"}).json()
         assert all(m["status"] == "active" for m in found["memories"])
+
+
+async def test_search_knowledge_degraded_relaxes_min_score() -> None:
+    """降级关键词路径（无 embedding）：门槛放宽一半，关键词命中不被清零。
+
+    回归（T3.1 验收发现）：知识库检索未随 search 一起放宽门槛，无
+    embedding 时混合分天花板 ~0.45 < 0.5，Tier 0 端点静默返回空。
+    """
+    store = await SqliteMemoryStore.create(str(Path(__file__).parent / "_tmp_kb_degraded.db"))
+    service = MemoryService(store=store, embedder=NullEmbedding(), settings=_settings())
+    try:
+        count = await service.ingest_document(
+            file_id="f1",
+            user_id="alice",
+            agent_id="chat",
+            text="本保险的等待期为九十天，等待期内出险不予赔付。",
+        )
+        assert count > 0
+        results = await service.search_knowledge(user_id="alice", agent_id=None, query="等待期")
+        assert results, "降级路径下关键词命中不应被未放宽的门槛清零"
+    finally:
+        await service.aclose()
