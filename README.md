@@ -142,6 +142,7 @@ uvicorn agent_base.entrypoints.server:app --reload
 curl -N -X POST http://localhost:8000/v1/agents/chat/invoke \
   -H "Content-Type: application/json" -d '{"message": "你好"}'
 # SSE 事件：ping → step(running/completed) → delta... → done(thread_id)
+# 复杂任务加 mode："plan"（强制）/ "auto"（启发式），见「任务模式」节
 # 其他端点：GET /health（分项健康，degraded 不崩溃）；GET /metrics（Prometheus 文本，路由模板 label）
 ```
 
@@ -235,6 +236,48 @@ embedding 模型后 `python scripts/memory_backfill_embeddings.py` 同时
 `MEMORY_CONTEXT_MAX_CHARS` / `MEMORY_CONTEXT_MAX_TOKENS`（注入与模型输入预算）。
 指标：`/metrics` 的 `memory_operations_total{op,outcome}`；健康：`/health` 的
 `memory` 组件（未启用时缺席，不算降级）。
+
+## 任务模式（M9）
+
+`AGENT_MODULES=chat,planner` 启用 planner 模块后，invoke 请求体可带
+`mode` 字段做难度分流：
+
+| mode | 行为 |
+| --- | --- |
+| `chat`（默认） | 请求模块自己的图，行为与此前完全一致 |
+| `plan` | 强制走 planner 图（plan → execute → check →(replan)* → synthesize）；planner 未启用时 **503，不降级** |
+| `auto` | 启发式：消息 >200 字或带附件 → plan；planner 缺席时静默降级 chat |
+
+**图选择与线程命名空间解耦**：`mode` 只决定调哪张图，线程永远是
+`{请求模块}:{thread_id}`——同一会话内 chat 轮与 plan 轮历史连续，
+thread 属主、记忆 `agent_id`、附件绑定都不受影响。
+
+planner 的执行语义：LLM 把目标拆解为 ≤`PLANNER_MAX_SUBTASKS` 条子任务，
+逐条以**内联 ReAct 循环**执行（每子任务工具轮数上限
+`PLANNER_SUBTASK_TOOL_ROUNDS`）；子任务失败（轮数耗尽 / 空输出门）触发
+重规划（预算 `PLANNER_MAX_REPLANS`，保留已完成结果）；预算耗尽后做
+best-effort 综合，如实标注未完成项。
+
+SSE 事件新增 `plan`（全量任务清单，前端整表替换）：
+
+```json
+{"type": "plan", "status": "created",
+ "plan": [{"id": 1, "goal": "查天气", "status": "pending"}],
+ "detail": "拆解出 1 个子任务"}
+```
+
+`status` 取值 `created / progress / replanned / done`。配套只读端点
+`GET /v1/agents/{module}/threads/{thread_id}/plan` 返回
+`{tasks, cursor, replans}`（planner 未启用 503；从未跑过 plan 的线程
+返回空默认值）。
+
+已知限制：
+
+- **chat 轮穿插会重置 plan 状态**（chat 图的 checkpoint 只含 messages
+  通道）；跨轮 plan 延续若成为需求，升级路径是独立 plan 表（M10 候选）；
+- 前端渲染 PlanEvent 属 agent-base-ui 仓库，本仓库只提供契约与端点；
+- planner 重度使用的最坏图步数约 34，超出默认
+  `AGENT_RECURSION_LIMIT=25`——按需在 .env 调高。
 
 ## 数据库迁移（mysql 后端）
 
