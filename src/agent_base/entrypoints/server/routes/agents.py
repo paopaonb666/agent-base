@@ -312,6 +312,37 @@ async def list_tool_calls(
     return {"tool_calls": records}
 
 
+@router.get("/{module}/threads/{thread_id}/plan")
+async def get_thread_plan(
+    module: str, thread_id: str, request: Request, user_id: str = Depends(get_current_user)
+) -> dict[str, Any]:
+    """只读计划状态（M9）。
+
+    plan 状态存在 planner 图的通道里，但线程命名空间属于请求模块
+    （决策 5：invoke 的 thread 永远是 ``{module}:{thread_id}``）——
+    读取必须经 **planner 图** 做 ``aget_state``（chat 图的通道表里没有
+    tasks，用它读会丢字段）。线程从未跑过 plan 时返回空默认值
+    （决策 6 的读取侧体现）。
+    """
+    rt = get_runtime(request)
+    if not known_module(rt, module):
+        raise HTTPException(status_code=404, detail=f"unknown module {module!r}")
+    if "planner" not in rt.modules:
+        raise HTTPException(status_code=503, detail="planner 模块未启用，无计划状态可读")
+    await _thread_owner_or_404(rt, module, thread_id, user_id)
+    planner_graph = rt.graph("planner")
+    config: RunnableConfig = {"configurable": {"thread_id": f"{module}:{thread_id}"}}
+    snapshot = await planner_graph.aget_state(config)
+    values = (snapshot.values or {}) if snapshot else {}
+    return {
+        "thread_id": thread_id,
+        "module": module,
+        "tasks": values.get("tasks") or [],
+        "cursor": values.get("cursor") or 0,
+        "replans": values.get("replans") or 0,
+    }
+
+
 @router.delete("/{module}/threads/{thread_id}")
 async def delete_thread(
     module: str, thread_id: str, request: Request, user_id: str = Depends(get_current_user)
