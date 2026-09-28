@@ -662,13 +662,13 @@ async def test_browse_lists_all_statuses_with_expired_flag(tmp_path: Path) -> No
         assert all(m["status"] == "active" for m in found["memories"])
 
 
-async def test_search_knowledge_degraded_relaxes_min_score() -> None:
+async def test_search_knowledge_degraded_relaxes_min_score(tmp_path: Path) -> None:
     """降级关键词路径（无 embedding）：门槛放宽一半，关键词命中不被清零。
 
     回归（T3.1 验收发现）：知识库检索未随 search 一起放宽门槛，无
     embedding 时混合分天花板 ~0.45 < 0.5，Tier 0 端点静默返回空。
     """
-    store = await SqliteMemoryStore.create(str(Path(__file__).parent / "_tmp_kb_degraded.db"))
+    store = await SqliteMemoryStore.create(str(tmp_path / "kb_degraded.db"))
     service = MemoryService(store=store, embedder=NullEmbedding(), settings=_settings())
     try:
         count = await service.ingest_document(
