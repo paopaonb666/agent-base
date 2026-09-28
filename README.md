@@ -258,14 +258,18 @@ embedding 模型后 `python scripts/memory_backfill_embeddings.py` 同时
 回填记忆与知识库分块的向量。
 
 **身份与安全（S1/P0-5）**：身份解析只有一条路径——可插拔的 `AuthBackend`
-（默认 `HmacHeaderAuth`：`X-User-Id` 头 + 可选 `X-User-Sig` HMAC 校验），
+（默认 `HmacHeaderAuth`：`X-User-Id` 头 + `X-User-Sig` HMAC 校验），
 `create_app(auth_backend=...)` 可替换为网关层的真实身份体系。生产环境
 （`ENV=production`）且记忆开启时**必须**配置 `MEMORY_AUTH_SECRET`，所有
-用户作用域请求需附带 `X-User-Sig = HMAC-SHA256(X-User-Id, secret)`（缺省
-用户也不例外），否则 401；签名生成：
+用户作用域请求需附带
+`X-User-Sig = HMAC-SHA256(user_id\ntimestamp\nnonce, secret)`（时间戳为
+unix 秒、nonce 可选但同窗口内不可重复），否则 401；签名生成：
 `python scripts/memory_user_sig.py --user-id alice --secret <密钥>`。
-浏览器不持有密钥——公网多用户部署请走服务端代理或真实身份体系。
-已知局限：HMAC 签名只覆盖 user_id、无时间戳/nonce，截获的请求头可重放。
+防重放：时间戳须落在 `MEMORY_AUTH_REPLAY_WINDOW_SECONDS`（默认 300s）
+内，带 nonce 的请求在窗口期内重放即 401；窗口设 0 退回仅覆盖 user_id
+的旧方案（不推荐）。浏览器不持有密钥——公网多用户部署请走服务端代理
+或真实身份体系。已知局限：nonce 重放缓存为单进程口径（多 worker 需
+网关侧防重放）。
 
 **会话线程作用域（S1）**：invoke 时把线程属主写入 `thread_index` 表
 （存储跟随 `CHECKPOINTER_BACKEND`，alembic 0008；`MEMORY_ENABLED=false`

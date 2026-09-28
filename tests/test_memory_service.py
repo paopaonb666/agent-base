@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import httpx
@@ -251,11 +252,25 @@ async def test_memory_blocks_profile_audit_endpoints() -> None:
 # ─────────────────────── 记忆身份鉴权（P0 安全加固） ───────────────────────
 
 
-def _user_sig(user_id: str, secret: str) -> str:
+def _auth_headers(
+    user_id: str, secret: str, *, timestamp: str | None = None, nonce: str | None = None
+) -> dict[str, str]:
+    """按当前签名方案生成一组可用的鉴权头（默认新鲜时间戳 + 随机 nonce）。"""
     import hashlib
     import hmac as hmac_mod
+    import time as time_mod
+    import uuid
 
-    return hmac_mod.new(secret.encode("utf-8"), user_id.encode("utf-8"), hashlib.sha256).hexdigest()
+    ts = timestamp if timestamp is not None else str(int(time_mod.time()))
+    nc = nonce if nonce is not None else uuid.uuid4().hex
+    message = f"{user_id}\n{ts}\n{nc}"
+    sig = hmac_mod.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+    return {
+        "X-User-Id": user_id,
+        "X-User-Timestamp": ts,
+        "X-User-Nonce": nc,
+        "X-User-Sig": sig,
+    }
 
 
 def test_memory_user_sig_enforced_when_secret_configured() -> None:
@@ -271,14 +286,55 @@ def test_memory_user_sig_enforced_when_secret_configured() -> None:
         )
         assert bad.status_code == 401
         # 正确签名 → 200，且作用域隔离仍然生效。
-        good = c.get(
-            "/v1/memory",
-            headers={"X-User-Id": "alice", "X-User-Sig": _user_sig("alice", "s3cret-key")},
-        )
+        good = c.get("/v1/memory", headers=_auth_headers("alice", "s3cret-key"))
         assert good.status_code == 200
         # default 用户用自己的签名也能通过。
-        default_ok = c.get("/v1/memory", headers={"X-User-Sig": _user_sig("default", "s3cret-key")})
+        default_ok = c.get("/v1/memory", headers=_auth_headers("default", "s3cret-key"))
         assert default_ok.status_code == 200
+
+
+def test_memory_user_sig_replay_protection() -> None:
+    """防重放（C2）：时间窗外的请求与窗内重放的 nonce 都被拒绝。"""
+    client = _client(memory_auth_secret="s3cret-key")
+    with client as c:
+        # 缺时间戳 → 401（默认 MEMORY_AUTH_REPLAY_WINDOW_SECONDS=300）。
+        assert (
+            c.get("/v1/memory", headers={"X-User-Id": "alice", "X-User-Sig": "0" * 64}).status_code
+            == 401
+        )
+        # 过期时间戳（窗口外）→ 401。
+        stale = _auth_headers("alice", "s3cret-key", timestamp=str(int(time.time()) - 3600))
+        assert c.get("/v1/memory", headers=stale).status_code == 401
+        # 旧方案签名（仅覆盖 user_id）在时间窗开启时不再有效 → 401。
+        import hashlib
+        import hmac as hmac_mod
+
+        old_scheme = hmac_mod.new(b"s3cret-key", b"alice", hashlib.sha256).hexdigest()
+        assert (
+            c.get(
+                "/v1/memory",
+                headers={"X-User-Id": "alice", "X-User-Sig": old_scheme},
+            ).status_code
+            == 401
+        )
+        # 同一 nonce 重放 → 第二次 401。
+        headers = _auth_headers("alice", "s3cret-key", nonce="fixed-nonce-1")
+        assert c.get("/v1/memory", headers=headers).status_code == 200
+        assert c.get("/v1/memory", headers=headers).status_code == 401
+        # 换 nonce 的新鲜请求照常通过。
+        assert c.get("/v1/memory", headers=_auth_headers("alice", "s3cret-key")).status_code == 200
+
+
+def test_memory_user_sig_replay_window_zero_keeps_legacy_scheme() -> None:
+    """逃生门：窗口设 0 退回仅覆盖 user_id 的旧签名方案。"""
+    import hashlib
+    import hmac as hmac_mod
+
+    client = _client(memory_auth_secret="s3cret-key", memory_auth_replay_window_seconds=0)
+    with client as c:
+        sig = hmac_mod.new(b"s3cret-key", b"alice", hashlib.sha256).hexdigest()
+        ok = c.get("/v1/memory", headers={"X-User-Id": "alice", "X-User-Sig": sig})
+        assert ok.status_code == 200
 
 
 def test_memory_user_sig_applies_to_invoke_scope() -> None:
@@ -294,7 +350,7 @@ def test_memory_user_sig_applies_to_invoke_scope() -> None:
         allowed = c.post(
             "/v1/agents/chat/invoke",
             json={"message": "hi"},
-            headers={"X-User-Id": "alice", "X-User-Sig": _user_sig("alice", "s3cret-key")},
+            headers=_auth_headers("alice", "s3cret-key"),
         )
         assert allowed.status_code == 200
         assert "done" in allowed.text

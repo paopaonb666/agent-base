@@ -359,10 +359,14 @@ class MemorySettings(BaseModel):
     # 两次的稳定流量，不是每 token。
     mysql_pool_size: int = 5
     # 记忆身份鉴权（安全加固 P0）：配置了密钥后，所有带记忆作用域的
-    # 请求必须附带 ``X-User-Sig = HMAC-SHA256(X-User-Id, secret)``，
-    # 否则 401。留空时 development 接受裸 X-User-Id；production 且
-    # memory_enabled 时强制要求配置（快速失败）。
+    # 请求必须附带 ``X-User-Sig = HMAC-SHA256(user_id\ntimestamp\nnonce,
+    # secret)``（nonce 可选），否则 401。时间窗（秒）外的请求与窗内
+    # 重放的 nonce 都被拒绝；0 = 退回仅覆盖 user_id 的旧签名方案
+    # （不推荐：截获的请求头可无限期重放）。留空时 development 接受
+    # 裸 X-User-Id；production 且 memory_enabled 时强制要求配置（快速
+    # 失败）。
     auth_secret: SecretStr = SecretStr("")
+    auth_replay_window_seconds: int = 300
 
     @field_validator("pipeline_profile")
     @classmethod
@@ -433,6 +437,13 @@ class MemorySettings(BaseModel):
     def _validate_trigger_intervals(cls, value: int, info: ValidationInfo) -> int:
         if value < 1:
             raise ValueError(f"{info.field_name} must be >= 1, got {value}")
+        return value
+
+    @field_validator("auth_replay_window_seconds")
+    @classmethod
+    def _validate_replay_window(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError(f"memory_auth_replay_window_seconds must be >= 0, got {value}")
         return value
 
     @field_validator("episodic_ttl_days")
@@ -855,7 +866,8 @@ class Settings(BaseSettings):
             raise SettingsError(
                 "MEMORY_AUTH_SECRET is required in production when MEMORY_ENABLED=true: "
                 "memory isolation is enforced via signed X-User-Id "
-                "(clients must send X-User-Sig = HMAC-SHA256(X-User-Id, secret))"
+                "(clients must send X-User-Sig = HMAC-SHA256("
+                "user_id\\ntimestamp\\nnonce, secret))"
             )
         if self.checkpointer.backend == "mysql":
             missing = [
