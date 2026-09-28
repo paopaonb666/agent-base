@@ -1,7 +1,7 @@
 # === Security hard rule: dev docs MUST NOT enter this repo ===
 # Workspace policy (user-mandated, 2026-09-04):
-#   All development / planning / review documents live in D:\job-learn
-#   (a non-git working area). They MUST NOT be tracked here. The
+#   All development / planning / review documents live in a non-git
+#   working area outside this repository. They MUST NOT be tracked here. The
 #   patterns below are defensive: even if such a file is accidentally
 #   copied into the tree, it will be silently excluded from tracking.
 #   Never bypass with `git add -f` on these — a leak of pre-publication

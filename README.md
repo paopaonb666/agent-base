@@ -369,7 +369,7 @@ checkpointer——线程历史跨档连续。
 
 ```bash
 python scripts/memory_nightly_capture.py            # force 旁路门控，批量抽取+整合
-python scripts/kb_ingest.py --dir D:/my/docs --module chat --user-id alice --watch
+python scripts/kb_ingest.py --dir path/to/docs --module chat --user-id alice --watch
 ```
 
 `kb_ingest.py` 把本地目录（递归，pdf/docx/txt/md）批量摄取进知识库：
@@ -414,7 +414,7 @@ python -m alembic stamp head
 
 ## 配合前端 agent-base-ui
 
-配套 Web 界面在独立仓库 `agent-base-ui`（同级目录 / `e:\ai_study\agent-base-ui`）：
+配套 Web 界面在独立仓库 `agent-base-ui`（克隆到与本仓库同级即可）：
 
 ```bash
 # 1. 启动本后端（默认 8000 端口）

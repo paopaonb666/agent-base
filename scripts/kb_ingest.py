@@ -2,7 +2,7 @@
 
 用法::
 
-    python scripts/kb_ingest.py --dir D:/my/docs --module chat \
+    python scripts/kb_ingest.py --dir path/to/docs --module chat \
         --base-url http://localhost:8000 --user-id alice [--watch] [--interval 30]
 
 - 遍历目录（递归）下的 pdf/docx/txt/md，逐个 POST 到既有上传端点
