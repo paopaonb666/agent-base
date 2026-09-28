@@ -1,49 +1,53 @@
 """记忆服务门面（M6b 起）：入口层与模块只跟它说话。
 
-职责是把"存储 + 向量 + 检索"组装成一个语义清晰的对象，让 server 与
-模块代码不直接摆弄 store 的 SQL 细节：
+P0-2 拆分后的形态：门面持有四个子域服务并委托——
 
-- **写路径**（``add_memory`` / ``update_memory``）——内容落库前尽力
-  向量化（embedding 不可用就存纯文本，检索自动走关键词路径）；
-- **读路径**（``search`` / ``recall``）——混合检索（retrieval.py）；
-- **生命周期**（``aclose``）——释放 sqlite 连接与 httpx 客户端。
+- **记忆 CRUD + 检索**（本文件）——写路径（``add_memory`` /
+  ``update_memory``）内容落库前尽力向量化；读路径（``search``）走
+  混合检索（retrieval.py）；
+- **知识库**（``knowledge.py``）——文档分块摄取 / 混合检索 / 撤销；
+- **画像**（``profile.py``）——结构化用户画像的读写；
+- **失败安全写入**（``audit.py``）——操作审计与版本史的旁路写入。
 
-M6c 将在此基础上追加形成管线（``capture_turn``：抽取/整合/画像/摘要）；
-M6d 追加上下文组装（``compose_context``）。
+M6c 的形成管线编排（``capture_turn``）与 M6d 的上下文组装
+（``compose_context``）见 orchestrator.py（P0-2 拆分）。
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
 import time
-import uuid
-from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from agent_base.extensions.metrics import MEMORY_METRICS
-from agent_base.memory.context import (
-    compose_frozen_context,
-    compose_recall_context,
-)
+from agent_base.memory.audit import MemoryAudit, record_version_safe
 from agent_base.memory.embeddings import EmbeddingClient, NullEmbedding, build_embedding_client
-from agent_base.memory.pipeline import MemoryPipeline, render_transcript
-from agent_base.memory.retrieval import ScoredChunk, ScoredMemory, recall_memories, score_chunks
+from agent_base.memory.knowledge import KnowledgeService
+from agent_base.memory.orchestrator import (
+    CaptureLockRegistry,
+    ContextSnapshotCache,
+    MemoryOrchestrator,
+)
+from agent_base.memory.pipeline import MemoryPipeline
+from agent_base.memory.profile import ProfileService
+from agent_base.memory.retrieval import (
+    ScoredChunk,
+    ScoredMemory,
+    recall_memories,
+    weights_from_settings,
+)
 from agent_base.memory.store import (
     KNOWN_MEMORY_KINDS,
     KNOWN_MEMORY_STATUSES,
-    DocChunk,
-    MemoryOp,
     MemoryRecord,
     MemoryStore,
     MemoryStoreError,
     MemoryVersion,
     build_memory_store,
     encode_embedding,
-    profile_memory_id,
+    new_memory_id,
 )
 from agent_base.memory.textkit import (  # noqa: F401  # re-export（历史 API 路径）
     ChunkSpan,
@@ -56,11 +60,6 @@ if TYPE_CHECKING:  # pragma: no cover - import avoided at runtime
     from agent_base.core.config import Settings
 
 logger = logging.getLogger(__name__)
-
-
-def new_memory_id() -> str:
-    """新生成的记忆 id（uuid hex 截断，与 file_id 同风格）。"""
-    return uuid.uuid4().hex[:32]
 
 
 class MemoryService:
@@ -78,17 +77,28 @@ class MemoryService:
         self.embedder = embedder
         self._settings = settings
         self._llm = llm
+        # 失败安全旁路写入（审计 + 版本史）。
+        self._audit = MemoryAudit(store)
+        # 子域服务（P0-2）：门面公开方法签名不变，内部委托。
+        self.knowledge = KnowledgeService(store, embedder, settings.memory, self._audit)
+        self.profile = ProfileService(store, settings.memory)
         # 形成管线（M6c）：仅在拿到对话模型时可用；测试与禁用场景下为 None。
         # fast_llm 是快档侧（组合根装配的限流回退包装），管线内部分派。
         self.pipeline: MemoryPipeline | None = (
             MemoryPipeline(llm, settings, self, fast_llm=fast_llm) if llm is not None else None
         )
-        # 每用户的整合锁（锐评 #10）：同一用户并发轮次的后台捕获会互相
-        # 看不到对方未写入的记忆，导致重复 ADD——串行化同一用户的捕获。
-        self._capture_locks: dict[str, asyncio.Lock] = {}
-        # 注入快照缓存（成本治理 T2.1）：键 (user_id, agent_id, thread_id)，
-        # LRU 逐出。单进程口径（与 /metrics 同款局限，多 worker 不保证）。
-        self._context_snapshots: OrderedDict[tuple[str, str, str], str] = OrderedDict()
+        # 编排层（P0-2）：捕获锁与注入快照缓存从对象实例迁出为独立组件。
+        self._locks = CaptureLockRegistry()
+        self._snapshots = ContextSnapshotCache()
+        self.orchestrator = MemoryOrchestrator(
+            store=store,
+            settings=settings.memory,
+            pipeline=lambda: self.pipeline,
+            profile=self.profile,
+            search=self.search,
+            locks=self._locks,
+            snapshots=self._snapshots,
+        )
 
     async def record_op(
         self,
@@ -103,24 +113,16 @@ class MemoryService:
         duration_ms: int = 0,
     ) -> None:
         """写一条操作审计（成功与失败都记录）；审计失败只记日志。"""
-        try:
-            await self.store.record_op(
-                MemoryOp(
-                    op_id=uuid.uuid4().hex[:32],
-                    op=op,
-                    user_id=user_id,
-                    agent_id=agent_id,
-                    thread_id=thread_id,
-                    # default=str：审计 detail 是诊断信息而非契约数据，
-                    # 序列化不了的对象降级为字符串表示，绝不让审计失败。
-                    detail=detail or {},
-                    status=status,
-                    error_text=error_text,
-                    duration_ms=duration_ms,
-                )
-            )
-        except Exception:
-            logger.warning("memory: 审计写入失败", exc_info=True)
+        await self._audit.record(
+            op=op,
+            user_id=user_id,
+            agent_id=agent_id,
+            thread_id=thread_id,
+            detail=detail,
+            status=status,
+            error_text=error_text,
+            duration_ms=duration_ms,
+        )
 
     # -- 写路径 -----------------------------------------------------------------
     async def _embed_one(self, text: str) -> list[float] | None:
@@ -259,10 +261,7 @@ class MemoryService:
     # -- 版本史（锐评 #7） ---------------------------------------------------------
     async def _record_version_safe(self, version: MemoryVersion) -> None:
         """版本史写入失败绝不影响主写入路径（与审计同语义）。"""
-        try:
-            await self.store.record_version(version)
-        except Exception:
-            logger.warning("memory: 版本史写入失败", exc_info=True)
+        await record_version_safe(self.store, version)
 
     async def list_versions(self, memory_id: str, limit: int = 50) -> list[MemoryVersion]:
         return await self.store.list_versions(memory_id, limit)
@@ -344,7 +343,7 @@ class MemoryService:
         MEMORY_METRICS.observe("search", "ok", time.perf_counter() - started)
         return results
 
-    # -- 知识库（M6e）：文档分块摄取与检索 ------------------------------------
+    # -- 知识库（M6e）：委托 knowledge.py ---------------------------------------
     async def ingest_document(
         self,
         *,
@@ -360,125 +359,31 @@ class MemoryService:
         日志。分块是用户级知识资产（``thread_id`` 仅作出处标注）——
         删除线程不回收分块，知识独立于会话存活。
         """
-        if not text.strip():
-            return 0
-        started = time.perf_counter()
-        try:
-            parts = chunk_text(
-                text,
-                chunk_chars=self._settings.memory.doc_chunk_chars,
-                overlap=self._settings.memory.doc_chunk_overlap,
-            )
-            # 幂等：同一 file_id 重复摄取（重试/重解析场景）先清旧分块，
-            # 防止 chunk_id 随机生成导致的重复堆积。
-            await self.store.delete_chunks_for_file(file_id)
-            vectors = await self.embedder.embed([span.text for span in parts])
-            chunks = [
-                DocChunk(
-                    chunk_id=new_memory_id(),
-                    file_id=file_id,
-                    thread_id=thread_id,
-                    user_id=user_id,
-                    agent_id=agent_id,
-                    ordinal=ordinal,
-                    text=span.text,
-                    offsets=span.segments,
-                    embedding=encode_embedding(vectors[ordinal]) if vectors is not None else None,
-                    embedding_dim=self.embedder.dims if vectors is not None else None,
-                )
-                for ordinal, span in enumerate(parts)
-            ]
-            await self.store.put_chunks(chunks)
-            duration_ms = int((time.perf_counter() - started) * 1000)
-            MEMORY_METRICS.observe("ingest", "ok", time.perf_counter() - started)
-            await self.record_op(
-                op="ingest",
-                user_id=user_id,
-                agent_id=agent_id,
-                thread_id=thread_id,
-                duration_ms=duration_ms,
-                detail={"file_id": file_id, "chunks": len(chunks)},
-            )
-            return len(chunks)
-        except Exception as exc:
-            logger.warning("memory: 文档摄取失败（不影响上传）：%s", exc)
-            MEMORY_METRICS.observe("ingest", "error", time.perf_counter() - started)
-            await self.record_op(
-                op="ingest",
-                user_id=user_id,
-                agent_id=agent_id,
-                thread_id=thread_id,
-                status="error",
-                error_text=f"{type(exc).__name__}: {exc}"[:300],
-                duration_ms=int((time.perf_counter() - started) * 1000),
-                detail={"file_id": file_id},
-            )
-            return 0
+        return await self.knowledge.ingest_document(
+            file_id=file_id,
+            user_id=user_id,
+            agent_id=agent_id,
+            text=text,
+            thread_id=thread_id,
+        )
 
     async def search_knowledge(
         self, *, user_id: str, agent_id: str | None, query: str, top_k: int | None = None
     ) -> list[ScoredChunk]:
         """知识库混合检索（向量 + BM25 + 时间衰减）。"""
-        chunks = await self.store.list_chunks(user_id, agent_id=agent_id)
-        if len(chunks) >= 2000:
-            # 容量契约（H2）：同召回候选——静默截断会让"检索质量莫名
-            # 下降"，这里显式告警。
-            logger.warning(
-                "memory: 知识库候选分块达到上限 2000（user=%r）——更早的文件不参与本轮检索",
-                user_id,
-            )
-        if not chunks:
-            return []
-        vectors = await self.embedder.embed([query])
-        query_embedding = vectors[0] if vectors else None
-        scored = score_chunks(
-            chunks,
-            query,
-            query_embedding,
-            now=time.time(),
-            half_life_days=self._settings.memory.time_decay_half_life_days,
-            weights=self._hybrid_weights(),
+        return await self.knowledge.search_knowledge(
+            user_id=user_id, agent_id=agent_id, query=query, top_k=top_k
         )
-        scored.sort(key=lambda item: item.score, reverse=True)
-        min_score = self._settings.memory.recall_min_score
-        if isinstance(self.embedder, NullEmbedding) and min_score > 0:
-            # 降级关键词路径与 search 同规则：混合分缺向量主力分量，硬门槛
-            # 会把关键词命中整体清零（天花板 ~0.45 < 0.5，Tier 3.1 验收
-            # 发现）——放宽一半，宁可多给弱序结果也不静默丢命中。
-            min_score = min_score / 2
-        if min_score > 0:
-
-            def _has_evidence(item: ScoredChunk) -> bool:
-                return (
-                    item.components.get("keyword", 0.0) > 0
-                    or item.components.get("vector", 0.0) > 0
-                )
-
-            scored = [item for item in scored if item.score >= min_score and _has_evidence(item)]
-        return scored[: max(1, top_k or self._settings.memory.recall_top_k)]
 
     def _hybrid_weights(self) -> dict[str, float]:
-        """从 settings 读混合权重（锐评 #4：可配置化，默认与 M6b 一致）。"""
-        return {
-            "vector": self._settings.memory.weight_vector,
-            "keyword": self._settings.memory.weight_keyword,
-            "recency": self._settings.memory.weight_recency,
-            "salience": self._settings.memory.weight_salience,
-        }
+        """从 settings 读混合权重（retrieval.weights_from_settings 的门面侧读取）。"""
+        return weights_from_settings(self._settings.memory)
 
     async def revoke_document(self, *, file_id: str, user_id: str) -> int:
         """撤销一份文档的知识库分块（用户级知识资产的显式收回路径，
         修复"传错文件无法撤回"的边界：DELETE /v1/agents/{module}/files/{id}）。
         """
-        started = time.perf_counter()
-        deleted = await self.store.delete_chunks_for_file(file_id)
-        MEMORY_METRICS.observe("revoke", "ok", time.perf_counter() - started)
-        await self.record_op(
-            op="revoke",
-            user_id=user_id,
-            detail={"file_id": file_id, "chunks": deleted},
-        )
-        return deleted
+        return await self.knowledge.revoke_document(file_id=file_id, user_id=user_id)
 
     # -- 生命周期 -----------------------------------------------------------------
     async def health_probe(self) -> str:
@@ -553,59 +458,20 @@ class MemoryService:
         logger.info("memory: 向量回填完成，共 %s 条（含知识库分块）", total)
         return total
 
-    # -- 用户画像（M6c；memories 表里的确定性记录） -------------------------------
+    # -- 用户画像（M6c）：委托 profile.py ----------------------------------------
     async def get_profile(self, user_id: str) -> dict[str, Any] | None:
         """读取结构化用户画像（JSON dict）；不存在或畸形返回 None。"""
-        record = await self.store.get_memory(profile_memory_id(user_id))
-        if record is None:
-            return None
-        try:
-            parsed = json.loads(record.content)
-        except ValueError:
-            return None
-        return parsed if isinstance(parsed, dict) else None
+        return await self.profile.get_profile(user_id)
 
     async def save_profile(self, user_id: str, profile: dict[str, Any]) -> None:
         """整包保存用户画像（管线合并后的完整 JSON）。
 
         画像不需要向量——它由上下文组装整体注入而不是按相似度召回，
         跳过 embedding 省一次 API 调用；检索侧已按 id 前缀排除画像。
-        保存前做结构级硬截断（锐评漏项）：prompt 里的"600 字以内"只是
-        软约束，这里保证序列化长度不超过 MEMORY_PROFILE_MAX_CHARS，
-        防止画像随对话缓慢膨胀注入预算。
         """
-        memory_id = profile_memory_id(user_id)
-        existing = await self.store.get_memory(memory_id)
-        now = time.time()
-        profile = _trim_profile_to_chars(profile, self._settings.memory.profile_max_chars)
-        await self.store.upsert_memory(
-            MemoryRecord(
-                memory_id=memory_id,
-                user_id=user_id,
-                agent_id="*",
-                kind="semantic",
-                content=json.dumps(profile, ensure_ascii=False),
-                tags=["profile"],
-                salience=1.0,
-                source_refs=["profile"],
-                created_at=existing.created_at if existing else now,
-                updated_at=now,
-                last_accessed_at=existing.last_accessed_at if existing else None,
-                access_count=existing.access_count if existing else 0,
-            )
-        )
-        await self._record_version_safe(
-            MemoryVersion(
-                version_id=new_memory_id(),
-                memory_id=memory_id,
-                user_id=user_id,
-                op="update" if existing else "create",
-                content=json.dumps(profile, ensure_ascii=False),
-                previous_content=existing.content if existing else "",
-            )
-        )
+        await self.profile.save_profile(user_id, profile)
 
-    # -- 形成管线编排（M6c） ------------------------------------------------------
+    # -- 形成管线编排（M6c）：委托 orchestrator.py -------------------------------
     async def capture_turn(
         self,
         *,
@@ -617,98 +483,37 @@ class MemoryService:
     ) -> dict[str, Any] | None:
         """一轮对话结束后的记忆形成（后台调用；绝不抛异常）。
 
-        ``messages`` 是该线程的全部持久化消息（来自 checkpointer 快照）：
-        转写渲染、轮次计数与触发阈值都在这里统一处理。``force=True``
-        旁路 ``MEMORY_CAPTURE_ENABLED`` 门控（夜间批脚本 T3.2）。
+        ``messages`` 是该线程的全部持久化消息（来自 checkpointer 快照）；
+        ``force=True`` 旁路 ``MEMORY_CAPTURE_ENABLED`` 门控（夜间批脚本）。
         """
-        if self.pipeline is None:
-            return None
-        human_count = sum(1 for m in messages if getattr(m, "type", "") == "human")
-        transcript = render_transcript(
-            messages[-self._settings.memory.extraction_max_messages :],
-            self._settings.memory.extraction_max_input_chars,
+        return await self.orchestrator.capture_turn(
+            user_id=user_id,
+            agent_id=agent_id,
+            thread_id=thread_id,
+            messages=messages,
+            force=force,
         )
-        if not transcript.strip():
-            return None
-        lock = self._capture_locks.setdefault(user_id, asyncio.Lock())
-        async with lock:
-            try:
-                return await self.pipeline.capture_turn(
-                    user_id=user_id,
-                    agent_id=agent_id,
-                    thread_id=thread_id,
-                    transcript=transcript,
-                    human_count=human_count,
-                    force=force,
-                )
-            except Exception:
-                # 管线内部已逐步失败安全；这里兜底防任何漏网异常干扰调用方。
-                logger.exception("memory: capture_turn 意外失败")
-                return None
 
     async def compose_context(
         self, *, user_id: str, agent_id: str, thread_id: str, query: str
     ) -> str | None:
         """线程级**冻结**注入段（M6d + T2.1）：画像 + 记忆块 + 会话摘要。
 
-        快照在线程首轮定型并缓存（LRU 上限 ``context_snapshot_max``）：
-        同线程后续调用返回逐字节相同的内容，即使画像/记忆块/摘要中途
-        已更新——供应商前缀缓存按最长公共前缀命中，冻结头部是输入缓存
-        的地基；数据变更在**下个会话**进入注入（接受的行为权衡，见
-        ``compose_frozen_context``）。``purge_thread`` 会级联清理。
-
-        逐轮变化的查询相关召回走 ``recall_context``（贴尾注入）。
-        任何一步失败都降级为"缺那一节"；整体无内容时返回 None。
+        同线程返回逐字节相同的缓存内容（供应商前缀缓存的地基）；逐轮
+        变化的查询相关召回走 ``recall_context``。任何一步失败都降级为
+        "缺那一节"；整体无内容时返回 None。
         """
-        key = (user_id, agent_id, thread_id)
-        cached = self._context_snapshots.get(key)
-        if cached is not None:
-            self._context_snapshots.move_to_end(key)
-            return cached
-        try:
-            global_blocks = await self.store.list_blocks(user_id, "*")
-            agent_blocks = await self.store.list_blocks(user_id, agent_id)
-            profile = (
-                await self.get_profile(user_id) if self._settings.memory.profile_enabled else None
-            )
-            summary_record = await self.store.get_summary(user_id, thread_id)
-            frozen = compose_frozen_context(
-                profile=profile,
-                blocks=[*global_blocks, *agent_blocks],
-                summary=summary_record.summary if summary_record else None,
-                max_chars=self._settings.memory.context_max_chars,
-            )
-        except Exception:
-            logger.warning("memory: 冻结注入段组装失败（本轮不注入）", exc_info=True)
-            return None
-        if frozen is not None:
-            self._context_snapshots[key] = frozen
-            while len(self._context_snapshots) > self._settings.memory.context_snapshot_max:
-                self._context_snapshots.popitem(last=False)
-        return frozen
+        return await self.orchestrator.compose_context(
+            user_id=user_id, agent_id=agent_id, thread_id=thread_id, query=query
+        )
 
     async def recall_context(self, *, user_id: str, query: str) -> str | None:
-        """本轮**召回**注入段（M6d + T2.1）：按查询召回的相关记忆。
-
-        用户级召回（与 memory_search 工具同契约：跨模块可见）。逐轮
-        变化，由 server 紧贴本轮 human 注入——尾部变化只牺牲自身之后
-        的缓存，不动冻结头部与历史体。失败降级为 None。
-        """
-        try:
-            recalled = await self.search(user_id=user_id, agent_id=None, query=query)
-            return compose_recall_context(
-                recalled=recalled,
-                max_chars=self._settings.memory.context_max_chars,
-            )
-        except Exception:
-            logger.warning("memory: 召回注入段组装失败（本轮不注入召回）", exc_info=True)
-            return None
+        """本轮**召回**注入段（M6d + T2.1）：按查询召回的相关记忆。"""
+        return await self.orchestrator.recall_context(user_id=user_id, query=query)
 
     async def purge_thread(self, thread_id: str) -> None:
         """线程删除的级联清理（滚动摘要 + 知识库分块 + 注入快照；跨会话记忆保留）。"""
-        await self.store.delete_for_thread(thread_id)
-        for key in [k for k in self._context_snapshots if k[2] == thread_id]:
-            self._context_snapshots.pop(key, None)
+        await self.orchestrator.purge_thread(thread_id)
 
     async def aclose(self) -> None:
         closer = getattr(self.store, "aclose", None)

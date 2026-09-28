@@ -22,14 +22,28 @@ import time
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from agent_base.memory.store import PROFILE_ID_PREFIX, DocChunk, MemoryRecord, decode_embedding
+
+if TYPE_CHECKING:  # pragma: no cover - import avoided at runtime
+    from agent_base.core.config import MemorySettings
 
 # 召回候选集上限（H2 容量契约）：与 store.list_memories 的默认上限一致。
 _CANDIDATE_LIMIT = 2000
 
 logger = logging.getLogger(__name__)
+
+
+def weights_from_settings(settings: MemorySettings) -> dict[str, float]:
+    """从 MemorySettings 节读混合检索权重（锐评 #4：可配置化，默认与 M6b 一致）。"""
+    return {
+        "vector": settings.weight_vector,
+        "keyword": settings.weight_keyword,
+        "recency": settings.weight_recency,
+        "salience": settings.weight_salience,
+    }
+
 
 # 混合权重默认值（和为 1）。向量是语义召回的主力，BM25 兜关键词，
 # 时间与显著度做轻量排序先验。M6 加固后可经 MEMORY_WEIGHT_* 配置覆盖

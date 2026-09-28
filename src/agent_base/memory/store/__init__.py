@@ -26,6 +26,7 @@ from agent_base.memory.store.models import (
     ThreadIndex,
     decode_embedding,
     encode_embedding,
+    new_memory_id,
     profile_memory_id,
 )
 from agent_base.memory.store.mysql_backend import MysqlMemoryStore
@@ -86,5 +87,6 @@ __all__ = [
     "build_memory_store",
     "decode_embedding",
     "encode_embedding",
+    "new_memory_id",
     "profile_memory_id",
 ]

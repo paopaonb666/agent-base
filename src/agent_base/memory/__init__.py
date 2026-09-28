@@ -13,7 +13,9 @@ mysql），同一套表结构在三条后端上语义一致。
 - ``pipeline``   —— 记忆形成：抽取/整合/画像/滚动摘要（M6c）
 - ``context``    —— 上下文组装与短期压缩（M6d）
 - ``tools``      —— agent 可调用的记忆工具（M6e）
-- ``service``    —— 对入口层与模块暴露的门面（M6c 起）
+- ``service``    —— 对入口层与模块暴露的门面（M6c 起；P0-2 拆分后为
+  CRUD+检索本体，知识库/画像/编排分别委托 knowledge / profile /
+  orchestrator 子域服务，审计与版本史的失败安全写入在 audit）
 """
 
 from agent_base.memory.embeddings import (
@@ -23,6 +25,13 @@ from agent_base.memory.embeddings import (
     OpenAICompatibleEmbedding,
     build_embedding_client,
 )
+from agent_base.memory.knowledge import KnowledgeService
+from agent_base.memory.orchestrator import (
+    CaptureLockRegistry,
+    ContextSnapshotCache,
+    MemoryOrchestrator,
+)
+from agent_base.memory.profile import ProfileService
 from agent_base.memory.retrieval import (
     ScoredChunk,
     ScoredMemory,
@@ -31,6 +40,7 @@ from agent_base.memory.retrieval import (
     score_chunks,
     score_memories,
     tokenize,
+    weights_from_settings,
 )
 from agent_base.memory.service import (
     MemoryService,
@@ -60,12 +70,16 @@ from agent_base.memory.store import (
 __all__ = [
     "KNOWN_MEMORY_KINDS",
     "KNOWN_MEMORY_STATUSES",
+    "CaptureLockRegistry",
+    "ContextSnapshotCache",
     "DocChunk",
     "EmbeddingClient",
     "EmbeddingError",
+    "KnowledgeService",
     "MemoryBlock",
     "MemoryMemoryStore",
     "MemoryOp",
+    "MemoryOrchestrator",
     "MemoryRecord",
     "MemoryService",
     "MemoryStore",
@@ -74,6 +88,7 @@ __all__ = [
     "MysqlMemoryStore",
     "NullEmbedding",
     "OpenAICompatibleEmbedding",
+    "ProfileService",
     "ScoredChunk",
     "ScoredMemory",
     "SessionSummary",
@@ -90,4 +105,5 @@ __all__ = [
     "score_chunks",
     "score_memories",
     "tokenize",
+    "weights_from_settings",
 ]

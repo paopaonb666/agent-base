@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sys
 import time
+import uuid
 from array import array
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -23,6 +24,11 @@ KNOWN_MEMORY_STATUSES: tuple[str, ...] = ("active", "superseded", "archived")
 # tags=["profile"]），以 id 前缀与普通记忆区分——检索时被排除（画像由
 # 上下文组装单独注入），管理端点里可见可删。
 PROFILE_ID_PREFIX = "profile:"
+
+
+def new_memory_id() -> str:
+    """新生成的记忆 id（uuid hex 截断，与 file_id 同风格）。"""
+    return uuid.uuid4().hex[:32]
 
 
 def profile_memory_id(user_id: str) -> str:
