@@ -104,15 +104,17 @@ python -m venv .venv
 .venv\Scripts\activate         # Windows（Linux/macOS: source .venv/bin/activate）
 pip install -e ".[dev,doc]"    # [doc] 提供 DOCX 解析；缺它时该格式优雅降级
 cp .env.example .env           # 填入 LLM_API_KEY（阶段 1 起由 config.py 消费）
-pytest                         # 覆盖率门（≥85%）依赖 MySQL 集成测试（见下）
+pytest                         # 核心集（默认排除 integration 标记，无需 MySQL，见下）
 ```
 
-> **测试与覆盖率门**：memory/mysql57 的集成测试在探测到可用的 MySQL 时
-> 自动启用——连接参数经 `MYSQL_HOST / MYSQL_PORT / MYSQL_USER /
-> MYSQL_PASSWORD` 环境变量传入（默认 `root` / 空密码连 `127.0.0.1:3306`）。
-> CI 在 test job 里挂了一个 MySQL 5.7 服务容器。本地没有 MySQL 时这些
-> 测试会被跳过，总覆盖率会跌破 85% 门槛（`pytest` 因此失败）——这是
-> 预期行为，起一个 MySQL 或接受本地红灯即可。
+> **测试与覆盖率门**：pytest 默认跑**核心集**（`pyproject.toml` addopts
+> 含 `-m "not integration"`），覆盖率门（branch ≥85%）按核心集计算——
+> 本地无 MySQL 也全绿。MySQL 集成测试带 `@pytest.mark.integration`
+> 标记，仅在两处运行：CI 的 test job（挂 MySQL 5.7 服务容器，
+> `-m "integration or not integration"` 跑全量）与本机显式指定同名
+> marker 且连接可用时——连接参数经 `MYSQL_HOST / MYSQL_PORT /
+> MYSQL_USER / MYSQL_PASSWORD` 环境变量传入（探测失败自动 skip）。
+> CI 另有跨平台 test-core job 背书"Windows 可用 / Python ≥3.10"。
 
 ### 配置说明（.env）
 
