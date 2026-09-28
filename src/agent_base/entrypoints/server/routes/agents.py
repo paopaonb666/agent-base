@@ -12,15 +12,16 @@ import base64
 import time
 from dataclasses import replace
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Path, Request
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
 from agent_base.core.bootstrap import UnknownModuleError
+from agent_base.core.threads import ThreadId
 from agent_base.entrypoints.server.deps import (
     get_current_user,
     get_runtime,
@@ -42,6 +43,11 @@ router = APIRouter(prefix="/v1/agents", tags=["agents"])
 _THREAD_LIST_SCAN_LIMIT = 2000
 _THREAD_LIST_TOTAL_LIMIT = 20_000
 _THREAD_LIST_LIMIT = 50
+
+# 路径参数形态的 thread_id：与 InvokeRequest.thread_id 同一约束
+# （ThreadId 构造会拒绝含分隔符的 raw——非法形态在这里以 422 先行拒绝，
+# 而不是落到 500）。
+_ThreadPathParam = Annotated[str, Path(max_length=128, pattern=r"^[\w.-]+$")]
 
 
 class InvokeRequest(BaseModel):
@@ -84,7 +90,7 @@ async def _thread_owner_or_404(rt: Any, module: str, thread_id: str, user_id: st
     index = rt.thread_index
     if index is None:
         return
-    entry = await index.get_thread_index(f"{module}:{thread_id}")
+    entry = await index.get_thread_index(str(ThreadId(module=module, raw=thread_id)))
     if entry is None or entry.user_id != user_id:
         raise HTTPException(status_code=404, detail=f"线程不存在：{thread_id}")
 
@@ -128,7 +134,7 @@ async def invoke(module: str, body: InvokeRequest, request: Request) -> Streamin
     # 按模块划分的 thread id：图共用一个 checkpointer；未划分命名空间
     # 的 id 会把它们的状态混在一起。user_id（M6）进 configurable：
     # 记忆工具经 RunnableConfig 注入读取（M6e）。
-    full_thread_id = f"{module}:{user_thread_id}"
+    full_thread_id = str(ThreadId(module=module, raw=user_thread_id))
     config: RunnableConfig = {
         "recursion_limit": rt.settings.agent_recursion_limit,
         "configurable": {"thread_id": full_thread_id, "user_id": user_id},
@@ -255,12 +261,16 @@ async def list_threads(
     index = rt.thread_index
     if index is not None:
         entries = await index.list_thread_index(user_id, module=module, limit=_THREAD_LIST_LIMIT)
+
+        def _user_part(thread_id: str) -> str:
+            # 索引行总是命名空间形态；异常行（历史数据）整串回退。
+            parsed = ThreadId.try_parse(thread_id)
+            return parsed.raw if parsed is not None else thread_id
+
         return {
             "threads": [
                 {
-                    "thread_id": entry.thread_id.split(":", 1)[1]
-                    if ":" in entry.thread_id
-                    else entry.thread_id,
+                    "thread_id": _user_part(entry.thread_id),
                     "module": entry.module or module,
                     "title": entry.title or entry.thread_id,
                     "updated_at": int(entry.updated_at * 1000),
@@ -315,14 +325,19 @@ async def list_threads(
 
 @router.get("/{module}/threads/{thread_id}")
 async def get_thread_history(
-    module: str, thread_id: str, request: Request, user_id: str = Depends(get_current_user)
+    module: str,
+    thread_id: _ThreadPathParam,
+    request: Request,
+    user_id: str = Depends(get_current_user),
 ) -> dict[str, Any]:
     """返回某会话已持久化的消息历史（供前端恢复会话显示）。"""
     rt = get_runtime(request)
     graph = _graph_or_404(rt, module)
     await _thread_owner_or_404(rt, module, thread_id, user_id)
     # thread id 按模块划分命名空间，与 invoke 端点保持一致。
-    config: RunnableConfig = {"configurable": {"thread_id": f"{module}:{thread_id}"}}
+    config: RunnableConfig = {
+        "configurable": {"thread_id": str(ThreadId(module=module, raw=thread_id))}
+    }
     snapshot = await graph.aget_state(config)
     raw_messages = (snapshot.values or {}).get("messages", []) if snapshot else []
     messages = [
@@ -336,7 +351,7 @@ async def get_thread_history(
 @router.get("/{module}/threads/{thread_id}/tool-calls")
 async def list_tool_calls(
     module: str,
-    thread_id: str,
+    thread_id: _ThreadPathParam,
     request: Request,
     user_id: str = Depends(get_current_user),
     limit: int = 100,
@@ -349,13 +364,18 @@ async def list_tool_calls(
     recorder = rt.tool_recorder
     if recorder is None:
         return {"tool_calls": []}
-    records = await recorder.list_for_thread(f"{module}:{thread_id}", limit=max(1, min(limit, 500)))
+    records = await recorder.list_for_thread(
+        str(ThreadId(module=module, raw=thread_id)), limit=max(1, min(limit, 500))
+    )
     return {"tool_calls": records}
 
 
 @router.get("/{module}/threads/{thread_id}/plan")
 async def get_thread_plan(
-    module: str, thread_id: str, request: Request, user_id: str = Depends(get_current_user)
+    module: str,
+    thread_id: _ThreadPathParam,
+    request: Request,
+    user_id: str = Depends(get_current_user),
 ) -> dict[str, Any]:
     """只读计划状态（M9）。
 
@@ -372,7 +392,9 @@ async def get_thread_plan(
         raise HTTPException(status_code=503, detail="planner 模块未启用，无计划状态可读")
     await _thread_owner_or_404(rt, module, thread_id, user_id)
     planner_graph = rt.graph("planner")
-    config: RunnableConfig = {"configurable": {"thread_id": f"{module}:{thread_id}"}}
+    config: RunnableConfig = {
+        "configurable": {"thread_id": str(ThreadId(module=module, raw=thread_id))}
+    }
     snapshot = await planner_graph.aget_state(config)
     values = (snapshot.values or {}) if snapshot else {}
     return {
@@ -386,7 +408,10 @@ async def get_thread_plan(
 
 @router.delete("/{module}/threads/{thread_id}")
 async def delete_thread(
-    module: str, thread_id: str, request: Request, user_id: str = Depends(get_current_user)
+    module: str,
+    thread_id: _ThreadPathParam,
+    request: Request,
+    user_id: str = Depends(get_current_user),
 ) -> dict[str, Any]:
     """删除某模块命名空间下的一个已持久化线程（仅属主）。"""
     rt = get_runtime(request)
@@ -397,7 +422,7 @@ async def delete_thread(
         return {"deleted": False, "reason": "checkpointer unconfigured"}
     # adelete_thread 接收原始 thread_id 字符串；与 invoke/get 一致地
     # 使用 module:thread_id 命名空间。
-    full_thread_id = f"{module}:{thread_id}"
+    full_thread_id = str(ThreadId(module=module, raw=thread_id))
     await rt.checkpointer.adelete_thread(full_thread_id)
     if rt.file_store is not None:
         await rt.file_store.delete_for_thread(full_thread_id)

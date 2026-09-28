@@ -29,6 +29,7 @@ from langchain_core.tools import BaseTool
 from langgraph.config import get_config
 
 from agent_base.core.contracts import AgentModule
+from agent_base.core.threads import ThreadId
 from agent_base.extensions.metrics import TOOL_METRICS
 from agent_base.extensions.observability import get_request_id
 from agent_base.extensions.toollog import (
@@ -81,15 +82,17 @@ def _execution_context() -> tuple[str, str]:
     """读取当前图执行的 (thread_id, module)；不在图上下文时留空。
 
     thread_id 命名空间是 ``{module}:{user_thread_id}``（server/CLI 统一
-    规则），module 前缀据此拆出；直调工具（单测、CLI ad-hoc）没有该
-    上下文，记录照常产生，只是这两个字段为空。
+    规则，值对象见 ``core.threads.ThreadId``），module 前缀据此拆出；
+    直调工具（单测、CLI ad-hoc）没有该上下文，记录照常产生，只是这
+    两个字段为空。
     """
     try:
         configurable = get_config().get("configurable") or {}
         thread_id = str(configurable.get("thread_id") or "")
     except Exception:
         return "", ""
-    module = thread_id.split(":", 1)[0] if ":" in thread_id else ""
+    parsed = ThreadId.try_parse(thread_id)
+    module = parsed.module if parsed is not None else ""
     return thread_id, module
 
 

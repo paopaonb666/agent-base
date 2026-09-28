@@ -16,6 +16,7 @@ from typing import Any
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 
+from agent_base.core.threads import ThreadId
 from agent_base.entrypoints.server.background import spawn_background
 from agent_base.entrypoints.server.serializers import _extract_text
 from agent_base.extensions.events import (
@@ -116,7 +117,7 @@ def _build_capture_hook(
             await memory.capture_turn(
                 user_id=user_id,
                 agent_id=module,
-                thread_id=f"{module}:{user_thread_id}",
+                thread_id=str(ThreadId(module=module, raw=user_thread_id)),
                 messages=messages,
             )
         except Exception:

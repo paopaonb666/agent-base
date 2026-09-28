@@ -28,6 +28,7 @@ from typing import Any
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field
 
+from agent_base.core.threads import ThreadId
 from agent_base.memory.service import MemoryService
 from agent_base.memory.store import MemoryBlock
 
@@ -49,13 +50,15 @@ def set_memory_scope(user_id: str, thread_id: str) -> None:
 def _scope() -> tuple[str, str, str]:
     """读取作用域 → (user_id, agent_id, full_thread_id)。
 
-    agent_id 从带模块前缀的 thread id（``chat:xxx``）解析；拿不到时
-    回退 ``default`` / ``*``（CLI、手工 invoke 工具等场景）。
+    agent_id 从带模块前缀的 thread id（``chat:xxx``，值对象见
+    ``core.threads.ThreadId``）解析；拿不到时回退 ``default`` / ``*``
+    （CLI、手工 invoke 工具等场景）。
     """
     scope = _memory_scope.get() or {}
     user_id = scope.get("user_id") or "default"
     thread_id = scope.get("thread_id") or ""
-    agent_id = thread_id.split(":", 1)[0] if ":" in thread_id else "*"
+    parsed = ThreadId.try_parse(thread_id)
+    agent_id = parsed.module if parsed is not None else "*"
     return user_id, agent_id, thread_id
 
 
