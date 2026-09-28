@@ -74,6 +74,10 @@ docs/
 *.sqlite3
 *.log
 gui-test-screenshots/
+.extreme-fixtures/
+
+# ZCode workspace file-watch rules (auto-synced FROM .gitignore by the tool)
+.zcodeignore
 
 # OS
 .DS_Store
