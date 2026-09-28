@@ -100,3 +100,68 @@ async def test_empty_output_gate_triggers_replan() -> None:
     result = await graph.ainvoke({"messages": [("human", "做 A")]}, {"configurable": {}})
     assert result["replans"] == 1
     assert result["messages"][-1].content == "最终答复"
+
+
+# ─────────────────────── 计划快照旁路持久化（M10） ───────────────────────
+
+
+class _CapturePlanStore:
+    """捕获 save_plan 调用的测试替身。"""
+
+    def __init__(self) -> None:
+        self.saves: list[dict[str, Any]] = []
+
+    async def save_plan(self, **kwargs: Any) -> None:
+        self.saves.append(kwargs)
+
+    async def get_plan(self, thread_id: str) -> dict[str, Any] | None:
+        return None
+
+    async def delete_plan(self, thread_id: str) -> None:
+        return None
+
+
+async def test_plan_snapshots_persisted_at_mutations() -> None:
+    """拆解/推进/完成都落表：快照含 module 与最新任务状态。"""
+    model = ScriptedChatModel(
+        [
+            _plan('[{"id": 1, "goal": "A"}, {"id": 2, "goal": "B"}]'),
+            AIMessage(content="A 的结果"),
+            AIMessage(content="B 的结果"),
+            AIMessage(content="综合答复"),
+        ]
+    )
+    store = _CapturePlanStore()
+    ctx = ModuleContext(
+        settings=Settings(llm_api_key="k", memory_enabled=False),
+        llm=model,
+        checkpointer=None,
+        tools=[],
+        plan_store=store,
+    )
+    graph = build_planner_graph(ctx)
+    result = await graph.ainvoke(
+        {"messages": [("human", "做 A 和 B")]}, {"configurable": {"thread_id": "chat:t9"}}
+    )
+    assert result["replans"] == 0
+    assert store.saves, "planner 应在状态变更点写快照"
+    first = store.saves[0]
+    assert first["thread_id"] == "chat:t9" and first["module"] == "chat"
+    assert all(t["status"] == "pending" for t in first["tasks"])
+    last = store.saves[-1]
+    assert all(t["status"] == "done" for t in last["tasks"])
+    assert last["cursor"] == 2
+
+
+async def test_plan_snapshots_absent_store_is_noop() -> None:
+    """plan_store 缺席（存储不可用）退化为只写图状态，行为不变。"""
+    model = ScriptedChatModel(
+        [
+            _plan('[{"id": 1, "goal": "A"}]'),
+            AIMessage(content="A 的结果"),
+            AIMessage(content="综合答复"),
+        ]
+    )
+    graph = build_planner_graph(_ctx(model))
+    result = await graph.ainvoke({"messages": [("human", "做 A")]}, {"configurable": {}})
+    assert [t["status"] for t in result["tasks"]] == ["done"]

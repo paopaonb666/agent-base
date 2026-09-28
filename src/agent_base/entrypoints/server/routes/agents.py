@@ -377,13 +377,14 @@ async def get_thread_plan(
     request: Request,
     user_id: str = Depends(get_current_user),
 ) -> dict[str, Any]:
-    """只读计划状态（M9）。
+    """只读计划状态（M9；M10 起读快照表）。
 
-    plan 状态存在 planner 图的通道里，但线程命名空间属于请求模块
-    （决策 5：invoke 的 thread 永远是 ``{module}:{thread_id}``）——
-    读取必须经 **planner 图** 做 ``aget_state``（chat 图的通道表里没有
-    tasks，用它读会丢字段）。线程从未跑过 plan 时返回空默认值
-    （决策 6 的读取侧体现）。
+    plan 快照存在 ``plan_snapshots`` 表（planner 图每个状态变更点
+    upsert）——**chat 轮穿插不再重置计划**（chat 图的 checkpoint 只含
+    messages 通道，但表独立于图状态存活）。线程命名空间属于请求模块
+    （决策 5：invoke 的 thread 永远是 ``{module}:{thread_id}``）。表缺席
+    （存储后端不可用）时回退读 planner 图状态；线程从未跑过 plan 时
+    返回空默认值。
     """
     rt = get_runtime(request)
     if not known_module(rt, module):
@@ -391,10 +392,19 @@ async def get_thread_plan(
     if "planner" not in rt.modules:
         raise HTTPException(status_code=503, detail="planner 模块未启用，无计划状态可读")
     await _thread_owner_or_404(rt, module, thread_id, user_id)
+    full_thread_id = str(ThreadId(module=module, raw=thread_id))
+    if rt.plan_store is not None:
+        stored = await rt.plan_store.get_plan(full_thread_id)
+        if stored is not None:
+            return {
+                "thread_id": thread_id,
+                "module": stored.get("module") or module,
+                "tasks": stored.get("tasks") or [],
+                "cursor": int(stored.get("cursor") or 0),
+                "replans": int(stored.get("replans") or 0),
+            }
     planner_graph = rt.graph("planner")
-    config: RunnableConfig = {
-        "configurable": {"thread_id": str(ThreadId(module=module, raw=thread_id))}
-    }
+    config: RunnableConfig = {"configurable": {"thread_id": full_thread_id}}
     snapshot = await planner_graph.aget_state(config)
     values = (snapshot.values or {}) if snapshot else {}
     return {
@@ -428,8 +438,10 @@ async def delete_thread(
         await rt.file_store.delete_for_thread(full_thread_id)
     if rt.thread_index is not None:
         # 索引行随线程消亡（store.delete_for_thread 也会清，这里显式
-        # 覆盖 memory 未启用、purge_thread 不可用的部署形态）。
+        # 覆盖 memory 未启用、purge_thread 不可用的部署形态）；计划
+        # 快照同属线程作用域数据面（M10）。
         await rt.thread_index.delete_thread_index(full_thread_id)
+        await rt.thread_index.delete_plan(full_thread_id)
     memory = memory_or_none(rt)
     if memory is not None:
         # 记忆级联（M6）：清该线程的滚动摘要与知识库分块；跨会话

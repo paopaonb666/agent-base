@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from collections.abc import Sequence
 from dataclasses import replace
+from typing import Any
 
 from agent_base.memory.store.models import (
     KNOWN_MEMORY_KINDS,
@@ -34,6 +35,7 @@ class MemoryMemoryStore:
         self._ops: list[tuple[MemoryOp, int]] = []
         self._versions: list[tuple[MemoryVersion, int]] = []
         self._op_counter = 0
+        self._plans: dict[str, dict[str, Any]] = {}
 
     async def upsert_memory(self, record: MemoryRecord) -> None:
         if record.kind not in KNOWN_MEMORY_KINDS:
@@ -180,6 +182,7 @@ class MemoryMemoryStore:
             if summary.thread_id != thread_id
         }
         self._threads.pop(thread_id, None)
+        self._plans.pop(thread_id, None)
 
     async def record_op(self, op: MemoryOp) -> None:
         self._op_counter += 1
@@ -235,3 +238,30 @@ class MemoryMemoryStore:
 
     async def delete_thread_index(self, thread_id: str) -> None:
         self._threads.pop(thread_id, None)
+
+    # -- 计划快照（plan_snapshots；M10 跨轮延续） --------------------------------
+
+    async def save_plan(
+        self,
+        *,
+        thread_id: str,
+        module: str,
+        tasks: list[dict[str, Any]],
+        cursor: int,
+        replans: int,
+    ) -> None:
+        self._plans[thread_id] = {
+            "thread_id": thread_id,
+            "module": module,
+            "tasks": [dict(task) for task in tasks],
+            "cursor": int(cursor),
+            "replans": int(replans),
+            "updated_at": time.time(),
+        }
+
+    async def get_plan(self, thread_id: str) -> dict[str, Any] | None:
+        snapshot = self._plans.get(thread_id)
+        return dict(snapshot) if snapshot is not None else None
+
+    async def delete_plan(self, thread_id: str) -> None:
+        self._plans.pop(thread_id, None)

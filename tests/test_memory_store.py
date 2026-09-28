@@ -435,3 +435,46 @@ async def test_versions_semantics_sqlite(tmp_path: Path) -> None:
         await _check_versions_semantics(store)
     finally:
         await store.aclose()
+
+
+# ─────────────────────── 计划快照（M10 跨轮延续） ───────────────────────
+
+
+async def _check_plan_semantics(store: MemoryMemoryStore | SqliteMemoryStore) -> None:
+    """save/get/delete 的三后端一致语义。"""
+    tasks = [{"id": 1, "goal": "查天气", "status": "done", "summary": "晴", "attempts": 1}]
+    await store.save_plan(thread_id="chat:t1", module="chat", tasks=tasks, cursor=1, replans=0)
+    stored = await store.get_plan("chat:t1")
+    assert stored is not None
+    assert stored["module"] == "chat"
+    assert stored["tasks"] == tasks
+    assert stored["cursor"] == 1 and stored["replans"] == 0
+    # 覆盖式 upsert：同一线程只保留最新快照。
+    await store.save_plan(
+        thread_id="chat:t1",
+        module="chat",
+        tasks=[*tasks, {"id": 2, "goal": "B"}],
+        cursor=2,
+        replans=1,
+    )
+    stored2 = await store.get_plan("chat:t1")
+    assert stored2 is not None and len(stored2["tasks"]) == 2 and stored2["replans"] == 1
+    # 未知线程 → None；删除后 → None；线程级联也清理。
+    assert await store.get_plan("chat:ghost") is None
+    await store.delete_plan("chat:t1")
+    assert await store.get_plan("chat:t1") is None
+    await store.save_plan(thread_id="chat:t2", module="chat", tasks=tasks, cursor=0, replans=0)
+    await store.delete_for_thread("chat:t2")
+    assert await store.get_plan("chat:t2") is None
+
+
+async def test_plan_semantics_in_memory() -> None:
+    await _check_plan_semantics(MemoryMemoryStore())
+
+
+async def test_plan_semantics_sqlite(tmp_path: Path) -> None:
+    store = await SqliteMemoryStore.create(str(tmp_path / "plan.db"))
+    try:
+        await _check_plan_semantics(store)
+    finally:
+        await store.aclose()

@@ -94,3 +94,44 @@ def test_plan_endpoint_empty_defaults_for_unplanned_thread() -> None:
         "cursor": 0,
         "replans": 0,
     }
+
+
+# ─────────────────────── 快照表：chat 穿插不再重置（M10） ───────────────────────
+
+
+def test_plan_endpoint_reads_table_after_chat_interleaving() -> None:
+    """chat 轮穿插（checkpoint 只含 messages 通道）后，端点仍返回表里的计划。"""
+    from agent_base.memory.store import MemoryMemoryStore
+
+    rt = _runtime(
+        ScriptedChatModel(
+            [
+                AIMessage(content='[{"id": 1, "goal": "A"}]'),
+                AIMessage(content="A 完成"),
+                AIMessage(content="综合完毕"),
+                AIMessage(content="闲聊回复"),
+            ]
+        )
+    )
+    rt.plan_store = MemoryMemoryStore()
+    _seed_plan(rt, "chat:t5")  # plan 轮：节点在每个变更点 upsert 快照
+
+    # chat 轮穿插：同一线程跑 chat 图，checkpoint 被仅含 messages 通道的
+    # 状态覆盖——旧实现里 plan 检查端点从此读不到 tasks（M10 的修复对象）。
+
+    async def chat_turn() -> None:
+        await rt.graph("chat").ainvoke(
+            {"messages": [("human", "闲聊一下")]}, {"configurable": {"thread_id": "chat:t5"}}
+        )
+
+    import asyncio
+
+    asyncio.run(chat_turn())
+
+    with TestClient(create_app(runtime=rt)) as client:
+        response = client.get("/v1/agents/chat/threads/t5/plan")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["module"] == "chat" and body["thread_id"] == "t5"
+    assert body["tasks"] and body["tasks"][0]["goal"] == "A"
+    assert body["tasks"][0]["status"] == "done"

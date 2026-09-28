@@ -332,8 +332,10 @@ SSE 事件新增 `plan`（全量任务清单，前端整表替换）：
 
 已知限制：
 
-- **chat 轮穿插会重置 plan 状态**（chat 图的 checkpoint 只含 messages
-  通道）；跨轮 plan 延续若成为需求，升级路径是独立 plan 表（M10 候选）；
+- **跨轮 plan 延续（M10）**：计划快照已落独立表（`plan_snapshots`，
+  alembic 0009 / sqlite 运行时自举），planner 在拆解/推进/重规划/完成
+  各变更点 upsert，`GET …/plan` 端点读表——chat 轮穿插不再重置计划。
+  新的 plan 轮仍会按当轮目标重新拆解（延续执行旧计划属后续增量）；
 - 前端渲染 PlanEvent 属 agent-base-ui 仓库，本仓库只提供契约与端点；
 - planner 重度使用的最坏图步数约 34，超出默认
   `AGENT_RECURSION_LIMIT=25`——按需在 .env 调高。

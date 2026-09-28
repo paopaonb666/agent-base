@@ -23,6 +23,7 @@ from langchain_core.runnables import RunnableConfig
 from agent_base.core.context import build_model_input
 from agent_base.core.contracts import ModuleContext
 from agent_base.core.graphs import _stream_and_accumulate
+from agent_base.modules.planner.persist import persist_plan
 from agent_base.modules.planner.prompts import REPLAN_PROMPT, SYNTH_PROMPT
 from agent_base.modules.planner.state import PlanState, _cursor, _messages, _replans, _tasks
 from agent_base.modules.planner.streaming import emit_plan
@@ -49,6 +50,7 @@ def make_check_node(ctx: ModuleContext) -> NodeFn:
                     "summary": f"输出不足 {min_chars} 字",
                 }
         next_idx = next((i for i, t in enumerate(tasks) if t["status"] == "pending"), len(tasks))
+        await persist_plan(ctx, config, tasks=tasks, cursor=next_idx, replans=_replans(state))
         return {"tasks": tasks, "cursor": next_idx}
 
     return check_node
@@ -87,6 +89,7 @@ def make_replan_node(ctx: ModuleContext) -> NodeFn:
         new_tasks = _parse_tasks(raw, max_subtasks=max_subtasks, fallback_goal=fallback_goal)
         merged = [*done, *new_tasks][:max_subtasks]
         emit_plan(merged, "replanned", detail=f"重规划为 {len(merged)} 个子任务")
+        await persist_plan(ctx, config, tasks=merged, cursor=len(done), replans=_replans(state) + 1)
         return {"tasks": merged, "cursor": len(done), "replans": _replans(state) + 1}
 
     return replan_node
@@ -109,6 +112,13 @@ def make_synthesize_node(ctx: ModuleContext) -> NodeFn:
             ],
         )
         emit_plan(_tasks(state), "done")
+        await persist_plan(
+            ctx,
+            config,
+            tasks=_tasks(state),
+            cursor=_cursor(state),
+            replans=_replans(state),
+        )
         return {"messages": [final] if final is not None else []}
 
     return synthesize_node

@@ -16,6 +16,7 @@ from langchain_core.runnables import RunnableConfig
 
 from agent_base.core.context import content_text
 from agent_base.core.contracts import ModuleContext
+from agent_base.modules.planner.persist import persist_plan
 from agent_base.modules.planner.prompts import PLAN_PROMPT
 from agent_base.modules.planner.state import PlanState, Task, _messages
 from agent_base.modules.planner.streaming import emit_plan
@@ -53,6 +54,7 @@ def make_plan_node(ctx: ModuleContext) -> NodeFn:
             )
             tasks = _parse_tasks(retry, max_subtasks=max_subtasks, fallback_goal=goal)
         emit_plan(tasks, "created", detail=f"拆解出 {len(tasks)} 个子任务")
+        await persist_plan(ctx, config, tasks=tasks, cursor=0, replans=0)
         return {"tasks": tasks, "cursor": 0, "replans": 0}
 
     return plan_node

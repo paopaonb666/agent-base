@@ -483,10 +483,60 @@ class _SqlMemoryStoreBase:
     # -- 线程级联 --------------------------------------------------------------------
     async def delete_for_thread(self, thread_id: str) -> None:
         # memories 刻意不删：跨会话记忆独立于线程存活（出处仍在
-        # source_thread_id）；随线程消亡的是它的摘要、知识库分块与会话索引。
+        # source_thread_id）；随线程消亡的是它的摘要、知识库分块、会话
+        # 索引与计划快照。
         await self._execute("DELETE FROM doc_chunks WHERE thread_id = ?", (thread_id,))
         await self._execute("DELETE FROM session_summaries WHERE thread_id = ?", (thread_id,))
         await self._execute("DELETE FROM thread_index WHERE thread_id = ?", (thread_id,))
+        await self._execute("DELETE FROM plan_snapshots WHERE thread_id = ?", (thread_id,))
+
+    # -- 计划快照（plan_snapshots；M10 跨轮延续） ------------------------------------
+    async def save_plan(
+        self,
+        *,
+        thread_id: str,
+        module: str,
+        tasks: list[dict[str, Any]],
+        cursor: int,
+        replans: int,
+    ) -> None:
+        await self._execute(
+            self._replace_into(
+                "plan_snapshots",
+                ("thread_id", "module", "tasks_json", "cursor", "replans", "updated_at"),
+            ),
+            (
+                thread_id,
+                module,
+                json.dumps(tasks, ensure_ascii=False),
+                int(cursor),
+                int(replans),
+                self._to_sql_ts(time.time()),
+            ),
+        )
+
+    async def get_plan(self, thread_id: str) -> dict[str, Any] | None:
+        rows = await self._fetch_all(
+            "SELECT module, tasks_json, cursor, replans FROM plan_snapshots WHERE thread_id = ?",
+            (thread_id,),
+        )
+        if not rows:
+            return None
+        module, tasks_json, cursor, replans = rows[0]
+        try:
+            tasks = json.loads(tasks_json or "[]")
+        except ValueError:
+            tasks = []
+        return {
+            "thread_id": thread_id,
+            "module": str(module or ""),
+            "tasks": tasks if isinstance(tasks, list) else [],
+            "cursor": int(cursor or 0),
+            "replans": int(replans or 0),
+        }
+
+    async def delete_plan(self, thread_id: str) -> None:
+        await self._execute("DELETE FROM plan_snapshots WHERE thread_id = ?", (thread_id,))
 
     # -- 操作审计 --------------------------------------------------------------------
     async def record_op(self, op: MemoryOp) -> None:

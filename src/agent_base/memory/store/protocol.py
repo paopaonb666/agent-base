@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from agent_base.memory.store.models import (
     DocChunk,
@@ -142,6 +142,31 @@ class ThreadIndexRepo(Protocol):
     async def delete_thread_index(self, thread_id: str) -> None: ...
 
 
+@runtime_checkable
+class PlanRepo(Protocol):
+    """计划快照（plan_snapshots 表，M10 跨轮延续的数据面）。
+
+    planner 图在每个状态变更点（拆解/推进/重规划/完成）upsert 快照；
+    plan 检查端点读表而非图状态——chat 轮穿插不再重置计划（chat 图的
+    checkpoint 只含 messages 通道）。``tasks`` 是序列化好的任务清单
+    （``list[dict]``，后端自行 JSON 化）。
+    """
+
+    async def save_plan(
+        self,
+        *,
+        thread_id: str,
+        module: str,
+        tasks: list[dict[str, Any]],
+        cursor: int,
+        replans: int,
+    ) -> None: ...
+
+    async def get_plan(self, thread_id: str) -> dict[str, Any] | None: ...
+
+    async def delete_plan(self, thread_id: str) -> None: ...
+
+
 class MemoryStore(
     MemoryRepo,
     BlockRepo,
@@ -150,6 +175,7 @@ class MemoryStore(
     AuditRepo,
     VersionRepo,
     ThreadIndexRepo,
+    PlanRepo,
     Protocol,
 ):
     """完整存储接口：各聚合根 Repo 的组合（方法集与拆分前一致）。

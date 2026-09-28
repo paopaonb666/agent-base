@@ -239,3 +239,32 @@ _SQLITE_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_thread_index_user"
     " ON thread_index (user_id, module, updated_at)",
 )
+
+# 计划快照（M10 跨轮延续）：planner 图的状态变更点 upsert，plan 检查
+# 端点读表——chat 轮穿插（chat 图 checkpoint 只含 messages 通道）不再
+# 重置计划。tasks_json 是序列化后的任务清单。alembic 0009 与本节同步。
+_PLAN_SNAPSHOTS_SQLITE = """
+CREATE TABLE IF NOT EXISTS plan_snapshots (
+  thread_id VARCHAR(190) PRIMARY KEY,
+  module VARCHAR(64) NOT NULL DEFAULT '',
+  tasks_json TEXT NOT NULL DEFAULT '[]',
+  cursor INTEGER NOT NULL DEFAULT 0,
+  replans INTEGER NOT NULL DEFAULT 0,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+)
+"""
+
+_PLAN_SNAPSHOTS_MYSQL = """
+CREATE TABLE IF NOT EXISTS plan_snapshots (
+  thread_id VARCHAR(190) NOT NULL,
+  module VARCHAR(64) NOT NULL DEFAULT '',
+  tasks_json LONGTEXT NOT NULL,
+  cursor BIGINT NOT NULL DEFAULT 0,
+  replans BIGINT NOT NULL DEFAULT 0,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (thread_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+"""
+
+_SQLITE_DDLS = (*_SQLITE_DDLS, _PLAN_SNAPSHOTS_SQLITE)
+_MYSQL_DDLS = (*_MYSQL_DDLS, _PLAN_SNAPSHOTS_MYSQL)

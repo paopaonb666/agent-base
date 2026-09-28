@@ -53,6 +53,31 @@ class MemoryPort(Protocol):
     async def aclose(self) -> None: ...
 
 
+@runtime_checkable
+class PlanStorePort(Protocol):
+    """计划快照存储的最小端口（M10 跨轮延续，依赖倒置同 MemoryPort）。
+
+    planner 图在每个状态变更点 upsert 快照；plan 检查端点读表而非图
+    状态——chat 轮穿插（chat 图 checkpoint 只含 messages 通道）不再
+    重置计划。载荷刻意用 dict 进出：core 契约不 import 存储层的数据
+    类，实现在组合根替换时契约不动。
+    """
+
+    async def save_plan(
+        self,
+        *,
+        thread_id: str,
+        module: str,
+        tasks: list[dict[str, Any]],
+        cursor: int,
+        replans: int,
+    ) -> None: ...
+
+    async def get_plan(self, thread_id: str) -> dict[str, Any] | None: ...
+
+    async def delete_plan(self, thread_id: str) -> None: ...
+
+
 @dataclass
 class ModuleContext:
     """基座交给每个模块的运行时服务。
@@ -73,6 +98,9 @@ class ModuleContext:
     # 记忆服务端口（M6）：None = 未启用（MEMORY_ENABLED=false 或后端
     # 不可用）。模块按需取用；不关心记忆的模块可以完全忽略它。
     memory: MemoryPort | None = None
+    # 计划快照端口（M10）：None = 存储不可用（planner 退化为只写图
+    # 状态，跨轮延续不可用）。planner 之外的模块可以完全忽略它。
+    plan_store: PlanStorePort | None = None
 
 
 @runtime_checkable

@@ -75,6 +75,9 @@ class AgentRuntime:
     # 与 memory 服务独立——MEMORY_ENABLED=false 时仍提供线程属主数据面；
     # memory 启用时它就是 memory.store 同一实例（随 memory.aclose 关闭）。
     thread_index: MemoryStore | None = None
+    # 计划快照存储（M10）：plan_snapshots 表的后端（同 thread_index 的
+    # 数据面策略）；planner 图写入，plan 检查端点读取。
+    plan_store: MemoryStore | None = None
     _graphs: dict[str, Graph] = field(default_factory=dict, repr=False)
     _supervisor: Graph | None = field(default=None, repr=False)
     # 快档视图缓存（成本治理 T1.2）：profile -> 共享状态的运行时副本。
@@ -107,6 +110,7 @@ class AgentRuntime:
             file_store=self.file_store,
             memory=self.memory,
             thread_index=self.thread_index,
+            plan_store=self.plan_store,
         )
         self._profile_views[profile] = view
         return view
@@ -119,6 +123,7 @@ class AgentRuntime:
             checkpointer=self.checkpointer,
             tools=self.tools,
             memory=self.memory,
+            plan_store=self.plan_store,
         )
 
     def graph(self, module_name: str) -> Graph:
@@ -250,4 +255,5 @@ async def create_runtime(settings: Settings | None = None) -> AgentRuntime:
         file_store=file_store,
         memory=memory_service,
         thread_index=memory_store,
+        plan_store=memory_store,
     )
