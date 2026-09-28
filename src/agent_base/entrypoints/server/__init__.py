@@ -115,6 +115,7 @@ def create_app(
                 COST_METER,
                 CostGovernor,
                 MemoryCostLedger,
+                MysqlCostLedger,
                 SqliteCostLedger,
             )
 
@@ -122,14 +123,12 @@ def create_app(
             backend = rt.settings.checkpointer.backend
             if backend == "sqlite":
                 ledger = await SqliteCostLedger.create(rt.settings.checkpointer.sqlite_path)
+            elif backend == "mysql":
+                ledger = MysqlCostLedger(rt.settings)
             else:
-                # mysql 账本暂未接入：回退内存账本（重启清零，方向安全
-                # ——只会少记不会误熔断），表结构已随 sqlite DDL 预留。
+                # memory 后端零依赖不持久化：预算累计重启清零（方向安全
+                # ——只会少记不会误熔断）。
                 ledger = MemoryCostLedger()
-                if backend == "mysql":
-                    logging.getLogger(__name__).warning(
-                        "cost: mysql 账本暂未接入，预算累计在重启后清零（内存账本）"
-                    )
             # 重启恢复：账本按日聚合回放进预算累计（totals_by_day 返回 dict，
             # 直接遍历只会拿到 key——这里是 2026-09-20 修复的启动崩溃点：
             # 账本一旦有数据，进程重启即 ValueError）。

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,7 @@ from agent_base.extensions.costmeter import (
     COST_METER,
     CostMeterHandler,
     MemoryCostLedger,
+    MysqlCostLedger,
     SqliteCostLedger,
 )
 
@@ -489,3 +492,72 @@ def test_server_startup_recovers_seeded_sqlite_ledger(tmp_path: Path) -> None:
             assert COST_METER.month_total_cny() == pytest.approx(1.0)
     finally:
         COST_METER.reset()
+
+
+# ─────────────────────── MySQL 账本（integration） ───────────────────────
+
+
+@pytest.mark.integration
+async def test_mysql_ledger_roundtrip() -> None:
+    """MySQL 账本语义一致性（本机无 MySQL 时自动跳过）。
+
+    与 sqlite 账本同款验收：insert → totals_since / totals_by_day，
+    再验证"重启恢复"语义——新实例从同一库读回同样的按日聚合。
+    """
+    pytest.importorskip("aiomysql")
+    import os
+    import uuid
+
+    import aiomysql
+
+    host = os.environ.get("MYSQL_HOST", "127.0.0.1")
+    port = int(os.environ.get("MYSQL_PORT", "3306"))
+    user = os.environ.get("MYSQL_USER", "root")
+    password = os.environ.get("MYSQL_PASSWORD", "")
+
+    try:
+        conn = await aiomysql.connect(
+            host=host, port=port, user=user, password=password, autocommit=True
+        )
+    except Exception as exc:
+        pytest.skip(f"MySQL 不可用：{exc}")
+
+    db = f"agent_base_cost_test_{uuid.uuid4().hex[:8]}"
+    async with conn.cursor() as cur:
+        await cur.execute(f"CREATE DATABASE `{db}` CHARACTER SET utf8mb4")
+    conn.close()
+
+    settings = _settings(
+        checkpointer_backend="mysql",
+        checkpointer_mysql_host=host,
+        checkpointer_mysql_port=port,
+        checkpointer_mysql_user=user,
+        checkpointer_mysql_password=password,
+        checkpointer_mysql_database=db,
+    )
+    try:
+        ledger = MysqlCostLedger(settings)
+        meter = _fresh_meter(prices_json='{"m": {"input_miss": 2, "input_hit": 0, "output": 0}}')
+        handler = CostMeterHandler(model="m", profile="fast", meter=meter)
+        handler.on_llm_end(
+            _response({"input_tokens": 1_000_000, "output_tokens": 0, "total_tokens": 1_000_000})
+        )
+        await ledger.insert(meter.take_pending())
+        assert await ledger.totals_since(0.0) == pytest.approx(2.0)
+        assert await ledger.totals_since(_far_future_ts()) == 0.0
+
+        # "重启恢复"：新实例（新连接池）读回同一份按日聚合。
+        await ledger.aclose()
+        ledger2 = MysqlCostLedger(settings)
+        by_day = await ledger2.totals_by_day()
+        assert sum(by_day.values()) == pytest.approx(2.0)
+        today = datetime.fromtimestamp(time.time()).date().isoformat()
+        assert by_day.get(today, 0.0) == pytest.approx(2.0)
+        await ledger2.aclose()
+    finally:
+        conn = await aiomysql.connect(
+            host=host, port=port, user=user, password=password, autocommit=True
+        )
+        async with conn.cursor() as cur:
+            await cur.execute(f"DROP DATABASE IF EXISTS `{db}`")
+        conn.close()

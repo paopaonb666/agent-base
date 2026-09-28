@@ -10,10 +10,10 @@
 - **累计**（``CostMeter``）：进程内按日/月聚合 + 价目表计价
   （``COST_PRICES_JSON``，单位 元/百万 tokens；未知模型计 0 并告警
   一次）。同步更新，预算门（T4.2）读它不需要 await；
-- **账本**（``MemoryCostLedger`` / ``SqliteCostLedger``）：pending 行的
-  落库恢复面——进程重启后预算累计从账本恢复。MySQL 后端暂回退内存
-  账本（重启清零，方向安全：只会少记不会误熔断），表结构随 sqlite
-  DDL 预留。
+- **账本**（``MemoryCostLedger`` / ``SqliteCostLedger`` /
+  ``MysqlCostLedger``）：pending 行的落库恢复面——进程重启后预算
+  累计从账本恢复；后端跟随 ``CHECKPOINTER_BACKEND``（memory 后端
+  用内存账本，重启清零，方向安全：只会少记不会误熔断）。
 
 已知局限：单进程口径（与 /metrics 同款）；价目手工维护。
 """
@@ -26,17 +26,20 @@ import time
 from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from langchain_core.callbacks import BaseCallbackHandler
 
 from agent_base.extensions.metrics import COST_METRICS
 from agent_base.extensions.observability import get_request_id
 
+if TYPE_CHECKING:  # pragma: no cover - import avoided at runtime
+    from agent_base.core.config import Settings
+
 logger = logging.getLogger(__name__)
 
-# sqlite 账本 DDL（幂等自举）。MySQL 的同名表随 sqlite 形态预留，
-# mysql 后端的账本接入是后续任务（当前回退内存账本并告警）。
+# sqlite 账本 DDL（幂等自举）。MySQL 的同名表由 MysqlCostLedger 自建
+# （5.7 没有 CREATE INDEX IF NOT EXISTS，索引进 CREATE TABLE）。
 _COST_USAGE_DDL = """
 CREATE TABLE IF NOT EXISTS cost_usage (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,6 +54,21 @@ CREATE TABLE IF NOT EXISTS cost_usage (
 );
 """
 _COST_USAGE_INDEX_DDL = "CREATE INDEX IF NOT EXISTS idx_cost_usage_ts ON cost_usage (ts);"
+
+_COST_USAGE_MYSQL_DDL = """
+CREATE TABLE IF NOT EXISTS cost_usage (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    ts DOUBLE NOT NULL,
+    request_id VARCHAR(64) NOT NULL DEFAULT '',
+    model VARCHAR(128) NOT NULL,
+    profile VARCHAR(16) NOT NULL DEFAULT 'main',
+    prompt_tokens BIGINT NOT NULL DEFAULT 0,
+    completion_tokens BIGINT NOT NULL DEFAULT 0,
+    cache_read_tokens BIGINT NOT NULL DEFAULT 0,
+    cost_cny DOUBLE NOT NULL DEFAULT 0,
+    INDEX idx_cost_usage_ts (ts)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+"""
 
 
 @dataclass(frozen=True)
@@ -260,7 +278,7 @@ class CostLedger(Protocol):
 
 
 class MemoryCostLedger:
-    """内存账本（测试、memory 后端与 mysql 后端的回退形态）。"""
+    """内存账本（测试与 memory 后端：重启清零，方向安全——只会少记不会误熔断）。"""
 
     def __init__(self) -> None:
         self._rows: list[UsageRecord] = []
@@ -333,6 +351,93 @@ class SqliteCostLedger:
 
     async def aclose(self) -> None:
         await self._db.close()
+
+
+class MysqlCostLedger:
+    """MySQL 账本：aiomysql 连接池（跟随 ``CHECKPOINTER_MYSQL_*``）。
+
+    与 ``MysqlMemoryStore`` 同款形态：池在首次操作时惰性创建，
+    ``autocommit=True``（账本是低频批量写，无跨语句事务需求）。
+    日聚合用 ``FROM_UNIXTIME``（会话时区），与 sqlite 侧的
+    ``'localtime'`` 语义对齐。
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+        self._pool: Any = None
+        self._table_ready = False
+
+    async def _get_pool(self) -> Any:
+        if self._pool is None:
+            import aiomysql  # type: ignore[import-untyped]
+
+            s = self._settings.checkpointer
+            self._pool = await aiomysql.create_pool(
+                host=s.mysql_host,
+                port=s.mysql_port,
+                user=s.mysql_user,
+                password=s.mysql_password.get_secret_value(),
+                db=s.mysql_database,
+                minsize=1,
+                maxsize=2,
+                autocommit=True,
+            )
+        return self._pool
+
+    async def _ensure_table(self, cursor: Any) -> None:
+        if not self._table_ready:
+            await cursor.execute(_COST_USAGE_MYSQL_DDL)
+            self._table_ready = True
+
+    async def insert(self, rows: list[UsageRecord]) -> None:
+        if not rows:
+            return
+        pool = await self._get_pool()
+        async with pool.acquire() as conn, conn.cursor() as cur:
+            await self._ensure_table(cur)
+            await cur.executemany(
+                "INSERT INTO cost_usage (ts, request_id, model, profile, prompt_tokens,"
+                " completion_tokens, cache_read_tokens, cost_cny)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                [
+                    (
+                        r.ts,
+                        r.request_id,
+                        r.model,
+                        r.profile,
+                        r.prompt_tokens,
+                        r.completion_tokens,
+                        r.cache_read_tokens,
+                        r.cost_cny,
+                    )
+                    for r in rows
+                ],
+            )
+
+    async def totals_since(self, ts: float) -> float:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn, conn.cursor() as cur:
+            await self._ensure_table(cur)
+            await cur.execute(
+                "SELECT COALESCE(SUM(cost_cny), 0) FROM cost_usage WHERE ts >= %s", (ts,)
+            )
+            row = await cur.fetchone()
+            return float(row[0]) if row else 0.0
+
+    async def totals_by_day(self) -> dict[str, float]:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn, conn.cursor() as cur:
+            await self._ensure_table(cur)
+            await cur.execute(
+                "SELECT DATE_FORMAT(FROM_UNIXTIME(ts), '%Y-%m-%d'), SUM(cost_cny)"
+                " FROM cost_usage GROUP BY 1"
+            )
+            return {str(day): float(cost or 0.0) for day, cost in await cur.fetchall()}
+
+    async def aclose(self) -> None:
+        if self._pool is not None:
+            self._pool.close()
+            await self._pool.wait_closed()
 
 
 # 进程级单例：与 TOOL_METRICS 同理，全部模型客户端共享一份累计。
