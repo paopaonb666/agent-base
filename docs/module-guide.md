@@ -111,11 +111,13 @@ def get_tools() -> list[BaseTool]:
 
 ### 第 5 步：配置与测试
 
-启用模块（`AGENT_MODULES` 是唯一开关）：
+启用模块（`AGENT_MODULES` 是模块清单；模块不在基座自带包里时，还要把包前缀
+加进 `AGENT_MODULE_PACKAGES`，见下一节）：
 
 ```bash
 # .env
 AGENT_MODULES=chat,writer,hello
+AGENT_MODULE_PACKAGES=agent_base.modules   # 默认值；独立包追加在后面
 ```
 
 至少覆盖四类测试：
@@ -130,6 +132,50 @@ AGENT_MODULES=chat,writer,hello
 为外部依赖注入 fake（LLM、checkpointer、记忆端口），不要连真实服务；
 覆盖率门要求分支 ≥85%，纯声明型代码也要有装配路径测试。
 
+## 把模块发布成独立包
+
+模块不必住在基座仓库里。registry 按 `AGENT_MODULE_PACKAGES` 给出的导入前缀
+依次查找 `<包>.<模块名>`，所以一个独立发行包只要满足「导入路径以模块名结尾、
+`<模块名>/__init__.py` 暴露 `module`」就能被装配，基座无需改代码。
+
+```
+packages/acme-agent-modules/
+├── pyproject.toml          # name = "acme-agent-modules", 依赖 agent-base>=0.3,<0.4
+└── src/acme_modules/
+    └── report/
+        ├── __init__.py     # from .module import module; __all__ = ["module"]
+        ├── module.py
+        └── graph.py
+```
+
+消费方部署时登记包前缀：
+
+```bash
+# .env
+AGENT_MODULE_PACKAGES=agent_base.modules,acme_modules
+AGENT_MODULES=chat,report
+```
+
+规则：
+
+- 前缀按书写顺序尝试，**同名以靠前的包为准**（`agent_base.modules` 在前时，
+  基座自带的同名模块会遮住外部包，便于本地覆盖调试）；
+- 前缀必须是小写点分标识符（`^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$`），
+  否则装配期报 `invalid module package`；
+- 列表为空直接报 `no module packages configured`——不存在“隐式默认”之外的兜底；
+- 包内导入失败（不是包本身缺失）会以 `failed to import from '<前缀>'` 上报，
+  不会被静默跳过。
+
+测试独立包模块时把前缀传进去，不必改动全局配置：
+
+```python
+modules = load_modules(["report"], packages=["acme_modules"])
+assert list(modules) == ["report"]
+```
+
+发布这类包不需要基座配合发版：只要遵守 `AgentModule` 契约与本节规则，
+就可以独立版本化、独立进 CI。
+
 ## 接入检查清单
 
 - [ ] 包名 = 模块 `name`，匹配 `^[a-z][a-z0-9_]*$`，且不是 `supervisor`
@@ -138,7 +184,8 @@ AGENT_MODULES=chat,writer,hello
 - [ ] `build_graph` 用 `ctx.checkpointer` 编译、`name=<模块名>`
 - [ ] 需要模型时用 `ctx.llm`，不自行构造客户端
 - [ ] 工具名全局唯一；长任务遵守超时约定
-- [ ] `AGENT_MODULES` 默认值与部署 `.env` 均已登记
+- [ ] `AGENT_MODULES` 默认值与部署 `.env` 均已登记；模块在独立发行包里时，
+      包前缀同时登记到 `AGENT_MODULE_PACKAGES`
 - [ ] 契约 / registry / 图 / 完整装配四类测试通过
 - [ ] `ruff check`、`ruff format --check`、`mypy`、`pytest` 全绿
 
@@ -146,7 +193,8 @@ AGENT_MODULES=chat,writer,hello
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
-| 启动即 `unknown module 'x'` | 包不存在或名字拼错 | 确认 `src/agent_base/modules/x/` 存在 |
+| 启动即 `unknown module 'x'` | 所有 `AGENT_MODULE_PACKAGES` 里都没有这个包名 | 确认包已安装，且前缀已登记 |
+| `invalid module package 'X'` | 前缀不是小写点分标识符 | 改成 `acme_modules` 这类形式 |
 | `module 'x' does not expose a 'module' object` | `__init__.py` 没导出 `module` | 按第 2 步补上 |
 | `module loaded as 'x' but declares name 'y'` | 包名与 `name` 不一致 | 改 `name` 或改目录名 |
 | `duplicate tool name ...` | 与其它模块/工具库重名 | 给工具加模块前缀 |

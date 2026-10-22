@@ -1,6 +1,6 @@
 # 设计边界与质量门
 
-本文记录 agent-base 在 0.2.0 时点**明确接受的设计边界**。它们不是待办清单，
+本文记录 agent-base 在 0.3.0 时点**明确接受的设计边界**。它们不是待办清单，
 而是有意为之的取舍：每条都写明当前口径、触发条件与升级路径。发布前请连同
 `docs/adr/` 一起阅读。
 
@@ -98,23 +98,27 @@ CI 都依赖它）。**代价**：memory 后端下，重启后的预算判断会
 
 | 门 | 命令 | 通过标准 |
 | --- | --- | --- |
-| 静态检查 | `ruff check src tests examples` | All checks passed |
-| 格式 | `ruff format --check src tests examples` | 无待格式化文件 |
-| 类型 | `mypy` | Success: no issues found（strict，`files=["src"]`） |
-| 测试 | `pytest` | 全绿，分支覆盖率 ≥85% |
+| 静态检查 | `ruff check src tests examples packages` | All checks passed |
+| 格式 | `ruff format --check src tests examples packages` | 无待格式化文件 |
+| 类型 | `mypy` | Success: no issues found（strict；`files` 含基座与记忆包） |
+| 测试 | `pytest` | 全绿，双包口径分支覆盖率 ≥85%（`--cov=agent_base --cov=agent_base_memory`） |
 | 依赖审计 | `pip-audit --skip-editable` | 无未处理漏洞 |
 | 容器 | `docker compose config --quiet` | exit 0 |
 
 CI 矩阵：Python 3.10–3.13（lint 全跑，typecheck/test 覆盖两端版本），
-test 使用 `mysql:8.0` 服务容器，另有 ubuntu/windows 的 test-core 与
-docker 构建作业。质量门与运行时行为无关——它们只约束代码、依赖与打包。
+test 使用 `mysql:8.0` 服务容器；另有 ubuntu/windows 的 test-core、
+`pip-audit`、`memory-package`（构建记忆包 wheel 并断言
+`agent_base.memory` 只暴露 `service` / `routes` 两个入口）与 `docker`
+构建作业。质量门与运行时行为无关——它们只约束代码、依赖与打包。
 
-## 已记录的取舍（不在本轮修复）
+## 架构演进记录
 
-- **P1**：memory 子系统拆独立包，基座只留 `MemoryPort` 契约
-  （涉及 20+ 文件与 9 个迁移，需单独分支）。
-- **P2**：多 worker 外置（成本账本、nonce、metrics 聚合），
+- **P1（已完成，0.3.0）**：memory 子系统拆为独立发行包 `agent-base-memory`，
+  基座只留 `MemoryPort` / `MemoryServicePort` 契约与 `agent_base.memory`
+  entry point 装配点，模块可来自独立包（`AGENT_MODULE_PACKAGES`）。
+  决策与代价见 `docs/adr/003-split-memory-package.md`，落地清单见
+  `docs/memory-package-split.md`。
+- **P2（未做）**：多 worker 外置（成本账本、nonce、metrics 聚合），
   先完成 `docs/deployment.md` 的外置设计，再按需实现。
 
-以上两项属于架构演进，不阻塞 0.2.0 的开源发布；它们与 H2/H3 的升级路径
-是同一件事的不同阶段。
+P2 与 H2/H3 的升级路径是同一件事的不同阶段；它不阻塞开源发布。
