@@ -14,7 +14,7 @@ import logging
 import uuid
 from typing import Any
 
-from agent_base.memory.store import MemoryOp, MemoryStore, MemoryVersion
+from agent_base_memory.store import MemoryOp, MemoryStore, MemoryVersion
 
 logger = logging.getLogger(__name__)
 

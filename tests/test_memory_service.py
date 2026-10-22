@@ -13,9 +13,9 @@ from langgraph.checkpoint.memory import InMemorySaver
 from agent_base.core.bootstrap import AgentRuntime
 from agent_base.core.config import Settings
 from agent_base.entrypoints.server import create_app
-from agent_base.memory.embeddings import NullEmbedding
-from agent_base.memory.service import MemoryService, build_memory_service
-from agent_base.memory.store import MemoryStoreError, SqliteMemoryStore
+from agent_base_memory.embeddings import NullEmbedding
+from agent_base_memory.service import MemoryService, build_memory_service
+from agent_base_memory.store import MemoryStoreError, SqliteMemoryStore
 from fakes import HashEmbedding, ScriptedChatModel
 
 
@@ -119,7 +119,7 @@ def _runtime(**overrides: object) -> AgentRuntime:
         checkpointer=InMemorySaver(),
     )
     if rt.memory is not None or rt.settings.memory_enabled:
-        from agent_base.memory.store import MemoryMemoryStore
+        from agent_base_memory.store import MemoryMemoryStore
 
         rt.memory = MemoryService(
             store=MemoryMemoryStore(), embedder=HashEmbedding(), settings=rt.settings
@@ -371,7 +371,7 @@ async def test_backfill_embeddings_skips_profile_and_archived(tmp_path: Path) ->
     # 人造旧维度 + 无向量 + 画像 + 归档四种形态。
     from dataclasses import replace
 
-    from agent_base.memory.store import (
+    from agent_base_memory.store import (
         MemoryRecord,
         encode_embedding,
         profile_memory_id,
@@ -489,7 +489,7 @@ async def test_health_probe_degraded_when_embedding_down(tmp_path: Path) -> None
     """embedding 端点不可达 → health degraded（存储正常），而非 error。"""
     import httpx
 
-    from agent_base.memory.embeddings import OpenAICompatibleEmbedding
+    from agent_base_memory.embeddings import OpenAICompatibleEmbedding
 
     settings = _settings()
     store = await SqliteMemoryStore.create(str(tmp_path / "h.db"))
@@ -547,7 +547,7 @@ async def test_version_restore_validates_version(tmp_path: Path) -> None:
 
 async def test_profile_changes_are_versioned(tmp_path: Path) -> None:
     """画像演化也有版本史（save_profile 记 create/update）。"""
-    from agent_base.memory.store import profile_memory_id
+    from agent_base_memory.store import profile_memory_id
 
     service = await _sqlite_service(tmp_path)
     await service.save_profile("u", {"偏好": ["深色"]})
@@ -614,7 +614,7 @@ async def test_browse_list_excludes_profile_records(tmp_path: Path) -> None:
     service = await _sqlite_service(tmp_path)
     await service.add_memory(user_id="u", agent_id="chat", content="普通记忆")
     await service.save_profile("u", {"偏好": ["简洁回答"]})
-    from agent_base.memory.store import profile_memory_id
+    from agent_base_memory.store import profile_memory_id
 
     browsed = await service.list_memories("u")
     assert all(not r.memory_id.startswith("profile:") for r in browsed)
@@ -628,7 +628,7 @@ async def test_browse_list_excludes_profile_records(tmp_path: Path) -> None:
 
     from agent_base.core.bootstrap import AgentRuntime
     from agent_base.entrypoints.server import create_app
-    from agent_base.memory.store import MemoryMemoryStore
+    from agent_base_memory.store import MemoryMemoryStore
     from fakes import HashEmbedding, ScriptedChatModel
 
     rt = AgentRuntime(
@@ -659,7 +659,7 @@ async def test_browse_lists_all_statuses_with_expired_flag(tmp_path: Path) -> No
 
     from agent_base.core.bootstrap import AgentRuntime
     from agent_base.entrypoints.server import create_app
-    from agent_base.memory.store import MemoryMemoryStore
+    from agent_base_memory.store import MemoryMemoryStore
     from fakes import HashEmbedding, ScriptedChatModel
 
     rt = AgentRuntime(
@@ -681,7 +681,7 @@ async def test_browse_lists_all_statuses_with_expired_flag(tmp_path: Path) -> No
         ("m-archived", "semantic", "archived", now),
         ("m-superseded", "semantic", "superseded", now),
     ):
-        from agent_base.memory.store import MemoryRecord
+        from agent_base_memory.store import MemoryRecord
 
         await store.upsert_memory(
             MemoryRecord(

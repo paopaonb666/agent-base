@@ -14,14 +14,14 @@ from collections import OrderedDict
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any
 
-from agent_base.memory.context import compose_frozen_context, compose_recall_context
-from agent_base.memory.pipeline import MemoryPipeline, render_transcript
-from agent_base.memory.retrieval import ScoredMemory
+from agent_base_memory.context import compose_frozen_context, compose_recall_context
+from agent_base_memory.pipeline import MemoryPipeline, render_transcript
+from agent_base_memory.retrieval import ScoredMemory
 
 if TYPE_CHECKING:  # pragma: no cover - import avoided at runtime
     from agent_base.core.config import MemorySettings
-    from agent_base.memory.profile import ProfileService
-    from agent_base.memory.store import MemoryStore
+    from agent_base_memory.profile import ProfileService
+    from agent_base_memory.store import MemoryStore
 
 logger = logging.getLogger(__name__)
 

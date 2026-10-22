@@ -14,15 +14,16 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from agent_base.core.bootstrap import AgentRuntime
 from agent_base.core.config import Settings
+from agent_base.core.storage import CoreMemoryStore, ThreadIndex
 from agent_base.entrypoints.server import create_app
-from agent_base.memory.pipeline import (
+from agent_base.modules.chat.module import ChatModule
+from agent_base_memory.pipeline import (
     MemoryPipeline,
     _parse_json_block,
     render_transcript,
 )
-from agent_base.memory.service import MemoryService
-from agent_base.memory.store import MemoryMemoryStore, SessionSummary
-from agent_base.modules.chat.module import ChatModule
+from agent_base_memory.service import MemoryService
+from agent_base_memory.store import MemoryMemoryStore, SessionSummary
 from fakes import HashEmbedding, ScriptedChatModel
 
 
@@ -228,7 +229,7 @@ async def test_pipeline_fast_unconfigured_degrades_to_main() -> None:
 
 async def test_build_memory_service_passes_fast_llm_through(tmp_path: Any) -> None:
     """组合根传入的 fast_llm 必须原样到达管线。"""
-    from agent_base.memory.service import build_memory_service
+    from agent_base_memory.service import build_memory_service
 
     settings = _settings(
         checkpointer_backend="memory",
@@ -268,7 +269,7 @@ async def test_consolidate_all_ops() -> None:
         # 每次整合前把决策放进模型队列；既有记忆让 UPDATE/DELETE 命中。
         _rearm(service, [_json_msg(decision)])
         assert service.pipeline is not None
-        from agent_base.memory.pipeline import Candidate
+        from agent_base_memory.pipeline import Candidate
 
         op = await service.pipeline.consolidate(
             Candidate(content=decision.get("content", "用户在开发记忆系统"), kind="semantic"),
@@ -282,7 +283,7 @@ async def test_consolidate_all_ops() -> None:
 async def test_consolidate_add_creates_memory_with_provenance() -> None:
     service = _service([_json_msg({"op": "ADD", "content": "用户在开发记忆系统"})])
     assert service.pipeline is not None
-    from agent_base.memory.pipeline import Candidate
+    from agent_base_memory.pipeline import Candidate
 
     await service.pipeline.consolidate(
         Candidate(content="用户在开发记忆系统", kind="semantic", salience=0.8, tags=["项目"]),
@@ -316,7 +317,7 @@ async def test_profile_merge_creates_and_updates() -> None:
     updated = await service.get_profile("u")
     assert updated is not None and "浅色主题" in json.dumps(updated, ensure_ascii=False)
     # 画像记录按确定性 id 存放，且不会被检索召回。
-    from agent_base.memory.store import profile_memory_id
+    from agent_base_memory.store import profile_memory_id
 
     assert await service.store.get_memory(profile_memory_id("u")) is not None
     hits = await service.search(user_id="u", agent_id="chat", query="深色主题")
@@ -443,7 +444,7 @@ def test_invoke_without_pipeline_skips_capture() -> None:
         tools=[],
         checkpointer=InMemorySaver(),
     )
-    from agent_base.memory.store import MemoryMemoryStore
+    from agent_base_memory.store import MemoryMemoryStore
 
     rt.memory = MemoryService(
         store=MemoryMemoryStore(), embedder=HashEmbedding(), settings=rt.settings
@@ -552,6 +553,7 @@ async def test_nightly_capture_since_processes_active_threads() -> None:
         ]
     )
     store = MemoryMemoryStore()
+    core_store = CoreMemoryStore()
     service = MemoryService(store=store, embedder=HashEmbedding(), settings=settings, llm=model)
     rt = AgentRuntime(
         settings=settings,
@@ -560,13 +562,11 @@ async def test_nightly_capture_since_processes_active_threads() -> None:
         tools=[],
         checkpointer=InMemorySaver(),
         memory=service,
-        thread_index=store,
+        thread_index=core_store,
     )
-    # 造一个活跃线程：写索引 + checkpointer 状态。
-    from agent_base.memory.store import ThreadIndex
-
+    # 造一个活跃线程：写索引 + checkpointer 状态（索引属于基座存储）。
     now = _time.time()
-    await store.upsert_thread_index(
+    await core_store.upsert_thread_index(
         ThreadIndex(thread_id="chat:t1", user_id="u1", module="chat", updated_at=now)
     )
     graph = rt.graph("chat")

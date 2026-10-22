@@ -30,11 +30,11 @@ from typing import TYPE_CHECKING, Any
 from langchain_core.messages import HumanMessage
 
 from agent_base.extensions.metrics import MEMORY_METRICS
-from agent_base.memory.store import KNOWN_MEMORY_KINDS
+from agent_base_memory.store import KNOWN_MEMORY_KINDS
 
 if TYPE_CHECKING:  # pragma: no cover - import avoided at runtime
     from agent_base.core.config import Settings
-    from agent_base.memory.service import MemoryService
+    from agent_base_memory.service import MemoryService
 
 logger = logging.getLogger(__name__)
 
@@ -349,7 +349,7 @@ class MemoryPipeline:
         text = raw.strip()
         if not text:
             return False
-        from agent_base.memory.store import SessionSummary
+        from agent_base_memory.store import SessionSummary
 
         await self._service.store.upsert_summary(
             SessionSummary(

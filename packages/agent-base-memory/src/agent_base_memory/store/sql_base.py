@@ -12,7 +12,8 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
-from agent_base.memory.store.models import (
+from agent_base.core.storage.sql_base import _CoreSqlStoreBase
+from agent_base_memory.store.models import (
     KNOWN_MEMORY_KINDS,
     KNOWN_MEMORY_STATUSES,
     DocChunk,
@@ -22,7 +23,6 @@ from agent_base.memory.store.models import (
     MemoryStoreError,
     MemoryVersion,
     SessionSummary,
-    ThreadIndex,
 )
 
 
@@ -39,48 +39,13 @@ def _json_list(value: Any) -> list[str]:
     return [str(item) for item in parsed]
 
 
-class _SqlMemoryStoreBase:
+class _SqlMemoryStoreBase(_CoreSqlStoreBase):
     """sqlite / MySQL 两个实现共享的 DML。
 
     子类只需提供四个连接原语（``_execute`` / ``_fetch_all`` / 时间戳互转）
     与建表自举；所有 SQL 用 ``?`` 占位符书写，MySQL 侧在执行前整体替换为
     ``%s``——本项目语句不含字面问号，整体替换是安全的。
     """
-
-    _PLACEHOLDER = "?"
-    # memory_ops 列表的同秒并列排序键：sqlite 用 rowid，MySQL 用 seq 列。
-    _OPS_TIEBREAK = "rowid DESC"
-
-    def _sql(self, sql: str) -> str:
-        if self._PLACEHOLDER == "?":
-            return sql
-        return sql.replace("?", "%s")
-
-    def _replace_into(self, table: str, columns: tuple[str, ...]) -> str:
-        """整行覆盖式 upsert：sqlite 是 INSERT OR REPLACE，MySQL 是 REPLACE
-        INTO——两者同为"遇冲突删旧插新"的原子语义，要求提供全列值。"""
-        if self._PLACEHOLDER == "?":
-            return (
-                f"INSERT OR REPLACE INTO {table} ({', '.join(columns)}) "
-                f"VALUES ({', '.join('?' for _ in columns)})"
-            )
-        return (
-            f"REPLACE INTO {table} ({', '.join(columns)}) "
-            f"VALUES ({', '.join('%s' for _ in columns)})"
-        )
-
-    # -- 连接原语（子类实现） -------------------------------------------------
-    async def _execute(self, sql: str, params: Sequence[Any] = ()) -> int:
-        raise NotImplementedError
-
-    async def _fetch_all(self, sql: str, params: Sequence[Any] = ()) -> list[tuple[Any, ...]]:
-        raise NotImplementedError
-
-    def _to_sql_ts(self, seconds: float) -> Any:
-        raise NotImplementedError
-
-    def _from_sql_ts(self, value: Any) -> float:
-        raise NotImplementedError
 
     # -- 行编解码 --------------------------------------------------------------
     @staticmethod
@@ -487,8 +452,6 @@ class _SqlMemoryStoreBase:
         # 索引与计划快照。
         await self._execute("DELETE FROM doc_chunks WHERE thread_id = ?", (thread_id,))
         await self._execute("DELETE FROM session_summaries WHERE thread_id = ?", (thread_id,))
-        await self._execute("DELETE FROM thread_index WHERE thread_id = ?", (thread_id,))
-        await self._execute("DELETE FROM plan_snapshots WHERE thread_id = ?", (thread_id,))
 
     # -- 计划快照（plan_snapshots；M10 跨轮延续） ------------------------------------
     async def save_plan(
@@ -555,6 +518,9 @@ class _SqlMemoryStoreBase:
                 self._to_sql_ts(op.created_at),
             ),
         )
+
+    # 同一秒内多条 op 的稳定次序：sqlite 用 rowid，MySQL 用自增 seq。
+    _OPS_TIEBREAK = "rowid DESC"
 
     async def list_ops(self, user_id: str | None = None, limit: int = 100) -> list[MemoryOp]:
         sql = f"SELECT {self._OP_COLUMNS} FROM memory_ops"
@@ -628,55 +594,3 @@ class _SqlMemoryStoreBase:
             (dims, max(1, limit)),
         )
         return [self._chunk_from_row(row) for row in rows]
-
-    # -- 会话索引（thread_index；S1 线程作用域） --------------------------------
-    _THREAD_COLUMNS = "thread_id, user_id, module, title, created_at, updated_at"
-
-    def _thread_from_row(self, row: tuple[Any, ...]) -> ThreadIndex:
-        return ThreadIndex(
-            thread_id=row[0],
-            user_id=row[1] or "",
-            module=row[2] or "",
-            title=row[3] or "",
-            created_at=self._from_sql_ts(row[4]),
-            updated_at=self._from_sql_ts(row[5]),
-        )
-
-    async def upsert_thread_index(self, entry: ThreadIndex) -> None:
-        await self._execute(
-            self._replace_into(
-                "thread_index",
-                ("thread_id", "user_id", "module", "title", "created_at", "updated_at"),
-            ),
-            (
-                entry.thread_id,
-                entry.user_id,
-                entry.module,
-                entry.title,
-                self._to_sql_ts(entry.created_at),
-                self._to_sql_ts(entry.updated_at),
-            ),
-        )
-
-    async def get_thread_index(self, thread_id: str) -> ThreadIndex | None:
-        rows = await self._fetch_all(
-            f"SELECT {self._THREAD_COLUMNS} FROM thread_index WHERE thread_id = ?",
-            (thread_id,),
-        )
-        return self._thread_from_row(rows[0]) if rows else None
-
-    async def list_thread_index(
-        self, user_id: str, *, module: str | None = None, limit: int = 50
-    ) -> list[ThreadIndex]:
-        sql = f"SELECT {self._THREAD_COLUMNS} FROM thread_index WHERE user_id = ?"
-        params: list[Any] = [user_id]
-        if module is not None:
-            sql += " AND module = ?"
-            params.append(module)
-        sql += " ORDER BY updated_at DESC LIMIT ?"
-        params.append(max(1, limit))
-        rows = await self._fetch_all(sql, params)
-        return [self._thread_from_row(row) for row in rows]
-
-    async def delete_thread_index(self, thread_id: str) -> None:
-        await self._execute("DELETE FROM thread_index WHERE thread_id = ?", (thread_id,))

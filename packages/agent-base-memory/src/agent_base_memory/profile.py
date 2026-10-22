@@ -12,10 +12,10 @@ import json
 import time
 from typing import TYPE_CHECKING, Any
 
-from agent_base.memory.audit import record_version_safe
-from agent_base.memory.store import MemoryRecord, MemoryStore, MemoryVersion
-from agent_base.memory.store.models import new_memory_id, profile_memory_id
-from agent_base.memory.textkit import _trim_profile_to_chars
+from agent_base_memory.audit import record_version_safe
+from agent_base_memory.store import MemoryRecord, MemoryStore, MemoryVersion
+from agent_base_memory.store.models import new_memory_id, profile_memory_id
+from agent_base_memory.textkit import _trim_profile_to_chars
 
 if TYPE_CHECKING:  # pragma: no cover - import avoided at runtime
     from agent_base.core.config import MemorySettings

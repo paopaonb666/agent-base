@@ -19,9 +19,9 @@ from agent_base.core.bootstrap import AgentRuntime
 from agent_base.core.config import Settings
 from agent_base.core.context import ATTACHMENT_CONTEXT_PREFIX, MEMORY_CONTEXT_PREFIX
 from agent_base.core.contracts import ModuleContext
+from agent_base.core.storage import CoreMemoryStore
 from agent_base.entrypoints.server import create_app
 from agent_base.extensions.filestore import MemoryUploadedFileStore, UploadedFileInfo
-from agent_base.memory.store import MemoryMemoryStore
 from agent_base.modules.chat.module import ChatModule
 from agent_base.modules.writer.module import WriterModule
 from fakes import ScriptedChatModel
@@ -38,7 +38,7 @@ def _scoped_runtime(model: Any = None) -> AgentRuntime:
         modules={"chat": ChatModule()},
         tools=[],
         checkpointer=InMemorySaver(),
-        thread_index=MemoryMemoryStore(),
+        thread_index=CoreMemoryStore(),
     )
 
 

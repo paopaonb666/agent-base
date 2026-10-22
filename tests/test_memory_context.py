@@ -7,7 +7,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from agent_base.core.context import MEMORY_CONTEXT_FROZEN_PREFIX
-from agent_base.memory.context import (
+from agent_base_memory.context import (
     ATTACHMENT_CONTEXT_PREFIX,
     MEMORY_CONTEXT_PREFIX,
     build_model_input,
@@ -18,9 +18,9 @@ from agent_base.memory.context import (
     is_injected_system,
     render_profile,
 )
-from agent_base.memory.retrieval import ScoredMemory
-from agent_base.memory.service import MemoryService
-from agent_base.memory.store import MemoryBlock, MemoryMemoryStore, MemoryRecord
+from agent_base_memory.retrieval import ScoredMemory
+from agent_base_memory.service import MemoryService
+from agent_base_memory.store import MemoryBlock, MemoryMemoryStore, MemoryRecord
 from fakes import HashEmbedding, ScriptedChatModel
 
 # ─────────────────────────── 估算与判定 ───────────────────────────

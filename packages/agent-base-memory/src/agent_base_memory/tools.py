@@ -29,8 +29,8 @@ from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field
 
 from agent_base.core.threads import ThreadId
-from agent_base.memory.service import MemoryService
-from agent_base.memory.store import MemoryBlock
+from agent_base_memory.service import MemoryService
+from agent_base_memory.store import MemoryBlock
 
 logger = logging.getLogger(__name__)
 

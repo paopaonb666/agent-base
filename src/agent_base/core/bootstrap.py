@@ -27,14 +27,15 @@ from langchain_core.tools import BaseTool
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from agent_base.core.config import Settings
-from agent_base.core.contracts import AgentModule, Graph, MemoryPort, ModuleContext
+from agent_base.core.contracts import AgentModule, Graph, MemoryServicePort, ModuleContext
 from agent_base.core.llm import ResilientLLM, build_llm
+from agent_base.core.memory_plugin import build_memory_plugin
 from agent_base.core.registry import RegistryError, load_modules
+from agent_base.core.storage import CoreStore, build_core_store
 from agent_base.core.tools import build_tool_pool
 from agent_base.extensions.filestore import UploadedFileStore, build_uploaded_file_store
 from agent_base.extensions.memory import build_checkpointer, close_checkpointer
 from agent_base.extensions.toollog import ToolCallRecorder, build_tool_call_recorder
-from agent_base.memory.store import MemoryStore
 from agent_base.tools.mcp import load_mcp_tools
 from agent_base.tools.registry import build_toolkit_tools, toolkit_timeouts
 
@@ -70,14 +71,15 @@ class AgentRuntime:
     tool_recorder: ToolCallRecorder | None = None
     file_store: UploadedFileStore | None = None
     # 记忆服务端口（M6）：None = 未启用；模块通过 ModuleContext.memory 取用。
-    memory: MemoryPort | None = None
+    # 0.3.0 起由可选的记忆发行包实现（entry point 发现），基座不 import 它。
+    memory: MemoryServicePort | None = None
     # 会话索引存储（S1）：thread_index 表的后端（跟随 checkpointer 后端）。
-    # 与 memory 服务独立——MEMORY_ENABLED=false 时仍提供线程属主数据面；
-    # memory 启用时它就是 memory.store 同一实例（随 memory.aclose 关闭）。
-    thread_index: MemoryStore | None = None
-    # 计划快照存储（M10）：plan_snapshots 表的后端（同 thread_index 的
-    # 数据面策略）；planner 图写入，plan 检查端点读取。
-    plan_store: MemoryStore | None = None
+    # 由基座自己拥有——MEMORY_ENABLED=false 时仍提供线程属主数据面，
+    # 也不再依赖记忆包是否安装。
+    thread_index: CoreStore | None = None
+    # 计划快照存储（M10）：plan_snapshots 表的后端（同为基座自有存储）；
+    # planner 图写入，plan 检查端点读取。
+    plan_store: CoreStore | None = None
     _graphs: dict[str, Graph] = field(default_factory=dict, repr=False)
     _supervisor: Graph | None = field(default=None, repr=False)
     # 快档视图缓存（成本治理 T1.2）：profile -> 共享状态的运行时副本。
@@ -170,10 +172,9 @@ class AgentRuntime:
             await self.file_store.aclose()
         if self.memory is not None:
             await self.memory.aclose()
-        elif self.thread_index is not None:
-            closer = getattr(self.thread_index, "aclose", None)
-            if closer is not None:
-                await closer()
+        # 基座存储与记忆存储相互独立（0.3.0）：两个都要关，不能 elif。
+        if self.thread_index is not None:
+            await self.thread_index.aclose()
 
 
 async def create_runtime(settings: Settings | None = None) -> AgentRuntime:
@@ -185,55 +186,46 @@ async def create_runtime(settings: Settings | None = None) -> AgentRuntime:
     resolved = settings if settings is not None else Settings()
     resolved.ensure_production_ready()
     llm = build_llm(resolved)
-    modules = load_modules(resolved.agent_modules)
+    modules = load_modules(resolved.agent_modules, packages=resolved.agent_module_packages)
     validate_module_names(modules)
-    # 记忆服务（M6）先于工具池装配：记忆工具（M6e）作为 extra_tools 进
-    # 池，与模块工具/工具库工具同样受超时包装与审计收口。延迟导入：
-    # core 装配层不在模块加载时依赖 memory 子系统的导入图（依赖倒置——
-    # 契约只认 MemoryPort）。
     checkpointer = await build_checkpointer(resolved)
     file_store = await build_uploaded_file_store(resolved)
-    from agent_base.memory.service import build_memory_service
-    from agent_base.memory.store import build_memory_store
-
-    # 存储后端常备（S1）：thread_index 的线程属主数据面不随
-    # MEMORY_ENABLED 关闭；记忆服务启用时复用同一 store 实例。
+    # 基座自有存储（S1/M10）：线程索引与计划快照的数据面由基座自己拥有，
+    # 不随 MEMORY_ENABLED 关闭，也不依赖记忆包是否安装。装配失败只降级
+    # （这两张表是体验增强面，不阻塞服务启动）。
     try:
-        memory_store = await build_memory_store(resolved)
+        core_store = await build_core_store(resolved)
     except Exception:
-        if resolved.memory_enabled:
-            raise
-        logger.warning("memory: 存储后端装配失败（记忆已禁用，仅线程索引降级）", exc_info=True)
-        memory_store = None
-    memory_service = None
-    if memory_store is not None:
-        # 快档侧（成本治理）：LLM_FAST_* 已配置且非 all_main 时，为形成管线
-        # 装配限流回退包装（抽取/画像/摘要走它，整合裁决按 profile 决定）。
-        # 组合根接线而非 memory 自建——memory 不在运行时依赖 core.llm。
-        fast_llm = None
-        if (
-            llm is not None
-            and resolved.memory.pipeline_profile != "all_main"
-            and resolved.llm_fast.is_configured
-        ):
-            fast_llm = ResilientLLM(
-                primary=build_llm(resolved, profile="fast"),
-                fallback=llm,
-                max_concurrency=resolved.llm_fast.concurrency,
-            )
-        memory_service = await build_memory_service(
-            resolved, llm, fast_llm=fast_llm, store=memory_store
+        logger.warning("core store: 装配失败（线程索引/计划快照降级为不可用）", exc_info=True)
+        core_store = None
+    # 快档侧（成本治理）：LLM_FAST_* 已配置且非 all_main 时，为形成管线
+    # 装配限流回退包装（抽取/画像/摘要走它，整合裁决按 profile 决定）。
+    # 组合根接线而非 memory 自建——memory 不在运行时依赖 core.llm。
+    fast_llm = None
+    if (
+        resolved.memory.enabled
+        and resolved.memory.pipeline_profile != "all_main"
+        and resolved.llm_fast.is_configured
+    ):
+        fast_llm = ResilientLLM(
+            primary=build_llm(resolved, profile="fast"),
+            fallback=llm,
+            max_concurrency=resolved.llm_fast.concurrency,
         )
+    # 记忆服务（M6）经 entry point 发现（0.3.0 拆分）：基座源码不 import
+    # 记忆包；MEMORY_ENABLED=true 而发行包缺失时 fail-fast 提示安装。
+    plugin = await build_memory_plugin(settings=resolved, llm=llm, fast_llm=fast_llm)
+    memory_service = plugin.service if plugin is not None else None
     # 工具库的内置工具按 TOOLKIT_ENABLED 装配后并入共享池（模块工具在
     # 前，工具库在后）；重名在任何一侧发生都会快速失败。注册表声明的
     # per-tool 超时在这里下发给池；审计记录器挂上收口，全量落库。
     recorder = build_tool_call_recorder(resolved)
     toolkit = build_toolkit_tools(resolved)
     extra_tools: list[BaseTool] = list(toolkit)
-    if memory_service is not None:
-        from agent_base.memory.tools import build_memory_tools
-
-        extra_tools.extend(build_memory_tools(memory_service))
+    if plugin is not None:
+        # 记忆工具（M6e）由插件随服务一起返回；与模块/工具库工具同样受
+        # 超时包装与审计收口。
+        extra_tools.extend(plugin.tools)
     # MCP 工具来源（可选 extras）：MCP_ENABLED=true 时把外部 MCP Server
     # 的工具并入池——超时包装 / 审计收口 / 重名快速失败与基座工具同规。
     # 未启用时返回空列表（零解析零导入），装配路径保持不变。
@@ -254,6 +246,6 @@ async def create_runtime(settings: Settings | None = None) -> AgentRuntime:
         tool_recorder=recorder,
         file_store=file_store,
         memory=memory_service,
-        thread_index=memory_store,
-        plan_store=memory_store,
+        thread_index=core_store,
+        plan_store=core_store,
     )

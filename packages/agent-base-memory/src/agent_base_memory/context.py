@@ -25,8 +25,8 @@ from agent_base.core.context import (  # re-export（历史 API 路径）
     injected_kind,
     is_injected_system,
 )
-from agent_base.memory.retrieval import ScoredMemory
-from agent_base.memory.store import MemoryBlock
+from agent_base_memory.retrieval import ScoredMemory
+from agent_base_memory.store import MemoryBlock
 
 
 def render_profile(profile: dict[str, Any]) -> str:

@@ -8,8 +8,8 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 
-from agent_base.memory.store.ddl import _SQLITE_DDLS, _SQLITE_INDEXES
-from agent_base.memory.store.sql_base import _SqlMemoryStoreBase
+from agent_base_memory.store.ddl import _SQLITE_DDLS, _SQLITE_INDEXES
+from agent_base_memory.store.sql_base import _SqlMemoryStoreBase
 
 logger = logging.getLogger(__name__)
 

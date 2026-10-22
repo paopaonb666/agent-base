@@ -5,9 +5,8 @@ from __future__ import annotations
 import time
 from collections.abc import Sequence
 from dataclasses import replace
-from typing import Any
 
-from agent_base.memory.store.models import (
+from agent_base_memory.store.models import (
     KNOWN_MEMORY_KINDS,
     KNOWN_MEMORY_STATUSES,
     PROFILE_ID_PREFIX,
@@ -18,7 +17,6 @@ from agent_base.memory.store.models import (
     MemoryStoreError,
     MemoryVersion,
     SessionSummary,
-    ThreadIndex,
 )
 
 
@@ -27,7 +25,6 @@ class MemoryMemoryStore:
 
     def __init__(self) -> None:
         self._memories: dict[str, MemoryRecord] = {}
-        self._threads: dict[str, ThreadIndex] = {}
         self._blocks: dict[tuple[str, str, str], MemoryBlock] = {}
         self._summaries: dict[tuple[str, str], SessionSummary] = {}
         self._chunks: dict[str, DocChunk] = {}
@@ -35,7 +32,6 @@ class MemoryMemoryStore:
         self._ops: list[tuple[MemoryOp, int]] = []
         self._versions: list[tuple[MemoryVersion, int]] = []
         self._op_counter = 0
-        self._plans: dict[str, dict[str, Any]] = {}
 
     async def upsert_memory(self, record: MemoryRecord) -> None:
         if record.kind not in KNOWN_MEMORY_KINDS:
@@ -181,8 +177,6 @@ class MemoryMemoryStore:
             for key, summary in self._summaries.items()
             if summary.thread_id != thread_id
         }
-        self._threads.pop(thread_id, None)
-        self._plans.pop(thread_id, None)
 
     async def record_op(self, op: MemoryOp) -> None:
         self._op_counter += 1
@@ -216,52 +210,3 @@ class MemoryMemoryStore:
         ]
         matched.sort(key=lambda chunk: chunk.created_at, reverse=True)
         return matched[: max(1, limit)]
-
-    # -- 会话索引（thread_index；S1 线程作用域） --------------------------------
-
-    async def upsert_thread_index(self, entry: ThreadIndex) -> None:
-        self._threads[entry.thread_id] = entry
-
-    async def get_thread_index(self, thread_id: str) -> ThreadIndex | None:
-        return self._threads.get(thread_id)
-
-    async def list_thread_index(
-        self, user_id: str, *, module: str | None = None, limit: int = 50
-    ) -> list[ThreadIndex]:
-        matched = [
-            entry
-            for entry in self._threads.values()
-            if entry.user_id == user_id and (module is None or entry.module == module)
-        ]
-        matched.sort(key=lambda entry: entry.updated_at, reverse=True)
-        return matched[: max(1, limit)]
-
-    async def delete_thread_index(self, thread_id: str) -> None:
-        self._threads.pop(thread_id, None)
-
-    # -- 计划快照（plan_snapshots；M10 跨轮延续） --------------------------------
-
-    async def save_plan(
-        self,
-        *,
-        thread_id: str,
-        module: str,
-        tasks: list[dict[str, Any]],
-        cursor: int,
-        replans: int,
-    ) -> None:
-        self._plans[thread_id] = {
-            "thread_id": thread_id,
-            "module": module,
-            "tasks": [dict(task) for task in tasks],
-            "cursor": int(cursor),
-            "replans": int(replans),
-            "updated_at": time.time(),
-        }
-
-    async def get_plan(self, thread_id: str) -> dict[str, Any] | None:
-        snapshot = self._plans.get(thread_id)
-        return dict(snapshot) if snapshot is not None else None
-
-    async def delete_plan(self, thread_id: str) -> None:
-        self._plans.pop(thread_id, None)

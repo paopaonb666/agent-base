@@ -14,12 +14,12 @@ import time
 from typing import TYPE_CHECKING
 
 from agent_base.extensions.metrics import MEMORY_METRICS
-from agent_base.memory.audit import MemoryAudit
-from agent_base.memory.embeddings import EmbeddingClient, NullEmbedding
-from agent_base.memory.retrieval import ScoredChunk, score_chunks, weights_from_settings
-from agent_base.memory.store import DocChunk, MemoryStore, encode_embedding
-from agent_base.memory.store.models import new_memory_id
-from agent_base.memory.textkit import chunk_text
+from agent_base_memory.audit import MemoryAudit
+from agent_base_memory.embeddings import EmbeddingClient, NullEmbedding
+from agent_base_memory.retrieval import ScoredChunk, score_chunks, weights_from_settings
+from agent_base_memory.store import DocChunk, MemoryStore, encode_embedding
+from agent_base_memory.store.models import new_memory_id
+from agent_base_memory.textkit import chunk_text
 
 if TYPE_CHECKING:  # pragma: no cover - import avoided at runtime
     from agent_base.core.config import MemorySettings

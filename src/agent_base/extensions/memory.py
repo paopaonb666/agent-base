@@ -2,7 +2,7 @@
 
 仅包含**短期**对话状态——thread 级别的持久化，让一次对话在轮次之间得以
 保留（使用 sqlite 后端时，还能跨进程重启保留）。长期记忆（跨对话、
-向量库、抽取）在 ``agent_base.memory`` 子系统落地（M6），其存储后端
+向量库、抽取）在 ``agent_base_memory`` 子系统落地（M6），其存储后端
 同样跟随这里选择的 ``CHECKPOINTER_BACKEND``。
 
 后端（``CHECKPOINTER_BACKEND``）：

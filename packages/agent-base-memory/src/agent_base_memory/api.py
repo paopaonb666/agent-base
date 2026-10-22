@@ -8,15 +8,21 @@
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from agent_base.entrypoints.server.deps import get_current_user, get_runtime, require_memory
-from agent_base.memory.store import KNOWN_MEMORY_KINDS, KNOWN_MEMORY_STATUSES, MemoryBlock
+from agent_base_memory.service import MemoryService
+from agent_base_memory.store import KNOWN_MEMORY_KINDS, KNOWN_MEMORY_STATUSES, MemoryBlock
 
 router = APIRouter(prefix="/v1/memory", tags=["memory"])
+
+
+def _service(request: Request) -> MemoryService:
+    """取记忆服务（未启用 503；入口层端口收窄为具体实现）。"""
+    return cast(MemoryService, require_memory(get_runtime(request)))
 
 
 class MemoryCreateRequest(BaseModel):
@@ -65,7 +71,7 @@ async def create_memory(
     与管线写入（M6c）同一条路径：内容落库前尽力向量化，embedding
     不可用时存纯文本、检索自动走关键词路径。响应不含 embedding 字节。
     """
-    memory = require_memory(get_runtime(request))
+    memory = _service(request)
     if body.kind not in KNOWN_MEMORY_KINDS:
         raise HTTPException(
             status_code=400,
@@ -105,7 +111,7 @@ async def search_memory(
     超过 TTL 即为已过期（召回时自动失效，是否保留由人工判断）。
     """
     rt = get_runtime(request)
-    memory = require_memory(rt)
+    memory = cast(MemoryService, require_memory(rt))
     if kind is not None and kind not in KNOWN_MEMORY_KINDS:
         raise HTTPException(
             status_code=400, detail=f"kind 非法：{kind!r}；允许 {list(KNOWN_MEMORY_KINDS)}"
@@ -158,7 +164,7 @@ async def patch_memory(
     user_id: str = Depends(get_current_user),
 ) -> dict[str, Any]:
     """部分更新一条长期记忆（改内容会重新向量化）。"""
-    memory = require_memory(get_runtime(request))
+    memory = _service(request)
     if body.status is not None and body.status not in KNOWN_MEMORY_STATUSES:
         raise HTTPException(
             status_code=400,
@@ -183,7 +189,7 @@ async def delete_memory(
     memory_id: str, request: Request, user_id: str = Depends(get_current_user)
 ) -> dict[str, Any]:
     """删除一条长期记忆（硬删除；版本墓碑与审计保留）。"""
-    memory = require_memory(get_runtime(request))
+    memory = _service(request)
     await _owned_memory(memory, memory_id, user_id)
     deleted = await memory.delete_memory(memory_id)
     return {"deleted": deleted}
@@ -197,7 +203,7 @@ async def list_memory_versions(
     limit: int = 50,
 ) -> dict[str, Any]:
     """一条记忆的内容版本史（create/update/delete/restore 快照），最新在前。"""
-    memory = require_memory(get_runtime(request))
+    memory = _service(request)
     await _owned_memory(memory, memory_id, user_id)
     versions = await memory.list_versions(memory_id, limit=max(1, min(limit, 200)))
     return {
@@ -223,7 +229,7 @@ async def restore_memory_version(
     user_id: str = Depends(get_current_user),
 ) -> dict[str, Any]:
     """把记忆内容恢复到指定版本（产生一条 op=restore 的新版本）。"""
-    memory = require_memory(get_runtime(request))
+    memory = _service(request)
     await _owned_memory(memory, memory_id, user_id)
     restored = await memory.restore_version(memory_id, version_id)
     if restored is None:
@@ -238,7 +244,7 @@ async def list_memory_blocks(
     module: str | None = None,
 ) -> dict[str, Any]:
     """列出当前用户的常驻记忆块（M6f；module 缺省查全局块）。"""
-    memory = require_memory(get_runtime(request))
+    memory = _service(request)
     blocks = await memory.store.list_blocks(user_id, module or "*")
     return {
         "blocks": [
@@ -264,7 +270,7 @@ async def put_memory_block(
 ) -> dict[str, Any]:
     """手工写一个常驻记忆块（覆盖式；与 agent 的 memory_update_block
     工具同表，版本号递增）。"""
-    memory = require_memory(get_runtime(request))
+    memory = _service(request)
     agent_id = body.module or "*"
     existing = await memory.store.get_block(user_id, agent_id, label)
     block = MemoryBlock(
@@ -294,7 +300,7 @@ async def delete_memory_block(
     module: str | None = None,
 ) -> dict[str, Any]:
     """删除一个常驻记忆块。"""
-    memory = require_memory(get_runtime(request))
+    memory = _service(request)
     deleted = await memory.store.delete_block(user_id, module or "*", label)
     return {"deleted": deleted}
 
@@ -304,7 +310,7 @@ async def get_memory_profile(
     request: Request, user_id: str = Depends(get_current_user)
 ) -> dict[str, Any]:
     """读取当前用户的结构化画像（M6c 形成，M6f 暴露）。"""
-    memory = require_memory(get_runtime(request))
+    memory = _service(request)
     return {"profile": await memory.get_profile(user_id)}
 
 
@@ -315,7 +321,7 @@ async def list_memory_audit(
     limit: int = 50,
 ) -> dict[str, Any]:
     """记忆系统的操作审计（M6）：抽取/整合/画像/摘要/摄取/手工增删。"""
-    memory = require_memory(get_runtime(request))
+    memory = _service(request)
     ops = await memory.store.list_ops(user_id, limit=max(1, min(limit, 200)))
     return {
         "ops": [
@@ -334,3 +340,8 @@ async def list_memory_audit(
             for op in ops
         ]
     }
+
+
+def routers() -> list[APIRouter]:
+    """记忆管理 API 的 router 列表（同包 pyproject 的 routes entry point）。"""
+    return [router]

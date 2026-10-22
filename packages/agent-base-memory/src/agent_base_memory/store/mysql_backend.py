@@ -10,8 +10,8 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from agent_base.memory.store.ddl import _MYSQL_DDLS
-from agent_base.memory.store.sql_base import _SqlMemoryStoreBase
+from agent_base_memory.store.ddl import _MYSQL_DDLS
+from agent_base_memory.store.sql_base import _SqlMemoryStoreBase
 
 if TYPE_CHECKING:  # pragma: no cover - import avoided at runtime
     from agent_base.core.config import Settings

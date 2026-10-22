@@ -15,7 +15,8 @@ from pathlib import Path
 import pytest
 
 from agent_base.core.config import Settings
-from agent_base.memory import (
+from agent_base.core.storage import CoreMemoryStore, CoreSqliteStore, CoreStore
+from agent_base_memory import (
     DocChunk,
     MemoryBlock,
     MemoryMemoryStore,
@@ -28,7 +29,7 @@ from agent_base.memory import (
     decode_embedding,
     encode_embedding,
 )
-from agent_base.memory.store import MysqlMemoryStore
+from agent_base_memory.store import MysqlMemoryStore
 
 
 def _settings(**overrides: object) -> Settings:
@@ -360,7 +361,7 @@ async def _check_needing_embedding(store: MemoryMemoryStore | SqliteMemoryStore)
     await store.upsert_memory(missing)
     await store.upsert_memory(fresh)
     await store.upsert_memory(archived_no_vec)
-    from agent_base.memory.store import MemoryRecord, profile_memory_id
+    from agent_base_memory.store import MemoryRecord, profile_memory_id
 
     await store.upsert_memory(
         MemoryRecord(
@@ -390,7 +391,7 @@ async def test_list_memories_needing_embedding_filter_sqlite(tmp_path: Path) -> 
 
 async def _check_versions_semantics(store: MemoryMemoryStore | SqliteMemoryStore) -> None:
     """版本史跨后端语义：写入、按记忆过滤、最新在前、按 id 取回。"""
-    from agent_base.memory.store import MemoryVersion
+    from agent_base_memory.store import MemoryVersion
 
     for i, op in enumerate(("create", "update", "delete")):
         await store.record_version(
@@ -440,8 +441,8 @@ async def test_versions_semantics_sqlite(tmp_path: Path) -> None:
 # ─────────────────────── 计划快照（M10 跨轮延续） ───────────────────────
 
 
-async def _check_plan_semantics(store: MemoryMemoryStore | SqliteMemoryStore) -> None:
-    """save/get/delete 的三后端一致语义。"""
+async def _check_plan_semantics(store: CoreStore) -> None:
+    """save/get/delete 的三后端一致语义（0.3.0 起属于基座自有存储）。"""
     tasks = [{"id": 1, "goal": "查天气", "status": "done", "summary": "晴", "attempts": 1}]
     await store.save_plan(thread_id="chat:t1", module="chat", tasks=tasks, cursor=1, replans=0)
     stored = await store.get_plan("chat:t1")
@@ -464,16 +465,16 @@ async def _check_plan_semantics(store: MemoryMemoryStore | SqliteMemoryStore) ->
     await store.delete_plan("chat:t1")
     assert await store.get_plan("chat:t1") is None
     await store.save_plan(thread_id="chat:t2", module="chat", tasks=tasks, cursor=0, replans=0)
-    await store.delete_for_thread("chat:t2")
+    await store.delete_plan("chat:t2")
     assert await store.get_plan("chat:t2") is None
 
 
 async def test_plan_semantics_in_memory() -> None:
-    await _check_plan_semantics(MemoryMemoryStore())
+    await _check_plan_semantics(CoreMemoryStore())
 
 
 async def test_plan_semantics_sqlite(tmp_path: Path) -> None:
-    store = await SqliteMemoryStore.create(str(tmp_path / "plan.db"))
+    store = await CoreSqliteStore.create(str(tmp_path / "plan.db"))
     try:
         await _check_plan_semantics(store)
     finally:

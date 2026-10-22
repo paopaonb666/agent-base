@@ -22,23 +22,23 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from agent_base.extensions.metrics import MEMORY_METRICS
-from agent_base.memory.audit import MemoryAudit, record_version_safe
-from agent_base.memory.embeddings import EmbeddingClient, NullEmbedding, build_embedding_client
-from agent_base.memory.knowledge import KnowledgeService
-from agent_base.memory.orchestrator import (
+from agent_base_memory.audit import MemoryAudit, record_version_safe
+from agent_base_memory.embeddings import EmbeddingClient, NullEmbedding, build_embedding_client
+from agent_base_memory.knowledge import KnowledgeService
+from agent_base_memory.orchestrator import (
     CaptureLockRegistry,
     ContextSnapshotCache,
     MemoryOrchestrator,
 )
-from agent_base.memory.pipeline import MemoryPipeline
-from agent_base.memory.profile import ProfileService
-from agent_base.memory.retrieval import (
+from agent_base_memory.pipeline import MemoryPipeline
+from agent_base_memory.profile import ProfileService
+from agent_base_memory.retrieval import (
     ScoredChunk,
     ScoredMemory,
     recall_memories,
     weights_from_settings,
 )
-from agent_base.memory.store import (
+from agent_base_memory.store import (
     KNOWN_MEMORY_KINDS,
     KNOWN_MEMORY_STATUSES,
     MemoryRecord,
@@ -49,7 +49,7 @@ from agent_base.memory.store import (
     encode_embedding,
     new_memory_id,
 )
-from agent_base.memory.textkit import (  # noqa: F401  # re-export（历史 API 路径）
+from agent_base_memory.textkit import (  # noqa: F401  # re-export（历史 API 路径）
     ChunkSpan,
     _join_spans,
     _trim_profile_to_chars,
@@ -385,7 +385,39 @@ class MemoryService:
         """
         return await self.knowledge.revoke_document(file_id=file_id, user_id=user_id)
 
+    async def list_file_chunks(
+        self, *, user_id: str, file_id: str, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """一份文档的切片视图（M7 可视化；字段与 HTTP 响应一致）。
+
+        由本服务而不是入口层拼装：``DocChunk`` 的数据形状属于记忆包的
+        内部细节，基座只拿到可序列化的 dict。
+        """
+        chunks = await self.store.list_chunks(
+            user_id, file_id=file_id, limit=max(1, min(limit, 2000))
+        )
+        return [
+            {
+                "chunk_id": chunk.chunk_id,
+                "ordinal": chunk.ordinal,
+                "text": chunk.text,
+                "offsets": [list(seg) for seg in chunk.offsets] if chunk.offsets else None,
+                "char_len": len(chunk.text),
+                "has_embedding": chunk.embedding is not None,
+                "embedding_dim": chunk.embedding_dim,
+            }
+            for chunk in chunks
+        ]
+
+    async def chunk_counts_by_file(self, user_id: str) -> dict[str, int]:
+        """该用户每个文件的切片数（M8 知识库列表的数据面）。"""
+        return await self.store.chunk_counts_by_file(user_id)
+
     # -- 生命周期 -----------------------------------------------------------------
+    def capture_ready(self) -> bool:
+        """记忆形成管线是否装配完成（未配置 LLM 时为 False）。"""
+        return self.pipeline is not None
+
     async def health_probe(self) -> str:
         """对 /health 的探针（锐评 #19）：存储可读 + embedding 可达。
 

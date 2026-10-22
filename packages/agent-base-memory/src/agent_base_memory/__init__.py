@@ -18,21 +18,21 @@ mysql），同一套表结构在三条后端上语义一致。
   orchestrator 子域服务，审计与版本史的失败安全写入在 audit）
 """
 
-from agent_base.memory.embeddings import (
+from agent_base_memory.embeddings import (
     EmbeddingClient,
     EmbeddingError,
     NullEmbedding,
     OpenAICompatibleEmbedding,
     build_embedding_client,
 )
-from agent_base.memory.knowledge import KnowledgeService
-from agent_base.memory.orchestrator import (
+from agent_base_memory.knowledge import KnowledgeService
+from agent_base_memory.orchestrator import (
     CaptureLockRegistry,
     ContextSnapshotCache,
     MemoryOrchestrator,
 )
-from agent_base.memory.profile import ProfileService
-from agent_base.memory.retrieval import (
+from agent_base_memory.profile import ProfileService
+from agent_base_memory.retrieval import (
     ScoredChunk,
     ScoredMemory,
     cosine_similarity,
@@ -42,13 +42,13 @@ from agent_base.memory.retrieval import (
     tokenize,
     weights_from_settings,
 )
-from agent_base.memory.service import (
+from agent_base_memory.service import (
     MemoryService,
     build_memory_service,
     chunk_text,
     new_memory_id,
 )
-from agent_base.memory.store import (
+from agent_base_memory.store import (
     KNOWN_MEMORY_KINDS,
     KNOWN_MEMORY_STATUSES,
     DocChunk,

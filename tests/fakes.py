@@ -28,7 +28,7 @@ class HashEmbedding:
         self.dims: int | None = dims
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]] | None:
-        from agent_base.memory.retrieval import tokenize
+        from agent_base_memory.retrieval import tokenize
 
         vectors: list[list[float]] = []
         for text in texts:

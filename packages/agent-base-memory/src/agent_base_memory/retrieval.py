@@ -24,7 +24,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from agent_base.memory.store import PROFILE_ID_PREFIX, DocChunk, MemoryRecord, decode_embedding
+from agent_base_memory.store import PROFILE_ID_PREFIX, DocChunk, MemoryRecord, decode_embedding
 
 if TYPE_CHECKING:  # pragma: no cover - import avoided at runtime
     from agent_base.core.config import MemorySettings

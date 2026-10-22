@@ -21,6 +21,8 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
 from agent_base.core.bootstrap import UnknownModuleError
+from agent_base.core.context import ATTACHMENT_CONTEXT_PREFIX
+from agent_base.core.storage import ThreadIndex
 from agent_base.core.threads import ThreadId
 from agent_base.entrypoints.server.deps import (
     get_current_user,
@@ -33,8 +35,6 @@ from agent_base.entrypoints.server.sse import _SSE_HEADERS, _build_capture_hook,
 from agent_base.extensions.costmeter import CostBudgetExceeded
 from agent_base.extensions.filestore import UploadedFileInfo
 from agent_base.extensions.observability import new_request_id
-from agent_base.memory.context import ATTACHMENT_CONTEXT_PREFIX
-from agent_base.memory.store import ThreadIndex
 
 router = APIRouter(prefix="/v1/agents", tags=["agents"])
 

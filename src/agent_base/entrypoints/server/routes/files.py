@@ -223,25 +223,13 @@ async def list_file_chunks(
         raise HTTPException(status_code=404, detail=f"unknown module {module!r}")
     await _owned_file(rt, file_id, user_id)
     memory = memory_or_none(rt)
-    chunks = []
+    chunks: list[dict[str, Any]] = []
     if memory is not None:
-        chunks = await memory.store.list_chunks(
-            user_id, file_id=file_id, limit=max(1, min(limit, 2000))
+        # 切片视图由记忆服务拼装（DocChunk 形状属于记忆包内部细节）。
+        chunks = await memory.list_file_chunks(
+            user_id=user_id, file_id=file_id, limit=max(1, min(limit, 2000))
         )
-    return {
-        "chunks": [
-            {
-                "chunk_id": chunk.chunk_id,
-                "ordinal": chunk.ordinal,
-                "text": chunk.text,
-                "offsets": [list(seg) for seg in chunk.offsets] if chunk.offsets else None,
-                "char_len": len(chunk.text),
-                "has_embedding": chunk.embedding is not None,
-                "embedding_dim": chunk.embedding_dim,
-            }
-            for chunk in chunks
-        ]
-    }
+    return {"chunks": chunks}
 
 
 @router.get("/agents/{module}/files/{file_id}/raw")
@@ -338,7 +326,7 @@ async def list_knowledge_files(
     counts: dict[str, int] = {}
     memory = memory_or_none(rt)
     if memory is not None:
-        counts = await memory.store.chunk_counts_by_file(user_id)
+        counts = await memory.chunk_counts_by_file(user_id)
     return {
         "files": [
             {

@@ -101,7 +101,7 @@ def test_plan_endpoint_empty_defaults_for_unplanned_thread() -> None:
 
 def test_plan_endpoint_reads_table_after_chat_interleaving() -> None:
     """chat 轮穿插（checkpoint 只含 messages 通道）后，端点仍返回表里的计划。"""
-    from agent_base.memory.store import MemoryMemoryStore
+    from agent_base.core.storage import CoreMemoryStore
 
     rt = _runtime(
         ScriptedChatModel(
@@ -113,7 +113,7 @@ def test_plan_endpoint_reads_table_after_chat_interleaving() -> None:
             ]
         )
     )
-    rt.plan_store = MemoryMemoryStore()
+    rt.plan_store = CoreMemoryStore()
     _seed_plan(rt, "chat:t5")  # plan 轮：节点在每个变更点 upsert 快照
 
     # chat 轮穿插：同一线程跑 chat 图，checkpoint 被仅含 messages 通道的

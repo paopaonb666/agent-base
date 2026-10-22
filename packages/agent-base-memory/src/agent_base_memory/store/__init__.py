@@ -11,8 +11,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from agent_base.memory.store.memory_backend import MemoryMemoryStore
-from agent_base.memory.store.models import (
+from agent_base_memory.store.memory_backend import MemoryMemoryStore
+from agent_base_memory.store.models import (
     KNOWN_MEMORY_KINDS,
     KNOWN_MEMORY_STATUSES,
     PROFILE_ID_PREFIX,
@@ -23,25 +23,22 @@ from agent_base.memory.store.models import (
     MemoryStoreError,
     MemoryVersion,
     SessionSummary,
-    ThreadIndex,
     decode_embedding,
     encode_embedding,
     new_memory_id,
     profile_memory_id,
 )
-from agent_base.memory.store.mysql_backend import MysqlMemoryStore
-from agent_base.memory.store.protocol import (
+from agent_base_memory.store.mysql_backend import MysqlMemoryStore
+from agent_base_memory.store.protocol import (
     AuditRepo,
     BlockRepo,
     KnowledgeRepo,
     MemoryRepo,
     MemoryStore,
-    PlanRepo,
     SummaryRepo,
-    ThreadIndexRepo,
     VersionRepo,
 )
-from agent_base.memory.store.sqlite_backend import SqliteMemoryStore
+from agent_base_memory.store.sqlite_backend import SqliteMemoryStore
 
 if TYPE_CHECKING:  # pragma: no cover - import avoided at runtime
     from agent_base.core.config import Settings
@@ -79,12 +76,9 @@ __all__ = [
     "MemoryStoreError",
     "MemoryVersion",
     "MysqlMemoryStore",
-    "PlanRepo",
     "SessionSummary",
     "SqliteMemoryStore",
     "SummaryRepo",
-    "ThreadIndex",
-    "ThreadIndexRepo",
     "VersionRepo",
     "build_memory_store",
     "decode_embedding",
