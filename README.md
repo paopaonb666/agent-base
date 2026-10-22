@@ -1,5 +1,9 @@
 # agent-base
 
+[![CI](https://github.com/paopaonb666/agent-base/actions/workflows/ci.yml/badge.svg)](https://github.com/paopaonb666/agent-base/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue.svg)](pyproject.toml)
+
 **LangGraph 之上的生产治理基座。** 编排交给 LangGraph（不自研）；基座补齐
 "从 Demo 到生产"缺的三件设施——**长期记忆、成本治理、事件可观测**。
 业务以模块接入，五步上手，不改基座代码。
@@ -21,8 +25,9 @@ LangGraph 解决"怎么把 Agent 编排起来"，本仓库解决"编排起来之
 pip-audit）本地与 CI 完全一致，依赖地板锁定（langgraph ≥1.2.6，修复三个 CVE）。
 
 > **范围红线**：业务鉴权、业务存储等**不属于基座**——它们以"模块"形式接入
-> （ADR 见本地 `docs/adr/`，不入库）。基座只提供运行时、注册规范、配置管理、
-> 可运行入口与扩展点。
+> （决策依据见 [ADR-001](docs/adr/001-langgraph-as-runtime.md) 与
+> [ADR-002](docs/adr/002-module-contract.md)）。基座只提供运行时、注册规范、
+> 配置管理、可运行入口与扩展点。
 
 ## 当前状态
 
@@ -94,7 +99,8 @@ pip-audit）本地与 CI 完全一致，依赖地板锁定（langgraph ≥1.2.6�
 
 开发依赖（`[dev]`）：pytest / pytest-asyncio / pytest-cov / ruff / mypy / pip-audit / httpx。
 安全审计由 CI 常驻：`pip-audit --skip-editable`。
-数据库迁移（`mysql` 后端）：Alembic + SQLAlchemy + PyMySQL（均为 dev 依赖）。
+数据库迁移（`mysql` 后端）：Alembic + SQLAlchemy + PyMySQL，经 `[migrate]`
+extra 安装（dev extras 含同一组依赖；运行时镜像即按 `.[migrate]` 构建）。
 对话状态表由 [`alembic/`](alembic/) 版本化管理，初始迁移复用 langgraph 内置迁移。
 
 ## 快速开始
@@ -107,10 +113,18 @@ cp .env.example .env           # 填入 LLM_API_KEY（阶段 1 起由 config.py 
 pytest                         # 核心集（默认排除 integration 标记，无需 MySQL，见下）
 ```
 
+容器一键起（app + MySQL 8.0，先迁移再启动）：
+
+```bash
+cp .env.example .env           # 填 LLM_API_KEY / MEMORY_AUTH_SECRET
+docker compose up --build      # http://localhost:8000/health
+docker compose config --quiet  # 仅校验 compose 语法与变量插值
+```
+
 > **测试与覆盖率门**：pytest 默认跑**核心集**（`pyproject.toml` addopts
 > 含 `-m "not integration"`），覆盖率门（branch ≥85%）按核心集计算——
 > 本地无 MySQL 也全绿。MySQL 集成测试带 `@pytest.mark.integration`
-> 标记，仅在两处运行：CI 的 test job（挂 MySQL 5.7 服务容器，
+> 标记，仅在两处运行：CI 的 test job（挂 MySQL 8.0 服务容器，
 > `-m "integration or not integration"` 跑全量）与本机显式指定同名
 > marker 且连接可用时——连接参数经 `MYSQL_HOST / MYSQL_PORT /
 > MYSQL_USER / MYSQL_PASSWORD` 环境变量传入（探测失败自动 skip）。
@@ -131,13 +145,13 @@ pytest                         # 核心集（默认排除 integration 标记，�
 | `TOOL_TIMEOUT_SECONDS` | 工具单次执行超时（默认 30s） |
 | `TOOL_CALL_LOG_ENABLED` | 工具调用审计（M5）：每条调用含参数/结果/耗时落库，UI 渲染调用面板 |
 | `DOC_PARSE_MAX_INPUT_BYTES` / `DOC_PARSE_MAX_OUTPUT_CHARS` | 上传文档解析限额（默认 10MB / 5 万字符） |
+| `TOOLKIT_ENABLED` | 装配进共享池的基座内置工具清单（默认 `current_time,calculator,json_query`）；`web_search` 需配 `SEARCH_*`，`python_repl` 为 exec 级默认关 |
+| `MCP_ENABLED` / `MCP_SERVERS_JSON` | MCP 工具来源（需 `pip install -e ".[mcp]"`）：开启即承诺——配置非法或 server 连不上在**启动时**快速失败；工具名自动加 `{server}_` 前缀并入共享池，超时 / 审计 / 重名检查与基座工具同规 |
+| `LOG_JSON` | `true` 输出结构化 JSON 日志（生产建议开启） |
 
 > **附件格式**：文档（pdf/docx/txt/md）提取文本注入上下文；图片
 >（png/jpg/webp/gif）按 magic bytes 校验后整字节入库，以多模态
 > content blocks 直达 vision 模型（需搭配视觉模型使用）。
-| `TOOLKIT_ENABLED` | 装配进共享池的基座内置工具清单（默认 `current_time,calculator,json_query`）；`web_search` 需配 `SEARCH_*`，`python_repl` 为 exec 级默认关 |
-| `MCP_ENABLED` / `MCP_SERVERS_JSON` | MCP 工具来源（需 `pip install -e ".[mcp]"`）：开启即承诺——配置非法或 server 连不上在**启动时**快速失败；工具名自动加 `{server}_` 前缀并入共享池，超时 / 审计 / 重名检查与基座工具同规 |
-| `LOG_JSON` | `true` 输出结构化 JSON 日志（生产建议开启） |
 
 运行一个对话（阶段 1 起可用）：
 
@@ -442,8 +456,15 @@ pip-audit --skip-editable                               # 4. 依赖安全审计
 
 ```
 agent-base/
-├── pyproject.toml            # 依赖 + 工具链配置（ruff / mypy / pytest + coverage 门槛 ≥85%）
-├── .env.example             # 配置契约（由 core/config.py 消费）
+├── pyproject.toml            # 依赖 + 打包元数据 + 工具链配置（ruff / mypy / pytest + coverage ≥85%）
+├── .env.example              # 配置契约（由 core/config.py 消费）
+├── LICENSE / NOTICE          # Apache-2.0 全文与版权声明
+├── CONTRIBUTING.md           # 贡献流程与四道质量门
+├── SECURITY.md               # 漏洞报告路径与安全边界
+├── CHANGELOG.md              # Keep a Changelog 风格变更记录
+├── Dockerfile                # python:3.12-slim 多阶段镜像（非 root 10001，HEALTHCHECK /health）
+├── docker-compose.yml        # app + MySQL 8.0 单机部署（健康检查 / 命名卷 / 启动前迁移）
+├── .dockerignore
 ├── src/agent_base/
 │   ├── core/                # config（嵌套配置节）/ contracts（含 MemoryPort）/ registry / llm
 │   │                        #           · bootstrap / tools（工具池）/ context（上下文引擎）/ graphs
@@ -456,7 +477,6 @@ agent-base/
 │   ├── modules/chat/        # 样板模块（graph + module + tools，兼作接入模板）
 │   ├── modules/writer/      # 第二样板模块（供 supervisor 编排演示）
 │   ├── modules/hello/       # 五步手册的真实落地实例（tests/test_hello_module.py 验证）
-│   │                        # 五步接入手册见 docs/module-guide.md（本地文档，不入库）
 │   └── entrypoints/
 │       ├── cli.py           # CLI 入口（--module / --message / --thread-id / --version）
 │       └── server/          # FastAPI + SSE 服务包（H1 拆分）：app 装配 + auth/deps/
@@ -465,20 +485,34 @@ agent-base/
 ├── tests/                   # config / registry / llm / chat / cli / smoke / observability
 │                            # / memory / tools / events / server / collab / hello
 │                            # / bootstrap / metrics
-├── docs/                    # 本地文档（按用户策略不入库；克隆后不存在是预期行为）
-│   ├── adr/                 # 架构决策记录
-│   ├── future/              # 未来模块路线图存档（circuit-breaker → reliability 模块）
-│   └── module-guide.md      # 五步接入手册 + 应用层规范（新模块接入不改基座）
-└── .github/workflows/ci.yml # CI：lint → typecheck → test（含 coverage 门槛）→ audit
+├── docs/                    # 公开文档（随仓库发布）
+│   ├── adr/                 # ADR-001 运行时选型 / ADR-002 模块契约
+│   ├── module-guide.md      # 五步接入手册 + 接入检查清单
+│   ├── deployment.md        # 部署形态 / 环境变量 / 单进程口径 / 迁移 / 安全 / 容器
+│   └── design-review.md     # 已知边界 H2–H6 与质量门
+└── .github/workflows/ci.yml # CI：lint → typecheck → test（MySQL 8.0）→ audit → docker
 ```
 
 ## 设计决策
 
-以下文档保存在本地工作区 `docs/`（按用户策略不入库，克隆后不会存在）：
+架构决策与边界文档随仓库发布，克隆后可直接阅读：
 
-- ADR-001：LangGraph 作为基座运行时（`docs/adr/001-langgraph-as-runtime.md`）
-- ADR-002：显式清单模块注册（`docs/adr/002-module-contract.md`）
-- module-guide：五步接入新模块 + 应用层规范（`docs/module-guide.md`）
+- [ADR-001：LangGraph 作为基座运行时](docs/adr/001-langgraph-as-runtime.md)——候选方案对比、CVE 版本地板、后果与约束
+- [ADR-002：显式清单 + fail-fast 的模块接入契约](docs/adr/002-module-contract.md)——为什么不做自动发现、校验规则与代价
+- [模块接入手册](docs/module-guide.md)——五步接入与检查清单
+- [部署指南](docs/deployment.md)——三种形态、环境变量、单进程口径、迁移与安全
+- [设计边界与质量门](docs/design-review.md)——H2–H6 已知边界
 
 定位与边界依据见 ADR-001/002；对外叙事（本 README 开头的差异化表）与其
 保持一致——基座不做编排，做编排之上的治理。
+
+## 许可证
+
+本项目采用 [Apache License 2.0](LICENSE) 许可；版权与归属声明见
+[NOTICE](NOTICE)。提交贡献即表示你同意以同一许可证授权你的贡献。
+
+## 贡献
+
+欢迎 issue 与 PR。开始之前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)：
+四道质量门必须全绿，契约优先、安全地板与文档同步更新是硬性要求。
+安全问题请按 [SECURITY.md](SECURITY.md) 私下报告，不要开公开 issue。
