@@ -1,12 +1,3 @@
-# === Security hard rule: dev docs MUST NOT enter this repo ===
-# Workspace policy (user-mandated, 2026-09-04):
-#   All development / planning / review documents live in a non-git
-#   working area outside this repository. They MUST NOT be tracked here. The
-#   patterns below are defensive: even if such a file is accidentally
-#   copied into the tree, it will be silently excluded from tracking.
-#   Never bypass with `git add -f` on these — a leak of pre-publication
-#   security-review notes would telegraph unpatched vulnerabilities.
-
 # Chinese planning / review / decomposition naming conventions
 *规划*.md
 *计划*.md
@@ -60,8 +51,8 @@ htmlcov/
 .env
 .env.local
 
-# Project docs (user-mandated: keep out of the GitHub repo)
-docs/
+# Internal planning documents (public docs live in docs/ and ARE tracked)
+docs/plans/
 
 # Editor/IDE + workspace assistant metadata
 .idea/
