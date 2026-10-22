@@ -93,8 +93,10 @@ HTTP 层在 `MEMORY_ENABLED=false` 时仍然要工作（线程属主校验、会
   `versions/0001_memory_tables.py`，`version_table=alembic_version_memory`。
   初始迁移把六张表（`memories` / `memory_blocks` / `session_summaries` /
   `doc_chunks`（含 `offsets_json`）/ `memory_ops` / `memory_versions`）
-  与全部索引定义为 `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`
-  的幂等 DDL。
+  与全部索引写成幂等 DDL：表用 `CREATE TABLE IF NOT EXISTS`，索引在建表语句
+  内联 `KEY`（MySQL 8 没有 `CREATE INDEX IF NOT EXISTS`）。老库上 `doc_chunks`
+  已存在但缺 `offsets_json` 时，迁移在 `inspect` 确认后补列；offline（`--sql`）
+  模式跳过该探测。
 
 ### 5.2 三类库的升级动作
 
@@ -120,10 +122,12 @@ HTTP 层在 `MEMORY_ENABLED=false` 时仍然要工作（线程属主校验、会
 
 ## 6. 业务模块来自独立包
 
-`core/registry.py` 增加多前缀加载：`load_modules(names, *, prefixes)`，
-按顺序在 `AGENT_MODULE_PACKAGES`（逗号分隔，默认 `agent_base.modules`）
-列出的命名空间里解析模块名；同一个名字命中多个前缀属于配置错误（fail-fast），
-不存在则报 `RegistryError` 并列出已搜索的前缀。业务方因此可以发布
+`core/registry.py` 增加多包加载：`load_modules(names, *,
+packages)`（旧的 `prefix` 参数保留），按顺序在 `AGENT_MODULE_PACKAGES`
+（逗号分隔，默认 `agent_base.modules`）列出的命名空间里解析模块名。
+同一个名字命中多个包时**靠前的包优先**（命中即返回，与 Python 的模块
+解析直觉一致）；找不到则报 `RegistryError` 并列出已搜索的包。
+包名必须是点分小写标识符，空列表在启动时即报错。业务方因此可以发布
 `my-company-agents`，在其中暴露 `my_company_agents.chat` 等模块。
 
 ## 7. 破坏性变更（0.3.0）
@@ -134,13 +138,54 @@ HTTP 层在 `MEMORY_ENABLED=false` 时仍然要工作（线程属主校验、会
   （方法签名不变，鸭子类型调用方不受影响）；
 - docker 镜像与 compose 默认安装记忆包，行为不变。
 
-## 8. 验收清单
+## 8. 验收结果（实测）
 
-1. `pip install -e . -e packages/agent-base-memory` 后四道门全绿；
-2. 只装基座（临时卸载记忆包）时：`MEMORY_ENABLED=false` 正常启动、
-   `MEMORY_ENABLED=true` 启动即报可操作的错误；
-3. 全新 sqlite 库：只跑基座链 → 无记忆表；跑记忆链 → 六表齐全；
-4. 老库样本（0.2.0 建的库）：两条链 upgrade 均成功且行数不变；
-5. `alembic -c packages/agent-base-memory/alembic.ini downgrade base` 后
-   记忆表消失、基座表保留；
-6. `docker compose config` 与镜像构建通过（构建受本机 Docker 状态限制）。
+| # | 检查 | 命令 | 结果 |
+| --- | --- | --- | --- |
+| 1 | 静态检查 | `ruff check src tests examples packages` | All checks passed |
+| 2 | 格式 | `ruff format --check src tests examples packages` | 156 files already formatted |
+| 3 | 类型 | `mypy`（files=src + packages/agent-base-memory/src） | Success: no issues found in 104 source files |
+| 4 | 测试与覆盖率 | `pytest`（`--cov=agent_base --cov=agent_base_memory`） | 548 passed / 1 skipped / 0 failed；分支覆盖率 87.46%（门槛 85%） |
+| 5 | 依赖审计 | `pip-audit --skip-editable` | No known vulnerabilities found |
+| 6 | 记忆包 wheel | `python -m build --wheel packages/agent-base-memory` | 构建成功，entry point 为 service + routes，含 LICENSE/NOTICE |
+| 7 | 记忆链 offline | `python -m alembic -c packages/agent-base-memory/alembic.ini upgrade head --sql` | 输出六表幂等 DDL 并按 `alembic_version_memory=0001` 收尾 |
+| 8 | compose 语法 | `docker compose config --quiet` | exit 0 |
+
+只装基座的两种语义由 `tests/test_memory_plugin.py` 固定下来：
+
+- `MEMORY_ENABLED=true` + 无可发现实现 → `create_runtime` 抛
+  `MemoryPluginError`，文案含 `pip install 'agent-base[memory]'`；
+- `MEMORY_ENABLED=false` + 无可发现实现 → 正常装配，`runtime.memory is None`；
+- 同文件还有静态 import 扫描：`src/agent_base` 下任何 `import agent_base_memory`
+  都会让它失败（依赖方向靠测试守住，而不是靠约定）。
+
+未在本机验证：真实 MySQL 上的老库升级（需要 0.2.0 库样本 + 服务容器）与
+`docker build`（本机 Docker daemon 未运行）。这两项由 CI 的 test / docker
+作业覆盖，发布前应在有 Docker 的环境补跑一次。
+
+## 9. 落地清单与已知限制
+
+落地：
+
+- 新包 `packages/agent-base-memory/`：`pyproject.toml`（entry points、
+  `agent-base>=0.3,<0.4`、LICENSE/NOTICE）、`src/agent_base_memory/`
+  （原 `agent_base.memory` 全量迁入改名）、独立 `alembic.ini` + `alembic/`、
+  安装/迁移说明 README；
+- 基座新增 `core/storage/`（thread_index / plan_snapshots 三后端）、
+  `core/memory_plugin.py`（entry point 发现）、`core/memory_scope.py`、
+  `ChatInvokerPort`；`bootstrap` 用插件装配记忆、`create_app` 按插件挂路由；
+- `registry` 多包加载 + `AGENT_MODULE_PACKAGES`（配置校验、first-wins）；
+- 迁移：基座三条记忆迁移改 no-op，记忆包独立链；
+- 打包与部署：根 `pyproject` 的 `[memory]` extra、Dockerfile/compose 双链迁移、
+  CI 的 packages 路径与 memory-package 作业、`.env.example` 说明。
+
+已知限制（不影响本次拆分结论，记录在案）：
+
+- **wheel 不含迁移资产**：`alembic/` 与 `alembic.ini` 随仓库与容器镜像分发
+  （与基座一致）。从 wheel 安装的部署要跑记忆链，需要从仓库或镜像取这两个
+  路径；后续若上 PyPI，再把迁移作为包数据并提供短命令。
+- **基座链 offline 模式仍不可用**：`alembic/versions/0001` 在 `--sql` 的
+  MockConnection 上调用 `sa.inspect` 会抛 `NoInspectionAvailable`。这是拆分
+  前就存在的问题，与记忆包无关，本次未修。记忆链的 offline 模式已处理。
+- `agent-base-memory` 尚未发布到 PyPI，`[memory]` extra 目前只对"从仓库/
+  镜像安装"有意义；发布顺序必须先基座 0.3.0、后记忆包 0.1.0。
