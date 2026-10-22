@@ -187,5 +187,9 @@ packages)`（旧的 `prefix` 参数保留），按顺序在 `AGENT_MODULE_PACKAG
 - **基座链 offline 模式仍不可用**：`alembic/versions/0001` 在 `--sql` 的
   MockConnection 上调用 `sa.inspect` 会抛 `NoInspectionAvailable`。这是拆分
   前就存在的问题，与记忆包无关，本次未修。记忆链的 offline 模式已处理。
+- **PyMySQL 上限**：钉 `pymysql>=1.1,<1.2.1`。PyMySQL 1.2.1 起删除了
+  `escape_bytes_prefixed`（1.2.3 换成字符串占位符，PyMySQL#1274），而 aiomysql 0.3.2
+  在导入处就要这个名字：1.2.1/1.2.2 直接 ImportError，1.2.3 在 BLOB 参数上抛
+  `TypeError`。等 aiomysql 发修复版后放宽。
 - `agent-base-memory` 尚未发布到 PyPI，`[memory]` extra 目前只对"从仓库/
   镜像安装"有意义；发布顺序必须先基座 0.3.0、后记忆包 0.1.0。

@@ -56,6 +56,12 @@ dependencies = [
     # 阶段 3（扩展）：MySQL 对话状态后端（CHECKPOINTER_BACKEND=mysql）。
     # 使用 aiomysql 驱动的异步 AIOMySQLSaver；要求 MySQL >= 8.0.19。
     "langgraph-checkpoint-mysql[aiomysql]>=2.0",
+    # PyMySQL 1.2.1 起删除了 escape_bytes_prefixed（PyMySQL#1274），1.2.3 又把它
+    # 换成字符串占位符；aiomysql 0.3.2 在模块导入时就 from pymysql.converters
+    # import escape_bytes_prefixed，于是：1.2.1/1.2.2 直接 ImportError，1.2.3
+    # 导入成功但任何 BLOB 参数（记忆向量）抛 TypeError。aiomysql 尚无修复版本，
+    # 因此在上限侧钉住 1.2.0，等 aiomysql 发版后再放宽。
+    "pymysql>=1.1,<1.2.1",
     # MySQL 8 默认的 caching_sha2_password 认证在完整握手时需要 cryptography。
     "cryptography>=41.0",
     # 阶段 4：supervisor 多 Agent 模板（create_supervisor）。

@@ -47,6 +47,17 @@
 - 基座 `alembic/versions/0004/0005/0007` 的建表逻辑改为空壳（revision 链保留，
   老库仍可 `upgrade head`）。
 
+### Fixed
+
+- MySQL 集成（`test_memory_store.py::test_mysql_store_semantics`）：PyMySQL 1.2.1 起
+  删除了 `escape_bytes_prefixed`（PyMySQL#1274），1.2.3 又把它换成字符串占位符，
+  而 aiomysql 0.3.2 在模块导入处 import 该名字——1.2.1/1.2.2 报 ImportError，
+  1.2.3 让任何 BLOB 参数（记忆向量）抛 `TypeError: 'str' object is not callable`。
+  现钉 `pymysql>=1.1,<1.2.1`。
+- `memory_versions.seq` 缺独立索引，MySQL 8 建表报
+  `1075: there can be only one auto column and it must be defined as a key`；
+  建表与迁移各补 `KEY idx_versions_seq (seq)`。
+
 ### 升级 0.2 → 0.3
 
 ```bash
