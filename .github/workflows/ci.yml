@@ -20,6 +20,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
       - name: Install
         run: pip install -e ".[dev,doc,search,mcp]"
       - name: Ruff lint
@@ -37,18 +39,20 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
       - name: Install
         run: pip install -e ".[dev,doc,search,mcp]"
       - name: Mypy (strict)
         run: mypy
 
   test:
-    # MySQL 全量集（含 integration 标记）：仅 ubuntu——Windows runner
-    # 不支持 service 容器。
+    # Full test set (includes integration-marked tests) on Ubuntu only:
+    # Windows runners do not support service containers.
     runs-on: ubuntu-latest
     services:
       mysql:
-        image: mysql:5.7
+        image: mysql:8.0
         env:
           MYSQL_ROOT_PASSWORD: root
         ports:
@@ -68,6 +72,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
       - name: Install
         run: pip install -e ".[dev,doc,search,mcp]"
       - name: Pytest
@@ -91,6 +97,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
       - name: Install
         run: pip install -e ".[dev,doc,search,mcp]"
       - name: Pytest
@@ -103,11 +111,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
       - name: Install
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev,doc,search,mcp]"
       - name: pip-audit (ubuntu)
-        # --skip-editable：本地 agent-base 包本身不是 PyPI 依赖；
-        # 它所依赖的一切仍会被审计。
+        # --skip-editable: agent-base itself is not a PyPI dependency;
+        # everything it depends on is still audited.
         run: pip-audit --skip-editable
+
+  docker:
+    # Verify the container image still builds on every push/PR.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t agent-base:ci .
