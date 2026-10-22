@@ -200,6 +200,8 @@ _MYSQL_DDLS: tuple[str, ...] = (
       status VARCHAR(16) NOT NULL DEFAULT 'active',
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (version_id),
+      -- MySQL 要求 AUTO_INCREMENT 列自身带索引；复合索引里 seq 不是首列不算。
+      KEY idx_versions_seq (seq),
       KEY idx_versions_memory (memory_id, seq)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
