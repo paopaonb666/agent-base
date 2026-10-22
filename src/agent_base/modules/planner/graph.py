@@ -8,6 +8,8 @@ best-effort synthesize。
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 from langgraph.graph import END, START, StateGraph
 
 from agent_base.core.contracts import Graph, ModuleContext
@@ -26,8 +28,10 @@ def build_planner_graph(ctx: ModuleContext) -> Graph:
     from agent_base.modules.planner.nodes_plan import make_plan_node
 
     graph = StateGraph(PlanState)
-    # add_node 的重载只认内联闭包的字面类型；工厂返回的节点函数
-    # （NodeFn 别名）在此边界用定向 ignore——与 collab.py 的做法一致。
+    # add_node 的重载只认内联闭包的字面类型；工厂返回的节点函数是
+    # NodeFn 别名，在此边界显式收窄（与 collab.py 的边界处理一致），
+    # 避免 mypy 结果随上游 langgraph 版本在 arg-type 与 unused-ignore
+    # 之间抖动。
     for name, make in (
         ("plan", make_plan_node),
         ("execute", make_execute_node),
@@ -35,7 +39,7 @@ def build_planner_graph(ctx: ModuleContext) -> Graph:
         ("replan", make_replan_node),
         ("synthesize", make_synthesize_node),
     ):
-        graph.add_node(name, make(ctx))  # type: ignore[call-overload]
+        graph.add_node(name, cast(Any, make(ctx)))
     graph.add_edge(START, "plan")
     graph.add_edge("plan", "execute")
     graph.add_edge("execute", "check")
