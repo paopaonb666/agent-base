@@ -50,6 +50,22 @@ def _settings(enabled: bool) -> Any:
     return SimpleNamespace(memory=SimpleNamespace(enabled=enabled))
 
 
+def _runtime_settings(state_dir: Path) -> Any:
+    """启动用例用的最小 Settings：不读 .env，也不要求真实 API key。
+
+    CI 里没有 .env，``Settings()`` 会因为 ``LLM_API_KEY`` 缺失在组合根之前
+    就报错——那样测到的就不是记忆插件的装配语义了。sqlite 状态库落到
+    tmp_path，避免用例在工作区里留文件。
+    """
+    from agent_base.core.config import Settings
+
+    return Settings(
+        _env_file=None,
+        llm={"api_key": "sk-test"},
+        checkpointer={"sqlite_path": str(state_dir / "state.db")},
+    )
+
+
 def _service_builder(plugin: Any):  # type: ignore[no-untyped-def]
     async def build(*, settings: Any, llm: Any, fast_llm: Any) -> Any:
         assert settings.memory.enabled is True
@@ -178,31 +194,29 @@ def test_base_sources_have_no_static_import_of_memory_package() -> None:
 
 @pytest.mark.asyncio
 async def test_startup_fails_fast_when_memory_package_is_missing(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """MEMORY_ENABLED=true 且没装记忆包：组合根在启动时报可操作的错误。"""
     from agent_base.core.bootstrap import create_runtime
-    from agent_base.core.config import Settings
 
     monkeypatch.setattr(memory_plugin, "entry_points", _entry_points())
     monkeypatch.setenv("MEMORY_ENABLED", "true")
 
     with pytest.raises(MemoryPluginError, match=r"pip install 'agent-base\[memory\]'"):
-        await create_runtime(Settings())
+        await create_runtime(_runtime_settings(tmp_path))
 
 
 @pytest.mark.asyncio
 async def test_startup_without_memory_package_works_when_disabled(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """MEMORY_ENABLED=false：零发现、零导入，运行时照常装配。"""
     from agent_base.core.bootstrap import create_runtime
-    from agent_base.core.config import Settings
 
     monkeypatch.setattr(memory_plugin, "entry_points", _entry_points())
     monkeypatch.setenv("MEMORY_ENABLED", "false")
 
-    runtime = await create_runtime(Settings())
+    runtime = await create_runtime(_runtime_settings(tmp_path))
     try:
         assert runtime.memory is None
         assert runtime.thread_index is not None
