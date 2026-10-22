@@ -154,7 +154,9 @@ jobs:
       - name: Build wheel
         run: |
           python -m pip install --upgrade pip build
-          python -m build --wheel packages/agent-base-memory
+          # --outdir keeps the artifact at ./dist so the install step does not
+          # depend on where the package happens to live in the repo.
+          python -m build --wheel packages/agent-base-memory --outdir dist
       - name: Install and verify entry points
         run: |
           pip install -e ".[dev]"
