@@ -4,10 +4,36 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-base"
-version = "0.1.0"
+version = "0.2.0"
 description = "Agent software foundation: LangGraph runtime + module registry + config + entrypoints; business capabilities plug in later as modules"
 readme = "README.md"
+license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
+authors = [{ name = "paopaonb666", email = "paopaonb666@users.noreply.github.com" }]
+keywords = [
+    "agents",
+    "langgraph",
+    "llm",
+    "multi-agent",
+    "fastapi",
+    "memory",
+    "orchestration",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
 
 dependencies = [
     # 核心编排运行时。
@@ -50,6 +76,15 @@ dependencies = [
     "tzdata>=2024.1",
 ]
 
+# 项目链接。注意：TOML 表必须写在 dependencies 数组之后、[project.scripts]
+# 之前——把 URL 依赖写进 [project] 表会让 hatchling 把它当成数组元素解析，
+# 报 "URL dependencies of field project.urls must be a string"。
+[project.urls]
+Homepage = "https://github.com/paopaonb666/agent-base"
+Repository = "https://github.com/paopaonb666/agent-base"
+Issues = "https://github.com/paopaonb666/agent-base/issues"
+Documentation = "https://github.com/paopaonb666/agent-base/tree/main/docs"
+
 [project.scripts]
 agent-base = "agent_base.entrypoints.cli:main"
 
@@ -68,6 +103,13 @@ doc = [
 # 承诺，见 src/agent_base/tools/mcp.py）；默认依赖不增重。
 mcp = [
     "langchain-mcp-adapters>=0.3",
+]
+# 数据库迁移：部署时执行 `alembic upgrade head` 需要（运行时镜像按此
+# extra 安装）。本地开发经 dev extras 安装同一组依赖。
+migrate = [
+    "alembic>=1.19",
+    "sqlalchemy>=2.0",
+    "pymysql>=1.1",
 ]
 dev = [
     "pytest>=8.0",
