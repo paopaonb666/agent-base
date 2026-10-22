@@ -15,9 +15,9 @@ from langchain_core.tools import BaseTool
 
 from agent_base.core.bootstrap import create_runtime
 from agent_base.core.config import Settings
-from agent_base.memory.service import MemoryService, chunk_text
-from agent_base.memory.store import MemoryMemoryStore
-from agent_base.memory.tools import build_memory_tools, set_memory_scope
+from agent_base_memory.service import MemoryService, chunk_text
+from agent_base_memory.store import MemoryMemoryStore
+from agent_base_memory.tools import build_memory_tools, set_memory_scope
 from fakes import HashEmbedding
 
 
@@ -360,7 +360,7 @@ async def test_ingest_document_is_idempotent() -> None:
 
 async def test_backfill_covers_doc_chunks(tmp_path) -> None:
     """向量回填覆盖知识库分块：旧维度/无向量的分块都被修复。"""
-    from agent_base.memory.store import DocChunk, encode_embedding
+    from agent_base_memory.store import DocChunk, encode_embedding
 
     service = _service()
     await service.store.put_chunks(
@@ -565,7 +565,7 @@ async def test_raw_endpoint_serves_image_bytes() -> None:
 
 async def test_legacy_chunks_without_offsets_degrade(tmp_path=None) -> None:
     """旧数据 offsets=None：chunks 端点原样返回 null（前端降级卡片视图）。"""
-    from agent_base.memory.store import DocChunk, MemoryMemoryStore
+    from agent_base_memory.store import DocChunk, MemoryMemoryStore
 
     service = _service()
     await service.store.put_chunks(

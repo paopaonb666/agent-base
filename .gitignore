@@ -46,6 +46,8 @@ venv/
 .coverage
 coverage.xml
 htmlcov/
+.dist/
+.pytest-junit.xml
 
 # Environment & secrets (never commit)
 .env

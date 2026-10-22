@@ -54,6 +54,61 @@ class MemoryPort(Protocol):
 
 
 @runtime_checkable
+class MemoryServicePort(MemoryPort, Protocol):
+    """入口层需要的记忆服务完整面（0.3.0 拆分后由记忆包实现）。
+
+    ``MemoryPort`` 是业务模块看到的最小面；HTTP 层还需要知识库入库/
+    检索、线程级联清理与健康探针。这些方法同样不 import 记忆包的数据
+    类——跨边界的载荷一律是 ``Any``/``dict``（依赖倒置：基座源码中
+    不出现 ``agent_base_memory``）。
+    """
+
+    def capture_ready(self) -> bool:
+        """记忆形成管线是否可用（未配置 LLM 时不可用）。"""
+        ...
+
+    async def recall_context(self, *, user_id: str, query: str) -> str | None: ...
+
+    async def purge_thread(self, thread_id: str) -> None: ...
+
+    async def ingest_document(
+        self,
+        *,
+        file_id: str,
+        user_id: str,
+        agent_id: str,
+        text: str,
+        thread_id: str = "",
+    ) -> int: ...
+
+    async def revoke_document(self, *, file_id: str, user_id: str) -> int: ...
+
+    async def search_knowledge(
+        self, *, user_id: str, agent_id: str | None, query: str, top_k: int | None = None
+    ) -> list[Any]: ...
+
+    async def list_file_chunks(
+        self, *, user_id: str, file_id: str, limit: int = 200
+    ) -> list[dict[str, Any]]: ...
+
+    async def chunk_counts_by_file(self, user_id: str) -> dict[str, int]: ...
+
+    async def health_probe(self) -> str: ...
+
+
+@runtime_checkable
+class ChatInvokerPort(Protocol):
+    """后台管线用到的快档模型最小面（0.3.0 拆分引入）。
+
+    成本治理的快档是 ResilientLLM——它刻意不继承 BaseChatModel
+    （只在后台管线做单次 ainvoke，不进图执行路径）。记忆包的装配
+    点只需要这个能力，因此契约按端口声明，双方都不绑定具体实现类。
+    """
+
+    async def ainvoke(self, messages: Any) -> Any: ...
+
+
+@runtime_checkable
 class PlanStorePort(Protocol):
     """计划快照存储的最小端口（M10 跨轮延续，依赖倒置同 MemoryPort）。
 

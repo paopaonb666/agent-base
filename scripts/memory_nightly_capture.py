@@ -29,7 +29,6 @@ from datetime import date, datetime
 from typing import Any
 
 from agent_base.core.bootstrap import AgentRuntime, create_runtime
-from agent_base.memory.service import MemoryService
 
 
 def _parse_args() -> argparse.Namespace:
@@ -62,13 +61,13 @@ async def capture_since(
     单线程失败不中断批次（失败安全语义与每轮路径一致），只记 stderr。
     """
     memory = rt.memory
-    if not isinstance(memory, MemoryService) or memory.pipeline is None:
+    if memory is None or not memory.capture_ready():
         print(
             "记忆形成管线不可用（MEMORY_ENABLED=false 或未装配 LLM），无事可做",
             file=sys.stderr,
         )
         return 0, 0
-    assert rt.thread_index is not None  # memory 启用时与 memory.store 同一实例
+    assert rt.thread_index is not None  # 基座自有存储：线程来源与列表端点同源
 
     processed = 0
     skipped = 0

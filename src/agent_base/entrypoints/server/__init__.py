@@ -11,8 +11,9 @@
 - ``serializers`` —— 消息序列化与图片内容嗅探
 - ``sse``       —— SSE 生产者 / 心跳 / 事件流 / 记忆形成钩子
 - ``background`` —— 后台任务助手（持引用 + 异常落日志，H4）
-- ``routes/``   —— agents（对话与线程）/ memory / files / system 四个
-  ``APIRouter``；路由层只做参数校验、依赖注入与编排，无业务规则
+- ``routes/``   —— agents（对话与线程）/ files / system 三个 ``APIRouter``；
+  记忆管理面（/v1/memory）随记忆包迁出，这里按 entry point 挂载；
+  路由层只做参数校验、依赖注入与编排，无业务规则
 
 本模块（包根）保留应用装配职责：lifespan、CORS、可观测性中间件，
 以及测试依赖的模块级符号（``_event_stream`` / ``_serialize_message`` /
@@ -34,10 +35,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from agent_base import __version__
 from agent_base.core.bootstrap import AgentRuntime, create_runtime
 from agent_base.core.config import Settings
+from agent_base.core.memory_plugin import MemoryPluginError, load_memory_routers
 from agent_base.entrypoints.server.auth import REQUEST_ID_RE, AuthBackend, HmacHeaderAuth
 from agent_base.entrypoints.server.routes import agents as agents_routes
 from agent_base.entrypoints.server.routes import files as files_routes
-from agent_base.entrypoints.server.routes import memory as memory_routes
 from agent_base.entrypoints.server.routes import system as system_routes
 from agent_base.entrypoints.server.routes.system import _probe_model
 from agent_base.entrypoints.server.serializers import (
@@ -203,9 +204,19 @@ def create_app(
         return response
 
     app.include_router(agents_routes.router)
-    app.include_router(memory_routes.router)
     app.include_router(files_routes.router)
     app.include_router(system_routes.router)
+    # 记忆管理面（/v1/memory）随记忆包发布：经 "agent_base.memory" 的
+    # routes entry point 发现，基座源码不 import 它。装了记忆包就挂载
+    # ——MEMORY_ENABLED=false 时端点保持 503 的可读语义；只有基座的
+    # 部署（无记忆包）才是 404（能力不存在）；若此时 MEMORY_ENABLED=true，
+    # startup 的插件发现已先行 fail-fast 给出安装提示。
+    try:
+        memory_routers = load_memory_routers()
+    except MemoryPluginError:
+        memory_routers = []
+    for router in memory_routers:
+        app.include_router(router)
     return app
 
 

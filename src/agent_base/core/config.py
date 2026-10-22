@@ -25,6 +25,7 @@ pydantic-settings 把环境变量（大小写不敏感）映射到这些字段�
 from __future__ import annotations
 
 import json
+import re
 from typing import Annotated, Any
 
 from pydantic import (
@@ -681,9 +682,15 @@ class Settings(BaseSettings):
         )
 
     # -- 模块 ------------------------------------------------------------
-    # 要加载的模块名；顺序即装配顺序。registry 会把每个名字解析为
-    # agent_base.modules.<name>。
+    # 要加载的模块名；顺序即装配顺序。registry 默认把每个名字解析为
+    # agent_base.modules.<name>；独立分发的模块包把包名加进
+    # AGENT_MODULE_PACKAGES 即可被发现（同名时靠前的包优先）。
     agent_modules: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["chat"])
+
+    # 模块包（导入前缀）搜索顺序；默认只有基座自带的样板模块包。
+    agent_module_packages: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["agent_base.modules"]
+    )
 
     # -- Agent 循环 ------------------------------------------------------
     # 单轮 invoke 的图步数上限（含工具往返）：防止工具循环失控空转。
@@ -713,10 +720,22 @@ class Settings(BaseSettings):
     cost: CostSettings = Field(default_factory=CostSettings)
     mcp: McpSettings = Field(default_factory=McpSettings)
 
-    @field_validator("agent_modules", "cors_origins", mode="before")
+    @field_validator("agent_modules", "agent_module_packages", "cors_origins", mode="before")
     @classmethod
     def _parse_root_lists(cls, value: object, info: ValidationInfo) -> object:
         return _parse_csv_or_json_list(value, info.field_name or "value")
+
+    @field_validator("agent_module_packages")
+    @classmethod
+    def _validate_module_packages(cls, value: list[str]) -> list[str]:
+        if not value:
+            raise ValueError("AGENT_MODULE_PACKAGES must list at least one package")
+        invalid = [
+            pkg for pkg in value if not re.match(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$", pkg)
+        ]
+        if invalid:
+            raise ValueError(f"invalid AGENT_MODULE_PACKAGES entries: {invalid}")
+        return value
 
     @field_validator("agent_recursion_limit")
     @classmethod
@@ -784,7 +803,14 @@ class Settings(BaseSettings):
             k
             for k in out
             if k != k.lower()
-            and k.lower() in ("agent_modules", "cors_origins", "env", "agent_recursion_limit")
+            and k.lower()
+            in (
+                "agent_modules",
+                "agent_module_packages",
+                "cors_origins",
+                "env",
+                "agent_recursion_limit",
+            )
         ]:
             # init kwargs（已是小写）优先：只补缺，不覆盖。
             out.setdefault(key.lower(), out.pop(key))

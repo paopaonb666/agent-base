@@ -96,6 +96,10 @@ pip-audit）本地与 CI 完全一致，依赖地板锁定（langgraph ≥1.2.6�
   启用 `web_search` 会在启动时报错。
 - `[doc]`：`python-docx`——DOCX 解析。未安装时 tools/parsing 的 docx
   格式不注册（`pip install -e ".[doc]"` 安装），其余格式不受影响。
+- `[memory]`：`agent-base-memory`——记忆子系统（0.3.0 起独立发行包）。
+  本仓库开发时直接从工作树装：`pip install -e packages/agent-base-memory`。
+  记忆包尚未发布到 PyPI，所以从 PyPI 安装 `agent-base[memory]` 目前只会
+  得到基座；镜像与 compose 已内置该包。
 
 开发依赖（`[dev]`）：pytest / pytest-asyncio / pytest-cov / ruff / mypy / pip-audit / httpx。
 安全审计由 CI 常驻：`pip-audit --skip-editable`。
@@ -109,6 +113,7 @@ extra 安装（dev extras 含同一组依赖；运行时镜像即按 `.[migrate]
 python -m venv .venv
 .venv\Scripts\activate         # Windows（Linux/macOS: source .venv/bin/activate）
 pip install -e ".[dev,doc]"    # [doc] 提供 DOCX 解析；缺它时该格式优雅降级
+pip install -e packages/agent-base-memory   # 记忆子系统（独立发行包，0.3.0 起）
 cp .env.example .env           # 填入 LLM_API_KEY（阶段 1 起由 config.py 消费）
 pytest                         # 核心集（默认排除 integration 标记，无需 MySQL，见下）
 ```
@@ -122,7 +127,8 @@ docker compose config --quiet  # 仅校验 compose 语法与变量插值
 ```
 
 > **测试与覆盖率门**：pytest 默认跑**核心集**（`pyproject.toml` addopts
-> 含 `-m "not integration"`），覆盖率门（branch ≥85%）按核心集计算——
+> 含 `-m "not integration"`），覆盖率门（branch ≥85%）按核心集计算，口径覆盖
+> 基座与记忆包两个发行包（`--cov=agent_base --cov=agent_base_memory`）——
 > 本地无 MySQL 也全绿。MySQL 集成测试带 `@pytest.mark.integration`
 > 标记，仅在两处运行：CI 的 test job（挂 MySQL 8.0 服务容器，
 > `-m "integration or not integration"` 跑全量）与本机显式指定同名
@@ -140,6 +146,7 @@ docker compose config --quiet  # 仅校验 compose 语法与变量插值
 | `LLM_PROVIDER` | `deepseek` \| `zhipu` \| `openai-compatible`（仅做拼写校验，不改变客户端） |
 | `LLM_BASE_URL` / `LLM_MODEL` | 模型服务地址与模型名，切换 provider 只需改这两项 |
 | `AGENT_MODULES` | 逗号分隔的模块清单，顺序即装配顺序（默认 `chat,writer`） |
+| `AGENT_MODULE_PACKAGES` | 模块所在包的导入前缀，逗号分隔、按顺序查找（默认 `agent_base.modules`）。独立分发的模块包加进来即可被发现；同名模块靠前的包优先 |
 | `CORS_ORIGINS` | 允许跨域调用 SSE 端点的来源（默认 `http://localhost:3000`，即 agent-base-ui） |
 | `CHECKPOINTER_BACKEND` | `sqlite`（默认，重启可恢复对话）\| `memory`（零依赖，不持久化）\| `mysql`（MySQL 持久化，配 `CHECKPOINTER_MYSQL_*`） |
 | `TOOL_TIMEOUT_SECONDS` | 工具单次执行超时（默认 30s） |
@@ -217,9 +224,19 @@ data: {"type":"delta","content":"he"}
 
 ## 记忆系统（M6）
 
-`src/agent_base/memory/` 是一套自研的混合式记忆系统（调研 mem0 / Letta / Memobase /
-Zep / LangMem 后的落地形态），存储跟随 `CHECKPOINTER_BACKEND`（memory/sqlite/mysql），
-六张自管表（含 thread_index 会话索引）由 alembic 迁移（MySQL，0004–0008）与运行时自举（sqlite，DDL 单一来源 `memory/store/ddl.py`）幂等建表：
+`packages/agent-base-memory/`（导入名 `agent_base_memory`）是一套自研的混合式记忆系统
+（调研 mem0 / Letta / Memobase / Zep / LangMem 后的落地形态）。0.3.0 起它是**独立发行包**：
+基座只保留 `MemoryPort` / `MemoryServicePort` 契约与 entry point 装配点
+（`agent_base.memory` 组），源码里不再 import 记忆包；`MEMORY_ENABLED=true` 但没装包
+会在启动时报出安装提示，`/v1/memory` 端点也不注册（404）。记忆实现可以整体替换——
+业务模块只依赖 `MemoryPort`（[替换示例](examples/custom_memory_port.py)）。
+
+存储跟随 `CHECKPOINTER_BACKEND`（memory/sqlite/mysql）。会话索引 `thread_index` 与
+计划快照 `plan_snapshots` 归基座（`core/storage/`：`MEMORY_ENABLED=false` 时 HTTP 层
+仍要用），其余六张记忆表（`memories` / `memory_blocks` / `session_summaries` /
+`doc_chunks` / `memory_ops` / `memory_versions`）归记忆包：MySQL 由记忆包自己的
+alembic 链管理（`version_table=alembic_version_memory`，`0001` 幂等建表，老库可直接
+upgrade），sqlite 仍由运行时自举（DDL 单一来源 `store/ddl.py`）：
 
 | 能力 | 说明 |
 | --- | --- |
@@ -232,7 +249,8 @@ Zep / LangMem 后的落地形态），存储跟随 `CHECKPOINTER_BACKEND`（memo
 | 上下文工程 | 每轮注入「画像 + 记忆块 + 摘要 + 相关记忆」注入块；基座级上下文引擎（`core/context.py` + `core/graphs.py`）对**所有模块**的模型输入做注入去重与 token 预算修剪（工具配对不拆散），checkpointer 全量历史保留（recall 语义） |
 | Agent 工具 | `memory_search` / `memory_save` / `memory_update_block` / `knowledge_search` 进共享工具池（超时 + 审计自动生效） |
 
-管理端点（均以 `X-User-Id` 头为作用域，缺省 `default`）：
+管理端点（由记忆包的 `routes` entry point 注册；均以 `X-User-Id` 头为作用域，
+缺省 `default`。只装基座时这些路径是 404，装了包但 `MEMORY_ENABLED=false` 时是 503）：
 
 ```
 POST   /v1/memory                 # 手工写入记忆（落库前尽力向量化）
@@ -409,22 +427,32 @@ checkpointer 后端；sqlite 为独立 sqlite 账本），进程重启后从账�
 
 ## 数据库迁移（mysql 后端）
 
-对话状态（checkpointer）表由 **Alembic** 版本化管理，初迁移复用 langgraph 内置迁移：
+表结构由 **Alembic** 版本化管理，分成两条独立的链（同一个库、同一组连接参数）：
+
+| 链 | 版本表 | 覆盖 |
+| --- | --- | --- |
+| 基座 | `alembic_version` | checkpointer（初迁移复用 langgraph 内置迁移）、工具审计、上传文件、线程索引、计划快照、成本账本 |
+| 记忆包 | `alembic_version_memory` | 六张记忆表（由 `agent-base-memory` 自带） |
 
 ```bash
-# 全新库：应用全部迁移（建出 checkpoint_* 表）
+# 基座链（仓库根）
 python -m alembic upgrade head
 
 # 已由 langgraph setup() 建过表的库：只对齐版本、不重复执行 DDL
 python -m alembic stamp head
 
+# 记忆链（先装好记忆包；首迁移幂等，0.2.0 老库无需 stamp）
+python -m alembic -c packages/agent-base-memory/alembic.ini upgrade head
+
 # 连接参数优先级：AGENT_BASE_DB_* 环境变量 > .env 的 CHECKPOINTER_MYSQL_*
 # 例：AGENT_BASE_DB_NAME=mydb AGENT_BASE_DB_PASSWORD=*** python -m alembic upgrade head
 ```
 
-迁移目录：[`alembic/`](alembic/)（`alembic.ini`、`env.py`、`versions/`）。
-说明：迁移通过读取 `checkpoint_migrations` 当前最大版本判断进度，与
-`AIOMySQLSaver.setup()` 的幂等逻辑一致，二者共存且不冲突。
+迁移目录：[`alembic/`](alembic/)（基座链：`alembic.ini`、`env.py`、`versions/`）与
+[`packages/agent-base-memory/alembic/`](packages/agent-base-memory/alembic/)（记忆链）。
+说明：基座迁移通过读取 `checkpoint_migrations` 当前最大版本判断进度，与
+`AIOMySQLSaver.setup()` 的幂等逻辑一致，二者共存且不冲突；记忆链只看自己的
+`alembic_version_memory`。容器内两条链由 compose 启动命令依次执行。
 
 ## 配合前端 agent-base-ui
 
@@ -446,7 +474,7 @@ pnpm dev        # http://localhost:3000
 ## 质量门（四道，本地与 CI 完全一致）
 
 ```bash
-ruff check src tests examples && ruff format --check src tests examples   # 1. lint + format
+ruff check src tests examples packages && ruff format --check src tests examples packages   # 1. lint + format
 mypy                                                     # 2. 类型检查（strict）
 pytest                                                   # 3. 测试（内置 branch coverage ≥85% 门槛）
 pip-audit --skip-editable                               # 4. 依赖安全审计
@@ -468,9 +496,8 @@ agent-base/
 ├── src/agent_base/
 │   ├── core/                # config（嵌套配置节）/ contracts（含 MemoryPort）/ registry / llm
 │   │                        #           · bootstrap / tools（工具池）/ context（上下文引擎）/ graphs
-│   ├── memory/              # 记忆系统（M6）：store/（包：models/protocol/ddl/三后端）
-│   │                        #           · embeddings / retrieval / pipeline / textkit
-│   │                        #           · context（注入组装）/ tools / service
+│   │                        #           · storage（thread_index + plan_snapshots，基座自有）
+│   │                        #           · memory_plugin（entry point 发现与装配）/ memory_scope
 │   ├── extensions/          # 扩展点：observability（request_id + 日志）· memory（checkpointer）
 │   │                        #           · collab（supervisor）· events（SSE 契约）· metrics
 │   │                        #           · toollog（工具审计）· filestore（附件存储）· mysql57
@@ -480,17 +507,23 @@ agent-base/
 │   └── entrypoints/
 │       ├── cli.py           # CLI 入口（--module / --message / --thread-id / --version）
 │       └── server/          # FastAPI + SSE 服务包（H1 拆分）：app 装配 + auth/deps/
-│                            #           serializers/sse/background + routes/{agents,memory,files,system}
-├── alembic/                 # 数据库迁移（alembic.ini + env.py + versions/）
+│                            #           serializers/sse/background + routes/{agents,files,system}
+├── packages/agent-base-memory/  # 记忆子系统独立发行包（导入名 agent_base_memory）
+│   ├── src/agent_base_memory/   # store/（models/protocol/ddl/三后端）· embeddings · retrieval
+│   │                            # · pipeline · textkit · context · tools · service · api · plugin
+│   └── alembic/                 # 记忆表迁移链（version_table=alembic_version_memory）
+├── alembic/                 # 基座迁移链（0004/0005/0007 记忆表迁移留 no-op 空壳，兼容旧库）
 ├── tests/                   # config / registry / llm / chat / cli / smoke / observability
 │                            # / memory / tools / events / server / collab / hello
 │                            # / bootstrap / metrics
 ├── docs/                    # 公开文档（随仓库发布）
-│   ├── adr/                 # ADR-001 运行时选型 / ADR-002 模块契约
-│   ├── module-guide.md      # 五步接入手册 + 接入检查清单
-│   ├── deployment.md        # 部署形态 / 环境变量 / 单进程口径 / 迁移 / 安全 / 容器
+│   ├── adr/                 # ADR-001 运行时 / ADR-002 模块契约 / ADR-003 记忆包拆分
+│   ├── module-guide.md      # 五步接入手册 + 接入检查清单（含独立模块包）
+│   ├── deployment.md        # 部署形态 / 环境变量 / 单进程口径 / 双迁移链 / 安全 / 容器
+│   ├── memory-package-split.md  # 拆分方案、迁移兼容与回滚
 │   └── design-review.md     # 已知边界 H2–H6 与质量门
-└── .github/workflows/ci.yml # CI：lint → typecheck → test（MySQL 8.0）→ audit → docker
+└── .github/workflows/ci.yml # CI：lint → typecheck → test（MySQL 8.0）→ audit
+                            #     → memory-package（wheel + entry points）→ docker
 ```
 
 ## 设计决策

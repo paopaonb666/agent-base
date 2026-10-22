@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from agent_base.memory.retrieval import (
+from agent_base_memory.retrieval import (
     cosine_similarity,
     filter_expired,
     recall_memories,
@@ -12,7 +12,7 @@ from agent_base.memory.retrieval import (
     score_memories,
     tokenize,
 )
-from agent_base.memory.store import MemoryMemoryStore, MemoryRecord, encode_embedding
+from agent_base_memory.store import MemoryMemoryStore, MemoryRecord, encode_embedding
 from fakes import HashEmbedding
 
 
@@ -193,7 +193,7 @@ async def test_recall_memories_end_to_end() -> None:
 
 
 def test_bm25_cache_hits_and_rebuilds() -> None:
-    from agent_base.memory.retrieval import Bm25Cache
+    from agent_base_memory.retrieval import Bm25Cache
 
     cache = Bm25Cache(maxsize=4)
     docs = ["用户使用 LangGraph", "用户喜欢猫"]
@@ -212,7 +212,7 @@ def test_bm25_cache_hits_and_rebuilds() -> None:
 
 
 def test_bm25_cache_lru_eviction_and_disable() -> None:
-    from agent_base.memory.retrieval import Bm25Cache
+    from agent_base_memory.retrieval import Bm25Cache
 
     cache = Bm25Cache(maxsize=2)
     cache.scores(["a 文档"], tokenize("a"))
@@ -221,7 +221,7 @@ def test_bm25_cache_lru_eviction_and_disable() -> None:
     cache.scores(["a 文档"], tokenize("a"))  # 重建仍正确
     assert len(cache._entries) <= 2
     # maxsize=0 显式禁用：不驻留任何条目，行为与直接构建一致。
-    from agent_base.memory.retrieval import _Bm25
+    from agent_base_memory.retrieval import _Bm25
 
     disabled = Bm25Cache(maxsize=0)
     direct = _Bm25([tokenize("x")]).scores(tokenize("x"))

@@ -17,8 +17,15 @@ WORKDIR /build
 # Metadata + package sources only: tests, docs and local state stay out.
 COPY pyproject.toml README.md LICENSE NOTICE ./
 COPY src ./src
+# The memory subsystem ships as its own distribution (agent-base-memory).
+COPY packages ./packages
 
-RUN pip install --prefix=/install ".[migrate]"
+# Base runtime first, then the memory package without dependency resolution:
+# agent-base is not on PyPI in this repository's lifecycle, so letting pip
+# resolve "agent-base>=0.3,<0.4" would fail. The base project installed in the
+# step above satisfies that requirement at runtime.
+RUN pip install --prefix=/install ".[migrate]" \
+    && pip install --prefix=/install --no-deps packages/agent-base-memory
 
 
 FROM python:3.12-slim AS runtime
@@ -37,8 +44,12 @@ COPY --from=builder /install/bin /usr/local/bin
 WORKDIR /app
 
 # Migration assets are required at runtime (compose runs alembic upgrade head).
+# The memory package owns its own chain / version table, so its alembic
+# directory ships alongside at /app/memory-alembic.
 COPY alembic.ini ./
 COPY alembic ./alembic
+COPY packages/agent-base-memory/alembic.ini ./memory-alembic/alembic.ini
+COPY packages/agent-base-memory/alembic ./memory-alembic/alembic
 
 # Writable location for the sqlite fallback checkpointer / uploads.
 RUN mkdir -p /app/data && chown -R app:app /app

@@ -15,7 +15,7 @@
 ### CLI 单机
 
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[dev]" -e packages/agent-base-memory   # 记忆子系统是独立包
 cp .env.example .env            # 至少填 LLM_API_KEY
 python -m agent_base --module chat --message "你好"
 ```
@@ -40,9 +40,10 @@ docker compose up --build
 ```
 
 `docker-compose.yml` 定义两个服务：`app`（本仓库镜像，非 root，8000 端口）
-与 `mysql`（`mysql:8.0`，utf8mb4，健康检查，命名卷）。`app` 在启动前执行
-`alembic upgrade head`，然后以 uvicorn 起服务。数据库凭据通过 `.env` 注入，
-不烘进镜像。
+与 `mysql`（`mysql:8.0`，utf8mb4，健康检查，命名卷）。`app` 在启动前依次执行
+两条迁移链（基座 `alembic upgrade head`、记忆包
+`alembic -c memory-alembic/alembic.ini upgrade head`），然后以 uvicorn 起服务。
+数据库凭据通过 `.env` 注入，不烘进镜像。
 
 ## 2. 环境变量最小集
 
@@ -55,10 +56,11 @@ docker compose up --build
 | `LLM_BASE_URL` / `LLM_MODEL` | 是 | OpenAI 兼容端点与模型名（provider 只做拼写校验，不改变客户端） |
 | `LLM_PROVIDER` | 否 | `deepseek` / `zhipu` / `openai-compatible`，默认 `deepseek` |
 | `AGENT_MODULES` | 是 | 逗号分隔的模块清单，顺序即装配顺序（默认 `chat,writer`） |
+| `AGENT_MODULE_PACKAGES` | 否 | 模块查找包，逗号分隔、靠前者优先（默认 `agent_base.modules`）；独立发行包里的模块在这里登记 |
 | `CHECKPOINTER_BACKEND` | 是 | `sqlite`（默认）/ `memory` / `mysql` |
 | `CHECKPOINTER_SQLITE_PATH` | sqlite 时 | 落盘路径；容器内建议放命名卷（如 `/app/data/agent_base_state.db`） |
 | `CHECKPOINTER_MYSQL_*` | mysql 时 | host / port / user / password / database；要求 MySQL ≥ 8.0.19 |
-| `MEMORY_ENABLED` | 否 | 默认 `true`；关闭时不装配记忆服务 |
+| `MEMORY_ENABLED` | 否 | 默认 `true`；为 `true` 时必须装好 `agent-base-memory`，缺包即启动失败；设 `false` 则不发现、不导入 |
 | `MEMORY_AUTH_SECRET` | production 且记忆开启时 | 缺失即拒绝启动；用于 `X-User-Sig` HMAC |
 | `CORS_ORIGINS` | 否 | 允许的前端来源，默认 `http://localhost:3000`；禁止 `*` |
 | `COST_ENABLED` / `COST_DAILY_CNY` / `COST_MONTHLY_CNY` | 否 | 成本计量与预算熔断，默认关闭 |
@@ -67,6 +69,10 @@ docker compose up --build
 > 记忆后端跟随 `CHECKPOINTER_BACKEND`：选 `mysql` 时记忆、工具审计、
 > 上传文件、计划快照与成本账本都落同一个 MySQL；选 `sqlite` 时共用同一
 > sqlite 文件；选 `memory` 时全部不持久化。
+>
+> 同一个库里有两张版本表：`alembic_version`（基座：checkpointer、工具审计、
+> 上传、线程索引、计划快照）与 `alembic_version_memory`（记忆包：六张记忆表）。
+> 两者独立升级，互不阻塞。
 
 ## 3. 健康与指标
 
@@ -128,16 +134,26 @@ Prometheus 文本格式，主要指标：
 
 ## 5. 数据库迁移（MySQL）
 
-对话状态（checkpointer）、记忆、工具审计、上传文件、计划快照与成本账本
-的表结构由 Alembic 版本化管理：
+表结构由 Alembic 版本化管理，**两条独立的链**：
+
+| 链 | 拥有者 | 版本表 | 覆盖的表 |
+| --- | --- | --- | --- |
+| 基座链 | `agent-base` | `alembic_version` | checkpointer、工具审计、上传文件、线程索引、计划快照、成本账本 |
+| 记忆链 | `agent-base-memory` | `alembic_version_memory` | 六张记忆表（文档、块、向量、会话等） |
+
+两者用同一个库、同一组连接参数，但各自记录版本，可以分别升级与回滚。
 
 ```bash
-python -m alembic upgrade head    # 全新库：应用全部迁移
+# 基座链（仓库根）
+python -m alembic upgrade head
 python -m alembic stamp head      # 已由 langgraph setup() 建过表：只对齐版本
+
+# 记忆链（仓库根；需要先 pip install -e packages/agent-base-memory）
+python -m alembic -c packages/agent-base-memory/alembic.ini upgrade head
 ```
 
 连接参数优先级：`AGENT_BASE_DB_*` 环境变量 > `.env` 的 `CHECKPOINTER_MYSQL_*`。
-例如：
+两条链都读这套优先级，例如：
 
 ```bash
 AGENT_BASE_DB_HOST=mysql AGENT_BASE_DB_NAME=agent_base \
@@ -145,9 +161,35 @@ AGENT_BASE_DB_USER=agent AGENT_BASE_DB_PASSWORD=*** \
 python -m alembic upgrade head
 ```
 
+记忆链首迁移是幂等的（`CREATE TABLE IF NOT EXISTS`，索引内联在建表语句里），
+所以 **0.2.0 的老库直接跑记忆链即可**，不需要 `stamp`：表已经在，迁移只是
+把版本写进 `alembic_version_memory`。基座链里的 `0004/0005/0007` 保留
+revision 编号但已是空壳，老库 `upgrade head` 不会报 "Can't locate revision"。
+
+容器内两条链的顺序由 compose 启动命令固定：
+
+```bash
+python -m alembic upgrade head
+python -m alembic -c memory-alembic/alembic.ini upgrade head
+exec python -m uvicorn agent_base.entrypoints.server:app --host 0.0.0.0 --port 8000
+```
+
+镜像把记忆包的迁移资产放在 `/app/memory-alembic/`（`alembic.ini` + `alembic/`），
+基座的在 `/app/alembic.ini` 与 `/app/alembic/`。
+
 要求 MySQL ≥ 8.0.19（官方 saver）。5.7 会走基座内置兼容 saver，但**不在
 支持矩阵内**，新部署不要使用。迁移是显式步骤：应用启动**不会**自动改表，
-容器镜像在 compose 的启动命令里先跑 `alembic upgrade head`。
+容器镜像在 compose 的启动命令里先跑两条链。
+
+### 回滚
+
+```bash
+python -m alembic -c packages/agent-base-memory/alembic.ini downgrade base
+```
+
+会删掉六张记忆表、保留基座表；应用仍可启动（`/v1/memory` 会因表缺失报错，
+需同时设 `MEMORY_ENABLED=false` 或恢复表）。应用回滚到 0.2.x 不需要改表结构：
+0.2 的基座迁移是空壳，老版本只读写基座表。
 
 ## 6. 安全
 
@@ -194,7 +236,9 @@ docker run --rm -p 8000:8000 --env-file .env \
 
 镜像特征：`python:3.12-slim` 多阶段构建、非 root（uid/gid 10001）、
 `EXPOSE 8000`、`HEALTHCHECK` 访问 `/health`、启动命令为
-`uvicorn agent_base.entrypoints.server:app`。镜像内不含 `.env`、测试与缓存。
+`uvicorn agent_base.entrypoints.server:app`。镜像内同时安装 `agent-base` 与
+`agent-base-memory`，并带两套迁移资产（`/app/alembic`、`/app/memory-alembic`）。
+镜像不含 `.env`、测试与缓存。
 
 ### Compose
 

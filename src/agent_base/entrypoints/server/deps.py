@@ -7,8 +7,8 @@ from typing import TYPE_CHECKING, cast
 from fastapi import HTTPException, Request
 
 from agent_base.core.bootstrap import SUPERVISOR_MODULE, AgentRuntime
+from agent_base.core.contracts import MemoryServicePort
 from agent_base.entrypoints.server.auth import AuthBackend
-from agent_base.memory.service import MemoryService
 
 if TYPE_CHECKING:  # pragma: no cover - import avoided at runtime
     from agent_base.extensions.metrics import Metrics
@@ -34,20 +34,20 @@ def get_current_user(request: Request) -> str:
     return str(backend.authenticate(request, rt.settings))
 
 
-def require_memory(rt: AgentRuntime) -> MemoryService:
-    """取记忆服务；未启用时以 503 给出可读原因。
+def require_memory(rt: AgentRuntime) -> MemoryServicePort:
+    """取记忆服务端口；未启用时以 503 给出可读原因。
 
-    ``rt.memory`` 的静态类型是契约端口（MemoryPort）；入口层需要完整
-    门面（store/管线/管理面），运行时对象实为 MemoryService 实例。
+    路由层只依赖契约（``agent_base.core.contracts.MemoryServicePort``），
+    具体实现由记忆发行包提供，基座不 import 它。
     """
     if rt.memory is None:
         raise HTTPException(status_code=503, detail="记忆系统未启用（MEMORY_ENABLED=false）")
-    return cast(MemoryService, rt.memory)
+    return rt.memory
 
 
-def memory_or_none(rt: AgentRuntime) -> MemoryService | None:
-    """完整记忆门面或 None（静态端口类型在此收窄为门面）。"""
-    return cast("MemoryService | None", rt.memory)
+def memory_or_none(rt: AgentRuntime) -> MemoryServicePort | None:
+    """记忆服务端口或 None。"""
+    return rt.memory
 
 
 def known_module(rt: AgentRuntime, module: str) -> bool:

@@ -415,8 +415,9 @@ def test_delete_thread_unknown_module_404() -> None:
 def _memory_runtime() -> AgentRuntime:
     """带记忆服务的运行时：HashEmbedding 确定性向量，ScriptedChatModel 空
     队列——检索端点若碰了 LLM 会以 500 暴露，通过即证明零 LLM。"""
-    from agent_base.memory.service import MemoryService
-    from agent_base.memory.store import MemoryMemoryStore
+    from agent_base.core.storage import CoreMemoryStore
+    from agent_base_memory.service import MemoryService
+    from agent_base_memory.store import MemoryMemoryStore
     from fakes import HashEmbedding
 
     rt = _runtime()
@@ -428,7 +429,7 @@ def _memory_runtime() -> AgentRuntime:
         llm=rt.llm,
     )
     rt.memory = service
-    rt.thread_index = service.store
+    rt.thread_index = CoreMemoryStore()
     return rt
 
 

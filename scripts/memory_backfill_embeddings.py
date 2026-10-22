@@ -15,7 +15,7 @@ import asyncio
 import sys
 
 from agent_base.core.config import Settings
-from agent_base.memory.service import build_memory_service
+from agent_base_memory.service import build_memory_service
 
 
 async def main() -> int:

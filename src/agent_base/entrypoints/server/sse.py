@@ -16,6 +16,8 @@ from typing import Any
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 
+from agent_base.core.contracts import MemoryServicePort
+from agent_base.core.memory_scope import set_memory_scope
 from agent_base.core.threads import ThreadId
 from agent_base.entrypoints.server.background import spawn_background
 from agent_base.entrypoints.server.serializers import _extract_text
@@ -31,8 +33,6 @@ from agent_base.extensions.events import (
     ToolCallEvent,
     encode_sse,
 )
-from agent_base.memory.service import MemoryService
-from agent_base.memory.tools import set_memory_scope
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +86,7 @@ def _decode_custom_event(payload: Any) -> AgentEvent | None:
 
 
 def _build_capture_hook(
-    runtime_memory: MemoryService | None,
+    runtime_memory: MemoryServicePort | None,
     module: str,
     user_thread_id: str,
     graph: Any,
@@ -103,7 +103,7 @@ def _build_capture_hook(
     也不会产生 "coroutine was never awaited" 警告（H4）。
     """
     memory = runtime_memory
-    if memory is None or memory.pipeline is None:
+    if memory is None or not memory.capture_ready():
         return None
 
     async def _capture() -> None:

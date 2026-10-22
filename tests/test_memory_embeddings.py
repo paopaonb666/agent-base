@@ -12,7 +12,7 @@ import httpx
 import pytest
 
 from agent_base.core.config import Settings
-from agent_base.memory.embeddings import (
+from agent_base_memory.embeddings import (
     EmbeddingError,
     NullEmbedding,
     OpenAICompatibleEmbedding,

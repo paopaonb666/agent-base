@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-base"
-version = "0.2.0"
+version = "0.3.0"
 description = "Agent software foundation: LangGraph runtime + module registry + config + entrypoints; business capabilities plug in later as modules"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -56,6 +56,12 @@ dependencies = [
     # 阶段 3（扩展）：MySQL 对话状态后端（CHECKPOINTER_BACKEND=mysql）。
     # 使用 aiomysql 驱动的异步 AIOMySQLSaver；要求 MySQL >= 8.0.19。
     "langgraph-checkpoint-mysql[aiomysql]>=2.0",
+    # PyMySQL 1.2.1 起删除了 escape_bytes_prefixed（PyMySQL#1274），1.2.3 又把它
+    # 换成字符串占位符；aiomysql 0.3.2 在模块导入时就 from pymysql.converters
+    # import escape_bytes_prefixed，于是：1.2.1/1.2.2 直接 ImportError，1.2.3
+    # 导入成功但任何 BLOB 参数（记忆向量）抛 TypeError。aiomysql 尚无修复版本，
+    # 因此在上限侧钉住 1.2.0，等 aiomysql 发版后再放宽。
+    "pymysql>=1.1,<1.2.1",
     # MySQL 8 默认的 caching_sha2_password 认证在完整握手时需要 cryptography。
     "cryptography>=41.0",
     # 阶段 4：supervisor 多 Agent 模板（create_supervisor）。
@@ -104,8 +110,16 @@ doc = [
 mcp = [
     "langchain-mcp-adapters>=0.3",
 ]
+# 长期记忆子系统（0.3.0 起独立发行包）。基座只保留契约与 entry point
+# 发现点；MEMORY_ENABLED=true（默认）时需要它，否则启动 fail-fast 提示。
+# 从本仓库安装请用 `pip install -e packages/agent-base-memory`（尚未发布到
+# PyPI，因此不能让 pip 去索引里解析这个 extra）。
+memory = [
+    "agent-base-memory>=0.1,<0.2",
+]
 # 数据库迁移：部署时执行 `alembic upgrade head` 需要（运行时镜像按此
-# extra 安装）。本地开发经 dev extras 安装同一组依赖。
+# extra 安装）。本地开发经 dev extras 安装同一组依赖。记忆包有自己独立的
+# 迁移链（packages/agent-base-memory/alembic.ini）。
 migrate = [
     "alembic>=1.19",
     "sqlalchemy>=2.0",
@@ -135,7 +149,7 @@ packages = ["src/agent_base"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
-src = ["src", "tests", "alembic", "examples"]
+src = ["src", "tests", "alembic", "examples", "packages/agent-base-memory/src"]
 extend-exclude = ["alembic/script.py.mako"]
 
 [tool.ruff.lint]
@@ -156,7 +170,7 @@ ignore = ["RUF001", "RUF002", "RUF003"]
 [tool.mypy]
 python_version = "3.10"
 strict = true
-files = ["src"]
+files = ["src", "packages/agent-base-memory/src"]
 warn_unreachable = true
 pretty = true
 
@@ -182,4 +196,4 @@ markers = [
 # 覆盖率门（阶段 5）：每次 `pytest` 运行都会对整个包测量分支覆盖率，
 # 低于 85% 即失败。集成测试（integration 标记）默认不在本地运行，
 # 也不进入覆盖率分母——本地与 CI 的"测试通过"语义一致（P2-2）。
-addopts = "-q --strict-markers -m \"not integration\" --cov=agent_base --cov-branch --cov-report=term-missing --cov-fail-under=85"
+addopts = "-q --strict-markers -m \"not integration\" --cov=agent_base --cov=agent_base_memory --cov-branch --cov-report=term-missing --cov-fail-under=85"

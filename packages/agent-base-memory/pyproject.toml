@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-base-memory"
+version = "0.1.0"
+description = "Long-term memory subsystem for agent-base: recall, profiles, knowledge index, session capture."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "agent-base contributors" }]
+keywords = ["agents", "llm", "memory", "rag", "langgraph"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Framework :: FastAPI",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+dependencies = [
+  "agent-base>=0.3,<0.4",
+]
+
+[project.urls]
+Homepage = "https://github.com/agent-base/agent-base"
+Repository = "https://github.com/agent-base/agent-base"
+Issues = "https://github.com/agent-base/agent-base/issues"
+
+[project.entry-points."agent_base.memory"]
+# 基座只认契约（agent_base.core.memory_plugin），实现在这里注册：
+# - service：装配 MemoryService + 记忆工具（bootstrap 的插件发现点）
+# - routes ：/v1/memory 管理 API 的 APIRouter 列表
+service = "agent_base_memory.plugin:build"
+routes = "agent_base_memory.api:routers"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_base_memory"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/agent_base_memory", "README.md", "LICENSE", "NOTICE"]
