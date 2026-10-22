@@ -3,7 +3,8 @@
 #   cp .env.example .env   # fill LLM_API_KEY and MEMORY_AUTH_SECRET
 #   docker compose up --build
 #
-# The app waits for MySQL's health check, applies Alembic migrations, then
+# The app waits for MySQL's health check, applies both Alembic chains (base
+# schema, then the memory package's own chain in alembic_version_memory), then
 # starts uvicorn. Secrets stay in .env (ignored by git) and are never baked
 # into the image.
 
@@ -53,7 +54,7 @@ services:
     command:
       - sh
       - -c
-      - python -m alembic upgrade head && exec python -m uvicorn agent_base.entrypoints.server:app --host 0.0.0.0 --port 8000
+      - python -m alembic upgrade head && python -m alembic -c memory-alembic/alembic.ini upgrade head && exec python -m uvicorn agent_base.entrypoints.server:app --host 0.0.0.0 --port 8000
     restart: unless-stopped
 
 volumes:

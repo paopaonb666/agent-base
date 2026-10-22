@@ -23,11 +23,15 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
       - name: Install
-        run: pip install -e ".[dev,doc,search,mcp]"
+        run: |
+          pip install -e ".[dev,doc,search,mcp]"
+          # The memory subsystem is a separate distribution in this repo and is
+          # not on PyPI: install it editable so the full suite exercises it.
+          pip install -e packages/agent-base-memory
       - name: Ruff lint
-        run: ruff check src tests examples
+        run: ruff check src tests examples packages
       - name: Ruff format check
-        run: ruff format --check src tests examples
+        run: ruff format --check src tests examples packages
 
   typecheck:
     runs-on: ubuntu-latest
@@ -42,7 +46,11 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
       - name: Install
-        run: pip install -e ".[dev,doc,search,mcp]"
+        run: |
+          pip install -e ".[dev,doc,search,mcp]"
+          # The memory subsystem is a separate distribution in this repo and is
+          # not on PyPI: install it editable so the full suite exercises it.
+          pip install -e packages/agent-base-memory
       - name: Mypy (strict)
         run: mypy
 
@@ -75,7 +83,11 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
       - name: Install
-        run: pip install -e ".[dev,doc,search,mcp]"
+        run: |
+          pip install -e ".[dev,doc,search,mcp]"
+          # The memory subsystem is a separate distribution in this repo and is
+          # not on PyPI: install it editable so the full suite exercises it.
+          pip install -e packages/agent-base-memory
       - name: Pytest
         # CLI 参数的 -m 覆盖 ini addopts 里的 "not integration"：
         # 本 job 挂了 MySQL 服务容器，跑全量集（含 integration）。
@@ -100,7 +112,11 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
       - name: Install
-        run: pip install -e ".[dev,doc,search,mcp]"
+        run: |
+          pip install -e ".[dev,doc,search,mcp]"
+          # The memory subsystem is a separate distribution in this repo and is
+          # not on PyPI: install it editable so the full suite exercises it.
+          pip install -e packages/agent-base-memory
       - name: Pytest
         run: pytest
 
@@ -117,10 +133,41 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev,doc,search,mcp]"
+          pip install -e packages/agent-base-memory
       - name: pip-audit (ubuntu)
         # --skip-editable: agent-base itself is not a PyPI dependency;
         # everything it depends on is still audited.
         run: pip-audit --skip-editable
+
+  memory-package:
+    # The memory subsystem is a separately versioned distribution: verify it
+    # builds standalone and exposes exactly the entry points the base looks for
+    # ("agent_base.memory" -> service / routes).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Build wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel packages/agent-base-memory
+      - name: Install and verify entry points
+        run: |
+          pip install -e ".[dev]"
+          pip install --no-deps dist/*.whl
+          python - <<'PY'
+          import agent_base_memory
+          from importlib.metadata import entry_points
+
+          names = {ep.name for ep in entry_points(group="agent_base.memory")}
+          assert names == {"service", "routes"}, names
+          assert agent_base_memory.__name__ == "agent_base_memory"
+          print("entry points found:", sorted(names))
+          PY
 
   docker:
     # Verify the container image still builds on every push/PR.
