@@ -1,0 +1,61 @@
+# Local / single-host deployment: app + MySQL 8.0.
+#
+#   cp .env.example .env   # fill LLM_API_KEY and MEMORY_AUTH_SECRET
+#   docker compose up --build
+#
+# The app waits for MySQL's health check, applies Alembic migrations, then
+# starts uvicorn. Secrets stay in .env (ignored by git) and are never baked
+# into the image.
+
+services:
+  mysql:
+    image: mysql:8.0
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-agent_base}
+      MYSQL_USER: ${MYSQL_USER:-agent}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-agent}
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  app:
+    build:
+      context: .
+    image: agent-base:local
+    env_file:
+      - .env
+    environment:
+      # Container-to-container MySQL coordinates override anything in .env.
+      CHECKPOINTER_BACKEND: mysql
+      CHECKPOINTER_MYSQL_HOST: mysql
+      CHECKPOINTER_MYSQL_PORT: "3306"
+      CHECKPOINTER_MYSQL_DATABASE: ${MYSQL_DATABASE:-agent_base}
+      CHECKPOINTER_MYSQL_USER: ${MYSQL_USER:-agent}
+      CHECKPOINTER_MYSQL_PASSWORD: ${MYSQL_PASSWORD:-agent}
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    volumes:
+      - app_data:/app/data
+    depends_on:
+      mysql:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - python -m alembic upgrade head && exec python -m uvicorn agent_base.entrypoints.server:app --host 0.0.0.0 --port 8000
+    restart: unless-stopped
+
+volumes:
+  mysql_data:
+  app_data:

@@ -1,0 +1,38 @@
+# Version control / CI
+.git
+.github
+.gitignore
+
+# Local environments and secrets
+.venv
+venv
+.env
+*.pem
+*.key
+
+# Python / tool caches and build output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+dist/
+build/
+*.egg-info/
+
+# Local state
+*.db
+*.sqlite
+*.sqlite3
+logs/
+data/
+
+# Not needed inside the image
+tests/
+examples/
+docs/
+scripts/
