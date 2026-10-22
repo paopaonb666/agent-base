@@ -37,6 +37,29 @@ def test_env_var_json_array_modules(monkeypatch: pytest.MonkeyPatch) -> None:
     assert Settings(_env_file=None).agent_modules == ["chat", "writer"]
 
 
+def test_default_module_packages() -> None:
+    # 独立分发的模块包需要显式加入；默认只有基座自带的样板模块包。
+    assert Settings(_env_file=None).agent_module_packages == ["agent_base.modules"]
+
+
+def test_module_packages_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AGENT_MODULE_PACKAGES", "agent_base.modules, acme_modules.agents")
+    assert Settings(_env_file=None).agent_module_packages == [
+        "agent_base.modules",
+        "acme_modules.agents",
+    ]
+
+
+def test_invalid_module_package_rejected() -> None:
+    with pytest.raises(ValidationError, match="invalid AGENT_MODULE_PACKAGES"):
+        Settings(_env_file=None, agent_module_packages="../evil")
+
+
+def test_empty_module_packages_rejected() -> None:
+    with pytest.raises(ValidationError, match="at least one package"):
+        Settings(_env_file=None, agent_module_packages="")
+
+
 def test_invalid_json_array_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AGENT_MODULES", '["chat", 3]')
     with pytest.raises(ValidationError, match="list of strings"):

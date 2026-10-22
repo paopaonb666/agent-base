@@ -160,3 +160,64 @@ def test_module_syntax_error_normalized(tmp_path: Path, monkeypatch: pytest.Monk
     monkeypatch.syspath_prepend(str(tmp_path))
     with pytest.raises(RegistryError, match="SyntaxError"):
         load_modules(["syntax_err"], prefix="fm_syntax")
+
+
+# ── 多模块包（AGENT_MODULE_PACKAGES）：独立分发的模块包 ──
+
+
+def test_module_found_in_second_package(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """第一个包没有该模块时继续找下一个包；包本身不存在也按"跳过"处理。"""
+    body = (
+        "class Hello:\n"
+        "    def __init__(self):\n"
+        "        self.name = 'hello'\n"
+        "        self.description = 'hello from second'\n"
+        "    def build_graph(self, ctx):\n"
+        "        raise NotImplementedError\n"
+        "    def get_tools(self):\n"
+        "        return []\n"
+        "module = Hello()\n"
+    )
+    _write_module(tmp_path, "fm_second", "hello", body)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    modules = load_modules(["hello"], packages=["fm_absent_package", "fm_second"])
+    assert modules["hello"].description == "hello from second"
+
+
+def test_first_package_wins_when_name_repeated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同名模块存在于多个包时，按 packages 顺序取第一个（可预测的覆盖规则）。"""
+    first = (
+        "class Hello:\n"
+        "    def __init__(self):\n"
+        "        self.name = 'hello'\n"
+        "        self.description = 'first'\n"
+        "    def build_graph(self, ctx):\n"
+        "        raise NotImplementedError\n"
+        "    def get_tools(self):\n"
+        "        return []\n"
+        "module = Hello()\n"
+    )
+    second = first.replace("'first'", "'second'")
+    _write_module(tmp_path, "fm_p1", "hello", first)
+    _write_module(tmp_path, "fm_p2", "hello", second)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    modules = load_modules(["hello"], packages=["fm_p1", "fm_p2"])
+    assert modules["hello"].description == "first"
+
+
+def test_unknown_module_reports_searched_packages() -> None:
+    with pytest.raises(RegistryError, match="not found in packages"):
+        load_modules(["definitely_not_a_module_xyz"], packages=["agent_base.modules"])
+
+
+def test_empty_packages_rejected() -> None:
+    with pytest.raises(RegistryError, match="no module packages configured"):
+        load_modules(["chat"], packages=[])
+
+
+@pytest.mark.parametrize("bad", ["../evil", "Has-Dash", "9pkg", ""])
+def test_invalid_package_name_rejected(bad: str) -> None:
+    with pytest.raises(RegistryError, match="invalid module package"):
+        load_modules(["chat"], packages=[bad])
