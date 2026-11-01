@@ -32,12 +32,16 @@ from agent_base.core.llm import ResilientLLM, build_llm
 from agent_base.core.memory_plugin import build_memory_plugin
 from agent_base.core.registry import RegistryError, load_modules
 from agent_base.core.storage import CoreStore, build_core_store
+from agent_base.core.tool_fewshot import build_tool_fewshot
+from agent_base.core.tool_resilience import ToolResilience
+from agent_base.core.tool_routing import build_tool_embedder, build_tool_router
 from agent_base.core.tools import build_tool_pool
 from agent_base.extensions.filestore import UploadedFileStore, build_uploaded_file_store
 from agent_base.extensions.memory import build_checkpointer, close_checkpointer
+from agent_base.extensions.redissvc import RedisService
 from agent_base.extensions.toollog import ToolCallRecorder, build_tool_call_recorder
 from agent_base.tools.mcp import load_mcp_tools
-from agent_base.tools.registry import build_toolkit_tools, toolkit_timeouts
+from agent_base.tools.registry import build_toolkit_tools, toolkit_tiers, toolkit_timeouts
 
 # 保留的模块名：不构建单个模块的图，而是在所有已加载模块之上构建
 # supervisor 图（阶段 4）。
@@ -70,6 +74,16 @@ class AgentRuntime:
     checkpointer: BaseCheckpointSaver[Any] | None = None
     tool_recorder: ToolCallRecorder | None = None
     file_store: UploadedFileStore | None = None
+    # Redis 共享状态服务（ADR-012）：None = 未启用（REDIS_ENABLED=false，
+    # 治理状态全部回退进程内实现）；启用即承诺——装配失败直接终止启动。
+    redis: RedisService | None = None
+    # 韧性层（ADR-009）：黑名单/重试/结构化参数反馈；始终装配（保守
+    # 默认），各开关在 ToolkitSettings 韧性节。
+    tool_resilience: ToolResilience | None = None
+    # 向量工具路由（ADR-010）：None = 未启用/降级；/health 可观测其状态。
+    tool_router: Any = None
+    # 工具 few-shot（ADR-011）：None = 未启用/无 embedder，零注入。
+    tool_fewshot: Any = None
     # 记忆服务端口（M6）：None = 未启用；模块通过 ModuleContext.memory 取用。
     # 0.3.0 起由可选的记忆发行包实现（entry point 发现），基座不 import 它。
     memory: MemoryServicePort | None = None
@@ -110,9 +124,13 @@ class AgentRuntime:
             checkpointer=self.checkpointer,
             tool_recorder=self.tool_recorder,
             file_store=self.file_store,
+            redis=self.redis,
             memory=self.memory,
             thread_index=self.thread_index,
             plan_store=self.plan_store,
+            tool_resilience=self.tool_resilience,
+            tool_router=self.tool_router,
+            tool_fewshot=self.tool_fewshot,
         )
         self._profile_views[profile] = view
         return view
@@ -126,6 +144,9 @@ class AgentRuntime:
             tools=self.tools,
             memory=self.memory,
             plan_store=self.plan_store,
+            tool_resilience=self.tool_resilience,
+            tool_router=self.tool_router,
+            tool_fewshot=self.tool_fewshot,
         )
 
     def graph(self, module_name: str) -> Graph:
@@ -170,6 +191,8 @@ class AgentRuntime:
             await self.tool_recorder.aclose()
         if self.file_store is not None and hasattr(self.file_store, "aclose"):
             await self.file_store.aclose()
+        if self.redis is not None:
+            await self.redis.aclose()
         if self.memory is not None:
             await self.memory.aclose()
         # 基座存储与记忆存储相互独立（0.3.0）：两个都要关，不能 elif。
@@ -190,6 +213,10 @@ async def create_runtime(settings: Settings | None = None) -> AgentRuntime:
     validate_module_names(modules)
     checkpointer = await build_checkpointer(resolved)
     file_store = await build_uploaded_file_store(resolved)
+    # Redis 共享状态服务（ADR-012）：启用即承诺——不可达直接终止启动
+    # （治理状态假共享比不可用更危险）；REDIS_ENABLED=false 时为 None，
+    # 各消费方回退进程内实现。
+    redis_service = await RedisService.create(resolved.redis) if resolved.redis.enabled else None
     # 基座自有存储（S1/M10）：线程索引与计划快照的数据面由基座自己拥有，
     # 不随 MEMORY_ENABLED 关闭，也不依赖记忆包是否安装。装配失败只降级
     # （这两张表是体验增强面，不阻塞服务启动）。
@@ -214,7 +241,9 @@ async def create_runtime(settings: Settings | None = None) -> AgentRuntime:
         )
     # 记忆服务（M6）经 entry point 发现（0.3.0 拆分）：基座源码不 import
     # 记忆包；MEMORY_ENABLED=true 而发行包缺失时 fail-fast 提示安装。
-    plugin = await build_memory_plugin(settings=resolved, llm=llm, fast_llm=fast_llm)
+    plugin = await build_memory_plugin(
+        settings=resolved, llm=llm, fast_llm=fast_llm, redis=redis_service
+    )
     memory_service = plugin.service if plugin is not None else None
     # 工具库的内置工具按 TOOLKIT_ENABLED 装配后并入共享池（模块工具在
     # 前，工具库在后）；重名在任何一侧发生都会快速失败。注册表声明的
@@ -229,14 +258,35 @@ async def create_runtime(settings: Settings | None = None) -> AgentRuntime:
     # MCP 工具来源（可选 extras）：MCP_ENABLED=true 时把外部 MCP Server
     # 的工具并入池——超时包装 / 审计收口 / 重名快速失败与基座工具同规。
     # 未启用时返回空列表（零解析零导入），装配路径保持不变。
-    extra_tools.extend(await load_mcp_tools(resolved))
+    mcp_tools = await load_mcp_tools(resolved)
+    extra_tools.extend(mcp_tools)
+    # 分层（ADR-010）：TOOLKIT 声明优先；MCP 工具一律 advanced——
+    # "几百个工具参与路由"的场景正是 MCP 接入。未列名者池内默认 basic。
+    tiers = {**toolkit_tiers(resolved), **{t.name: "advanced" for t in mcp_tools}}
+    # 韧性层（ADR-009）：始终装配（保守默认：重试瞬时错误 1 次、连续
+    # 失败 3 次冷却 60s）；各阈值经 TOOL_* 环境变量调校或关闭。
+    resilience = ToolResilience.from_settings(resolved.toolkit)
     tools = build_tool_pool(
         modules,
         timeout=resolved.tool_timeout_seconds,
         extra_tools=extra_tools,
         timeouts=toolkit_timeouts(resolved),
         recorder=recorder,
+        resilience=resilience,
+        tiers=tiers,
     )
+    # 路由与 few-shot（ADR-010/011）：共享一个嵌入提供方（懒降级，记忆
+    # 包缺席/未配 key 都安静退回"不启用"）；未启用时两者均为 None，
+    # 图工厂保持建图时全量绑定的快路径，行为零变化。
+    embedder = (
+        build_tool_embedder(resolved)
+        if (resolved.toolkit.routing_enabled or resolved.toolkit.fewshot_enabled)
+        else None
+    )
+    router = build_tool_router(
+        tools, settings=resolved, registry=resilience.registry, embedder=embedder
+    )
+    fewshot = build_tool_fewshot(resolved, embedder=embedder)
     return AgentRuntime(
         settings=resolved,
         llm=llm,
@@ -245,7 +295,11 @@ async def create_runtime(settings: Settings | None = None) -> AgentRuntime:
         checkpointer=checkpointer,
         tool_recorder=recorder,
         file_store=file_store,
+        redis=redis_service,
         memory=memory_service,
         thread_index=core_store,
         plan_store=core_store,
+        tool_resilience=resilience,
+        tool_router=router,
+        tool_fewshot=fewshot,
     )

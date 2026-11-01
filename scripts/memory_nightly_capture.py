@@ -11,9 +11,13 @@
 走形成管线的快档分派（``MEMORY_PIPELINE_PROFILE=split`` + ``LLM_FAST_*``，
 见 .env.example）。
 
+核心逻辑在 ``agent_base.extensions.scheduler.run_memory_capture``（进程内
+调度器与 webhook 触发共用同一实现）；本脚本是 CLI 薄壳：
+``SCHEDULER_ENABLED=true`` 的部署可以直接用调度器的 ``memory_nightly_capture``
+任务类型替代外部 cron。
+
 - 线程来源：``thread_index`` 中在 ``--date``（默认今天，本地时区）之后
   活跃（updated_at）的线程，与线程列表端点同源；
-- 消息来源：checkpointer 快照（与 SSE 后台捕获同一路径）；
 - 失败安全：单线程失败不中断批次，仅记 stderr；
 - ``--dry-run``：只列出将处理的线程与消息数，不做任何 LLM 调用。
 
@@ -24,11 +28,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import sys
 from datetime import date, datetime
-from typing import Any
 
 from agent_base.core.bootstrap import AgentRuntime, create_runtime
+from agent_base.extensions.scheduler import run_memory_capture
 
 
 def _parse_args() -> argparse.Namespace:
@@ -58,57 +61,23 @@ async def capture_since(
 ) -> tuple[int, int]:
     """批量处理 ``since_ts`` 之后活跃的线程；返回 (处理数, 跳过数)。
 
-    单线程失败不中断批次（失败安全语义与每轮路径一致），只记 stderr。
+    兼容薄壳：委托包内实现（dry-run 时把处理明细打到 stdout）。
     """
-    memory = rt.memory
-    if memory is None or not memory.capture_ready():
-        print(
-            "记忆形成管线不可用（MEMORY_ENABLED=false 或未装配 LLM），无事可做",
-            file=sys.stderr,
-        )
-        return 0, 0
-    assert rt.thread_index is not None  # 基座自有存储：线程来源与列表端点同源
-
-    processed = 0
-    skipped = 0
-    for user_id in user_ids:
-        entries = await rt.thread_index.list_thread_index(user_id, limit=500)
-        for entry in entries:
-            if entry.updated_at < since_ts:
-                skipped += 1
-                continue
-            if dry_run:
-                print(f"[dry-run] 将处理：{entry.thread_id}（user={user_id}，{entry.title}）")
-                processed += 1
-                continue
-            try:
-                graph = rt.graph(entry.module or "chat")
-                snapshot = await graph.aget_state({"configurable": {"thread_id": entry.thread_id}})
-                messages: list[Any] = (
-                    (snapshot.values or {}).get("messages", []) if snapshot else []
-                )
-                if not messages:
+    if dry_run:
+        assert rt.thread_index is not None
+        processed = 0
+        skipped = 0
+        for user_id in user_ids:
+            entries = await rt.thread_index.list_thread_index(user_id, limit=500)
+            for entry in entries:
+                if entry.updated_at < since_ts:
                     skipped += 1
                     continue
-                detail = await memory.capture_turn(
-                    user_id=user_id,
-                    agent_id=entry.module or "chat",
-                    thread_id=entry.thread_id,
-                    messages=messages,
-                    force=True,
-                )
-            except Exception as exc:  # 单线程失败不中断批次
-                print(f"失败：{entry.thread_id}：{type(exc).__name__}: {exc}", file=sys.stderr)
-                continue
-            if detail is None:
-                skipped += 1
-                continue
-            processed += 1
-            print(
-                f"已处理：{entry.thread_id}（候选 {detail.get('candidates', 0)}，"
-                f"画像 {'已更新' if detail.get('profile_updated') else '未变'}）"
-            )
-    return processed, skipped
+                print(f"[dry-run] 将处理：{entry.thread_id}（user={user_id}，{entry.title}）")
+                processed += 1
+        return processed, skipped
+    summary = await run_memory_capture(rt, user_ids=user_ids, since_ts=since_ts, dry_run=False)
+    return int(summary["processed"]), int(summary["skipped"]) + int(summary["failed"])
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -138,3 +107,7 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\n已停止")
         return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -15,7 +15,9 @@
   累计从账本恢复；后端跟随 ``CHECKPOINTER_BACKEND``（memory 后端
   用内存账本，重启清零，方向安全：只会少记不会误熔断）。
 
-已知局限：单进程口径（与 /metrics 同款）；价目手工维护。
+已知局限：meter 聚合与 /metrics 是单进程口径；预算门的跨 worker 判定经
+``RedisCostCounters``（ADR-012，REDIS_ENABLED=true 时由装配层注入）共享；
+价目手工维护。
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ from agent_base.extensions.observability import get_request_id
 
 if TYPE_CHECKING:  # pragma: no cover - import avoided at runtime
     from agent_base.core.config import Settings
+    from agent_base.extensions.redissvc import RedisService
 
 logger = logging.getLogger(__name__)
 
@@ -268,13 +271,15 @@ class CostMeterHandler(BaseCallbackHandler):
 
 
 class CostLedger(Protocol):
-    """账本协议：批量落库 + 按时间点累计 + 按日聚合（重启恢复用）。"""
+    """成本账本协议（T4.1）：insert 批量写入，totals_* 聚合读取。"""
 
     async def insert(self, rows: list[UsageRecord]) -> None: ...
 
     async def totals_since(self, ts: float) -> float: ...
 
     async def totals_by_day(self) -> dict[str, float]: ...
+
+    async def list_recent(self, *, since_ts: float, limit: int = 5000) -> list[UsageRecord]: ...
 
 
 class MemoryCostLedger:
@@ -295,6 +300,10 @@ class MemoryCostLedger:
             day = datetime.fromtimestamp(row.ts).date().isoformat()
             totals[day] = totals.get(day, 0.0) + row.cost_cny
         return totals
+
+    async def list_recent(self, *, since_ts: float, limit: int = 5000) -> list[UsageRecord]:
+        matched = [row for row in self._rows if row.ts >= since_ts]
+        return matched[-limit:]
 
 
 class SqliteCostLedger:
@@ -348,6 +357,28 @@ class SqliteCostLedger:
             "SELECT date(ts, 'unixepoch', 'localtime'), SUM(cost_cny) FROM cost_usage GROUP BY 1"
         ) as cursor:
             return {str(day): float(cost or 0.0) for day, cost in await cursor.fetchall()}
+
+    async def list_recent(self, *, since_ts: float, limit: int = 5000) -> list[UsageRecord]:
+        async with self._db.execute(
+            "SELECT ts, request_id, model, profile, prompt_tokens, completion_tokens,"
+            " cache_read_tokens, cost_cny FROM cost_usage"
+            " WHERE ts >= ? ORDER BY ts DESC LIMIT ?",
+            (since_ts, limit),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [
+            UsageRecord(
+                ts=float(r[0]),
+                request_id=str(r[1]),
+                model=str(r[2]),
+                profile=str(r[3]),
+                prompt_tokens=int(r[4] or 0),
+                completion_tokens=int(r[5] or 0),
+                cache_read_tokens=int(r[6] or 0),
+                cost_cny=float(r[7] or 0.0),
+            )
+            for r in reversed(rows)
+        ]
 
     async def aclose(self) -> None:
         await self._db.close()
@@ -434,6 +465,31 @@ class MysqlCostLedger:
             )
             return {str(day): float(cost or 0.0) for day, cost in await cur.fetchall()}
 
+    async def list_recent(self, *, since_ts: float, limit: int = 5000) -> list[UsageRecord]:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn, conn.cursor() as cur:
+            await self._ensure_table(cur)
+            await cur.execute(
+                "SELECT ts, request_id, model, profile, prompt_tokens, completion_tokens,"
+                " cache_read_tokens, cost_cny FROM cost_usage"
+                " WHERE ts >= %s ORDER BY ts DESC LIMIT %s",
+                (since_ts, limit),
+            )
+            rows = await cur.fetchall()
+        return [
+            UsageRecord(
+                ts=float(r[0]),
+                request_id=str(r[1]),
+                model=str(r[2]),
+                profile=str(r[3]),
+                prompt_tokens=int(r[4] or 0),
+                completion_tokens=int(r[5] or 0),
+                cache_read_tokens=int(r[6] or 0),
+                cost_cny=float(r[7] or 0.0),
+            )
+            for r in reversed(rows)
+        ]
+
     async def aclose(self) -> None:
         if self._pool is not None:
             self._pool.close()
@@ -448,6 +504,57 @@ class CostBudgetExceeded(Exception):
     """预算熔断（``action="block"``）时抛出；调用方转 429。"""
 
 
+class RedisCostCounters:
+    """跨 worker 的日/月成本计数器（ADR-012 外置方向 1）。
+
+    ``INCRBYFLOAT`` 原子累加，键含日期（``cost:day:{YYYY-MM-DD}`` /
+    ``cost:month:{YYYY-MM}``），跨日自然滚动；每次累加都刷新 ``EXPIRE``
+    （日键 40 天 / 月键 400 天，过期键自动清理）。
+
+    - ``add``：按行的 ``ts`` 聚合到所属日/月键（flush 批次跨午夜也归位
+      正确）；失败向上抛，由调用方（flush 循环）保留积压重试；
+    - ``totals``：读取**当日/当月**共享累计；Redis 故障返回 None，预算
+      门回退进程内聚合值（方向安全：只会少记不误熔断）。
+
+    计数器只承载预算门的**共享判定值**；明细行仍走 SQL 账本
+    （``cost_usage``），两个数据面互不替代。
+    """
+
+    _DAY_TTL_SECONDS = 40 * 24 * 3600
+    _MONTH_TTL_SECONDS = 400 * 24 * 3600
+
+    def __init__(self, redis: RedisService) -> None:
+        self._redis = redis
+
+    async def add(self, rows: list[UsageRecord]) -> None:
+        if not rows:
+            return
+        day_sums: dict[str, float] = {}
+        month_sums: dict[str, float] = {}
+        for row in rows:
+            day = datetime.fromtimestamp(row.ts).date().isoformat()
+            day_sums[day] = day_sums.get(day, 0.0) + row.cost_cny
+            month_sums[day[:7]] = month_sums.get(day[:7], 0.0) + row.cost_cny
+        for day, delta in day_sums.items():
+            key = f"cost:day:{day}"
+            await self._redis.incr_by_float(key, delta)
+            await self._redis.expire(key, ttl_seconds=self._DAY_TTL_SECONDS)
+        for month, delta in month_sums.items():
+            key = f"cost:month:{month}"
+            await self._redis.incr_by_float(key, delta)
+            await self._redis.expire(key, ttl_seconds=self._MONTH_TTL_SECONDS)
+
+    async def totals(self) -> tuple[float, float] | None:
+        day = datetime.fromtimestamp(time.time()).date().isoformat()
+        try:
+            day_value = await self._redis.get(f"cost:day:{day}")
+            month_value = await self._redis.get(f"cost:month:{day[:7]}")
+        except Exception:
+            logger.warning("cost: Redis 计数器读取失败，预算门回退进程内聚合值", exc_info=True)
+            return None
+        return (float(day_value or 0.0), float(month_value or 0.0))
+
+
 class CostGovernor:
     """预算门（T4.2）：日/月阈值 + warn/block 两档行为。
 
@@ -456,15 +563,26 @@ class CostGovernor:
       非 LLM 端点照常（熔断的是电表，不是整个房子）；
     - ``warn``：只告警放行，``status()`` 报 ``warn``；
     - 阈值为 0 表示对应周期不限额。
+
+    多 worker 口径（ADR-012）：``counters`` 在场时 ``acheck()/astatus()``
+    读 Redis 共享累计（全部 worker 的总和），缺席时委托进程内同步路径
+    ——调用方统一走 async 版即可，无需关心部署形态。
     """
 
     def __init__(
-        self, *, daily_cny: float, monthly_cny: float, action: str, meter: CostMeter
+        self,
+        *,
+        daily_cny: float,
+        monthly_cny: float,
+        action: str,
+        meter: CostMeter,
+        counters: RedisCostCounters | None = None,
     ) -> None:
         self._daily = daily_cny
         self._monthly = monthly_cny
         self._action = action
         self._meter = meter
+        self._counters = counters
         self._warned_day = ""
 
     def _exceeded(self) -> bool:
@@ -472,36 +590,66 @@ class CostGovernor:
             self._monthly > 0 and self._meter.month_total_cny() >= self._monthly
         )
 
-    def check(self) -> None:
-        """预算门前置检查；超限且 action=block 时抛出。"""
-        if self._exceeded():
+    def _gate(self, day_total: float, month_total: float) -> None:
+        """按给定累计值做超限判定与预警（共享/进程内两条路径共用）。"""
+        exceeded = (self._daily > 0 and day_total >= self._daily) or (
+            self._monthly > 0 and month_total >= self._monthly
+        )
+        if exceeded:
             if self._action == "block":
                 raise CostBudgetExceeded(
-                    f"cost budget exceeded: 今日 {self._meter.day_total_cny():.4f} 元 /"
-                    f" 本月 {self._meter.month_total_cny():.4f} 元"
-                    f"（阈值 {self._daily}/{self._monthly}）"
+                    f"cost budget exceeded: 今日 {day_total:.4f} 元 /"
+                    f" 本月 {month_total:.4f} 元（阈值 {self._daily}/{self._monthly}）"
                 )
             logger.warning(
                 "cost: 超出预算阈值仍在运行（action=warn）：今日 %.4f / 本月 %.4f 元",
-                self._meter.day_total_cny(),
-                self._meter.month_total_cny(),
+                day_total,
+                month_total,
             )
             return
         # 80% 预警（每日至多提醒一次）：让"快没钱了"先于"没钱"出现。
         day = datetime.fromtimestamp(time.time()).date().isoformat()
-        near = (self._daily > 0 and self._meter.day_total_cny() >= self._daily * 0.8) or (
-            self._monthly > 0 and self._meter.month_total_cny() >= self._monthly * 0.8
+        near = (self._daily > 0 and day_total >= self._daily * 0.8) or (
+            self._monthly > 0 and month_total >= self._monthly * 0.8
         )
         if near and self._warned_day != day:
             self._warned_day = day
             logger.warning(
-                "cost: 已达预算阈值的 80%%（今日 %.4f / 本月 %.4f 元）",
-                self._meter.day_total_cny(),
-                self._meter.month_total_cny(),
+                "cost: 已达预算阈值的 80%%（今日 %.4f / 本月 %.4f 元）", day_total, month_total
             )
 
+    async def _shared_totals(self) -> tuple[float, float] | None:
+        if self._counters is None:
+            return None
+        return await self._counters.totals()
+
+    def check(self) -> None:
+        """预算门前置检查（进程内口径）；超限且 action=block 时抛出。"""
+        self._gate(self._meter.day_total_cny(), self._meter.month_total_cny())
+
+    async def acheck(self) -> None:
+        """预算门前置检查：共享计数器在场读跨 worker 累计，否则走 ``check``。"""
+        totals = await self._shared_totals()
+        if totals is None:
+            self.check()
+            return
+        self._gate(*totals)
+
     def status(self) -> str:
-        """health 组件状态：ok | warn | blocked。"""
+        """health 组件状态（进程内口径）：ok | warn | blocked。"""
         if self._exceeded():
+            return "blocked" if self._action == "block" else "warn"
+        return "ok"
+
+    async def astatus(self) -> str:
+        """health 组件状态：共享计数器在场读跨 worker 累计。"""
+        totals = await self._shared_totals()
+        if totals is None:
+            return self.status()
+        day_total, month_total = totals
+        exceeded = (self._daily > 0 and day_total >= self._daily) or (
+            self._monthly > 0 and month_total >= self._monthly
+        )
+        if exceeded:
             return "blocked" if self._action == "block" else "warn"
         return "ok"

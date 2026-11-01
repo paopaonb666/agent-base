@@ -9,7 +9,10 @@ service = "agent_base_memory.plugin:build"
 routes = "agent_base_memory.api:routers"
 ```
 
-- ``service``：``async build(*, settings, llm, fast_llm) -> MemoryPlugin | None``；
+- ``service``：``async build(*, settings, llm, fast_llm, redis=None) ->
+  MemoryPlugin | None``——``redis``（共享状态服务，ADR-012）自 0.2 契约
+  起为**可选**形参：接受的实现可用它把捕获锁/注入快照外置到 Redis；
+  0.1 老实现按旧三参签名调用，不受影响；
 - ``routes``：``routers() -> list[APIRouter]``（管理 API，由 ``create_app`` 挂载）。
 
 语义：``MEMORY_ENABLED=true`` 即"启用即承诺"——找不到实现就报错并提示
@@ -18,6 +21,7 @@ routes = "agent_base_memory.api:routers"
 
 from __future__ import annotations
 
+import inspect
 import logging
 from dataclasses import dataclass
 from importlib.metadata import entry_points
@@ -31,6 +35,7 @@ from agent_base.core.contracts import ChatInvokerPort, MemoryServicePort
 
 if TYPE_CHECKING:  # pragma: no cover - import avoided at runtime
     from agent_base.core.config import Settings
+    from agent_base.extensions.redissvc import RedisService
 
 ENTRY_POINT_GROUP = "agent_base.memory"
 _SERVICE = "service"
@@ -79,15 +84,27 @@ async def build_memory_plugin(
     settings: Settings,
     llm: BaseChatModel | None,
     fast_llm: ChatInvokerPort | None,
+    redis: RedisService | None = None,
 ) -> MemoryPlugin | None:
-    """装配记忆服务；未启用返回 None，启用但实现缺失抛错。"""
+    """装配记忆服务；未启用返回 None，启用但实现缺失抛错。
+
+    ``redis``（ADR-012）：按实现的签名选择性透传——0.2+ 的记忆包接受
+    它并外置捕获锁/注入快照；0.1 老实现（三参签名）按原样调用。
+    """
     if not settings.memory.enabled:
         return None
     entry = _select(_SERVICE)
     if entry is None:
         raise _missing()
     builder = entry.load()
-    plugin = await builder(settings=settings, llm=llm, fast_llm=fast_llm)
+    kwargs: dict[str, Any] = {"settings": settings, "llm": llm, "fast_llm": fast_llm}
+    try:
+        accepts_redis = "redis" in inspect.signature(builder).parameters
+    except (TypeError, ValueError):  # pragma: no cover - 非函数式 builder 防御
+        accepts_redis = False
+    if accepts_redis:
+        kwargs["redis"] = redis
+    plugin = await builder(**kwargs)
     if plugin is None or not isinstance(plugin, MemoryPlugin):
         raise MemoryPluginError(
             f"memory plugin entry point {entry.value!r} returned no MemoryPlugin"

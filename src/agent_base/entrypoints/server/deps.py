@@ -24,14 +24,16 @@ def get_metrics(request: Request) -> Metrics:
     return cast("Metrics", request.app.state.metrics)
 
 
-def get_current_user(request: Request) -> str:
+async def get_current_user(request: Request) -> str:
     """用户作用域身份：经可插拔的 AuthBackend 解析（S1 统一依赖）。
 
     所有用户作用域端点必须显式声明该依赖——身份解析只有这一条路径。
+    0.4 起为 async 依赖（``AuthBackend.authenticate`` 是 async 协议，
+    nonce 防重放可经 Redis 跨 worker 共享，ADR-012）。
     """
     rt = get_runtime(request)
     backend: AuthBackend = request.app.state.auth_backend
-    return str(backend.authenticate(request, rt.settings))
+    return str(await backend.authenticate(request, rt.settings))
 
 
 def require_memory(rt: AgentRuntime) -> MemoryServicePort:

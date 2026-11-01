@@ -4,6 +4,8 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue.svg)](pyproject.toml)
 
+**简体中文** | [English](README.en.md)
+
 **LangGraph 之上的生产治理基座。** 编排交给 LangGraph（不自研）；基座补齐
 "从 Demo 到生产"缺的三件设施——**长期记忆、成本治理、事件可观测**。
 业务以模块接入，五步上手，不改基座代码。
@@ -88,6 +90,7 @@ pip-audit）本地与 CI 完全一致，依赖地板锁定（langgraph ≥1.2.6�
 | `fastapi` / `uvicorn` | HTTP + SSE 服务入口 | `>=0.115` / `>=0.30` |
 | `pypdf` | 工具库 parsing：PDF 文本提取（M4 前置） | `>=5.0`：纯 Python 且轻量，PDF 是文档读取的主格式，进主依赖开箱即用 |
 | `httpx` / `tzdata` | 工具库基础：Tavily 搜索引擎 HTTP 客户端 / Windows 上的时区数据库 | `>=0.27`（原 dev 依赖转正）/ `>=2024.1`（POSIX 自带） |
+| `redis` | 治理状态共享层（ADR-012）：成本预算计数 / nonce 防重放 / 分布式锁 / 注入快照 / SSE 镜像 | `>=5.0`：asyncio 客户端与类型标注稳定；`REDIS_ENABLED=false` 时零依赖回退进程内实现 |
 | `python-multipart` | 文件上传端点的 multipart/form 解析 | `>=0.0.9`：FastAPI 官方要求 |
 
 可选 extras：
@@ -118,7 +121,7 @@ cp .env.example .env           # 填入 LLM_API_KEY（阶段 1 起由 config.py 
 pytest                         # 核心集（默认排除 integration 标记，无需 MySQL，见下）
 ```
 
-容器一键起（app + MySQL 8.0，先迁移再启动）：
+容器一键起（app + MySQL 8.0 + Redis 7.4，先迁移再启动）：
 
 ```bash
 cp .env.example .env           # 填 LLM_API_KEY / MEMORY_AUTH_SECRET
@@ -126,14 +129,17 @@ docker compose up --build      # http://localhost:8000/health
 docker compose config --quiet  # 仅校验 compose 语法与变量插值
 ```
 
+> 本地裸跑（不经容器）且没有 Redis 时，`.env` 里设 `REDIS_ENABLED=false`
+> ——治理状态回退进程内实现（单进程口径），行为与 0.3 一致。
+>
 > **测试与覆盖率门**：pytest 默认跑**核心集**（`pyproject.toml` addopts
 > 含 `-m "not integration"`），覆盖率门（branch ≥85%）按核心集计算，口径覆盖
 > 基座与记忆包两个发行包（`--cov=agent_base --cov=agent_base_memory`）——
-> 本地无 MySQL 也全绿。MySQL 集成测试带 `@pytest.mark.integration`
-> 标记，仅在两处运行：CI 的 test job（挂 MySQL 8.0 服务容器，
-> `-m "integration or not integration"` 跑全量）与本机显式指定同名
-> marker 且连接可用时——连接参数经 `MYSQL_HOST / MYSQL_PORT /
-> MYSQL_USER / MYSQL_PASSWORD` 环境变量传入（探测失败自动 skip）。
+> 本地无 MySQL、无 Redis 也全绿。MySQL/Redis 集成测试带
+> `@pytest.mark.integration` 标记，仅在两处运行：CI 的 test job（挂
+> MySQL 8.0 与 Redis 7.4 服务容器，`-m "integration or not integration"`
+> 跑全量）与本机显式指定同名 marker 且连接可用时——MySQL 连接参数经
+> `MYSQL_*`、Redis 经 `REDIS_URL` 环境变量传入（探测失败自动 skip）。
 > CI 另有跨平台 test-core job 背书"Windows 可用 / Python ≥3.10"。
 
 ### 配置说明（.env）
@@ -149,7 +155,11 @@ docker compose config --quiet  # 仅校验 compose 语法与变量插值
 | `AGENT_MODULE_PACKAGES` | 模块所在包的导入前缀，逗号分隔、按顺序查找（默认 `agent_base.modules`）。独立分发的模块包加进来即可被发现；同名模块靠前的包优先 |
 | `CORS_ORIGINS` | 允许跨域调用 SSE 端点的来源（默认 `http://localhost:3000`，即 agent-base-ui） |
 | `CHECKPOINTER_BACKEND` | `sqlite`（默认，重启可恢复对话）\| `memory`（零依赖，不持久化）\| `mysql`（MySQL 持久化，配 `CHECKPOINTER_MYSQL_*`） |
+| `REDIS_ENABLED` / `REDIS_URL` | 治理状态共享层（ADR-012，默认开）：预算门计数 / nonce 防重放 / 捕获分布式锁 / 注入快照 / SSE 事件镜像跨 worker 共享；**启用即承诺**（连不上拒绝启动）。单机无 Redis 设 `REDIS_ENABLED=false` 回退进程内实现。键前缀 `REDIS_KEY_PREFIX`（默认 `agent_base:`）隔离多应用 |
 | `TOOL_TIMEOUT_SECONDS` | 工具单次执行超时（默认 30s） |
+| `TOOL_RETRY_*` / `TOOL_BLACKLIST_*` / `TOOL_GLOBAL_FAILURE_*` / `TOOL_ARG_REPAIR_*` | 工具韧性层（ADR-009）：瞬时错误指数退避重试（默认开，超时默认不重试）；连续失败 3 次进短时冷却（60s 起指数翻倍）；全局失败预算熔断；同工具参数连续校验失败 3 次给终止性反馈并按字段列出错误 |
+| `TOOL_ROUTING_ENABLED` / `TOOL_ROUTING_TOP_K` | 向量工具路由（ADR-010，默认关）：按查询语义召回 top-k 个 advanced 工具（basic 永远绑定，MCP 工具均为 advanced）；复用 `MEMORY_EMBEDDING_*` 提供方，未配置时优雅降级回全量池 |
+| `TOOL_FEWSHOT_ENABLED` / `TOOL_FEWSHOT_TOP_N` / `TOOL_FEWSHOT_MIN_SCORE` / `TOOL_FEWSHOT_PATH` | 工具调用 few-shot（ADR-011，默认关）：按查询相似度动态选样注入 system prompt，低于阈值不注入；效果用 `scripts/tool_eval.py` 两臂对照评测（工具选择/参数/完成率三指标） |
 | `TOOL_CALL_LOG_ENABLED` | 工具调用审计（M5）：每条调用含参数/结果/耗时落库，UI 渲染调用面板 |
 | `DOC_PARSE_MAX_INPUT_BYTES` / `DOC_PARSE_MAX_OUTPUT_CHARS` | 上传文档解析限额（默认 10MB / 5 万字符） |
 | `TOOLKIT_ENABLED` | 装配进共享池的基座内置工具清单（默认 `current_time,calculator,json_query`）；`web_search` 需配 `SEARCH_*`，`python_repl` 为 exec 级默认关 |

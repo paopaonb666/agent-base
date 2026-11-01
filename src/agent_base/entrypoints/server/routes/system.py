@@ -104,11 +104,27 @@ async def health(request: Request) -> dict[str, Any]:
     memory = memory_or_none(rt)
     if memory is not None:
         components["memory"] = await memory.health_probe()
+    # Redis 共享状态服务（ADR-012）：未启用即缺席（同 memory 口径）；
+    # 启用时 ping 探活——治理状态共享面损坏要让整体状态变 degraded。
+    if rt.redis is not None:
+        try:
+            await rt.redis.ping()
+            components["redis"] = "ok"
+        except Exception:
+            components["redis"] = "error"
     # 成本治理（T4.2）：仅在 COST_ENABLED=true 时出现；warn/blocked 都
     # 会把整体状态推到 degraded（预算见底与依赖损坏同级可见）。
     governor = getattr(request.app.state, "cost_governor", None)
     if governor is not None:
-        components["cost"] = governor.status()
+        components["cost"] = await governor.astatus()
+    # 事件触发器（ADR-007）：启用时出现；任务连续失败 → degraded。
+    scheduler = getattr(request.app.state, "scheduler", None)
+    if scheduler is not None:
+        components["scheduler"] = scheduler.health()
+    # 工具韧性层（ADR-009）：工具冷却中或全局熔断 → degraded（与
+    # scheduler 同口径——部分失效显式可见，而不是静默吞掉）。
+    if rt.tool_resilience is not None:
+        components["tool_resilience"] = rt.tool_resilience.registry.health()
     status = "ok" if all(v == "ok" for v in components.values()) else "degraded"
     return {"status": status, "components": components}
 

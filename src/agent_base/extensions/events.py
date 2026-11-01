@@ -14,9 +14,12 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, TypeAdapter
+
+logger = logging.getLogger(__name__)
 
 
 class StepEvent(BaseModel):
@@ -110,6 +113,28 @@ class PlanEvent(BaseModel):
     detail: str | None = None
 
 
+class ApprovalRequest(BaseModel):
+    """一个等待人工决策的工具调用（ADR-005 审批门的载荷单元）。"""
+
+    tool_call_id: str
+    tool: str
+    args: dict[str, Any] = Field(default_factory=dict)
+
+
+class ApprovalRequestEvent(BaseModel):
+    """审批门暂停信号：图在工具执行前 interrupt，等待 resume 决策。
+
+    由 SSE 层从 LangGraph 的 ``__interrupt__`` 更新翻译而来（基座翻译，
+    非模块 custom 事件）；事件后紧跟 done——流的语义是"本轮暂停待审批"，
+    客户端经 ``POST .../threads/{id}/resume`` 携带对每个
+    ``tool_call_id`` 的 approve/reject/modify 决策续流。
+    """
+
+    type: Literal["approval_request"] = "approval_request"
+    thread_id: str | None = None
+    requests: list[ApprovalRequest] = Field(default_factory=list)
+
+
 AgentEvent = (
     StepEvent
     | DeltaEvent
@@ -119,9 +144,25 @@ AgentEvent = (
     | PingEvent
     | ToolCallEvent
     | PlanEvent
+    | ApprovalRequestEvent
 )
 
 
 def encode_sse(event: AgentEvent) -> str:
     """把一个契约事件渲染为 Server-Sent Events 帧。"""
     return f"event: {event.type}\ndata: {event.model_dump_json()}\n\n"
+
+
+# 联合类型的反序列化器（ADR-012 SSE 镜像的订阅侧）：``type`` 字面量即
+# 判别器，未知/畸形载荷与 sse.py 的 custom 事件解码同一纪律——丢弃记
+# 日志，绝不把未校验数据透给浏览器。
+_AGENT_EVENT_ADAPTER: TypeAdapter[AgentEvent] = TypeAdapter(AgentEvent)
+
+
+def decode_event(payload: str) -> AgentEvent | None:
+    """把 JSON 载荷还原为契约事件；畸形/未知类型返回 None。"""
+    try:
+        return _AGENT_EVENT_ADAPTER.validate_json(payload)
+    except ValueError:
+        logger.warning("events: dropping malformed event payload: %.120s", payload)
+        return None

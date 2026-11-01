@@ -1,16 +1,17 @@
 # 部署指南
 
 本文覆盖 agent-base 的三种部署形态、环境变量最小集、健康与指标口径、
-数据库迁移、身份安全，以及容器用法。**单进程**是当前所有形态的共同前提：
-成本账本、nonce 防重放、指标聚合与检索缓存都按进程持有（见下文口径表）。
+数据库迁移、身份安全，以及容器用法。**多 worker 共享层**（Redis，ADR-012）
+自 0.4 起默认开启：成本预算计数、nonce 防重放、记忆捕获锁与注入快照跨
+进程共享；未启用 Redis 时全部回退进程内实现（单进程口径，见下文口径表）。
 
 ## 1. 三种部署形态
 
 | 形态 | 入口 | 适用场景 | 状态存储 | 身份 |
 | --- | --- | --- | --- | --- |
 | CLI 单机 | `python -m agent_base` | 本机自用、脚本化、快速验证 | `memory` 或 `sqlite` | 无（单用户） |
-| HTTP 单进程 | `uvicorn agent_base.entrypoints.server:app` | 配合 agent-base-ui / 自建前端，单机多用户 | `sqlite`（默认）或 `mysql` | `HmacHeaderAuth`（`X-User-Id` + `X-User-Sig`） |
-| 容器（app + MySQL） | `docker compose up` | 可复现部署、迁移与升级 | `mysql` | 同上；生产必须配 `MEMORY_AUTH_SECRET` |
+| HTTP 单进程 | `uvicorn agent_base.entrypoints.server:app` | 配合 agent-base-ui / 自建前端，单机多用户 | `sqlite`（默认）或 `mysql`；Redis（治理状态，默认开） | `HmacHeaderAuth`（`X-User-Id` + `X-User-Sig`） |
+| 容器（app + MySQL + Redis） | `docker compose up` | 可复现部署、迁移与升级 | `mysql` + `redis` | 同上；生产必须配 `MEMORY_AUTH_SECRET` |
 
 ### CLI 单机
 
@@ -32,16 +33,17 @@ uvicorn agent_base.entrypoints.server:app --host 0.0.0.0 --port 8000
 默认 `CHECKPOINTER_BACKEND=sqlite`（`./agent_base_state.db`），开箱即用；
 需要多实例共享状态时切 `mysql`。TLS 由前置反向代理终止，应用不内置证书管理。
 
-### 容器（app + MySQL 8.0）
+### 容器（app + MySQL 8.0 + Redis 7.4）
 
 ```bash
 cp .env.example .env            # 填 LLM_API_KEY / MEMORY_AUTH_SECRET
 docker compose up --build
 ```
 
-`docker-compose.yml` 定义两个服务：`app`（本仓库镜像，非 root，8000 端口）
-与 `mysql`（`mysql:8.0`，utf8mb4，健康检查，命名卷）。`app` 在启动前依次执行
-两条迁移链（基座 `alembic upgrade head`、记忆包
+`docker-compose.yml` 定义三个服务：`app`（本仓库镜像，非 root，8000 端口）、
+`mysql`（`mysql:8.0`，utf8mb4，健康检查，命名卷）与 `redis`（`redis:7.4`，
+AOF 持久化，健康检查，命名卷——承载治理状态共享，ADR-012）。`app` 在启动前
+依次执行两条迁移链（基座 `alembic upgrade head`、记忆包
 `alembic -c memory-alembic/alembic.ini upgrade head`），然后以 uvicorn 起服务。
 数据库凭据通过 `.env` 注入，不烘进镜像。
 
@@ -62,6 +64,7 @@ docker compose up --build
 | `CHECKPOINTER_MYSQL_*` | mysql 时 | host / port / user / password / database；要求 MySQL ≥ 8.0.19 |
 | `MEMORY_ENABLED` | 否 | 默认 `true`；为 `true` 时必须装好 `agent-base-memory`，缺包即启动失败；设 `false` 则不发现、不导入 |
 | `MEMORY_AUTH_SECRET` | production 且记忆开启时 | 缺失即拒绝启动；用于 `X-User-Sig` HMAC |
+| `REDIS_ENABLED` / `REDIS_URL` | 否 | 治理状态共享层（ADR-012），默认开启；连不上即拒绝启动（启用即承诺）。本地裸跑没有 Redis 时设 `REDIS_ENABLED=false` 回退单进程口径 |
 | `CORS_ORIGINS` | 否 | 允许的前端来源，默认 `http://localhost:3000`；禁止 `*` |
 | `COST_ENABLED` / `COST_DAILY_CNY` / `COST_MONTHLY_CNY` | 否 | 成本计量与预算熔断，默认关闭 |
 | `LOG_JSON` | 否 | 生产建议 `true`，输出结构化 JSON 日志 |
@@ -85,6 +88,7 @@ docker compose up --build
 | `checkpointer` | `ok` / `error` / `unconfigured` | 探一次 `aget_tuple` |
 | `model` | `ok` / `error` / `unconfigured` / `misconfigured` | 默认只做配置检查；`LLM_HEALTH_PROBE_MODEL=true` 才真实探活（30s 缓存） |
 | `memory` | `ok` / `degraded` / `error` | 仅 `MEMORY_ENABLED=true` 时出现；缺席不算降级 |
+| `redis` | `ok` / `error` | 仅 `REDIS_ENABLED=true` 时出现（ADR-012）；ping 失败算 degraded |
 | `cost` | `ok` / `warn` / `blocked` | 仅 `COST_ENABLED=true` 时出现；warn/blocked 都算 degraded |
 
 容器 `HEALTHCHECK` 只验证 HTTP 可应答（存活探针）。**就绪探针**应解析
@@ -100,7 +104,7 @@ Prometheus 文本格式，主要指标：
 
 指标是**进程内聚合**：多 worker 时需在采集侧按 instance 聚合，不能假设单点数值。
 
-## 4. 单进程口径表
+## 4. 单进程口径表（REDIS_ENABLED=false 时）
 
 | 能力 | 作用域 | 进程重启 | 多 worker / 多副本 |
 | --- | --- | --- | --- |
@@ -110,27 +114,44 @@ Prometheus 文本格式，主要指标：
 | `/metrics` | 进程内计数器 | 归零 | 采集侧按实例聚合 |
 | 检索候选 | 每用户最多 2000 条候选 | — | 检索在进程内完成；更大规模需下推索引（H2） |
 | BM25 索引缓存 | 进程内 LRU，按内容指纹失效 | 丢失（自动重建） | 各进程各自缓存，一致性由内容指纹保证 |
-| SSE 连接 | 绑定到单个 worker | 断开 | 需要粘性会话或单 worker；当前不提供跨 worker 广播 |
+| 记忆捕获锁 | 进程内 `asyncio.Lock` 注册表 | 丢失 | 同用户并发捕获可能重复 ADD（锐评 #10 的竞态窗口回归） |
+| 注入快照缓存 | 进程内 LRU | 丢失 | 各进程各自冻结，同线程注入段跨 worker 不一致 |
+| 夜间捕获批 | 进程内调度器 | — | 多实例同时跑全量批，重复消耗 LLM |
+| SSE 连接 | 绑定到单个 worker | 断开 | 需要粘性会话或单 worker |
 | 工具超时 | 每进程线程池 | — | 各自计时，互不影响 |
 
-结论：**同一个数据库可以挂多个进程，但"治理状态"不跨进程共享**。
-在实现外置之前，生产建议 `--workers 1`，或把预算/nonce/metrics 收到网关层。
+结论：未启用 Redis 时，**同一个数据库可以挂多个进程，但"治理状态"不跨
+进程共享**——生产保持 `--workers 1`。
 
-### 外置方向（P2，尚未实现）
+## 4b. Redis 共享层（ADR-012，默认开启）
 
-1. **成本账本与预算**：把 meter 改为写入共享表（`cost_usage` 增加
-   `instance_id` 与时间桶），预算门按 `SUM()` 在库内原子判定；或接 Redis
-   计数器。接口层只替换账本实现，`CostMeter` 的调用点不变。
-2. **nonce 防重放**：从进程内 LRU 改为 Redis `SET key NX EX <窗口>`，
-   或在 API 网关做重放过滤；`AuthBackend` 契约保持不变，由部署方注入。
-3. **metrics 聚合**：保持每个 worker 各自暴露 `/metrics`，由 Prometheus
-   按 `instance` 抓取并用 `sum by (job)` 聚合；不要把聚合逻辑塞进应用。
-4. **SSE**：多 worker 需要粘性会话或消息总线（Redis Pub/Sub）广播事件；
-   在此之前保持单 worker。
+`REDIS_ENABLED=true`（默认）时，下表状态的口径升级为跨 worker 共享：
 
-外置的目标是让"治理状态"成为可水平扩展的共享设施，而不是把单进程结构
-直接复制到每个 worker。分阶段落地，不改变现有 `MemoryPort` / `AuthBackend`
-契约。
+| 能力 | Redis 承载 | 语义 |
+| --- | --- | --- |
+| 预算门累计 | `cost:day:{日期}` / `cost:month:{年月}` 计数器（`INCRBYFLOAT` + TTL） | 门检查读**全部 worker 总和**；累计延迟 ≤ 一个 flush 周期（5s）；Redis 读失败回退进程内值（只会少记不误熔断） |
+| nonce 防重放 | `nonce:{user_id}:{nonce}`（`SET NX EX 2×窗口`） | 跨 worker 重放被拒；Redis 故障回退进程内 LRU |
+| 记忆捕获锁 | `lock:capture:{user_id}`（`SET NX PX` + token + Lua 安全释放） | 同用户捕获跨进程串行；等待超时跳过本轮（下一轮补上），不死等 |
+| 注入快照缓存 | `snap:{thread_id}/{user_id}/{agent_id}`（TTL 限界） | 冻结注入段跨 worker 逐字节一致 |
+| 夜间捕获批 | `lock:nightly_capture` 全局锁 | 多实例只跑一份，其余让位（`reason=locked`） |
+| SSE 事件镜像 | Pub/Sub 频道 `sse:{thread_id}` | invoke/resume 的事件 best-effort 双写；只读观察端点 `GET /v1/agents/{module}/threads/{id}/events` 跨实例订阅（at-most-once，主链路不受影响） |
+
+启用即承诺：连接失败即拒绝启动（不静默降级成"假共享"）。键统一拼
+`REDIS_KEY_PREFIX`（默认 `agent_base:`），多应用可共享同一实例。
+`/health` 出现 `components["redis"]`。共享层就位后 `--workers N`
+开箱可用（对话状态本就在共享 checkpointer 里，缺的只是治理状态——
+现在补齐了）。
+
+部署要点：
+
+1. **成本预算**已接 Redis 计数器（上表第 1 行）；`CostMeter` 调用点与
+   SQL 明细账本（`cost_usage`）不变——计数器只承载预算门的共享判定值。
+2. **nonce 防重放**已内置 Redis 方案；`AuthBackend` 契约自 0.4 起为
+   async（自定义后端需 `async def authenticate`）。
+3. **metrics 聚合**维持 Prometheus 按 `instance` 抓取的既定方案，不塞进应用。
+4. **SSE**：多 worker 下 invoke/resume 本就是请求内闭环（状态在共享
+   checkpointer 里，落在哪个 worker 就在那个 worker 流），镜像与观察端点
+   解决的是"跨实例旁路观察/前端重挂"，不是主链路扇出。
 
 ## 5. 数据库迁移（MySQL）
 

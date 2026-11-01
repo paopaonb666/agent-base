@@ -8,8 +8,10 @@ upsert）。列表端点只返回**当前用户**的线程；历史/删除/工�
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import time
+from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import datetime
 from typing import Annotated, Any, Literal
@@ -18,6 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Request
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from agent_base.core.bootstrap import UnknownModuleError
@@ -31,8 +34,16 @@ from agent_base.entrypoints.server.deps import (
     memory_or_none,
 )
 from agent_base.entrypoints.server.serializers import IMAGE_STORED_FORMATS, _serialize_message
-from agent_base.entrypoints.server.sse import _SSE_HEADERS, _build_capture_hook, _event_stream
+from agent_base.entrypoints.server.sse import (
+    _SSE_HEADERS,
+    SSE_QUEUE_MAXSIZE,
+    _build_capture_hook,
+    _event_stream,
+    _heartbeat,
+    sse_channel,
+)
 from agent_base.extensions.costmeter import CostBudgetExceeded
+from agent_base.extensions.events import AgentEvent, PingEvent, decode_event, encode_sse
 from agent_base.extensions.filestore import UploadedFileInfo
 from agent_base.extensions.observability import new_request_id
 
@@ -71,6 +82,66 @@ class InvokeRequest(BaseModel):
     profile: Literal["main", "fast"] = "main"
 
 
+class ApprovalDecision(BaseModel):
+    """对单个工具调用的审批决策（ADR-005）。"""
+
+    action: Literal["approve", "reject", "modify"]
+    # 仅 modify 使用：替换后的完整参数（工具自身 schema 校验兜底）。
+    args: dict[str, Any] | None = None
+
+
+class ResumeRequest(BaseModel):
+    """审批恢复：对 approval_request 事件里每个 tool_call_id 给出决策。"""
+
+    decisions: dict[str, ApprovalDecision] = Field(min_length=1)
+
+
+@router.post("/{module}/threads/{thread_id}/resume")
+async def resume_thread(
+    module: str,
+    thread_id: _ThreadPathParam,
+    body: ResumeRequest,
+    request: Request,
+    user_id: str = Depends(get_current_user),
+) -> StreamingResponse:
+    """审批门恢复（ADR-005）：携带决策续走暂停的对话流（SSE）。
+
+    线程必须处于待审批暂停态（图快照存在未决 interrupt），否则 409——
+    避免把 resume 当成普通输入重放。恢复流与 invoke 流同契约；记忆形成
+    钩子同样在正常完成后触发。
+    """
+    rt = get_runtime(request)
+    if not known_module(rt, module):
+        raise HTTPException(status_code=404, detail=f"unknown module {module!r}")
+    await _thread_owner_or_404(rt, module, thread_id, user_id)
+    # 审批恢复必须命中原请求模块的图（thread 命名空间属于请求模块——
+    # 与 invoke 的决策 5 一致：mode=plan 的轮也挂在请求模块名下）。
+    graph = _graph_or_404(rt, module)
+    full_thread_id = str(ThreadId(module=module, raw=thread_id))
+    config: RunnableConfig = {
+        "recursion_limit": rt.settings.agent_recursion_limit,
+        "configurable": {"thread_id": full_thread_id, "user_id": user_id},
+    }
+    snapshot = await graph.aget_state(config)
+    pending = any(
+        getattr(task, "interrupts", None) for task in (snapshot.tasks if snapshot else [])
+    )
+    if not pending:
+        raise HTTPException(status_code=409, detail="该线程没有待决策的审批请求")
+    resume_value = {
+        call_id: {"action": d.action, "args": d.args} for call_id, d in body.decisions.items()
+    }
+    memory = memory_or_none(rt)
+    on_complete = _build_capture_hook(memory, module, thread_id, graph, config)
+    return StreamingResponse(
+        _event_stream(
+            graph, Command(resume=resume_value), config, thread_id, on_complete, bus=rt.redis
+        ),
+        media_type="text/event-stream",
+        headers=_SSE_HEADERS,
+    )
+
+
 def _graph_or_404(rt: Any, module: str) -> Any:
     """按模块取图；未知模块给干净的 404（UnknownModuleError 是 KeyError
     子类，str() 会带引号包装，取 args[0]）。"""
@@ -100,11 +171,12 @@ async def invoke(module: str, body: InvokeRequest, request: Request) -> Streamin
     """一次对话轮：SSE 流输出契约事件（ping/step/delta/sources/done/error）。"""
     rt = get_runtime(request)
     # 预算熔断（T4.2）：在建流之前检查——429 优先于半截 SSE。只挡新的
-    # LLM 消耗；非 LLM 端点不经过这里，不受熔断影响。
+    # LLM 消耗；非 LLM 端点不经过这里，不受熔断影响。acheck（ADR-012）：
+    # 共享计数器在场时读跨 worker 累计。
     governor = getattr(request.app.state, "cost_governor", None)
     if governor is not None:
         try:
-            governor.check()
+            await governor.acheck()
         except CostBudgetExceeded as exc:
             raise HTTPException(status_code=429, detail=str(exc)) from exc
     # 难度分流（M9）：mode 只决定调哪张图——thread 前缀、记忆 agent_id、
@@ -130,7 +202,7 @@ async def invoke(module: str, body: InvokeRequest, request: Request) -> Streamin
         )
     graph = _graph_or_404(view, "planner" if use_plan else module)
     user_thread_id = body.thread_id or new_request_id()
-    user_id = get_current_user(request)
+    user_id = await get_current_user(request)
     # 按模块划分的 thread id：图共用一个 checkpointer；未划分命名空间
     # 的 id 会把它们的状态混在一起。user_id（M6）进 configurable：
     # 记忆工具经 RunnableConfig 注入读取（M6e）。
@@ -240,10 +312,77 @@ async def invoke(module: str, body: InvokeRequest, request: Request) -> Streamin
     # 需要形成管线可用（llm 已装配）且记忆系统启用。
     on_complete = _build_capture_hook(memory, module, user_thread_id, graph, config)
     return StreamingResponse(
-        _event_stream(graph, messages_input, config, user_thread_id, on_complete),
+        _event_stream(
+            graph,
+            {"messages": messages_input},
+            config,
+            user_thread_id,
+            on_complete,
+            bus=rt.redis,
+        ),
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
     )
+
+
+@router.get("/{module}/threads/{thread_id}/events")
+async def observe_thread_events(
+    module: str,
+    thread_id: _ThreadPathParam,
+    request: Request,
+    user_id: str = Depends(get_current_user),
+) -> StreamingResponse:
+    """线程事件的只读 SSE 镜像（ADR-012；REDIS_ENABLED=true 时可用）。
+
+    订阅 Redis 频道 ``sse:{thread_id}`` 并转发镜像事件：多实例部署下可
+    从任一实例观察正在发生（或后续发生）的对话轮——前端在连接漂移后
+    重挂、运维旁路观察都走这里。Pub/Sub 是 at-most-once：订阅建立前与
+    Redis 抖动期间的事件不补发；主对话流仍是 invoke/resume 请求内闭环，
+    镜像缺席不影响正确性。未启用 Redis 时 503（能力未开启，不是故障）。
+    """
+    rt = get_runtime(request)
+    if not known_module(rt, module):
+        raise HTTPException(status_code=404, detail=f"unknown module {module!r}")
+    await _thread_owner_or_404(rt, module, thread_id, user_id)
+    redis = rt.redis
+    if redis is None:
+        raise HTTPException(status_code=503, detail="SSE 事件镜像未启用（REDIS_ENABLED=false）")
+
+    async def _mirror() -> AsyncIterator[str]:
+        queue: asyncio.Queue[AgentEvent | None] = asyncio.Queue(maxsize=SSE_QUEUE_MAXSIZE)
+
+        async def _relay() -> None:
+            # 订阅→解码→入队；连接断开（Redis 抖动/关停）时送哨兵结束流
+            # ——客户端按 SSE 惯例重连，期间事件不补发（at-most-once）。
+            try:
+                async for payload in redis.pubsub_messages(sse_channel(thread_id)):
+                    event = decode_event(payload)
+                    if event is not None:
+                        await queue.put(event)
+            finally:
+                while True:
+                    try:
+                        queue.put_nowait(None)
+                        break
+                    except asyncio.QueueFull:
+                        await asyncio.sleep(0.05)
+
+        relay = asyncio.create_task(_relay())
+        heartbeat = asyncio.create_task(_heartbeat(queue))
+        try:
+            # 立即发出存活信号：订阅在 Redis 侧生效前客户端就知道流已打开。
+            yield encode_sse(PingEvent())
+            while True:
+                event = await queue.get()
+                if event is None:
+                    break
+                yield encode_sse(event)
+        finally:
+            for task in (relay, heartbeat):
+                task.cancel()
+            await asyncio.gather(relay, heartbeat, return_exceptions=True)
+
+    return StreamingResponse(_mirror(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
 @router.get("/{module}/threads")

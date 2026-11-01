@@ -22,6 +22,9 @@ from langgraph.graph.state import CompiledStateGraph
 
 if TYPE_CHECKING:  # pragma: no cover - import avoided at runtime
     from agent_base.core.config import Settings
+    from agent_base.core.tool_fewshot import ToolFewShot
+    from agent_base.core.tool_resilience import ToolResilience
+    from agent_base.core.tool_routing import ToolRouter
 
 # CompiledStateGraph 对 (StateT, ContextT, InputT, OutputT) 是泛型的。
 # 基座把编译后的图当作不透明对象处理——它只会把图回传给入口——
@@ -47,7 +50,13 @@ class MemoryPort(Protocol):
     ) -> str | None: ...
 
     async def capture_turn(
-        self, *, user_id: str, agent_id: str, thread_id: str, messages: list[Any]
+        self,
+        *,
+        user_id: str,
+        agent_id: str,
+        thread_id: str,
+        messages: list[Any],
+        force: bool = False,
     ) -> Any: ...
 
     async def aclose(self) -> None: ...
@@ -156,6 +165,15 @@ class ModuleContext:
     # 计划快照端口（M10）：None = 存储不可用（planner 退化为只写图
     # 状态，跨轮延续不可用）。planner 之外的模块可以完全忽略它。
     plan_store: PlanStorePort | None = None
+    # 韧性层（ADR-009）：None = 未装配（测试直调语境），错误反馈退回
+    # 无状态 handle_tool_error；已装配时三个错误收口共用其 reporter。
+    tool_resilience: ToolResilience | None = None
+    # 向量工具路由（ADR-010）：None = 未启用/降级，图工厂走建图时
+    # 全量绑定的快路径；active 时每轮按查询语义动态绑定。
+    tool_router: ToolRouter | None = None
+    # 工具 few-shot（ADR-011）：None = 未启用/无 embedder，提示词零变化；
+    # 已启用时按查询相似度动态选样注入 system prompt。
+    tool_fewshot: ToolFewShot | None = None
 
 
 @runtime_checkable

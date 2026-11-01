@@ -105,6 +105,22 @@ def create_app(
         setup_logging(json_lines=rt.settings.observability.log_json)
         app.state.runtime = rt
 
+        # nonce 防重放外置（ADR-012）：默认身份后端在 create_app 构造时
+        # 拿不到运行时（它在 lifespan 里才装配），这里补绑共享 Redis——
+        # 多 worker 下重放指纹跨进程共享；注入自定义 backend 的部署自带
+        # 防重放策略，不受影响。
+        if rt.redis is not None and isinstance(app.state.auth_backend, HmacHeaderAuth):
+            app.state.auth_backend.bind_redis(rt.redis)
+
+        # 事件触发器（ADR-007）：声明解析在装配期完成（非法即启动失败），
+        # 循环与关闭仿照成本账本 flush 任务的形态。
+        from agent_base.extensions.scheduler import build_scheduler
+
+        scheduler_obj = build_scheduler(rt.settings, rt)
+        if scheduler_obj is not None:
+            scheduler_obj.start()
+        app.state.scheduler = scheduler_obj
+
         # 成本治理（T4.1/T4.2）：装配账本 + 预算门 + 周期落库。仅在
         # COST_ENABLED=true 时激活；app.state.cost_governor 恒存在（None
         # = 未启用），路由据此跳过预算检查。
@@ -117,7 +133,9 @@ def create_app(
                 CostGovernor,
                 MemoryCostLedger,
                 MysqlCostLedger,
+                RedisCostCounters,
                 SqliteCostLedger,
+                UsageRecord,
             )
 
             COST_METER.configure(cost.prices_json)
@@ -130,9 +148,13 @@ def create_app(
                 # memory 后端零依赖不持久化：预算累计重启清零（方向安全
                 # ——只会少记不会误熔断）。
                 ledger = MemoryCostLedger()
-            # 重启恢复：账本按日聚合回放进预算累计（totals_by_day 返回 dict，
-            # 直接遍历只会拿到 key——这里是 2026-09-20 修复的启动崩溃点：
-            # 账本一旦有数据，进程重启即 ValueError）。
+            # 跨 worker 计数器（ADR-012）：Redis 在场时预算门读共享累计；
+            # 计数器自带 TTL，跨重启保留，无需从账本恢复共享值。
+            counters = RedisCostCounters(rt.redis) if rt.redis is not None else None
+            # 重启恢复（进程内口径的兜底路径）：账本按日聚合回放进预算
+            # 累计（totals_by_day 返回 dict，直接遍历只会拿到 key——这里是
+            # 2026-09-20 修复的启动崩溃点：账本一旦有数据，进程重启即
+            # ValueError）。
             for day, day_cost in (await ledger.totals_by_day()).items():
                 COST_METER.restore_day(day, day_cost)
             app.state.cost_governor = CostGovernor(
@@ -140,12 +162,31 @@ def create_app(
                 monthly_cny=cost.monthly_cny,
                 action=cost.action,
                 meter=COST_METER,
+                counters=counters,
             )
 
+            # Redis 累加失败的积压行：下个 flush 周期连同新行重试（有界，
+            # 极端场景丢最老的——方向安全，只会少记不误熔断）。
+            counter_backlog: list[UsageRecord] = []
+
             async def _flush_cost_ledger() -> None:
+                nonlocal counter_backlog
                 while True:
                     await asyncio.sleep(_COST_FLUSH_INTERVAL_SECONDS)
-                    await ledger.insert(COST_METER.take_pending())
+                    rows = COST_METER.take_pending()
+                    if counters is not None and (counter_backlog or rows):
+                        attempt = counter_backlog + rows
+                        try:
+                            await counters.add(attempt)
+                            counter_backlog = []
+                        except Exception:
+                            counter_backlog = attempt[-10000:]
+                            logger.warning(
+                                "cost: Redis 计数器累加失败（SQL 账本照写，"
+                                "计数差额进入下个 flush 周期重试）",
+                                exc_info=True,
+                            )
+                    await ledger.insert(rows)
 
             flush_task = asyncio.create_task(_flush_cost_ledger())
         else:
@@ -155,6 +196,8 @@ def create_app(
         finally:
             # H4：优雅关闭必须释放运行时资源（MySQL 池、httpx client、
             # sqlite 连接、toollog 写线程），否则全部泄漏到进程退出。
+            if scheduler_obj is not None:
+                await scheduler_obj.stop()
             if flush_task is not None:
                 flush_task.cancel()
             if ledger is not None:
@@ -206,6 +249,9 @@ def create_app(
     app.include_router(agents_routes.router)
     app.include_router(files_routes.router)
     app.include_router(system_routes.router)
+    from agent_base.entrypoints.server.routes import triggers as triggers_routes
+
+    app.include_router(triggers_routes.router)
     # 记忆管理面（/v1/memory）随记忆包发布：经 "agent_base.memory" 的
     # routes entry point 发现，基座源码不 import 它。装了记忆包就挂载
     # ——MEMORY_ENABLED=false 时端点保持 503 的可读语义；只有基座的

@@ -1,0 +1,15 @@
+{"id": "time-now", "query": "现在几点了？", "expected_tools": ["current_time"], "expected_args": {}, "success_criteria": ""}
+{"id": "time-tokyo", "query": "东京现在几点？", "expected_tools": ["current_time"], "expected_args": {"current_time": {"tz": "Asia/Tokyo"}}, "arg_match": "exact", "success_criteria": ""}
+{"id": "time-weekday", "query": "今天是星期几？", "expected_tools": ["current_time"], "expected_args": {}, "success_criteria": ""}
+{"id": "calc-power", "query": "帮我算一下 3 的 8 次方是多少。", "expected_tools": ["calculator"], "expected_args": {"calculator": {"expression": "3\\s*\\*\\*\\s*8"}}, "arg_match": "regex", "success_criteria": "6561"}
+{"id": "calc-paren", "query": "(128+72) 除以 25 等于多少？", "expected_tools": ["calculator"], "expected_args": {"calculator": {"expression": "\\(\\s*128\\s*\\+\\s*72\\s*\\)\\s*/\\s*25"}}, "arg_match": "regex", "success_criteria": "8"}
+{"id": "calc-monthly", "query": "月供 3500 元，一年总共要还多少？", "expected_tools": ["calculator"], "expected_args": {"calculator": {"expression": "3500\\s*\\*\\s*12"}}, "arg_match": "regex", "success_criteria": "42000"}
+{"id": "calc-sum-1-100", "query": "从 1 一直加到 100，总和是多少？", "expected_tools": ["calculator"], "expected_args": {"calculator": {"expression": "(100\\s*\\+\\s*1)\\s*\\*\\s*100\\s*/\\s*2|1\\s*\\+\\s*2.*100"}}, "arg_match": "regex", "success_criteria": "5050"}
+{"id": "json-top-keys", "query": "看看这份 JSON 有哪些顶层键：{\"name\":\"张三\",\"age\":30,\"city\":\"北京\"}", "expected_tools": ["json_query"], "expected_args": {"json_query": {"path": ""}}, "arg_match": "exact", "success_criteria": "name"}
+{"id": "json-extract-path", "query": "从这份 JSON 里取出 data.items[0].name：{\"data\":{\"items\":[{\"name\":\"甲\"},{\"name\":\"乙\"}]}}", "expected_tools": ["json_query"], "expected_args": {"json_query": {"path": "data.items[0].name"}}, "arg_match": "exact", "success_criteria": "甲"}
+{"id": "json-array-index", "query": "这份 JSON 数组的第二个元素是什么：[\"春\",\"夏\",\"秋\",\"冬\"]", "expected_tools": ["json_query"], "expected_args": {"json_query": {"path": "[1]"}}, "arg_match": "exact", "success_criteria": "夏"}
+{"id": "json-nested-count", "query": "这份 JSON 里 users 一共有几个人：{\"users\":[{\"id\":1},{\"id\":2},{\"id\":3},{\"id\":4},{\"id\":5}]}", "expected_tools": ["json_query"], "expected_args": {"json_query": {"path": "users"}}, "arg_match": "exact", "success_criteria": "5"}
+{"id": "multi-calc-chain", "query": "先算 2 的 10 次方，再把结果乘以 8，告诉我最终数值。", "expected_tools": ["calculator"], "expected_args": {"calculator": {"expression": "2\\s*\\*\\*\\s*10"}}, "arg_match": "regex", "success_criteria": "8192"}
+{"id": "no-tool-selfintro", "query": "用一句话介绍你自己，不要调用任何工具。", "expected_tools": [], "expected_args": {}, "success_criteria": ""}
+{"id": "calc-completion-only", "query": "帮我算 999 加 1 再除以 4。", "expected_tools": ["calculator"], "expected_args": {}, "success_criteria": "250"}
+{"id": "json-completion-only", "query": "这份 JSON 的 status 字段是什么：{\"status\":\"ok\",\"code\":200}", "expected_tools": ["json_query"], "expected_args": {}, "success_criteria": "ok"}

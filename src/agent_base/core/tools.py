@@ -10,6 +10,10 @@ LLM，并通过 LangGraph 的 ``ToolNode`` 执行它，后者把工具失败归�
 调用方在截止时刻立即收到 ``ToolTimeoutError``，但底层调用仍在其工作
 线程中继续运行直至自然结束（有界泄漏，已记录在案的权衡——Python 线程
 无法被杀死）。
+
+ADR-009 起包装器可挂韧性层（``resilience`` 参数）：冷却中的工具短路
+返回可读原因（黑名单），瞬时错误指数退避重试，成功/失败落健康注册表。
+不挂时行为与阶段 3 完全一致。
 """
 
 from __future__ import annotations
@@ -17,7 +21,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import threading
 import time
 import uuid
@@ -30,6 +33,12 @@ from langgraph.config import get_config
 
 from agent_base.core.contracts import AgentModule
 from agent_base.core.threads import ThreadId
+from agent_base.core.tool_resilience import (
+    TOOL_ERROR_MAX_CHARS,
+    TOOL_ERROR_URL_RE,
+    ToolResilience,
+    classify_tool_error,
+)
 from agent_base.extensions.metrics import TOOL_METRICS
 from agent_base.extensions.observability import get_request_id
 from agent_base.extensions.toollog import (
@@ -44,11 +53,6 @@ DEFAULT_TOOL_TIMEOUT_SECONDS = 30.0
 
 logger = logging.getLogger(__name__)
 
-# 工具错误文本会进入 ToolMessage（模型 + 会话历史回放都会看到）：
-# URL 脱敏、长度封顶，避免把内部端点/巨型负载泄给前端。
-_TOOL_ERROR_URL_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://\S+")
-_TOOL_ERROR_MAX_CHARS = 300
-
 
 class ToolTimeoutError(TimeoutError):
     """某个工具超出了其挂钟预算而被截断。"""
@@ -59,14 +63,19 @@ class ToolPoolError(ValueError):
 
 
 def handle_tool_error(exc: Exception) -> str:
-    """把任何工具失败归一成模型可读的反馈。
+    """把任何工具失败归一成模型可读的反馈（无状态版，兼容收口）。
 
     LangGraph 1.2 默认的 ``handle_tool_errors`` 只会转换参数错误，
     其余的一律重新抛出；基座的契约更强——坏掉的工具绝不能打断对话，
     因此每个异常都被转换为模型能够回应的 ``ToolMessage``（阶段 3）。
+
+    ADR-009 起装配了韧性层（``ToolResilience.reporter``）的运行时改用
+    有状态版 ``ToolErrorReporter.handle``：schema 错误按字段结构化反馈
+    并执行修复预算；本函数仍是未装配韧性层调用方（测试直调、旧接线）
+    的语义基线，两者对非 schema 错误的输出逐字节一致。
     """
-    text = _TOOL_ERROR_URL_RE.sub("<redacted-url>", str(exc))
-    return f"tool execution failed: {text}"[:_TOOL_ERROR_MAX_CHARS]
+    text = TOOL_ERROR_URL_RE.sub("<redacted-url>", str(exc))
+    return f"tool execution failed: {text}"[:TOOL_ERROR_MAX_CHARS]
 
 
 def _json_safe(value: Any) -> dict[str, Any]:
@@ -107,6 +116,46 @@ class _TimeoutTool(BaseTool):
     inner: BaseTool
     timeout: float
     recorder: Any = None  # ToolCallRecorder | None；协议类型交由运行时鸭子匹配
+    resilience: Any = None  # ToolResilience | None；黑名单短路/重试/落账（ADR-009）
+    tier: str = "basic"  # 分层（ADR-010）：basic 永远绑定，advanced 参与路由
+
+    def _blocked_reason(self) -> str | None:
+        """韧性黑名单检查：冷却中返回给模型看的短路原因，否则 None。"""
+        if self.resilience is None:
+            return None
+        blocked, reason = self.resilience.registry.is_blocked(self.name)
+        return reason if blocked else None
+
+    def _should_retry(
+        self,
+        attempt: int,
+        attempts: int,
+        *,
+        timeout: bool = False,
+        exc: Exception | None = None,
+    ) -> bool:
+        """重试判据：最后一轮不重试；仅瞬时错误重试；超时须显式开启。
+
+        熔断态下 ``attempts_for()`` 已返回 1（无下一轮），自然短路。
+        """
+        if attempt >= attempts - 1 or self.resilience is None:
+            return False
+        if timeout:
+            # 同步路径超时后底层线程仍在执行（见 _run 注释），盲目重试
+            # 会造成重复副作用——默认关闭，TOOL_RETRY_ON_TIMEOUT 显式打开。
+            return bool(self.resilience.retry_on_timeout)
+        assert exc is not None
+        return classify_tool_error(exc) == "transient"
+
+    def _log_retry(self, attempt: int, attempts: int, delay: float, cause: str) -> None:
+        logger.warning(
+            "tool %s: 第 %d/%d 次尝试失败，%.1fs 后重试：%s",
+            self.name,
+            attempt + 1,
+            attempts,
+            delay,
+            cause[:120],
+        )
 
     def _track(
         self,
@@ -119,6 +168,7 @@ class _TimeoutTool(BaseTool):
     ) -> None:
         """完结一支调用：发流事件 + 交审计记录（两者都绝不抛错打断对话）。"""
         duration_ms = int((time.perf_counter() - started) * 1000)
+        thread_id, module = _execution_context()
         try:
             emit_tool_call(
                 call_id,
@@ -133,7 +183,6 @@ class _TimeoutTool(BaseTool):
             logger.debug("tool %s: emit tool_call end failed", self.name, exc_info=True)
         if self.recorder is not None:
             try:
-                thread_id, module = _execution_context()
                 self.recorder.record(
                     ToolCallRecord(
                         call_id=call_id,
@@ -150,6 +199,13 @@ class _TimeoutTool(BaseTool):
                 )
             except Exception:
                 logger.exception("tool %s: recorder.record failed", self.name)
+        # 韧性层落账（ADR-009）：blocked 短路不执行也不计失败；schema 校验
+        # 失败到不了这里（在 BaseTool.invoke 就被拦下，由 reporter 计数）。
+        if self.resilience is not None:
+            if outcome == "ok":
+                self.resilience.reporter.note_success(self.name, thread_id)
+            if outcome != "blocked":
+                self.resilience.registry.record(self.name, outcome)
         TOOL_METRICS.observe_tool(self.name, outcome, time.perf_counter() - started)
 
     def _run(self, **kwargs: Any) -> Any:
@@ -165,33 +221,58 @@ class _TimeoutTool(BaseTool):
         result_text = ""
         error_text = ""
         try:
-            result: list[Any] = []
-            error: list[Exception] = []
-            done = threading.Event()
+            # 短时黑名单（ADR-009）：冷却中的工具不执行；原因文本作为正常
+            # 结果返回，模型据此改道而不是反复撞同一堵墙。
+            blocked_reason = self._blocked_reason()
+            if blocked_reason is not None:
+                outcome = "blocked"
+                error_text = blocked_reason
+                return blocked_reason
+            attempts = 1 if self.resilience is None else self.resilience.attempts_for()
             # config 在调用方上下文取出后随参数进工作线程——ContextVar
             # 不会跨线程传播，必须在 start 之前固化（与 _arun 同语义）。
             config = ensure_config()
+            for attempt in range(attempts):
+                result: list[Any] = []
+                error: list[Exception] = []
+                done = threading.Event()
 
-            def _target() -> None:
-                try:
-                    result.append(self.inner.invoke(kwargs, config))
-                except Exception as exc:
-                    error.append(exc)
-                finally:
-                    done.set()
+                def _target() -> None:
+                    try:
+                        result.append(self.inner.invoke(kwargs, config))
+                    except Exception as exc:
+                        error.append(exc)
+                    finally:
+                        done.set()
 
-            worker = threading.Thread(target=_target, name=f"tool-{self.name}", daemon=True)
-            worker.start()
-            if not done.wait(timeout=self.timeout):
-                outcome = "timeout"
-                error_text = f"tool {self.name!r} exceeded {self.timeout}s timeout"
-                raise ToolTimeoutError(error_text)
-            if error:
-                outcome = "error"
-                error_text = handle_tool_error(error[0])
-                raise error[0]
-            result_text = str(result[0])
-            return result[0]
+                worker = threading.Thread(target=_target, name=f"tool-{self.name}", daemon=True)
+                worker.start()
+                if not done.wait(timeout=self.timeout):
+                    outcome = "timeout"
+                    error_text = f"tool {self.name!r} exceeded {self.timeout}s timeout"
+                    if self._should_retry(attempt, attempts, timeout=True):
+                        delay = self.resilience.backoff_delay(attempt)
+                        self._log_retry(attempt, attempts, delay, error_text)
+                        time.sleep(delay)
+                        continue
+                    raise ToolTimeoutError(error_text)
+                if error:
+                    exc = error[0]
+                    outcome = "error"
+                    error_text = handle_tool_error(exc)
+                    if self._should_retry(attempt, attempts, exc=exc):
+                        delay = self.resilience.backoff_delay(attempt)
+                        self._log_retry(attempt, attempts, delay, error_text)
+                        time.sleep(delay)
+                        continue
+                    raise exc
+                result_text = str(result[0])
+                outcome = "ok"
+                error_text = ""
+                return result[0]
+            raise RuntimeError(  # pragma: no cover - _should_retry 保证最后一轮不 continue
+                f"tool {self.name!r} retry loop exhausted without an outcome"
+            )
         finally:
             self._track(call_id, safe_args, started, outcome, result_text, error_text)
 
@@ -204,25 +285,51 @@ class _TimeoutTool(BaseTool):
         result_text = ""
         error_text = ""
         try:
+            # 短时黑名单（ADR-009）：冷却中的工具不执行；原因文本作为正常
+            # 结果返回，模型据此改道而不是反复撞同一堵墙。
+            blocked_reason = self._blocked_reason()
+            if blocked_reason is not None:
+                outcome = "blocked"
+                error_text = blocked_reason
+                return blocked_reason
+            attempts = 1 if self.resilience is None else self.resilience.attempts_for()
             # RunnableConfig 透传（M4 修复）：ensure_config 从当前运行上下文
             # 取出调用方传入的 config——此前 _TimeoutTool 不转发 config，
             # callbacks/metadata/configurable 在包装层被静默丢弃。
             config = ensure_config()
-            try:
-                value = await asyncio.wait_for(
-                    self.inner.ainvoke(kwargs, config), timeout=self.timeout
-                )
-                result_text = str(value)
-                return value
-            # 3.10 上 asyncio.TimeoutError 与内置 TimeoutError 是不同类型，两者都要接住。
-            except (TimeoutError, asyncio.TimeoutError) as exc:
-                outcome = "timeout"
-                error_text = f"tool {self.name!r} exceeded {self.timeout}s timeout"
-                raise ToolTimeoutError(error_text) from exc
-            except Exception as exc:
-                outcome = "error"
-                error_text = handle_tool_error(exc)
-                raise
+            for attempt in range(attempts):
+                try:
+                    value = await asyncio.wait_for(
+                        self.inner.ainvoke(kwargs, config), timeout=self.timeout
+                    )
+                    result_text = str(value)
+                    outcome = "ok"
+                    error_text = ""
+                    return value
+                # 3.10 上 asyncio.TimeoutError 与内置 TimeoutError 是不同类型，两者都要接住。
+                except (TimeoutError, asyncio.TimeoutError) as exc:
+                    outcome = "timeout"
+                    error_text = f"tool {self.name!r} exceeded {self.timeout}s timeout"
+                    if self._should_retry(attempt, attempts, timeout=True):
+                        # 异步路径的 wait_for 会取消内层任务，重试无悬挂风险
+                        # （与同步路径不同），仍默认关闭、由配置显式打开。
+                        delay = self.resilience.backoff_delay(attempt)
+                        self._log_retry(attempt, attempts, delay, error_text)
+                        await asyncio.sleep(delay)
+                        continue
+                    raise ToolTimeoutError(error_text) from exc
+                except Exception as exc:
+                    outcome = "error"
+                    error_text = handle_tool_error(exc)
+                    if self._should_retry(attempt, attempts, exc=exc):
+                        delay = self.resilience.backoff_delay(attempt)
+                        self._log_retry(attempt, attempts, delay, error_text)
+                        await asyncio.sleep(delay)
+                        continue
+                    raise
+            raise RuntimeError(  # pragma: no cover - _should_retry 保证最后一轮不 continue
+                f"tool {self.name!r} retry loop exhausted without an outcome"
+            )
         finally:
             self._track(call_id, safe_args, started, outcome, result_text, error_text)
 
@@ -234,6 +341,8 @@ def build_tool_pool(
     extra_tools: Sequence[BaseTool] = (),
     timeouts: Mapping[str, float] | None = None,
     recorder: Any = None,
+    resilience: ToolResilience | None = None,
+    tiers: Mapping[str, str] | None = None,
 ) -> list[BaseTool]:
     """把每个模块的工具收集进一个带超时包装、无冲突的池。
 
@@ -245,8 +354,12 @@ def build_tool_pool(
     ``timeouts`` 支持按工具名覆盖全局 ``timeout``（如网络搜索要用显著
     短于全局的预算）；未列出的工具沿用全局值。``recorder`` 是工具调用
     审计记录器（extensions/toollog），挂到每个包装器上实现全量落库。
+    ``resilience`` 是韧性层（ADR-009：黑名单短路/瞬时错误退避重试/健康
+    落账），None 时包装器行为与阶段 3 完全一致。``tiers`` 是按工具名的
+    分层声明（ADR-010：basic/advanced），未列出的工具默认 basic。
     """
     overrides = timeouts or {}
+    tier_overrides = tiers or {}
     pool: list[BaseTool] = []
     seen: set[str] = set()
     candidates: list[tuple[str, AgentModule | None, BaseTool]] = []
@@ -270,6 +383,8 @@ def build_tool_pool(
                 inner=tool,
                 timeout=overrides.get(name, timeout),
                 recorder=recorder,
+                resilience=resilience,
+                tier=tier_overrides.get(name, "basic"),
             )
         )
     return pool

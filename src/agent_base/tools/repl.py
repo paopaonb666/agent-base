@@ -95,6 +95,9 @@ PYTHON_REPL_SPEC = ToolSpec(
     name="python_repl",
     category="code",
     safety="exec",
+    # 高风险重火力工具：参与向量路由的 top-k 召回（ADR-010），默认不
+    # 直接暴露给模型（仍受 TOOLKIT_ENABLED 显式启用约束）。
+    tier="advanced",
     factory=lambda _settings: [python_repl],
     available=lambda _settings: True,
     unavailable_reason="",

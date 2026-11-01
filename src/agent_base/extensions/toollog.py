@@ -23,6 +23,7 @@ import logging
 import queue
 import sqlite3
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -121,22 +122,32 @@ class ToolCallRecorder(Protocol):
 
     async def list_for_thread(self, thread_id: str, limit: int = 100) -> list[dict[str, Any]]: ...
 
+    async def list_recent(self, *, since_ts: float, limit: int = 5000) -> list[dict[str, Any]]: ...
+
 
 class MemoryToolCallRecorder:
     """进程内环形缓冲；memory 后端（重启即丢）与测试用。"""
 
     def __init__(self) -> None:
-        self._records: deque[ToolCallRecord] = deque(maxlen=MEMORY_MAX_RECORDS)
+        # (record, wall_ts)：wall_ts 供 list_recent 的时间窗过滤。
+        self._records: deque[tuple[ToolCallRecord, float]] = deque(maxlen=MEMORY_MAX_RECORDS)
         self._lock = threading.Lock()
 
     def record(self, record: ToolCallRecord) -> None:
         with self._lock:
-            self._records.append(record)
+            self._records.append((record, time.time()))
 
     async def list_for_thread(self, thread_id: str, limit: int = 100) -> list[dict[str, Any]]:
         with self._lock:
-            matched = [r for r in self._records if r.thread_id == thread_id]
+            matched = [r for r, _ts in self._records if r.thread_id == thread_id]
         return [r.as_dict() for r in matched[-limit:]]
+
+    async def list_recent(self, *, since_ts: float, limit: int = 5000) -> list[dict[str, Any]]:
+        with self._lock:
+            matched = [
+                {**r.as_dict(), "created_at": ts} for r, ts in self._records if ts >= since_ts
+            ]
+        return matched[-limit:]
 
 
 class SqliteToolCallRecorder:
@@ -205,6 +216,27 @@ class SqliteToolCallRecorder:
                     "status": r[7],
                     "error": r[8] or None,
                     "duration_ms": r[9],
+                }
+                for r in reversed(rows)
+            ]
+
+        return await asyncio.to_thread(_query)
+
+    async def list_recent(self, *, since_ts: float, limit: int = 5000) -> list[dict[str, Any]]:
+        def _query() -> list[dict[str, Any]]:
+            rows = self._conn.execute(
+                "SELECT tool, status, error_text, duration_ms, strftime('%s', created_at)"
+                " FROM tool_call_records WHERE created_at >= datetime(?, 'unixepoch')"
+                " ORDER BY id DESC LIMIT ?",
+                (since_ts, limit),
+            ).fetchall()
+            return [
+                {
+                    "tool": r[0],
+                    "status": r[1],
+                    "error_text": r[2] or "",
+                    "duration_ms": r[3] or 0,
+                    "created_at": float(r[4] or 0),
                 }
                 for r in reversed(rows)
             ]
@@ -305,6 +337,30 @@ class MySqlToolCallRecorder:
                     "status": r[7],
                     "error": r[8] or None,
                     "duration_ms": r[9],
+                }
+                for r in reversed(rows)
+            ]
+        finally:
+            conn.close()
+
+    async def list_recent(self, *, since_ts: float, limit: int = 5000) -> list[dict[str, Any]]:
+        conn = await self._connect()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT tool, status, error_text, duration_ms, UNIX_TIMESTAMP(created_at)"
+                    " FROM tool_call_records"
+                    " WHERE created_at >= FROM_UNIXTIME(%s) ORDER BY id DESC LIMIT %s",
+                    (since_ts, limit),
+                )
+                rows = await cur.fetchall()
+            return [
+                {
+                    "tool": r[0],
+                    "status": r[1],
+                    "error_text": r[2] or "",
+                    "duration_ms": r[3] or 0,
+                    "created_at": float(r[4] or 0),
                 }
                 for r in reversed(rows)
             ]

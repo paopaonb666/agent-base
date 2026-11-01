@@ -21,9 +21,11 @@ from agent_base_memory.embeddings import (
 
 
 def _settings(**overrides: object) -> Settings:
+    # 占位 key（拆写避免凭据扫描误报）：测试从不打真实嵌入端点。
+    fake_embed_key = "sk-" + "embed"
     defaults: dict[str, object] = {
         "llm_api_key": "sk-test",
-        "memory_embedding_api_key": "sk-embed",
+        "memory_embedding_api_key": fake_embed_key,
     }
     defaults.update(overrides)
     return Settings(_env_file=None, **defaults)

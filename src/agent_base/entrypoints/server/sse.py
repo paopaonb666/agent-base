@@ -11,7 +11,7 @@ import contextlib
 import logging
 import re
 from collections.abc import AsyncIterator, Coroutine
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
@@ -23,6 +23,8 @@ from agent_base.entrypoints.server.background import spawn_background
 from agent_base.entrypoints.server.serializers import _extract_text
 from agent_base.extensions.events import (
     AgentEvent,
+    ApprovalRequest,
+    ApprovalRequestEvent,
     DeltaEvent,
     DoneEvent,
     ErrorEvent,
@@ -34,6 +36,9 @@ from agent_base.extensions.events import (
     encode_sse,
 )
 
+if TYPE_CHECKING:  # pragma: no cover - import avoided at runtime
+    from agent_base.extensions.redissvc import RedisService
+
 logger = logging.getLogger(__name__)
 
 HEARTBEAT_SECONDS = 15.0
@@ -41,6 +46,31 @@ HEARTBEAT_SECONDS = 15.0
 # SSE 事件队列上限：慢客户端（半开连接、不读数据）停止消费时，生产者在
 # 队列满后阻塞等待——内存有界，背压自然传导到 LLM 流。ping 允许丢弃。
 SSE_QUEUE_MAXSIZE = 256
+
+
+def sse_channel(thread_id: str) -> str:
+    """线程的 SSE 镜像频道名（ADR-012；键前缀由 RedisService 统一拼接）。"""
+    return f"sse:{thread_id}"
+
+
+async def _emit(
+    queue: asyncio.Queue[AgentEvent | None],
+    event: AgentEvent,
+    bus: RedisService | None,
+    channel: str,
+) -> None:
+    """事件进本地队列（主链路，唯一事实源），并 best-effort 镜像到 Redis。
+
+    镜像供跨实例订阅（观察端点）；Pub/Sub 是 at-most-once，发布失败只
+    记日志——镜像丢了不影响本连接的对话流。
+    """
+    await queue.put(event)
+    if bus is not None:
+        try:
+            await bus.publish(channel, event.model_dump_json())
+        except Exception:
+            logger.warning("sse: 事件镜像发布失败（不影响本地流）", exc_info=True)
+
 
 _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
@@ -82,6 +112,31 @@ def _decode_custom_event(payload: Any) -> AgentEvent | None:
         logger.warning("sse: dropping malformed %r event: %s", kind, exc)
         return None
     logger.warning("sse: dropping unknown custom event type: %r", kind)
+    return None
+
+
+def _decode_interrupt_event(interrupts: Any, user_thread_id: str) -> ApprovalRequestEvent | None:
+    """把 LangGraph 的 ``__interrupt__`` 更新翻译成审批请求事件（ADR-005）。
+
+    目前唯一的 interrupt 源是审批门（载荷形如 ``{"pending": [...]}``）；
+    未知载荷形状记日志丢弃——未来新增 interrupt 源时在此分派。审批事件
+    之后 ``_produce`` 会照常发出 done：本轮的语义是"暂停待审批"，
+    客户端凭 thread_id + tool_call_id 调 resume 端点续流。
+    """
+    for entry in interrupts if isinstance(interrupts, (list, tuple)) else ():
+        value = getattr(entry, "value", None)
+        if not isinstance(value, dict):
+            continue
+        pending = value.get("pending")
+        if not isinstance(pending, list):
+            continue
+        try:
+            requests = [ApprovalRequest.model_validate(item) for item in pending]
+        except ValueError as exc:
+            logger.warning("sse: dropping malformed approval interrupt: %s", exc)
+            return None
+        return ApprovalRequestEvent(thread_id=user_thread_id, requests=requests)
+    logger.warning("sse: dropping unknown interrupt payload: %r", interrupts)
     return None
 
 
@@ -129,21 +184,29 @@ def _build_capture_hook(
 async def _produce(
     queue: asyncio.Queue[AgentEvent | None],
     graph: Any,
-    messages_input: list[Any],
+    input_value: Any,
     config: RunnableConfig,
     user_thread_id: str,
     on_complete: Coroutine[Any, Any, None] | None = None,
+    bus: RedisService | None = None,
 ) -> None:
     """把图事件推入队列；用哨兵值终止。
+
+    ``input_value``：新轮是 ``{"messages": [...]}``；审批恢复（ADR-005）
+    是 ``Command(resume=...)``——两者对 ``astream`` 是同一种输入。
 
     ``on_complete``（M6c）：轮次正常完成后触发的后台回调（记忆形成管
     线）。经 ``spawn_background`` 独立调度（持强引用、异常落日志）——
     不阻塞哨兵送达，客户端中途断开或本轮出错时不会被调用。
 
+    ``bus``（ADR-012）：Redis 在场时每个契约事件镜像发布到
+    ``sse:{thread_id}`` 频道（best-effort，见 ``_emit``）。
+
     记忆作用域（M6e）：在这里设置 ContextVar——图节点与工具都运行在
     本任务上下文里，记忆工具据此拿到 user/thread（工具池的
     ``_TimeoutTool`` 现已转发 RunnableConfig，ContextVar 是双保险）。
     """
+    channel = sse_channel(user_thread_id)
     _configurable = config.get("configurable") or {}
     _raw_user = _configurable.get("user_id")
     set_memory_scope(
@@ -153,7 +216,7 @@ async def _produce(
     running: set[str] = set()
     try:
         stream: Any = graph.astream(
-            {"messages": messages_input},
+            input_value,
             config,
             # custom：工具通过 get_stream_writer 发的 UI 事件（M3.5）——
             # 联网搜索的进度步骤与来源引用由此到达前端。
@@ -165,7 +228,7 @@ async def _produce(
                 node = str(metadata.get("langgraph_node") or "")
                 if node and node not in running:
                     running.add(node)
-                    await queue.put(StepEvent(name=node, status="running"))
+                    await _emit(queue, StepEvent(name=node, status="running"), bus, channel)
                 # supervisor 模板（react agent）的模型节点是非流式调用，
                 # 回复以完整 AIMessage（非逐 token 的 AIMessageChunk）经
                 # messages 模式的节点输出路径到达——必须一并接收，否则
@@ -173,17 +236,26 @@ async def _produce(
                 # 对账补内容，短回复会整条丢失）。chunk 是 AIMessage 的
                 # 子类；同一消息的完整发射已被按 id 去重，不会双发。
                 if isinstance(chunk, AIMessage) and chunk.content:
-                    await queue.put(DeltaEvent(content=_extract_text(chunk.content)))
+                    await _emit(
+                        queue, DeltaEvent(content=_extract_text(chunk.content)), bus, channel
+                    )
             elif mode == "custom":
                 event = _decode_custom_event(payload)
                 if event is not None:
-                    await queue.put(event)
+                    await _emit(queue, event, bus, channel)
             elif mode == "updates":
+                # 审批门（ADR-005）：__interrupt__ 更新翻译为契约事件；
+                # 其余 __ 前缀键（如 __end__）照旧跳过。
+                interrupts = payload.get("__interrupt__") if isinstance(payload, dict) else None
+                if interrupts:
+                    approval = _decode_interrupt_event(interrupts, user_thread_id)
+                    if approval is not None:
+                        await _emit(queue, approval, bus, channel)
                 for node in payload:
                     if str(node).startswith("__"):
                         continue
-                    await queue.put(StepEvent(name=str(node), status="completed"))
-        await queue.put(DoneEvent(thread_id=user_thread_id))
+                    await _emit(queue, StepEvent(name=str(node), status="completed"), bus, channel)
+        await _emit(queue, DoneEvent(thread_id=user_thread_id), bus, channel)
         if on_complete is not None:
             # 独立任务：随后的哨兵与 finally 取消都不影响它跑完。
             spawn_background(on_complete, name="memory-capture")
@@ -215,15 +287,21 @@ async def _heartbeat(queue: asyncio.Queue[AgentEvent | None]) -> None:
 
 async def _event_stream(
     graph: Any,
-    messages_input: list[Any],
+    input_value: Any,
     config: RunnableConfig,
     user_thread_id: str,
     on_complete: Coroutine[Any, Any, None] | None = None,
+    bus: RedisService | None = None,
 ) -> AsyncIterator[str]:
-    """一次对话轮的 SSE 帧（契约事件，已编码）。"""
+    """一次对话轮（或审批恢复轮）的 SSE 帧（契约事件，已编码）。
+
+    ``bus``（ADR-012）：Redis 在场时事件同时镜像发布到
+    ``sse:{thread_id}`` 频道——本地队列仍是本连接的唯一事实源，镜像
+    仅供跨实例观察端点订阅。
+    """
     queue: asyncio.Queue[AgentEvent | None] = asyncio.Queue(maxsize=SSE_QUEUE_MAXSIZE)
     producer = asyncio.create_task(
-        _produce(queue, graph, messages_input, config, user_thread_id, on_complete)
+        _produce(queue, graph, input_value, config, user_thread_id, on_complete, bus)
     )
     heartbeat = asyncio.create_task(_heartbeat(queue))
     try:

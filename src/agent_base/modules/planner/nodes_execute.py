@@ -28,6 +28,7 @@ from langchain_core.tools import BaseTool
 from agent_base.core.context import build_model_input, content_text
 from agent_base.core.contracts import ModuleContext
 from agent_base.core.graphs import _stream_and_accumulate
+from agent_base.core.tool_routing import recent_tool_names
 from agent_base.core.tools import handle_tool_error
 from agent_base.modules.planner.prompts import EXECUTE_SYSTEM
 from agent_base.modules.planner.state import PlanState, Task, _cursor, _messages, _tasks
@@ -42,7 +43,9 @@ _SUMMARY_MAX_CHARS = 500
 
 def _make_tool_runner(
     pool: list[BaseTool],
+    error_handler: Callable[..., str] | None = None,
 ) -> Callable[[list[ToolCall], RunnableConfig], Awaitable[list[ToolMessage]]]:
+    handler = error_handler or (lambda exc, tool="": handle_tool_error(exc))
     tool_map = {t.name: t for t in pool}
 
     async def _execute_tool_calls(
@@ -64,7 +67,9 @@ def _make_tool_runner(
                         else json.dumps(result, ensure_ascii=False, default=str)
                     )
                 except Exception as exc:
-                    content = handle_tool_error(exc)
+                    # ADR-009：收口与共享图同规（有状态 reporter 时带上
+                    # 工具名，参数校验失败走结构化反馈 + 修复预算）。
+                    content = handler(exc, name)
             messages.append(
                 ToolMessage(content=content, tool_call_id=call.get("id") or "", name=name)
             )
@@ -76,9 +81,12 @@ def _make_tool_runner(
 def make_execute_node(ctx: ModuleContext) -> NodeFn:
     pool = list(ctx.tools)
     model = ctx.llm.bind_tools(pool) if pool else ctx.llm
-    run_tool_calls = _make_tool_runner(pool) if pool else None
+    reporter = ctx.tool_resilience.reporter if ctx.tool_resilience is not None else None
+    run_tool_calls = _make_tool_runner(pool, reporter.handle if reporter else None) if pool else None
+    router = ctx.tool_router
     p = ctx.settings.planner
     max_tokens = ctx.settings.memory.context_max_tokens
+    recent_rounds = ctx.settings.toolkit.routing_recent_rounds
 
     def _subtask_input(state: PlanState, task: Task, tasks: list[Task], cursor: int) -> list[Any]:
         done = (
@@ -110,11 +118,18 @@ def make_execute_node(ctx: ModuleContext) -> NodeFn:
         emit_plan(tasks, "progress", detail=f"子任务 {cursor + 1}/{len(tasks)} 执行中")
 
         inputs = _subtask_input(state, task, tasks, cursor)
+        # 向量路由（ADR-010）：按子任务目标语义选择绑定集——子任务内各轮
+        # 共享同一目标，逐子任务路由一次即可；降级路径在 select 内收口。
+        bound_model = model
+        if router is not None and router.active and pool:
+            recent = recent_tool_names(_messages(state), rounds=recent_rounds)
+            selected = await router.select(str(task.get("goal") or ""), recent_tools=recent)
+            bound_model = ctx.llm.bind_tools(selected) if selected else ctx.llm
         produced: list[Any] = []
         exhausted = True
         summary = ""
         for _ in range(p.subtask_tool_rounds):
-            final = await _stream_and_accumulate(model, [*inputs, *produced])
+            final = await _stream_and_accumulate(bound_model, [*inputs, *produced])
             if final is None:
                 exhausted = False  # 模型无产出：交给 check 的空输出门改判
                 break

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-base"
-version = "0.3.0"
+version = "0.4.0"
 description = "Agent software foundation: LangGraph runtime + module registry + config + entrypoints; business capabilities plug in later as modules"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -80,6 +80,10 @@ dependencies = [
     # zoneinfo 的时区数据库（current_time 工具需要，POSIX 自带）。
     "httpx>=0.27",
     "tzdata>=2024.1",
+    # 共享状态服务（ADR-012）：redis-py 自带 asyncio 客户端（redis.asyncio）
+    # 与完整类型标注。下限 5.0：asyncio API 稳定 + aclose() 生命周期。
+    # 仅承载治理状态外置（计数/nonce/锁/快照/镜像），不是存储后端。
+    "redis>=5.0",
 ]
 
 # 项目链接。注意：TOML 表必须写在 dependencies 数组之后、[project.scripts]
@@ -115,7 +119,7 @@ mcp = [
 # 从本仓库安装请用 `pip install -e packages/agent-base-memory`（尚未发布到
 # PyPI，因此不能让 pip 去索引里解析这个 extra）。
 memory = [
-    "agent-base-memory>=0.1,<0.2",
+    "agent-base-memory>=0.2,<0.3",
 ]
 # 数据库迁移：部署时执行 `alembic upgrade head` 需要（运行时镜像按此
 # extra 安装）。本地开发经 dev extras 安装同一组依赖。记忆包有自己独立的

@@ -1,12 +1,14 @@
-# Local / single-host deployment: app + MySQL 8.0.
+# Local / single-host deployment: app + MySQL 8.0 + Redis 7.4.
 #
 #   cp .env.example .env   # fill LLM_API_KEY and MEMORY_AUTH_SECRET
 #   docker compose up --build
 #
 # The app waits for MySQL's health check, applies both Alembic chains (base
 # schema, then the memory package's own chain in alembic_version_memory), then
-# starts uvicorn. Secrets stay in .env (ignored by git) and are never baked
-# into the image.
+# starts uvicorn. Redis carries shared governance state (cost counters, nonce
+# replay guard, distributed locks, SSE mirror; ADR-012) and is on by default —
+# set REDIS_ENABLED=false in .env to fall back to in-process state. Secrets
+# stay in .env (ignored by git) and are never baked into the image.
 
 services:
   mysql:
@@ -30,6 +32,21 @@ services:
       retries: 10
       start_period: 30s
 
+  redis:
+    image: redis:7.4
+    # AOF 持久化：成本计数器等治理状态跨重启保留（每秒 fsync，够用且轻）。
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
   app:
     build:
       context: .
@@ -44,12 +61,16 @@ services:
       CHECKPOINTER_MYSQL_DATABASE: ${MYSQL_DATABASE:-agent_base}
       CHECKPOINTER_MYSQL_USER: ${MYSQL_USER:-agent}
       CHECKPOINTER_MYSQL_PASSWORD: ${MYSQL_PASSWORD:-agent}
+      # Redis 容器间地址（ADR-012）：治理状态共享默认开启。
+      REDIS_URL: redis://redis:6379/0
     ports:
       - "${APP_PORT:-8000}:8000"
     volumes:
       - app_data:/app/data
     depends_on:
       mysql:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     command:
       - sh
@@ -59,4 +80,5 @@ services:
 
 volumes:
   mysql_data:
+  redis_data:
   app_data:

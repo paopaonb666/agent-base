@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-base-memory"
-version = "0.1.0"
+version = "0.2.0"
 description = "Long-term memory subsystem for agent-base: recall, profiles, knowledge index, session capture."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -25,7 +25,9 @@ classifiers = [
   "Topic :: Software Development :: Libraries :: Application Frameworks",
 ]
 dependencies = [
-  "agent-base>=0.3,<0.4",
+  "agent-base>=0.4,<0.5",
+  # embeddings/rerank 的 HTTP 客户端（ADR-004 起显式声明；此前为传递依赖）。
+  "httpx>=0.27",
 ]
 
 [project.urls]
@@ -35,10 +37,13 @@ Issues = "https://github.com/agent-base/agent-base/issues"
 
 [project.entry-points."agent_base.memory"]
 # 基座只认契约（agent_base.core.memory_plugin），实现在这里注册：
-# - service：装配 MemoryService + 记忆工具（bootstrap 的插件发现点）
-# - routes ：/v1/memory 管理 API 的 APIRouter 列表
+# - service ：装配 MemoryService + 记忆工具（bootstrap 的插件发现点）
+# - routes  ：/v1/memory 管理 API 的 APIRouter 列表
+# - embedder：嵌入客户端（工具向量路由/few-shot 共用，ADR-010/011；
+#             与 MEMORY_ENABLED 无关，内部自带降级）
 service = "agent_base_memory.plugin:build"
 routes = "agent_base_memory.api:routers"
+embedder = "agent_base_memory.plugin:build_embedder"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_base_memory"]

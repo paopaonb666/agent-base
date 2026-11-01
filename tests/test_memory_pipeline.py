@@ -383,6 +383,39 @@ async def test_capture_turn_respects_switches() -> None:
     assert await service.store.list_ops() == []
 
 
+async def test_capture_turn_every_n_turns_gate() -> None:
+    """``MEMORY_CAPTURE_EVERY_TURNS``>1 时按人类消息数倍数门控（M0 消费该配置）。"""
+    service = _service([], memory_capture_every_turns=2)
+    # 第 1 轮（1 条 human）：非倍数 → 跳过（返回 None，管线不跑、无审计）。
+    detail = await service.capture_turn(
+        user_id="u", agent_id="chat", thread_id="chat:t", messages=[HumanMessage(content="hi")]
+    )
+    assert detail is None
+    assert await service.store.list_ops() == []
+    # 第 2 轮（2 条 human）：倍数 → 管线运行（空脚本模型 → extract 失败也留审计）。
+    detail = await service.capture_turn(
+        user_id="u",
+        agent_id="chat",
+        thread_id="chat:t",
+        messages=[HumanMessage(content="hi"), HumanMessage(content="hi again")],
+    )
+    assert detail is not None and detail["candidates"] == 0
+    assert any(op.op == "extract" for op in await service.store.list_ops())
+
+
+async def test_capture_turn_force_bypasses_every_n_gate() -> None:
+    """``force=True`` 旁路每 N 轮门控（夜间批语义，与 capture_enabled 门控一致）。"""
+    service = _service([], memory_capture_every_turns=2)
+    detail = await service.capture_turn(
+        user_id="u",
+        agent_id="chat",
+        thread_id="chat:t",
+        messages=[HumanMessage(content="hi")],
+        force=True,
+    )
+    assert detail is not None
+
+
 def _runtime_with_memory(responses: list[AIMessage], **overrides: object) -> AgentRuntime:
     rt = AgentRuntime(
         settings=_settings(**overrides),

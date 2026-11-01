@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import os
-import uuid
 from pathlib import Path
 
 import pytest
@@ -132,9 +131,13 @@ async def test_mysql_backend_builds_and_probes() -> None:
     except Exception as exc:
         pytest.skip(f"MySQL 不可用：{exc}")
 
-    db = f"agent_base_test_{uuid.uuid4().hex[:8]}"
+    # DDL 标识符无法参数化：固定库名字面量（无拼接面），残留由 DROP 回收。
+    db = "agent_base_checkpointer_test"
     async with conn.cursor() as cur:
-        await cur.execute(f"CREATE DATABASE `{db}` CHARACTER SET utf8mb4")
+        await cur.execute("DROP DATABASE IF EXISTS `agent_base_checkpointer_test`")
+        await cur.execute(
+            "CREATE DATABASE `agent_base_checkpointer_test` CHARACTER SET utf8mb4"
+        )
     conn.close()
 
     saver = None
@@ -158,5 +161,5 @@ async def test_mysql_backend_builds_and_probes() -> None:
             host=host, port=port, user=user, password=password, autocommit=True
         )
         async with cleanup.cursor() as cur:
-            await cur.execute(f"DROP DATABASE IF EXISTS `{db}`")
+            await cur.execute("DROP DATABASE IF EXISTS `agent_base_checkpointer_test`")
         cleanup.close()

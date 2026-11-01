@@ -3,6 +3,54 @@
 本文件格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.4.0] - 2026-11-02
+
+Redis 承载治理状态外置（ADR-012）：多 worker 部署从"不建议"变为
+"开箱可用"。`REDIS_ENABLED=false` 时全部回退进程内实现，单进程行为与
+0.3 一致。对话与记忆的持久化后端不变（sqlite/mysql）。
+
+### Added
+
+- Redis 共享状态服务：主依赖 `redis>=5.0`（asyncio 客户端）；
+  `RedisSettings` 配置节（`REDIS_*`，默认开启、启用即承诺——连不上拒绝
+  启动）与 `extensions/redissvc.py::RedisService`（键前缀隔离、命令超时、
+  分布式锁 SET NX PX + token + Lua 安全释放、Pub/Sub 原语）。
+- 预算门跨 worker：`RedisCostCounters`（日/月键 `INCRBYFLOAT` + TTL，
+  flush 周期累加、失败有界积压重试）+ `CostGovernor.acheck()/astatus()`
+  （共享值判定；Redis 读失败回退进程内值——只会少记不误熔断）。
+  SQL 明细账本不变。
+- nonce 防重放外置：`SET nonce:{user_id}:{nonce} NX EX 2×窗口`，
+  跨 worker 重放被拒；Redis 故障回退进程内 LRU。
+- 记忆域共享状态（memory 包 0.2.0）：`CaptureLocks` / `SnapshotCache`
+  协议 + Redis 实现（捕获锁等待超时跳过本轮；快照键
+  `snap:{thread}/{user}/{agent}`，TTL 限界，purge 按前缀清理）；
+  entry point 契约扩展为 `build(*, settings, llm, fast_llm, redis=None)`
+  ——`inspect.signature` 判断后透传，0.1 老插件不破坏。
+- 夜间捕获批全局去重锁：多实例只跑一份，其余让位（`reason=locked`）。
+- SSE 事件镜像：invoke/resume 的契约事件 best-effort 双写 Pub/Sub 频道
+  `sse:{thread_id}`；新增只读观察端点
+  `GET /v1/agents/{module}/threads/{id}/events`（属主校验，at-most-once，
+  未启用 Redis 时 503）；订阅侧解码 `events.decode_event`。
+- `/health` 新增 `components["redis"]`（未启用即缺席；ping 失败 degraded）。
+- 部署：docker-compose 增 `redis:7.4`（AOF + healthcheck + 命名卷），
+  app 覆盖 `REDIS_URL`；CI test job 挂 redis 服务容器；
+  `tests/fakes.py::FakeRedisService` 手写替身 + `tests/test_redis_service.py`
+  （核心集 Fake 语义 + integration 真连语义）。
+- 文档：`docs/adr/012-redis-shared-state.md`；`docs/deployment.md` §4
+  重构为"单进程口径表（REDIS_ENABLED=false）+ §4b Redis 共享层"。
+
+### Changed
+
+- **破坏性**：`AuthBackend.authenticate` 协议由 sync 改 async（0.4 唯一
+  破坏性契约变更；自定义后端实现需改 `async def`，调用方 `await`）。
+- `deps.get_current_user` 与 invoke 路由改 async 调用；`HmacHeaderAuth`
+  新增 `bind_redis`（lifespan 装配后注入共享 Redis）。
+- invoke 的预算门与 `/health` 的 cost 组件改调 `acheck()/astatus()`；
+  进程内同步 `check()/status()` 保留。
+- 版本：agent-base 0.4.0；agent-base-memory 0.2.0（依赖
+  `agent-base>=0.4,<0.5`）；核心测试套件经 conftest 默认
+  `REDIS_ENABLED=false`，覆盖率门（≥85%）零 Redis 依赖。
+
 ## [0.3.0] - 2026-10-22
 
 记忆子系统拆为独立发行包。基座只保留契约与装配点；不改任何业务语义

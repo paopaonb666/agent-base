@@ -140,6 +140,8 @@ WEB_SEARCH_SPEC = ToolSpec(
     name="web_search",
     category="network",
     safety="network",
+    # 依赖外部服务的语义型工具：参与向量路由的 top-k 召回（ADR-010）。
+    tier="advanced",
     # 包装一层以匹配 ToolSpec.factory 的签名（engine_factory 仅测试注入）。
     factory=lambda settings: [build_web_search_tool(settings)],
     available=_web_search_available,

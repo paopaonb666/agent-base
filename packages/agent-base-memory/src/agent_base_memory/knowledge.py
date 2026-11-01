@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 from agent_base.extensions.metrics import MEMORY_METRICS
 from agent_base_memory.audit import MemoryAudit
 from agent_base_memory.embeddings import EmbeddingClient, NullEmbedding
+from agent_base_memory.rerank import NullReranker, Reranker
 from agent_base_memory.retrieval import ScoredChunk, score_chunks, weights_from_settings
 from agent_base_memory.store import DocChunk, MemoryStore, encode_embedding
 from agent_base_memory.store.models import new_memory_id
@@ -36,11 +37,14 @@ class KnowledgeService:
         embedder: EmbeddingClient,
         settings: MemorySettings,
         audit: MemoryAudit,
+        reranker: Reranker | None = None,
     ) -> None:
         self._store = store
         self._embedder = embedder
         self._settings = settings
         self._audit = audit
+        # 检索精排（ADR-004）：默认 Null（未启用），由门面注入共享实例。
+        self._reranker: Reranker = reranker if reranker is not None else NullReranker()
 
     async def ingest_document(
         self,
@@ -108,9 +112,15 @@ class KnowledgeService:
             return 0
 
     async def search_knowledge(
-        self, *, user_id: str, agent_id: str | None, query: str, top_k: int | None = None
+        self,
+        *,
+        user_id: str,
+        agent_id: str | None,
+        query: str,
+        top_k: int | None = None,
+        use_rerank: bool = True,
     ) -> list[ScoredChunk]:
-        """知识库混合检索（向量 + BM25 + 时间衰减）。"""
+        """知识库混合检索（向量 + BM25 + 时间衰减 [+ 精排，ADR-004]）。"""
         chunks = await self._store.list_chunks(user_id, agent_id=agent_id)
         if len(chunks) >= 2000:
             # 容量契约（H2）：同召回候选——静默截断会让"检索质量莫名
@@ -121,6 +131,8 @@ class KnowledgeService:
             )
         if not chunks:
             return []
+        rerank_active = use_rerank and not isinstance(self._reranker, NullReranker)
+        final_k = max(1, top_k or self._settings.recall_top_k)
         vectors = await self._embedder.embed([query])
         query_embedding = vectors[0] if vectors else None
         scored = score_chunks(
@@ -138,6 +150,10 @@ class KnowledgeService:
             # 会把关键词命中整体清零（天花板 ~0.45 < 0.5，Tier 3.1 验收
             # 发现）——放宽一半，宁可多给弱序结果也不静默丢命中。
             min_score = min_score / 2
+        if rerank_active and min_score > 0:
+            # 精排宽召回（ADR-004）：硬门槛会把 rerank 能救回的分块挡在
+            # 精排之前——放宽一半，噪音由精排阶段压下去。
+            min_score = min_score / 2
         if min_score > 0:
 
             def _has_evidence(item: ScoredChunk) -> bool:
@@ -147,7 +163,31 @@ class KnowledgeService:
                 )
 
             scored = [item for item in scored if item.score >= min_score and _has_evidence(item)]
-        return scored[: max(1, top_k or self._settings.recall_top_k)]
+        # 知识库候选量远小于记忆候选（按文件摄取），不做宽召回放大：
+        # 全量过精排即可。
+        if rerank_active and len(scored) > 1:
+            started = time.perf_counter()
+            scores = await self._reranker.rerank(query, [item.chunk.text for item in scored])
+            if scores is not None:
+                rescored: list[ScoredChunk] = []
+                for item, rerank_score in zip(scored, scores, strict=True):
+                    components = dict(item.components)
+                    components["rerank"] = rerank_score
+                    components["hybrid"] = item.score
+                    rescored.append(
+                        ScoredChunk(chunk=item.chunk, score=rerank_score, components=components)
+                    )
+                rescored.sort(
+                    key=lambda entry: (entry.score, entry.components.get("hybrid", 0.0)),
+                    reverse=True,
+                )
+                scored = rescored
+            MEMORY_METRICS.observe(
+                "rerank",
+                "ok" if scores is not None else "degraded",
+                time.perf_counter() - started,
+            )
+        return scored[:final_k]
 
     async def revoke_document(self, *, file_id: str, user_id: str) -> int:
         """撤销一份文档的知识库分块（用户级知识资产的显式收回路径，

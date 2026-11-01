@@ -261,7 +261,11 @@ class MemoryPipeline:
     ) -> str:
         """对一条候选拿到整合决策并落库；返回实际执行的 op。"""
         similar = await self._service.search(
-            user_id=user_id, agent_id=agent_id, query=candidate.content, top_k=3
+            user_id=user_id,
+            agent_id=agent_id,
+            query=candidate.content,
+            top_k=3,
+            use_rerank=False,  # 整合是高频后台路径，旁路精排保延迟（ADR-004）
         )
         existing_block = (
             "\n".join(f"{item.record.memory_id}: {item.record.content}" for item in similar)

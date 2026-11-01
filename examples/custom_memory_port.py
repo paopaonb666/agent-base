@@ -64,7 +64,13 @@ class DictMemoryPort:
         return "[自定义记忆-注入块] " + "；".join(facts)
 
     async def capture_turn(
-        self, *, user_id: str, agent_id: str, thread_id: str, messages: list[Any]
+        self,
+        *,
+        user_id: str,
+        agent_id: str,
+        thread_id: str,
+        messages: list[Any],
+        force: bool = False,
     ) -> Any:
         text = str(getattr(messages[-1], "content", "")) if messages else ""
         self._facts.setdefault(agent_id, []).append(f"用户提到过：{text}")

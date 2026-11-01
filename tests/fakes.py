@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import Sequence
+import secrets
+import time
+from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel, ChatResult
@@ -167,6 +169,128 @@ class ChunkedChatModel(BaseChatModel):
         self, tools: list[BaseTool], **kwargs: Any
     ) -> ChunkedChatModel:
         return self
+
+
+class FakeRedisService:
+    """手写 Redis 替身（ADR-012 测试用）：内存 dict + TTL 记账 + 队列 Pub/Sub。
+
+    与 ``RedisService`` 同一原语面（含键前缀与锁 token 语义），消费方
+    （成本计数 / nonce / 分布式锁 / 快照缓存 / SSE 镜像）的核心测试不
+    需要真实 Redis；真连语义走 integration 标记（见 test_redis_service.py）。
+    """
+
+    def __init__(self, *, key_prefix: str = "agent_base:") -> None:
+        self._prefix = key_prefix
+        self._data: dict[str, str] = {}
+        # 键 → 过期时刻（单调时钟）；无记录 = 永不过期。
+        self._expiry: dict[str, float] = {}
+        # 频道 → 订阅者队列（publish 扇出）。
+        self._channels: dict[str, list[asyncio.Queue[str]]] = {}
+        # 置 True 后 ping 抛错（/health 的 error 分支与失败路径测试）。
+        self.fail_ping = False
+        self.closed = False
+
+    def _k(self, key: str) -> str:
+        return f"{self._prefix}{key}"
+
+    def _alive(self, full_key: str) -> bool:
+        expire_at = self._expiry.get(full_key)
+        if expire_at is not None and expire_at <= time.monotonic():
+            self._data.pop(full_key, None)
+            self._expiry.pop(full_key, None)
+            return False
+        return full_key in self._data
+
+    async def ping(self) -> None:
+        if self.fail_ping:
+            raise RuntimeError("fake redis: ping failed (fail_ping=True)")
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+    async def get(self, key: str) -> str | None:
+        full = self._k(key)
+        return self._data.get(full) if self._alive(full) else None
+
+    async def set_ex(self, key: str, value: str, *, ttl_seconds: int) -> None:
+        full = self._k(key)
+        self._data[full] = value
+        self._expiry[full] = time.monotonic() + max(ttl_seconds, 0)
+
+    async def set_nx(self, key: str, value: str, *, ttl_seconds: int) -> bool:
+        full = self._k(key)
+        if self._alive(full):
+            return False
+        self._data[full] = value
+        self._expiry[full] = time.monotonic() + max(ttl_seconds, 0)
+        return True
+
+    async def delete(self, *keys: str) -> int:
+        removed = 0
+        for key in keys:
+            full = self._k(key)
+            if full in self._data:
+                self._data.pop(full, None)
+                self._expiry.pop(full, None)
+                removed += 1
+        return removed
+
+    async def delete_prefix(self, prefix: str) -> int:
+        matched = [k for k in self._data if k.startswith(f"{self._prefix}{prefix}")]
+        for full in matched:
+            self._data.pop(full, None)
+            self._expiry.pop(full, None)
+        return len(matched)
+
+    async def incr_by_float(self, key: str, amount: float) -> float:
+        full = self._k(key)
+        current = float(self._data[full]) if self._alive(full) else 0.0
+        current += amount
+        self._data[full] = repr(current)
+        return current
+
+    async def expire(self, key: str, *, ttl_seconds: int) -> None:
+        full = self._k(key)
+        if full in self._data:
+            self._expiry[full] = time.monotonic() + max(ttl_seconds, 0)
+
+    async def publish(self, channel: str, message: str) -> int:
+        subscribers = self._channels.get(self._k(channel), [])
+        for queue in list(subscribers):
+            queue.put_nowait(message)
+        return len(subscribers)
+
+    async def pubsub_messages(self, channel: str) -> AsyncIterator[str]:
+        full = self._k(channel)
+        queue: asyncio.Queue[str] = asyncio.Queue()
+        subscribers = self._channels.setdefault(full, [])
+        subscribers.append(queue)
+        try:
+            while True:
+                yield await queue.get()
+        finally:
+            if queue in subscribers:
+                subscribers.remove(queue)
+
+    async def acquire_lock(
+        self, key: str, *, ttl_seconds: int, acquire_timeout_seconds: float
+    ) -> str | None:
+        token = secrets.token_hex(16)
+        deadline = time.monotonic() + acquire_timeout_seconds
+        while True:
+            if await self.set_nx(key, token, ttl_seconds=ttl_seconds):
+                return token
+            if time.monotonic() >= deadline:
+                return None
+            await asyncio.sleep(0.001)
+
+    async def release_lock(self, key: str, token: str) -> bool:
+        full = self._k(key)
+        if self._alive(full) and self._data.get(full) == token:
+            self._data.pop(full, None)
+            self._expiry.pop(full, None)
+            return True
+        return False
 
 
 class CancellableChatModel(BaseChatModel):

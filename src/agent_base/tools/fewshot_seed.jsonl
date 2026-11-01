@@ -1,0 +1,15 @@
+{"query": "现在几点了？", "tool": "current_time", "args": {}, "note": "tz 缺省即本地时区，用户没点名其他时区就不要传"}
+{"query": "东京现在几点？", "tool": "current_time", "args": {"tz": "Asia/Tokyo"}, "note": "时区用 IANA 名（如 Asia/Tokyo），不是缩写 JST"}
+{"query": "今天是星期几？", "tool": "current_time", "args": {}}
+{"query": "帮我算一下 3 的 8 次方", "tool": "calculator", "args": {"expression": "3 ** 8"}}
+{"query": "(128+72) 除以 25 等于多少？", "tool": "calculator", "args": {"expression": "(128 + 72) / 25"}, "note": "中文表述翻译成运算符表达式；幂用 **、整除用 //"}
+{"query": "月供 3500，一年总共多少？", "tool": "calculator", "args": {"expression": "3500 * 12"}, "note": "单位换算自己完成，工具只吃纯算术表达式"}
+{"query": "2 的 10 次方再乘 8 是多少？", "tool": "calculator", "args": {"expression": "2 ** 10 * 8"}}
+{"query": "这段 JSON 里 data.items 第一个元素的 name 是什么", "tool": "json_query", "args": {"json_text": "{\"data\":{\"items\":[{\"name\":\"甲\"},{\"name\":\"乙\"}]}}", "path": "data.items[0].name"}, "note": "路径语法 a.b[0].c，下标从 0 开始"}
+{"query": "先看看这份 JSON 有哪些顶层键", "tool": "json_query", "args": {"json_text": "<用户的 JSON 文本>", "path": ""}, "note": "path 留空返回结构概要；先概要再取值最稳妥"}
+{"query": "列表里第二个元素是什么？", "tool": "json_query", "args": {"json_text": "<用户的 JSON 文本>", "path": "[1]"}, "note": "顶层数组直接用下标路径"}
+{"query": "拉康的镜像阶段理论说了什么？", "tool": "web_search", "args": {"query": "拉康 镜像阶段 理论"}, "note": "专有名词保持完整不拆字，空格分隔多关键词"}
+{"query": "最近一周 AI 领域有什么大新闻？", "tool": "web_search", "args": {"query": "AI 领域 大新闻 本周"}, "note": "实时性信息必须搜索，不要凭训练记忆回答"}
+{"query": "帮我查下明天北京的天气", "tool": "web_search", "args": {"query": "北京 明天 天气预报"}}
+{"query": "把 1 到 100 加起来是多少？", "tool": "python_repl", "args": {"code": "print(sum(range(1, 101)))"}, "note": "批量/迭代计算用代码，不要手算长串"}
+{"query": "这批数字的中位数：3,1,4,1,5,9,2,6", "tool": "python_repl", "args": {"code": "import statistics; print(statistics.median([3,1,4,1,5,9,2,6]))"}, "note": "统计类计算直接用标准库"}

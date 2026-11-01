@@ -27,11 +27,14 @@ from agent_base_memory.embeddings import EmbeddingClient, NullEmbedding, build_e
 from agent_base_memory.knowledge import KnowledgeService
 from agent_base_memory.orchestrator import (
     CaptureLockRegistry,
+    CaptureLocks,
     ContextSnapshotCache,
     MemoryOrchestrator,
+    SnapshotCache,
 )
 from agent_base_memory.pipeline import MemoryPipeline
 from agent_base_memory.profile import ProfileService
+from agent_base_memory.rerank import NullReranker, Reranker, build_reranker
 from agent_base_memory.retrieval import (
     ScoredChunk,
     ScoredMemory,
@@ -72,15 +75,23 @@ class MemoryService:
         settings: Settings,
         llm: Any | None = None,
         fast_llm: Any | None = None,
+        reranker: Reranker | None = None,
+        locks: CaptureLocks | None = None,
+        snapshots: SnapshotCache | None = None,
     ) -> None:
         self.store = store
         self.embedder = embedder
         self._settings = settings
         self._llm = llm
+        # 检索精排（ADR-004）：默认按 settings 装配（未启用 → NullReranker）；
+        # 参数注入供测试与自定义实现替换。
+        self._reranker: Reranker = reranker if reranker is not None else build_reranker(settings)
         # 失败安全旁路写入（审计 + 版本史）。
         self._audit = MemoryAudit(store)
         # 子域服务（P0-2）：门面公开方法签名不变，内部委托。
-        self.knowledge = KnowledgeService(store, embedder, settings.memory, self._audit)
+        self.knowledge = KnowledgeService(
+            store, embedder, settings.memory, self._audit, reranker=self._reranker
+        )
         self.profile = ProfileService(store, settings.memory)
         # 形成管线（M6c）：仅在拿到对话模型时可用；测试与禁用场景下为 None。
         # fast_llm 是快档侧（组合根装配的限流回退包装），管线内部分派。
@@ -88,8 +99,11 @@ class MemoryService:
             MemoryPipeline(llm, settings, self, fast_llm=fast_llm) if llm is not None else None
         )
         # 编排层（P0-2）：捕获锁与注入快照缓存从对象实例迁出为独立组件。
-        self._locks = CaptureLockRegistry()
-        self._snapshots = ContextSnapshotCache()
+        # 默认进程内实现；多 worker 部署经参数注入 Redis 实现（ADR-012）。
+        self._locks: CaptureLocks = locks if locks is not None else CaptureLockRegistry()
+        self._snapshots: SnapshotCache = (
+            snapshots if snapshots is not None else ContextSnapshotCache()
+        )
         self.orchestrator = MemoryOrchestrator(
             store=store,
             settings=settings.memory,
@@ -318,15 +332,29 @@ class MemoryService:
         agent_id: str | None,
         query: str,
         top_k: int | None = None,
+        use_rerank: bool = True,
     ) -> list[ScoredMemory]:
-        """混合检索（注入路径与搜索端点共用）。"""
+        """混合检索（注入路径与搜索端点共用）；精排见 ADR-004。
+
+        ``use_rerank=False`` 供高频/后台路径（整合裁决的相似检索）旁路
+        精排保延迟；精排客户端未启用或不可用时自动退化为现状排序。
+        """
         started = time.perf_counter()
         embedder = self.embedder if not isinstance(self.embedder, NullEmbedding) else None
+        active_reranker: Reranker | None = (
+            self._reranker if use_rerank and not isinstance(self._reranker, NullReranker) else None
+        )
+        final_k = top_k or self._settings.memory.recall_top_k
         min_score = self._settings.memory.recall_min_score
         if embedder is None and min_score > 0:
             # 降级关键词路径：混合分缺向量主力分量（权重 0.4），硬门槛会
             # 误杀老而准的关键词命中（如 14 天前的一条精确匹配只剩 ~0.45）
             # ——阈值放宽一半，宁可多给几条弱序结果也不静默丢相关记忆。
+            min_score = min_score / 2
+        if active_reranker is not None and min_score > 0:
+            # 精排宽召回（ADR-004）：硬门槛会把 rerank 能救回的候选挡在
+            # 精排之前——再放宽一半，相关性证据门槛仍由 recall_memories
+            # 的双条件保留，噪音由精排阶段压下去。
             min_score = min_score / 2
         results = await recall_memories(
             self.store,
@@ -334,12 +362,41 @@ class MemoryService:
             agent_id=agent_id,
             query=query,
             embedder=embedder,
-            top_k=top_k or self._settings.memory.recall_top_k,
+            top_k=final_k * self._settings.memory.rerank_fetch_multiplier
+            if active_reranker is not None
+            else final_k,
             episodic_ttl_days=self._settings.memory.episodic_ttl_days,
             half_life_days=self._settings.memory.time_decay_half_life_days,
             min_score=min_score,
             weights=self._hybrid_weights(),
         )
+        if active_reranker is not None and len(results) > 1:
+            rerank_started = time.perf_counter()
+            scores = await active_reranker.rerank(query, [item.record.content for item in results])
+            if scores is not None:
+                rescored: list[ScoredMemory] = []
+                for item, rerank_score in zip(results, scores, strict=True):
+                    components = dict(item.components)
+                    # rerank 分是新的主排序键（分域与混合分不同，不做加权
+                    # 融合）；混合分降级为次级键留档在 components["hybrid"]。
+                    components["rerank"] = rerank_score
+                    components["hybrid"] = item.score
+                    rescored.append(
+                        ScoredMemory(record=item.record, score=rerank_score, components=components)
+                    )
+                rescored.sort(
+                    key=lambda entry: (entry.score, entry.components.get("hybrid", 0.0)),
+                    reverse=True,
+                )
+                results = rescored[:final_k]
+            MEMORY_METRICS.observe(
+                "rerank",
+                "ok" if scores is not None else "degraded",
+                time.perf_counter() - rerank_started,
+            )
+        if active_reranker is not None and len(results) > final_k:
+            # 精排降级（None）或候选数不足触发精排：按混合分原序截回 top_k。
+            results = results[:final_k]
         MEMORY_METRICS.observe("search", "ok", time.perf_counter() - started)
         return results
 
@@ -368,11 +425,17 @@ class MemoryService:
         )
 
     async def search_knowledge(
-        self, *, user_id: str, agent_id: str | None, query: str, top_k: int | None = None
+        self,
+        *,
+        user_id: str,
+        agent_id: str | None,
+        query: str,
+        top_k: int | None = None,
+        use_rerank: bool = True,
     ) -> list[ScoredChunk]:
-        """知识库混合检索（向量 + BM25 + 时间衰减）。"""
+        """知识库混合检索（向量 + BM25 + 时间衰减 [+ 精排，ADR-004]）。"""
         return await self.knowledge.search_knowledge(
-            user_id=user_id, agent_id=agent_id, query=query, top_k=top_k
+            user_id=user_id, agent_id=agent_id, query=query, top_k=top_k, use_rerank=use_rerank
         )
 
     def _hybrid_weights(self) -> dict[str, float]:
@@ -554,6 +617,9 @@ class MemoryService:
         embedder_close = getattr(self.embedder, "aclose", None)
         if embedder_close is not None:
             await embedder_close()
+        reranker_close = getattr(self._reranker, "aclose", None)
+        if reranker_close is not None:
+            await reranker_close()
 
 
 async def build_memory_service(
@@ -562,6 +628,8 @@ async def build_memory_service(
     fast_llm: Any | None = None,
     *,
     store: MemoryStore | None = None,
+    locks: CaptureLocks | None = None,
+    snapshots: SnapshotCache | None = None,
 ) -> MemoryService | None:
     """按 settings 装配记忆服务；未启用或后端不可用时返回 None。
 
@@ -570,7 +638,8 @@ async def build_memory_service(
     画像/摘要走它，整合裁决按 ``MEMORY_PIPELINE_PROFILE`` 决定）。测试可以
     都不传——检索与手工管理照常工作，仅形成管线缺席。``store`` 允许调用
     方注入已装配的存储（bootstrap 复用同一实例作为 thread_index 数据面）；
-    缺省时按 settings 自建。
+    ``locks`` / ``snapshots`` 允许注入共享实现（多 worker 部署的 Redis
+    分布式锁与快照缓存，ADR-012）；三者缺省时按进程内实现自建。
     """
     if not settings.memory.enabled:
         logger.info("memory: 记忆系统已禁用（MEMORY_ENABLED=false）")
@@ -581,7 +650,13 @@ async def build_memory_service(
         return None
     embedder = build_embedding_client(settings)
     return MemoryService(
-        store=store, embedder=embedder, settings=settings, llm=llm, fast_llm=fast_llm
+        store=store,
+        embedder=embedder,
+        settings=settings,
+        llm=llm,
+        fast_llm=fast_llm,
+        locks=locks,
+        snapshots=snapshots,
     )
 
 

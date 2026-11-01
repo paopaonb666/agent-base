@@ -71,9 +71,42 @@ def toolkit_timeouts(settings: Settings) -> dict[str, float]:
     }
 
 
+def toolkit_tiers(settings: Settings) -> dict[str, str]:
+    """收集已启用工具声明的分层（供 ``build_tool_pool(tiers=...)``）。
+
+    未登记名字（模块工具 / 记忆包工具）由池默认 ``basic``；MCP 工具在
+    bootstrap 一律标记 ``advanced``（"几百个工具"的路由场景正是 MCP）。
+    """
+    return {
+        name: spec.tier
+        for name, spec in TOOLKIT.items()
+        if name in settings.toolkit.enabled
+    }
+
+
 def known_toolkit_names() -> list[str]:
     """注册表里的全部工具名（错误信息与文档用）。"""
     return sorted(TOOLKIT)
+
+
+def resolve_approval_names(settings: Settings) -> frozenset[str]:
+    """解析审批门名单（ADR-005）：两个来源取并集。
+
+    - ``TOOL_APPROVAL_TOOLS``：工具名精确匹配（覆盖模块工具、MCP 前缀名
+      ``{server}_{tool}``、记忆包工具与 TOOLKIT 工具）；
+    - ``TOOL_APPROVAL_SAFETY_LEVELS``：TOOLKIT 注册表中该 safety 级
+      （read/network/exec）的全部内置工具——``ToolSpec.safety`` 自 M1
+      起登记的"为审批门预留的元数据"在此兑现。
+
+    审批未启用时返回空集（图工厂据此保持 ToolNode 原状，零行为变化）。
+    """
+    if not settings.toolkit.approval_enabled:
+        return frozenset()
+    names: set[str] = set(settings.toolkit.approval_tools)
+    levels = set(settings.toolkit.approval_safety_levels)
+    if levels:
+        names.update(name for name, spec in TOOLKIT.items() if spec.safety in levels)
+    return frozenset(names)
 
 
 __all__ = [
@@ -81,5 +114,7 @@ __all__ = [
     "ToolkitError",
     "build_toolkit_tools",
     "known_toolkit_names",
+    "resolve_approval_names",
+    "toolkit_tiers",
     "toolkit_timeouts",
 ]

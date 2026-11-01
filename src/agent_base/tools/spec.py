@@ -21,6 +21,11 @@ class ToolkitError(ValueError):
     """工具库装配失败（启用了不可用的工具、未知工具名等）。"""
 
 
+# 工具分层（ADR-010）：basic 永远绑定给模型；advanced 参与向量路由
+# （top-k 召回）。两档是封闭枚举——分层语义只被 ToolRouter 消费。
+KNOWN_TOOL_TIERS: tuple[str, ...] = ("basic", "advanced")
+
+
 @dataclass(frozen=True)
 class ToolSpec:
     """一个基座内置工具的注册条目。
@@ -29,6 +34,8 @@ class ToolSpec:
     ``category``    —— 类别（basic / network / code），仅供观测与文档
     ``safety``      —— 安全级别（read / network / exec），为将来的审批门
                         预留的元数据；本阶段只登记不强制
+    ``tier``        —— 分层（basic / advanced，ADR-010）：basic 永远绑定，
+                        advanced 参与向量路由的 top-k 召回；默认 basic
     ``factory``     —— 惰性工厂：仅在工具被启用且可用时才调用，产出加入
                         共享池的 ``BaseTool`` 实例（可携带 settings 装配的
                         依赖，如搜索管理器）
@@ -44,6 +51,14 @@ class ToolSpec:
     available: Callable[[Settings], bool]
     unavailable_reason: str
     timeout: float | None = None
+    tier: str = "basic"
+
+    def __post_init__(self) -> None:
+        if self.tier not in KNOWN_TOOL_TIERS:
+            raise ToolkitError(
+                f"tool {self.name!r} declares unknown tier {self.tier!r}; "
+                f"expected one of {list(KNOWN_TOOL_TIERS)}"
+            )
 
 
-__all__ = ["ToolSpec", "ToolkitError"]
+__all__ = ["KNOWN_TOOL_TIERS", "ToolkitError", "ToolSpec"]

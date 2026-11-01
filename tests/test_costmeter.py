@@ -25,6 +25,10 @@ from agent_base.extensions.costmeter import (
 
 _SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 
+# 集成测试库名：DDL 标识符无法参数化，用固定字面量（无拼接面）；崩溃
+# 残留由用例开头的 DROP IF EXISTS 回收。
+_COST_TEST_DB = "agent_base_cost_test"
+
 
 def _settings(**overrides: object) -> Settings:
     defaults: dict[str, object] = {"llm_api_key": "sk-test"}
@@ -506,7 +510,6 @@ async def test_mysql_ledger_roundtrip() -> None:
     """
     pytest.importorskip("aiomysql")
     import os
-    import uuid
 
     import aiomysql
 
@@ -522,10 +525,11 @@ async def test_mysql_ledger_roundtrip() -> None:
     except Exception as exc:
         pytest.skip(f"MySQL 不可用：{exc}")
 
-    db = f"agent_base_cost_test_{uuid.uuid4().hex[:8]}"
     async with conn.cursor() as cur:
-        await cur.execute(f"CREATE DATABASE `{db}` CHARACTER SET utf8mb4")
+        await cur.execute("DROP DATABASE IF EXISTS `agent_base_cost_test`")
+        await cur.execute("CREATE DATABASE `agent_base_cost_test` CHARACTER SET utf8mb4")
     conn.close()
+    db = _COST_TEST_DB
 
     settings = _settings(
         checkpointer_backend="mysql",
@@ -559,5 +563,5 @@ async def test_mysql_ledger_roundtrip() -> None:
             host=host, port=port, user=user, password=password, autocommit=True
         )
         async with conn.cursor() as cur:
-            await cur.execute(f"DROP DATABASE IF EXISTS `{db}`")
+            await cur.execute("DROP DATABASE IF EXISTS `agent_base_cost_test`")
         conn.close()

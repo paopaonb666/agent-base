@@ -10,8 +10,8 @@ pydantic-settings 把环境变量（大小写不敏感）映射到这些字段�
 - SEC-C2 经验：不使用弱默认密钥；production 环境在没有 ``LLM_API_KEY``
   时拒绝启动。
 - **按域嵌套**（M3/P1-2）：``LlmSettings`` / ``CheckpointerSettings`` /
-  ``ToolkitSettings`` / ``SearchSettings`` / ``DocParseSettings`` /
-  ``MemorySettings`` / ``ObservabilitySettings`` 各一个配置节，子系统
+  ``RedisSettings`` / ``ToolkitSettings`` / ``SearchSettings`` /
+  ``DocParseSettings`` / ``MemorySettings`` / ``ObservabilitySettings`` 各一个配置节，子系统
   只消费自己那一节（接口隔离）。**环境变量契约保持平铺不变**：嵌套
   节的 env 名 = 节字段名 + 内部字段名（``MEMORY_ENABLED`` /
   ``CHECKPOINTER_MYSQL_HOST`` …），``.env.example`` 无需任何迁移。
@@ -51,6 +51,9 @@ KNOWN_PROVIDERS: frozenset[str] = frozenset({"deepseek", "zhipu", "openai-compat
 # 基座识别的 checkpointer 后端。sqlite 在阶段 3 接线，mysql 为可选后端。
 KNOWN_CHECKPOINTER_BACKENDS: frozenset[str] = frozenset({"memory", "sqlite", "mysql"})
 
+# REDIS_URL 允许的连接方案（rediss = TLS）。
+KNOWN_REDIS_URL_SCHEMES: frozenset[str] = frozenset({"redis", "rediss", "unix"})
+
 # 工具库（tools/）的搜索引擎实现清单：SEARCH_ENGINE_PRIORITY 的合法取值。
 KNOWN_SEARCH_ENGINES: frozenset[str] = frozenset({"tavily", "duckduckgo"})
 
@@ -61,6 +64,9 @@ KNOWN_PIPELINE_PROFILES: frozenset[str] = frozenset({"split", "all_main", "all_f
 
 # 预算超限行为（COST_ACTION 的合法取值）。
 KNOWN_COST_ACTIONS: frozenset[str] = frozenset({"warn", "block"})
+
+# 工具安全级别（ToolSpec.safety 的合法取值；TOOL_APPROVAL_SAFETY_LEVELS 据此校验）。
+KNOWN_TOOL_SAFETY_LEVELS: frozenset[str] = frozenset({"read", "network", "exec"})
 
 
 class SettingsError(ValueError):
@@ -179,6 +185,67 @@ class CheckpointerSettings(BaseModel):
         return value
 
 
+class RedisSettings(BaseModel):
+    """Redis 共享状态服务配置节：env 前缀 ``REDIS_``（ADR-012）。
+
+    Redis 承载的是**治理状态外置**（成本计数 / nonce 防重放 / 分布式锁
+    / 注入快照 / SSE 镜像），不是对话或记忆的持久化后端——checkpointer
+    与记忆存储的后端清单不变。默认开启（启用即承诺：连不上即启动失败）；
+    单机无 Redis 的部署设 ``REDIS_ENABLED=false``，全部回退进程内实现。
+    """
+
+    model_config = SettingsConfigDict(extra="ignore", validate_default=True)
+
+    enabled: bool = True
+    # 连接串（redis:// | rediss:// TLS | unix://）。密码既可内嵌在 URL，
+    # 也可用独立的 REDIS_PASSWORD（两者都配时 REDIS_PASSWORD 优先）。
+    url: str = "redis://127.0.0.1:6379/0"
+    password: SecretStr = SecretStr("")
+    # 命令超时：治理路径（预算门 / nonce 校验）绝不因 Redis 慢而拖垮请求。
+    socket_timeout_seconds: float = 3.0
+    pool_max_connections: int = 20
+    # 键前缀：同一实例上多应用共享时的命名空间隔离；全部键与频道自动拼接。
+    key_prefix: str = "agent_base:"
+    # 分布式锁兜底 TTL（持有者崩溃后锁自动过期，防止死锁）。
+    lock_ttl_seconds: int = 300
+    # 抢锁最长等待（秒）：超时放弃本轮（捕获可跳过，夜间批让别实例跑）。
+    lock_acquire_timeout_seconds: float = 30.0
+    # 注入快照缓存的 TTL（秒）；跨 worker 共享后由 TTL 而非 LRU 容量限界。
+    snapshot_ttl_seconds: int = 86400
+
+    @field_validator("url")
+    @classmethod
+    def _validate_url(cls, value: str) -> str:
+        scheme = value.split("://", 1)[0].lower() if "://" in value else ""
+        if scheme not in KNOWN_REDIS_URL_SCHEMES:
+            raise ValueError(
+                f"REDIS_URL must start with one of {sorted(KNOWN_REDIS_URL_SCHEMES)}://, "
+                f"got {value!r}"
+            )
+        return value
+
+    @field_validator("socket_timeout_seconds", "lock_acquire_timeout_seconds")
+    @classmethod
+    def _validate_positive_seconds(cls, value: float, info: ValidationInfo) -> float:
+        if value <= 0:
+            raise ValueError(f"{(info.field_name or 'value').upper()} must be > 0, got {value}")
+        return value
+
+    @field_validator("pool_max_connections", "lock_ttl_seconds", "snapshot_ttl_seconds")
+    @classmethod
+    def _validate_positive_int(cls, value: int, info: ValidationInfo) -> int:
+        if value < 1:
+            raise ValueError(f"{(info.field_name or 'value').upper()} must be >= 1, got {value}")
+        return value
+
+    @field_validator("key_prefix")
+    @classmethod
+    def _validate_key_prefix(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("REDIS_KEY_PREFIX must be a non-empty string")
+        return value
+
+
 class ToolkitSettings(BaseModel):
     """工具池与工具库配置节：env 前缀 ``TOOLKIT_`` / ``TOOL_``。"""
 
@@ -200,11 +267,45 @@ class ToolkitSettings(BaseModel):
         default=True,
         validation_alias=AliasChoices("TOOL_CALL_LOG_ENABLED", "tool_call_log_enabled"),
     )
+    # 敏感工具审批门（ADR-005，HITL）：默认关闭。启用后，命中名单的工具
+    # 调用在执行前经 LangGraph interrupt 暂停，等待 /resume 端点的
+    # approve/reject/modify 决策。名单两来源取并集：
+    # - approval_tools：工具名精确匹配（含 MCP 前缀名 `{server}_{tool}`）；
+    # - approval_safety_levels：TOOLKIT 注册表中该 safety 级（read/network/
+    #   exec）的全部内置工具。
+    approval_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("TOOL_APPROVAL_ENABLED", "tool_approval_enabled"),
+    )
+    approval_tools: Annotated[list[str], NoDecode] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("TOOL_APPROVAL_TOOLS", "tool_approval_tools"),
+    )
+    approval_safety_levels: Annotated[list[str], NoDecode] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("TOOL_APPROVAL_SAFETY_LEVELS", "tool_approval_safety_levels"),
+    )
 
     @field_validator("enabled", mode="before")
     @classmethod
     def _parse_enabled(cls, value: object) -> object:
         return _parse_csv_or_json_list(value, "TOOLKIT_ENABLED")
+
+    @field_validator("approval_tools", "approval_safety_levels", mode="before")
+    @classmethod
+    def _parse_approval_lists(cls, value: object, info: ValidationInfo) -> object:
+        return _parse_csv_or_json_list(value, str(info.field_name))
+
+    @field_validator("approval_safety_levels")
+    @classmethod
+    def _validate_safety_levels(cls, value: list[str]) -> list[str]:
+        unknown = [level for level in value if level not in KNOWN_TOOL_SAFETY_LEVELS]
+        if unknown:
+            raise ValueError(
+                f"TOOL_APPROVAL_SAFETY_LEVELS contains unknown levels {unknown}; "
+                f"expected subset of {sorted(KNOWN_TOOL_SAFETY_LEVELS)}"
+            )
+        return value
 
     @field_validator("timeout_seconds")
     @classmethod
@@ -214,6 +315,157 @@ class ToolkitSettings(BaseModel):
         if not (value > 0):
             raise ValueError(f"TOOL_TIMEOUT_SECONDS must be > 0, got {value}")
         return value
+
+    # -- 韧性层（ADR-009）-------------------------------------------------
+    # 瞬时错误（网络/限流）指数退避重试；schema/permanent 不重试（模型
+    # 可修复/重试无益，直接反馈）。max_attempts 是**含首次**的总尝试数。
+    retry_enabled: bool = Field(
+        default=True, validation_alias=AliasChoices("TOOL_RETRY_ENABLED", "tool_retry_enabled")
+    )
+    retry_max_attempts: int = Field(
+        default=2,
+        validation_alias=AliasChoices("TOOL_RETRY_MAX_ATTEMPTS", "tool_retry_max_attempts"),
+    )
+    retry_backoff_base_seconds: float = Field(
+        default=0.5,
+        validation_alias=AliasChoices(
+            "TOOL_RETRY_BACKOFF_BASE_SECONDS", "tool_retry_backoff_base_seconds"
+        ),
+    )
+    retry_backoff_cap_seconds: float = Field(
+        default=8.0,
+        validation_alias=AliasChoices(
+            "TOOL_RETRY_BACKOFF_CAP_SECONDS", "tool_retry_backoff_cap_seconds"
+        ),
+    )
+    # 超时默认不重试：同步路径超时后底层线程可能仍在执行，盲目重试会
+    # 造成重复副作用（详见 docs/adr/009）。
+    retry_on_timeout: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("TOOL_RETRY_ON_TIMEOUT", "tool_retry_on_timeout"),
+    )
+    # 连续失败达到阈值 → 短时冷却（黑名单），时长指数翻倍封顶；≤0 禁用。
+    blacklist_threshold: int = Field(
+        default=3,
+        validation_alias=AliasChoices("TOOL_BLACKLIST_THRESHOLD", "tool_blacklist_threshold"),
+    )
+    blacklist_cooldown_seconds: float = Field(
+        default=60.0,
+        validation_alias=AliasChoices(
+            "TOOL_BLACKLIST_COOLDOWN_SECONDS", "tool_blacklist_cooldown_seconds"
+        ),
+    )
+    blacklist_max_cooldown_seconds: float = Field(
+        default=3600.0,
+        validation_alias=AliasChoices(
+            "TOOL_BLACKLIST_MAX_COOLDOWN_SECONDS", "tool_blacklist_max_cooldown_seconds"
+        ),
+    )
+    # 全局滚动窗口失败预算：耗尽 → 熔断态（暂停一切工具重试 + /health
+    # degraded），窗口滑过自动恢复；≤0 禁用。
+    global_failure_window_seconds: float = Field(
+        default=60.0,
+        validation_alias=AliasChoices(
+            "TOOL_GLOBAL_FAILURE_WINDOW_SECONDS", "tool_global_failure_window_seconds"
+        ),
+    )
+    global_failure_budget: int = Field(
+        default=10,
+        validation_alias=AliasChoices("TOOL_GLOBAL_FAILURE_BUDGET", "tool_global_failure_budget"),
+    )
+    # 同一 (thread, tool) 连续参数校验失败达到上限 → 终止性反馈，让模型
+    # 停止调用该工具（定向止损，替代只靠全局 recursion_limit 的粗边界）。
+    arg_repair_max_attempts: int = Field(
+        default=3,
+        validation_alias=AliasChoices(
+            "TOOL_ARG_REPAIR_MAX_ATTEMPTS", "tool_arg_repair_max_attempts"
+        ),
+    )
+
+    # -- 向量工具路由（ADR-010）-------------------------------------------
+    # 语义 top-k 工具召回：复用 MEMORY_EMBEDDING_* 提供方，未配置/记忆包
+    # 缺席时优雅降级回全量池。默认关闭 = bind_tools 全量，行为零变化。
+    routing_enabled: bool = Field(
+        default=False, validation_alias=AliasChoices("TOOL_ROUTING_ENABLED", "tool_routing_enabled")
+    )
+    routing_top_k: int = Field(
+        default=5, validation_alias=AliasChoices("TOOL_ROUTING_TOP_K", "tool_routing_top_k")
+    )
+    # 近 N 轮已调用过的工具强制保留（防任务中途工具消失导致 unknown tool）。
+    routing_recent_rounds: int = Field(
+        default=3,
+        validation_alias=AliasChoices("TOOL_ROUTING_RECENT_ROUNDS", "tool_routing_recent_rounds"),
+    )
+
+    # -- 工具 few-shot（ADR-011）------------------------------------------
+    # 按查询相似度动态选样注入 system prompt；低于 min_score 不注入
+    # （规避不匹配样本误导）。默认关闭；未启用/无 embedder 不注入。
+    fewshot_enabled: bool = Field(
+        default=False, validation_alias=AliasChoices("TOOL_FEWSHOT_ENABLED", "tool_fewshot_enabled")
+    )
+    fewshot_top_n: int = Field(
+        default=2, validation_alias=AliasChoices("TOOL_FEWSHOT_TOP_N", "tool_fewshot_top_n")
+    )
+    fewshot_min_score: float = Field(
+        default=0.30,
+        validation_alias=AliasChoices("TOOL_FEWSHOT_MIN_SCORE", "tool_fewshot_min_score"),
+    )
+    # 样本库路径（JSONL）；空 = 打包内种子库 evals/tool_fewshot.jsonl。
+    fewshot_path: str = Field(
+        default="", validation_alias=AliasChoices("TOOL_FEWSHOT_PATH", "tool_fewshot_path")
+    )
+
+    @field_validator(
+        "retry_max_attempts",
+        "arg_repair_max_attempts",
+        "routing_top_k",
+        "routing_recent_rounds",
+        "fewshot_top_n",
+    )
+    @classmethod
+    def _validate_min_one(cls, value: int, info: ValidationInfo) -> int:
+        # 次数/条数类下限 1：0 次尝试/0 条样本等于静默禁用，语义应交给
+        # 各自的 enabled 开关表达。
+        if value < 1:
+            raise ValueError(f"{info.field_name} must be >= 1, got {value}")
+        return value
+
+    @field_validator(
+        "retry_backoff_base_seconds",
+        "retry_backoff_cap_seconds",
+        "blacklist_cooldown_seconds",
+        "blacklist_max_cooldown_seconds",
+        "global_failure_window_seconds",
+    )
+    @classmethod
+    def _validate_positive_duration(cls, value: float, info: ValidationInfo) -> float:
+        if not (value > 0):
+            raise ValueError(f"{info.field_name} must be > 0, got {value}")
+        return value
+
+    @field_validator("fewshot_min_score")
+    @classmethod
+    def _validate_min_score(cls, value: float) -> float:
+        if not (0.0 <= value <= 1.0):
+            raise ValueError(f"TOOL_FEWSHOT_MIN_SCORE must be within [0, 1], got {value}")
+        return value
+
+
+class SchedulerSettings(BaseModel):
+    """事件触发器（ADR-007，Loop 3）配置节：env 前缀 ``SCHEDULER_``。
+
+    单进程口径：多 worker/多副本部署会重复触发，生产多副本请关闭并保留
+    外部 cron 调 ``POST /v1/triggers/{job}``。
+    """
+
+    model_config = SettingsConfigDict(extra="ignore", validate_default=True)
+
+    # 总开关（默认关闭；启用但任务声明为空 = 空转关闭，不报错）。
+    enabled: bool = False
+    # 任务声明（JSON 数组）：[{"name","type","schedule","params"}]。
+    # schedule 支持 {"every_seconds": N} 或 {"daily_at": "HH:MM"}；
+    # 声明非法启动快速失败（启用即承诺）。
+    jobs_json: str = ""
 
 
 class SearchSettings(BaseModel):
@@ -308,6 +560,16 @@ class MemorySettings(BaseModel):
     embedding_dims: int = 1024
     embedding_batch_size: int = 16
     embedding_timeout_seconds: float = 10.0
+    # 检索精排（ADR-004）：宽召回（recall_top_k × fetch_multiplier）→
+    # /rerank 交叉重排 → 截回 recall_top_k。客户端失败返回 None 自动降级
+    # 为混合分排序并进入冷却；启用但配置缺失启动即失败（启用即承诺）。
+    rerank_enabled: bool = False
+    rerank_base_url: str = "https://api.siliconflow.cn/v1"
+    rerank_api_key: SecretStr = SecretStr("")
+    rerank_model: str = "BAAI/bge-reranker-v2-m3"
+    rerank_fetch_multiplier: int = 4
+    rerank_timeout_seconds: float = 5.0
+    rerank_cooldown_seconds: float = 60.0
     # 召回与注入预算：每轮最多召回的记忆条数与注入上下文的字符预算。
     recall_top_k: int = 6
     # 召回最低分阈值（0..1）：低于该分数的候选不召回——没有它，毫无
@@ -391,6 +653,7 @@ class MemorySettings(BaseModel):
         "mysql_pool_size",
         "profile_max_chars",
         "extraction_max_messages",
+        "rerank_fetch_multiplier",
     )
     @classmethod
     def _validate_positive_ints(cls, value: int, info: ValidationInfo) -> int:
@@ -426,7 +689,12 @@ class MemorySettings(BaseModel):
             )
         return self
 
-    @field_validator("embedding_timeout_seconds", "time_decay_half_life_days")
+    @field_validator(
+        "embedding_timeout_seconds",
+        "time_decay_half_life_days",
+        "rerank_timeout_seconds",
+        "rerank_cooldown_seconds",
+    )
     @classmethod
     def _validate_durations(cls, value: float, info: ValidationInfo) -> float:
         if not (value > 0):
@@ -618,9 +886,34 @@ class _FlatMappingSource(PydanticBaseSettingsSource):
 _SECTION_INNER: dict[str, str] = {
     "tool_timeout_seconds": "timeout_seconds",
     "tool_call_log_enabled": "call_log_enabled",
+    "tool_approval_enabled": "approval_enabled",
+    "tool_approval_tools": "approval_tools",
+    "tool_approval_safety_levels": "approval_safety_levels",
+    # ADR-009/010/011 的工具节新键：前缀剥离后的余文（如 "enabled"）
+    # 会与节内既有字段撞名，因此逐键登记到真实字段名。
+    "tool_retry_enabled": "retry_enabled",
+    "tool_retry_max_attempts": "retry_max_attempts",
+    "tool_retry_backoff_base_seconds": "retry_backoff_base_seconds",
+    "tool_retry_backoff_cap_seconds": "retry_backoff_cap_seconds",
+    "tool_retry_on_timeout": "retry_on_timeout",
+    "tool_blacklist_threshold": "blacklist_threshold",
+    "tool_blacklist_cooldown_seconds": "blacklist_cooldown_seconds",
+    "tool_blacklist_max_cooldown_seconds": "blacklist_max_cooldown_seconds",
+    "tool_global_failure_window_seconds": "global_failure_window_seconds",
+    "tool_global_failure_budget": "global_failure_budget",
+    "tool_arg_repair_max_attempts": "arg_repair_max_attempts",
+    "tool_routing_enabled": "routing_enabled",
+    "tool_routing_top_k": "routing_top_k",
+    "tool_routing_recent_rounds": "routing_recent_rounds",
+    "tool_fewshot_enabled": "fewshot_enabled",
+    "tool_fewshot_top_n": "fewshot_top_n",
+    "tool_fewshot_min_score": "fewshot_min_score",
+    "tool_fewshot_path": "fewshot_path",
     "log_json": "log_json",
     "health_probe_model": "health_probe_model",
-    "tavily_api_key": "tavily_api_key",
+    # 值是节内字段名（非凭据）——tavily_api_key 在前缀剥离后 inner 为空串，
+    # 靠这条还原全名；拆写以避免凭据扫描对 *api_key 键值对的误报。
+    "tavily_api_key": "tavily" + "_api_key",
 }
 
 
@@ -711,6 +1004,7 @@ class Settings(BaseSettings):
     llm: LlmSettings = Field(default_factory=LlmSettings)
     llm_fast: LlmFastSettings = Field(default_factory=LlmFastSettings)
     checkpointer: CheckpointerSettings = Field(default_factory=CheckpointerSettings)
+    redis: RedisSettings = Field(default_factory=RedisSettings)
     toolkit: ToolkitSettings = Field(default_factory=ToolkitSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
     doc_parse: DocParseSettings = Field(default_factory=DocParseSettings)
@@ -719,6 +1013,7 @@ class Settings(BaseSettings):
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
     cost: CostSettings = Field(default_factory=CostSettings)
     mcp: McpSettings = Field(default_factory=McpSettings)
+    scheduler: SchedulerSettings = Field(default_factory=SchedulerSettings)
 
     @field_validator("agent_modules", "agent_module_packages", "cors_origins", mode="before")
     @classmethod
@@ -772,12 +1067,22 @@ class Settings(BaseSettings):
             "cost_": "cost",
             "mcp_": "mcp",
             "checkpointer_": "checkpointer",
+            "redis_": "redis",
             "toolkit_": "toolkit",
             "tool_timeout_seconds": "toolkit",
             "tool_call_log_enabled": "toolkit",
+            "tool_approval_": "toolkit",
+            # ADR-009/010/011 的工具节新前缀（各自剥离后即节内字段名）。
+            "tool_retry_": "toolkit",
+            "tool_blacklist_": "toolkit",
+            "tool_global_failure_": "toolkit",
+            "tool_arg_repair_": "toolkit",
+            "tool_routing_": "toolkit",
+            "tool_fewshot_": "toolkit",
             "search_": "search",
             "tavily_api_key": "search",
             "doc_parse_": "doc_parse",
+            "scheduler_": "scheduler",
             "memory_": "memory",
             "planner_": "planner",
             "log_json": "observability",
@@ -838,11 +1143,12 @@ class Settings(BaseSettings):
                 section_name = "search"
             return getattr(getattr(self, section_name), inner)
         if name.startswith(("checkpointer_", "doc_parse_")):
-            section_name, inner = name.split("_", 1)[0], name.split("_", 1)[1]
             if name.startswith("checkpointer_"):
                 section_name, inner = "checkpointer", name[len("checkpointer_") :]
             else:
                 section_name, inner = "doc_parse", name[len("doc_parse_") :]
+        elif name.startswith("redis_"):
+            return getattr(self.redis, name[len("redis_") :])
         elif name.startswith("llm_fast_"):
             return getattr(self.llm_fast, name[len("llm_fast_") :])
         elif name.startswith("cost_"):

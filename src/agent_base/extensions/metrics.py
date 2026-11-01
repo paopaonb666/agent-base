@@ -32,8 +32,8 @@ BUCKETS: tuple[float, ...] = (0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0)
 MAX_SAMPLES_PER_ROUTE = 1000
 
 # 工具执行结果的封闭枚举：label 不接纳任意字符串，与路由模板同源地
-# 防基数爆炸。
-TOOL_OUTCOMES: tuple[str, ...] = ("ok", "timeout", "error")
+# 防基数爆炸。blocked = 韧性黑名单短路（ADR-009：工具未被执行）。
+TOOL_OUTCOMES: tuple[str, ...] = ("ok", "timeout", "error", "blocked")
 
 # 记忆系统操作的封闭枚举（M6）：与 TOOL_OUTCOMES 同源，label 不接纳
 # 任意字符串，防基数爆炸。M6c 的管线操作（extract/consolidate/…）沿用

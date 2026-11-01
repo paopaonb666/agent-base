@@ -275,7 +275,7 @@ async def test_client_disconnect_cancels_llm_call() -> None:
     runtime = _runtime(model)
     graph = runtime.graph("chat")
     config: dict[str, Any] = {"configurable": {"thread_id": "chat:t-cancel"}}
-    stream = _event_stream(graph, "hi", config, "t-cancel")  # type: ignore[arg-type]
+    stream = _event_stream(graph, {"messages": [HumanMessage(content="hi")]}, config, "t-cancel")
 
     # 像 SSE 客户端一样消费；模型会挂起，因此在最初的 ping 之后，
     # 流会像一次真实的慢速 LLM 调用一样处于空闲状态。
