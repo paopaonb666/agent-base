@@ -21,7 +21,7 @@ from agent_base.core.bootstrap import AgentRuntime
 from agent_base.core.config import Settings
 from agent_base.core.storage import CoreMemoryStore
 from agent_base.core.storage import tree as tree_mod
-from agent_base.core.storage.models import MessageNode
+from agent_base.core.storage.models import MessageNode, ThreadIndex
 from agent_base.entrypoints.server import create_app
 from agent_base.modules.chat.module import ChatModule
 from fakes import ScriptedChatModel
@@ -361,6 +361,35 @@ def test_tree_endpoints_are_owner_scoped() -> None:
         )
 
 
+def test_invoke_into_other_users_thread_rejected() -> None:
+    """越权回归（对抗性审查发现）：invoke 是唯一带写语义的会话端点，
+    此前未校验属主——知道他人 thread_id 即可向其树落节点/推进指针/
+    物化覆盖执行缓存。修复后：索引有行且属主不符 → 404 掩蔽。"""
+    bob = {"X-User-Id": "bob"}
+    with TestClient(create_app(runtime=_runtime())) as client:
+        thread_id, human_id = _start_thread(client)
+        response = client.post(
+            "/v1/agents/chat/invoke",
+            json={
+                "message": "越权写入",
+                "thread_id": thread_id,
+                "parent_node_id": human_id,
+            },
+            headers=bob,
+        )
+        assert response.status_code == 404, response.text
+        # A 的树未被污染（节点数不变、指针不变）。
+        tree = client.get(
+            f"/v1/agents/chat/threads/{thread_id}/tree", headers=ALICE
+        ).json()
+        assert len(tree["nodes"]) == 2
+        # bob 自己的新会话不受影响（索引无行 = 新线程，放行）。
+        own = client.post(
+            "/v1/agents/chat/invoke", json={"message": "bob 的会话"}, headers=bob
+        )
+        assert own.status_code == 200
+
+
 def test_export_markdown_and_json() -> None:
     with TestClient(create_app(runtime=_runtime())) as client:
         thread_id, human_id = _start_thread(client)
@@ -404,6 +433,10 @@ def test_append_turn_tail_is_idempotent_by_msg_id() -> None:
             HumanMessage(content="问", id="m1"),
             AIMessage(content="答", id="m2"),
         ]
+        # 生产时序：invoke 的 upsert 先建索引行，钩子回写时行必在。
+        await store.upsert_thread_index(
+            ThreadIndex(thread_id="t", user_id="u", module="chat")
+        )
         # 第一批（invoke 落 human 后的完整快照回写——含 human，按 id 跳过）。
         human_node = tree_mod.message_to_node(messages[0], thread_id="t", parent_id=None)
         assert human_node is not None
@@ -442,6 +475,9 @@ def test_append_turn_tail_without_anchor_on_nonempty_tree_bails_out() -> None:
 
     async def _flow() -> None:
         store = CoreMemoryStore()
+        await store.upsert_thread_index(
+            ThreadIndex(thread_id="t", user_id="u", module="chat")
+        )
         root = tree_mod.message_to_node(
             HumanMessage(content="已有", id="m-root"), thread_id="t", parent_id=None
         )

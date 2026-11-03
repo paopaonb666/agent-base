@@ -151,6 +151,7 @@ def _build_capture_hook(
     tree_store: Any = None,
     full_thread_id: str = "",
     turn_node_id: str | None = None,
+    redis: Any = None,
 ) -> Coroutine[Any, Any, None] | None:
     """构造轮次完成后的回调（M6c + ADR-013）；两条管线都不可用时 None。
 
@@ -158,7 +159,10 @@ def _build_capture_hook(
 
     - **树回写**（tree_store 在场时）：从 checkpointer 快照取本轮完整
       消息，按消息 id 把新增的 AI/tool 消息追加回消息树（幂等——审批
-      恢复轮与中断轮的重叠自动跳过），指针推进到本轮真实叶子；
+      恢复轮与中断轮的重叠自动跳过），指针推进到本轮真实叶子。回写是
+      **树写操作，必须在会话树写锁内执行**——否则与并发的 invoke 落
+      节点/维护操作在 ``next_node_seq`` 上竞态，seq 重复会打乱树结构；
+      锁等待超时被内层兜底捕获，本轮回写自弃、下轮物化自愈；
     - **记忆形成**（管线可用时）：同一次快照交给 ``capture_turn``，
       树模式下摘要键控到本轮叶子节点、先近后远地继承祖先摘要。
 
@@ -184,18 +188,24 @@ def _build_capture_hook(
             covered: int | None = None
             if tree_store is not None:
                 from agent_base.core.storage import tree as tree_mod
+                from agent_base.core.storage.tree import TreeBusyError
 
-                leaf_node_id = await tree_mod.append_turn_tail(
-                    tree_store, full_thread_id, messages, after_node_id=turn_node_id
-                )
-                if leaf_node_id is not None:
-                    context = await tree_mod.tree_turn_context(
-                        tree_store, full_thread_id, leaf_node_id
-                    )
-                    prior_nodes = list(context.get("ancestors") or [])
-                    covered = len(
-                        [m for m in messages if not is_injected_system(m)]
-                    )
+                try:
+                    async with tree_mod.tree_write_lock(redis, full_thread_id):
+                        leaf_node_id = await tree_mod.append_turn_tail(
+                            tree_store, full_thread_id, messages, after_node_id=turn_node_id
+                        )
+                        if leaf_node_id is not None:
+                            context = await tree_mod.tree_turn_context(
+                                tree_store, full_thread_id, leaf_node_id
+                            )
+                            prior_nodes = list(context.get("ancestors") or [])
+                            covered = len(
+                                [m for m in messages if not is_injected_system(m)]
+                            )
+                except TreeBusyError:
+                    logger.warning("tree: 会话树写锁等待超时，本轮回写自弃（下轮物化自愈）")
+                    leaf_node_id = turn_node_id
             if memory is not None and memory_ready:
                 await memory.capture_turn(
                     user_id=user_id,

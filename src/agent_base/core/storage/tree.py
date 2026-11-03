@@ -57,7 +57,16 @@ class TreeBusyError(RuntimeError):
     """会话树写锁等待超时（另一写方持锁）；调用方映射为 503。"""
 
 
-_process_locks: dict[str, asyncio.Lock] = {}
+_process_locks: dict[tuple[int, str], asyncio.Lock] = {}
+
+
+def _process_lock_for(full_thread_id: str) -> asyncio.Lock:
+    """进程内锁按事件循环隔离：asyncio.Lock 绑定创建它的循环，跨循环
+    复用会抛 "bound to a different event loop"（同进程多循环的测试/
+    嵌入场景会踩到）。生产 uvicorn 是单循环——键里带上循环 id 后行为
+    不变；残留的旧循环锁对象随字典驻留（与原实现同量级，可接受）。"""
+    loop_key = id(asyncio.get_running_loop())
+    return _process_locks.setdefault((loop_key, full_thread_id), asyncio.Lock())
 
 
 @asynccontextmanager
@@ -68,7 +77,7 @@ async def tree_write_lock(redis: Any, full_thread_id: str) -> AsyncIterator[None
         # 进程内兜底：每个 thread 一把锁，随进程生命周期驻留（Lock 对象
         # 极小，且仅在 REDIS_ENABLED=false 的本地开发/测试路径启用）——
         # 不能事后从 dict 摘除：并发等待者可能仍持有该对象引用。
-        lock = _process_locks.setdefault(full_thread_id, asyncio.Lock())
+        lock = _process_lock_for(full_thread_id)
         async with lock:
             yield
         return
@@ -447,6 +456,13 @@ async def append_turn_tail(
     """
     plain = plain_view(list(messages))
     if store is None:
+        return None
+    # 会话已删除（索引行消亡）则不再回写：删除与会话树写锁之间没有
+    # 全局串行——不设这道闸，钩子会在删除完成后把节点追加回已销毁的
+    # 会话，留下孤儿行。
+    index_entry = await store.get_thread_index(full_thread_id)
+    if index_entry is None:
+        logger.info("tree: 会话 %s 已删除，跳过尾部回写", full_thread_id)
         return None
     nodes = await store.list_nodes(full_thread_id)
     by_msg_id = {node.msg_id: node for node in nodes if node.msg_id}

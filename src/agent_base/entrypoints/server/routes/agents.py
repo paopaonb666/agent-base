@@ -156,6 +156,7 @@ async def resume_thread(
         tree_store=rt.thread_index,
         full_thread_id=full_thread_id,
         turn_node_id=turn_node_id,
+        redis=rt.redis,
     )
     return StreamingResponse(
         _event_stream(
@@ -366,6 +367,14 @@ async def invoke(module: str, body: InvokeRequest, request: Request) -> Streamin
     if not human_message.id:
         human_message.id = tree_mod.new_node_id()
     if store is not None:
+        # 越权防护（S1 对齐）：invoke 是唯一带写语义的会话端点——不校验
+        # 属主的话，知道他人 thread_id 即可向其消息树落节点、推进活跃
+        # 指针、物化覆盖执行缓存。策略是"存在即校验"：索引无行 = 新线程
+        # （放行，由下方 upsert 建立属主记录），有行则属主必须匹配（404
+        # 掩蔽，与其余线程端点同一语义）。
+        existing_entry = await store.get_thread_index(full_thread_id)
+        if existing_entry is not None and existing_entry.user_id != user_id:
+            raise HTTPException(status_code=404, detail=f"线程不存在：{user_thread_id}")
         # 树写临界区（ADR-013）：落 human 节点 + 推指针。Redis 在场用
         # 分布式锁，缺席退化进程内锁（本地开发 / 测试语义）。
         try:
@@ -436,9 +445,13 @@ async def invoke(module: str, body: InvokeRequest, request: Request) -> Streamin
             if block:
                 messages_input.insert(-1, SystemMessage(content=block))
     # 会话索引 upsert（S1）：属主/模块/标题（首条用户消息前 60 字符）。
+    # existing 已在树块的属主校验处查过（两者之间没有其他写入方），复用。
     if rt.thread_index is not None:
         now = time.time()
-        existing = await rt.thread_index.get_thread_index(full_thread_id)
+        if store is not None:
+            existing = existing_entry
+        else:
+            existing = await rt.thread_index.get_thread_index(full_thread_id)
         if existing is None:
             entry = ThreadIndex(
                 thread_id=full_thread_id,
@@ -462,6 +475,7 @@ async def invoke(module: str, body: InvokeRequest, request: Request) -> Streamin
         tree_store=rt.thread_index,
         full_thread_id=full_thread_id,
         turn_node_id=turn_node_id,
+        redis=rt.redis,
     )
     return StreamingResponse(
         _event_stream(
