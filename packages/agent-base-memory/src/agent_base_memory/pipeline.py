@@ -24,6 +24,7 @@ import json
 import logging
 import re
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -339,10 +340,54 @@ class MemoryPipeline:
 
     # -- 滚动摘要 ----------------------------------------------------------------
     async def update_summary(
-        self, user_id: str, agent_id: str, thread_id: str, transcript: str
+        self,
+        user_id: str,
+        agent_id: str,
+        thread_id: str,
+        transcript: str,
+        *,
+        summary_node: str | None = None,
+        prior_summary_nodes: Sequence[str] = (),
+        covered_message_count: int | None = None,
     ) -> bool:
-        """把既有摘要与最新对话合并为新的滚动摘要。"""
-        prior_summary = await self._service.store.get_summary(user_id, thread_id)
+        """把既有摘要与最新对话合并为新的滚动摘要。
+
+        树模式（ADR-013）：``summary_node`` 在位时摘要键控到该节点——
+        prior 取祖先链上**最近的节点摘要**（分支共享祖先、独立续写）；
+        线程口径（session_summaries）仅作为新分岔无祖先摘要时的内容回退，
+        写入仍落节点。非树模式与历史行为完全一致。
+        """
+        store = self._service.store
+        if summary_node:
+            prior_text = ""
+            for node_id in prior_summary_nodes:
+                prior = await store.get_node_summary(user_id, node_id)
+                if prior is not None:
+                    prior_text = prior.summary
+                    break
+            else:
+                thread_fallback = await store.get_summary(user_id, thread_id)
+                prior_text = thread_fallback.summary if thread_fallback else ""
+            raw = await self._complete(
+                SUMMARY_PROMPT.format(prior=prior_text or "（空）", transcript=transcript),
+                profile=self._bulk_profile,
+            )
+            text = raw.strip()
+            if not text:
+                return False
+            from agent_base_memory.store import NodeSummary
+
+            await store.upsert_node_summary(
+                NodeSummary(
+                    user_id=user_id,
+                    node_id=summary_node,
+                    agent_id=agent_id,
+                    summary=text[:1000],
+                    covered_message_count=covered_message_count or 0,
+                )
+            )
+            return True
+        prior_summary = await store.get_summary(user_id, thread_id)
         raw = await self._complete(
             SUMMARY_PROMPT.format(
                 prior=prior_summary.summary if prior_summary else "（空）",
@@ -355,7 +400,7 @@ class MemoryPipeline:
             return False
         from agent_base_memory.store import SessionSummary
 
-        await self._service.store.upsert_summary(
+        await store.upsert_summary(
             SessionSummary(
                 user_id=user_id,
                 thread_id=thread_id,
@@ -376,6 +421,9 @@ class MemoryPipeline:
         transcript: str,
         human_count: int,
         force: bool = False,
+        summary_node: str | None = None,
+        prior_summary_nodes: Sequence[str] = (),
+        covered_message_count: int | None = None,
     ) -> dict[str, Any]:
         """一轮对话结束后的完整形成流程；每步独立审计、失败安全。
 
@@ -457,7 +505,16 @@ class MemoryPipeline:
             and human_count >= self._settings.memory.summary_trigger_messages
         ):
             summary_updated = await _run(
-                "summary", self.update_summary(user_id, agent_id, thread_id, transcript)
+                "summary",
+                self.update_summary(
+                    user_id,
+                    agent_id,
+                    thread_id,
+                    transcript,
+                    summary_node=summary_node,
+                    prior_summary_nodes=prior_summary_nodes,
+                    covered_message_count=covered_message_count,
+                ),
             )
             detail["summary_updated"] = bool(summary_updated)
         return detail

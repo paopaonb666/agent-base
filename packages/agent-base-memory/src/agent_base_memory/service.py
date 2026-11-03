@@ -575,11 +575,15 @@ class MemoryService:
         thread_id: str,
         messages: list[Any],
         force: bool = False,
+        summary_node: str | None = None,
+        prior_summary_nodes: Sequence[str] = (),
+        covered_message_count: int | None = None,
     ) -> dict[str, Any] | None:
         """一轮对话结束后的记忆形成（后台调用；绝不抛异常）。
 
         ``messages`` 是该线程的全部持久化消息（来自 checkpointer 快照）；
         ``force=True`` 旁路 ``MEMORY_CAPTURE_ENABLED`` 门控（夜间批脚本）。
+        树模式的摘要键控参数（ADR-013）见 orchestrator.capture_turn。
         """
         return await self.orchestrator.capture_turn(
             user_id=user_id,
@@ -587,19 +591,33 @@ class MemoryService:
             thread_id=thread_id,
             messages=messages,
             force=force,
+            summary_node=summary_node,
+            prior_summary_nodes=prior_summary_nodes,
+            covered_message_count=covered_message_count,
         )
 
     async def compose_context(
-        self, *, user_id: str, agent_id: str, thread_id: str, query: str
+        self,
+        *,
+        user_id: str,
+        agent_id: str,
+        thread_id: str,
+        query: str,
+        summary_nodes: Sequence[str] = (),
     ) -> str | None:
         """线程级**冻结**注入段（M6d + T2.1）：画像 + 记忆块 + 会话摘要。
 
-        同线程返回逐字节相同的缓存内容（供应商前缀缓存的地基）；逐轮
-        变化的查询相关召回走 ``recall_context``。任何一步失败都降级为
-        "缺那一节"；整体无内容时返回 None。
+        同线程同分支返回逐字节相同的缓存内容（供应商前缀缓存的地基）；
+        逐轮变化的查询相关召回走 ``recall_context``。任何一步失败都降级
+        为"缺那一节"；整体无内容时返回 None。``summary_nodes``（ADR-013）
+        是先近后远的祖先节点候选——取最近一个有摘要的祖先。
         """
         return await self.orchestrator.compose_context(
-            user_id=user_id, agent_id=agent_id, thread_id=thread_id, query=query
+            user_id=user_id,
+            agent_id=agent_id,
+            thread_id=thread_id,
+            query=query,
+            summary_nodes=summary_nodes,
         )
 
     async def recall_context(self, *, user_id: str, query: str) -> str | None:
@@ -609,6 +627,10 @@ class MemoryService:
     async def purge_thread(self, thread_id: str) -> None:
         """线程删除的级联清理（滚动摘要 + 知识库分块 + 注入快照；跨会话记忆保留）。"""
         await self.orchestrator.purge_thread(thread_id)
+
+    async def purge_nodes(self, node_ids: Sequence[str]) -> int:
+        """会话消息树删除的摘要级联（ADR-013）：按节点 id 清 node_summaries。"""
+        return await self.orchestrator.purge_nodes(node_ids)
 
     async def aclose(self) -> None:
         closer = getattr(self.store, "aclose", None)

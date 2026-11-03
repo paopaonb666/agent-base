@@ -12,7 +12,7 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
-from agent_base.core.storage.models import ThreadIndex
+from agent_base.core.storage.models import MessageNode, ThreadIndex
 
 
 class _CoreSqlStoreBase:
@@ -155,3 +155,155 @@ class _CoreSqlStoreBase:
 
     async def delete_plan(self, thread_id: str) -> None:
         await self._execute("DELETE FROM plan_snapshots WHERE thread_id = ?", (thread_id,))
+
+    # -- 消息树（message_nodes；ADR-013） ----------------------------------------
+    # append-only + 软删除；树形导航/子树计算在 tree.py 的纯函数里做，
+    # 存储层只提供按 seq 排序的行集与逐行写。
+    _NODE_COLUMNS = (
+        "node_id, seq, thread_id, parent_id, msg_id, role, content, content_json, "
+        "tool_calls_json, tool_call_id, name, status, attachments_json, "
+        "label, starred, archived, created_at, deleted_at"
+    )
+
+    def _node_from_row(self, row: tuple[Any, ...]) -> MessageNode:
+        return MessageNode(
+            node_id=row[0],
+            seq=int(row[1] or 0),
+            thread_id=row[2],
+            parent_id=row[3],
+            msg_id=row[4] or "",
+            role=row[5],
+            content=row[6] or "",
+            content_json=int(row[7] or 0),
+            tool_calls_json=row[8] or "[]",
+            tool_call_id=row[9] or "",
+            name=row[10] or "",
+            status=row[11] or "",
+            attachments_json=row[12] or "[]",
+            label=row[13] or "",
+            starred=bool(row[14]),
+            archived=bool(row[15]),
+            created_at=self._from_sql_ts(row[16]),
+            deleted_at=self._from_sql_ts(row[17]) if row[17] is not None else None,
+        )
+
+    async def next_node_seq(self, thread_id: str) -> int:
+        """线程内的下一个节点序号（树锁内调用，天然无竞态）。"""
+        rows = await self._fetch_all(
+            "SELECT COALESCE(MAX(seq), 0) FROM message_nodes WHERE thread_id = ?",
+            (thread_id,),
+        )
+        return int(rows[0][0] or 0) + 1
+
+    async def append_node(self, node: MessageNode) -> None:
+        seq = node.seq or await self.next_node_seq(node.thread_id)
+        await self._execute(
+            f"INSERT INTO message_nodes ({self._NODE_COLUMNS})"
+            f" VALUES ({', '.join('?' for _ in range(18))})",
+            (
+                node.node_id,
+                seq,
+                node.thread_id,
+                node.parent_id,
+                node.msg_id,
+                node.role,
+                node.content,
+                node.content_json,
+                node.tool_calls_json,
+                node.tool_call_id,
+                node.name,
+                node.status,
+                node.attachments_json,
+                node.label,
+                int(node.starred),
+                int(node.archived),
+                self._to_sql_ts(node.created_at),
+                self._to_sql_ts(node.deleted_at) if node.deleted_at is not None else None,
+            ),
+        )
+
+    async def get_node(self, thread_id: str, node_id: str) -> MessageNode | None:
+        rows = await self._fetch_all(
+            f"SELECT {self._NODE_COLUMNS} FROM message_nodes"
+            " WHERE thread_id = ? AND node_id = ?",
+            (thread_id, node_id),
+        )
+        return self._node_from_row(rows[0]) if rows else None
+
+    async def list_nodes(
+        self, thread_id: str, *, include_deleted: bool = False
+    ) -> list[MessageNode]:
+        sql = f"SELECT {self._NODE_COLUMNS} FROM message_nodes WHERE thread_id = ?"
+        if not include_deleted:
+            sql += " AND deleted_at IS NULL"
+        sql += " ORDER BY seq"
+        rows = await self._fetch_all(sql, (thread_id,))
+        return [self._node_from_row(row) for row in rows]
+
+    async def update_node_meta(
+        self,
+        thread_id: str,
+        node_id: str,
+        *,
+        label: str | None = None,
+        starred: bool | None = None,
+        archived: bool | None = None,
+    ) -> bool:
+        """按需更新维护元数据；None 的字段不动。返回是否存在该节点。"""
+        sets: list[str] = []
+        params: list[Any] = []
+        if label is not None:
+            sets.append("label = ?")
+            params.append(label[:120])
+        if starred is not None:
+            sets.append("starred = ?")
+            params.append(int(starred))
+        if archived is not None:
+            sets.append("archived = ?")
+            params.append(int(archived))
+        if not sets:
+            return await self.get_node(thread_id, node_id) is not None
+        params.extend((thread_id, node_id))
+        rowcount = await self._execute(
+            f"UPDATE message_nodes SET {', '.join(sets)}"
+            " WHERE thread_id = ? AND node_id = ?",
+            tuple(params),
+        )
+        return rowcount > 0
+
+    async def set_nodes_deleted(
+        self, thread_id: str, node_ids: Sequence[str], *, deleted: bool
+    ) -> int:
+        """子树软删 / 恢复：deleted=True 打标，False 清标（恢复）。"""
+        if not node_ids:
+            return 0
+        marks = ", ".join("?" for _ in node_ids)
+        value = self._to_sql_ts(time.time()) if deleted else None
+        return await self._execute(
+            f"UPDATE message_nodes SET deleted_at = ?"
+            f" WHERE thread_id = ? AND node_id IN ({marks})",
+            (value, thread_id, *node_ids),
+        )
+
+    async def set_current_node(self, thread_id: str, node_id: str | None) -> bool:
+        """更新会话的活跃叶子指针（tree_pointers 表）；树写操作在锁内
+        调用。返回是否写入了指针行。"""
+        if node_id is None:
+            await self._execute("DELETE FROM tree_pointers WHERE thread_id = ?", (thread_id,))
+            return True
+        await self._execute(
+            self._replace_into("tree_pointers", ("thread_id", "current_node_id", "updated_at")),
+            (thread_id, node_id, self._to_sql_ts(time.time())),
+        )
+        return True
+
+    async def get_current_node(self, thread_id: str) -> str | None:
+        rows = await self._fetch_all(
+            "SELECT current_node_id FROM tree_pointers WHERE thread_id = ?",
+            (thread_id,),
+        )
+        return str(rows[0][0]) if rows else None
+
+    async def delete_nodes_for_thread(self, thread_id: str) -> None:
+        await self._execute("DELETE FROM message_nodes WHERE thread_id = ?", (thread_id,))
+        await self._execute("DELETE FROM tree_pointers WHERE thread_id = ?", (thread_id,))

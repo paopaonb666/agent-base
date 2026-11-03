@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Callable, Coroutine
+from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -125,11 +125,19 @@ class RedisCaptureLocks:
 
 
 class SnapshotCache(Protocol):
-    """线程级冻结注入段缓存（进程内 LRU 或 Redis 共享，ADR-012）。"""
+    """线程级冻结注入段缓存（进程内 LRU 或 Redis 共享，ADR-012）。
 
-    async def get(self, key: tuple[str, str, str]) -> str | None: ...
+    键 (user_id, agent_id, thread_id, summary_node)：第 4 位是冻结段实际
+    命中的**摘要节点 id**（树模式，ADR-013）或空串（线程口径）——同一
+    分支的摘要节点不变 → 缓存持续命中；切分支 / 摘要推进到新叶子 →
+    新键重建。
+    """
 
-    async def put(self, key: tuple[str, str, str], value: str, *, max_entries: int) -> None: ...
+    async def get(self, key: tuple[str, str, str, str]) -> str | None: ...
+
+    async def put(
+        self, key: tuple[str, str, str, str], value: str, *, max_entries: int
+    ) -> None: ...
 
     async def purge_thread(self, thread_id: str) -> int: ...
 
@@ -137,20 +145,20 @@ class SnapshotCache(Protocol):
 class ContextSnapshotCache:
     """线程级冻结注入段的 LRU 缓存（成本治理 T2.1；进程内实现）。
 
-    键 (user_id, agent_id, thread_id)。单进程口径（与 /metrics 同款
-    局限）；多 worker 共享见 ``RedisSnapshotCache``。
+    键 (user_id, agent_id, thread_id, summary_node)。单进程口径（与
+    /metrics 同款局限）；多 worker 共享见 ``RedisSnapshotCache``。
     """
 
     def __init__(self) -> None:
-        self._entries: OrderedDict[tuple[str, str, str], str] = OrderedDict()
+        self._entries: OrderedDict[tuple[str, str, str, str], str] = OrderedDict()
 
-    async def get(self, key: tuple[str, str, str]) -> str | None:
+    async def get(self, key: tuple[str, str, str, str]) -> str | None:
         cached = self._entries.get(key)
         if cached is not None:
             self._entries.move_to_end(key)
         return cached
 
-    async def put(self, key: tuple[str, str, str], value: str, *, max_entries: int) -> None:
+    async def put(self, key: tuple[str, str, str, str], value: str, *, max_entries: int) -> None:
         self._entries[key] = value
         while len(self._entries) > max_entries:
             self._entries.popitem(last=False)
@@ -178,18 +186,22 @@ class RedisSnapshotCache:
         self._ttl_seconds = ttl_seconds
 
     @staticmethod
-    def _key(key: tuple[str, str, str]) -> str:
-        user_id, agent_id, thread_id = key
-        return f"snap:{thread_id}/{user_id}/{agent_id}"
+    def _key(key: tuple[str, str, str, str]) -> str:
+        # 线程口径（summary_node 为空）保持历史键格式不变（存量部署兼容）；
+        # 树模式（ADR-013）追加命中的摘要节点段，切分支自然换键。
+        user_id, agent_id, thread_id = key[0], key[1], key[2]
+        summary_node = key[3] if len(key) > 3 else ""
+        base = f"snap:{thread_id}/{user_id}/{agent_id}"
+        return f"{base}/{summary_node}" if summary_node else base
 
-    async def get(self, key: tuple[str, str, str]) -> str | None:
+    async def get(self, key: tuple[str, str, str, str]) -> str | None:
         try:
             return await self._redis.get(self._key(key))
         except Exception:
             logger.warning("memory: 快照缓存读取失败（按未命中处理）", exc_info=True)
             return None
 
-    async def put(self, key: tuple[str, str, str], value: str, *, max_entries: int) -> None:
+    async def put(self, key: tuple[str, str, str, str], value: str, *, max_entries: int) -> None:
         try:
             await self._redis.set_ex(self._key(key), value, ttl_seconds=self._ttl_seconds)
         except Exception:
@@ -234,12 +246,19 @@ class MemoryOrchestrator:
         thread_id: str,
         messages: list[Any],
         force: bool = False,
+        summary_node: str | None = None,
+        prior_summary_nodes: Sequence[str] = (),
+        covered_message_count: int | None = None,
     ) -> dict[str, Any] | None:
         """一轮对话结束后的记忆形成（后台调用；绝不抛异常）。
 
         ``messages`` 是该线程的全部持久化消息（来自 checkpointer 快照）：
         转写渲染、轮次计数与触发阈值都在这里统一处理。``force=True``
         旁路 ``MEMORY_CAPTURE_ENABLED`` 门控（夜间批脚本 T3.2）。
+
+        树模式（ADR-013）：``summary_node`` 是本轮叶子节点——摘要键控到
+        它；``prior_summary_nodes`` 是先近后远的祖先链（继承最近的祖先
+        摘要继续滚动）；``covered_message_count`` 是路径消息数。
         """
         pipeline = self._pipeline()
         if pipeline is None:
@@ -272,6 +291,9 @@ class MemoryOrchestrator:
                     transcript=transcript,
                     human_count=human_count,
                     force=force,
+                    summary_node=summary_node,
+                    prior_summary_nodes=prior_summary_nodes,
+                    covered_message_count=covered_message_count,
                 )
             except Exception:
                 # 管线内部已逐步失败安全；这里兜底防任何漏网异常干扰调用方。
@@ -279,34 +301,56 @@ class MemoryOrchestrator:
                 return None
 
     async def compose_context(
-        self, *, user_id: str, agent_id: str, thread_id: str, query: str
+        self,
+        *,
+        user_id: str,
+        agent_id: str,
+        thread_id: str,
+        query: str,
+        summary_nodes: Sequence[str] = (),
     ) -> str | None:
         """线程级**冻结**注入段（M6d + T2.1）：画像 + 记忆块 + 会话摘要。
 
         快照在线程首轮定型并缓存（LRU 上限 ``context_snapshot_max``）：
-        同线程后续调用返回逐字节相同的内容，即使画像/记忆块/摘要中途
+        同线程同分支返回逐字节相同的内容，即使画像/记忆块/摘要中途
         已更新——供应商前缀缓存按最长公共前缀命中，冻结头部是输入缓存
         的地基；数据变更在**下个会话**进入注入（接受的行为权衡，见
         ``compose_frozen_context``）。``purge_thread`` 会级联清理。
 
-        逐轮变化的查询相关召回走 ``recall_context``（贴尾注入）。
-        任何一步失败都降级为"缺那一节"；整体无内容时返回 None。
+        树模式（ADR-013）：``summary_nodes`` 是先近后远的祖先节点 id 候
+        选——取**最近一个有摘要的祖先**（分支共享祖先摘要、独立续写）；
+        缓存键带命中的摘要节点，同分支持续命中，切分支自动重建。候选
+        为空（非树模式）走线程口径 ``session_summaries``。逐轮变化的查
+        询相关召回走 ``recall_context``（贴尾注入）。任何一步失败都降级
+        为"缺那一节"；整体无内容时返回 None。
         """
-        key = (user_id, agent_id, thread_id)
-        cached = await self._snapshots.get(key)
-        if cached is not None:
-            return cached
+        candidates = [node_id for node_id in summary_nodes if node_id]
         try:
+            # 先近后远找最近的祖先摘要；候选为空或全部未命中时回退线程
+            # 口径（非树模式的原路径 / 新分岔的树干内容回退）。
+            summary_text: str | None = None
+            hit_node = ""
+            for node_id in candidates:
+                record = await self._store.get_node_summary(user_id, node_id)
+                if record is not None:
+                    summary_text, hit_node = record.summary, node_id
+                    break
+            key = (user_id, agent_id, thread_id, hit_node)
+            cached = await self._snapshots.get(key)
+            if cached is not None:
+                return cached
+            if summary_text is None:
+                thread_record = await self._store.get_summary(user_id, thread_id)
+                summary_text = thread_record.summary if thread_record else None
             global_blocks = await self._store.list_blocks(user_id, "*")
             agent_blocks = await self._store.list_blocks(user_id, agent_id)
             profile = (
                 await self._profile.get_profile(user_id) if self._settings.profile_enabled else None
             )
-            summary_record = await self._store.get_summary(user_id, thread_id)
             frozen = compose_frozen_context(
                 profile=profile,
                 blocks=[*global_blocks, *agent_blocks],
-                summary=summary_record.summary if summary_record else None,
+                summary=summary_text,
                 max_chars=self._settings.context_max_chars,
             )
         except Exception:
@@ -337,3 +381,16 @@ class MemoryOrchestrator:
         """线程删除的级联清理（滚动摘要 + 知识库分块 + 注入快照；跨会话记忆保留）。"""
         await self._store.delete_for_thread(thread_id)
         await self._snapshots.purge_thread(thread_id)
+
+    async def purge_nodes(self, node_ids: Sequence[str]) -> int:
+        """会话消息树删除的摘要级联（ADR-013）：按节点 id 清 node_summaries。
+
+        返回清理的摘要条数；失败安全（树已删，遗留摘要只是孤儿行）。
+        """
+        if not node_ids:
+            return 0
+        try:
+            return await self._store.purge_nodes(list(node_ids))
+        except Exception:
+            logger.warning("memory: 节点摘要清理失败（遗留孤儿行）", exc_info=True)
+            return 0

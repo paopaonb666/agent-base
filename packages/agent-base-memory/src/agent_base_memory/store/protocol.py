@@ -20,6 +20,7 @@ from agent_base_memory.store.models import (
     MemoryOp,
     MemoryRecord,
     MemoryVersion,
+    NodeSummary,
     SessionSummary,
 )
 
@@ -68,11 +69,18 @@ class BlockRepo(Protocol):
 
 @runtime_checkable
 class SummaryRepo(Protocol):
-    """线程滚动摘要（session_summaries 表）。"""
+    """滚动摘要：线程口径（session_summaries）与树节点口径
+    （node_summaries，ADR-013）双表。"""
 
     async def get_summary(self, user_id: str, thread_id: str) -> SessionSummary | None: ...
 
     async def upsert_summary(self, summary: SessionSummary) -> None: ...
+
+    async def get_node_summary(self, user_id: str, node_id: str) -> NodeSummary | None: ...
+
+    async def upsert_node_summary(self, summary: NodeSummary) -> None: ...
+
+    async def purge_nodes(self, node_ids: Sequence[str]) -> int: ...
 
 
 @runtime_checkable

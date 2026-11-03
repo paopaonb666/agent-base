@@ -75,3 +75,7 @@ gui-test-screenshots/
 # OS
 .DS_Store
 Thumbs.db
+
+# 本地工具产物（安全扫描 hook 状态 / 文档抓取草稿）
+.mimosa/
+.qqdoc_extract/

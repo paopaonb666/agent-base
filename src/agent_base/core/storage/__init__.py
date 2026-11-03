@@ -12,9 +12,14 @@ import logging
 from typing import TYPE_CHECKING
 
 from agent_base.core.storage.memory_backend import CoreMemoryStore
-from agent_base.core.storage.models import ThreadIndex
+from agent_base.core.storage.models import MessageNode, ThreadIndex
 from agent_base.core.storage.mysql_backend import CoreMysqlStore
-from agent_base.core.storage.protocol import CoreStore, PlanRepo, ThreadIndexRepo
+from agent_base.core.storage.protocol import (
+    CoreStore,
+    MessageNodeRepo,
+    PlanRepo,
+    ThreadIndexRepo,
+)
 from agent_base.core.storage.sqlite_backend import CoreSqliteStore
 
 if TYPE_CHECKING:  # pragma: no cover - import avoided at runtime
@@ -41,6 +46,8 @@ __all__ = [
     "CoreMysqlStore",
     "CoreSqliteStore",
     "CoreStore",
+    "MessageNode",
+    "MessageNodeRepo",
     "PlanRepo",
     "ThreadIndex",
     "ThreadIndexRepo",

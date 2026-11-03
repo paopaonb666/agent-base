@@ -16,6 +16,7 @@ from agent_base_memory.store.models import (
     MemoryRecord,
     MemoryStoreError,
     MemoryVersion,
+    NodeSummary,
     SessionSummary,
 )
 
@@ -27,6 +28,7 @@ class MemoryMemoryStore:
         self._memories: dict[str, MemoryRecord] = {}
         self._blocks: dict[tuple[str, str, str], MemoryBlock] = {}
         self._summaries: dict[tuple[str, str], SessionSummary] = {}
+        self._node_summaries: dict[tuple[str, str], NodeSummary] = {}
         self._chunks: dict[str, DocChunk] = {}
         # (op, 插入序号) 二元组：同秒并列时按插入顺序稳定排序。
         self._ops: list[tuple[MemoryOp, int]] = []
@@ -129,6 +131,20 @@ class MemoryMemoryStore:
 
     async def upsert_summary(self, summary: SessionSummary) -> None:
         self._summaries[(summary.user_id, summary.thread_id)] = summary
+
+    async def get_node_summary(self, user_id: str, node_id: str) -> NodeSummary | None:
+        return self._node_summaries.get((user_id, node_id))
+
+    async def upsert_node_summary(self, summary: NodeSummary) -> None:
+        self._node_summaries[(summary.user_id, summary.node_id)] = summary
+
+    async def purge_nodes(self, node_ids: Sequence[str]) -> int:
+        removed = 0
+        for node_id in node_ids:
+            for key in [k for k in self._node_summaries if k[1] == node_id]:
+                del self._node_summaries[key]
+                removed += 1
+        return removed
 
     async def put_chunks(self, chunks: Sequence[DocChunk]) -> None:
         for chunk in chunks:

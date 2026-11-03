@@ -126,6 +126,23 @@ class SessionSummary:
 
 
 @dataclass(frozen=True)
+class NodeSummary:
+    """会话消息树一个叶子节点的滚动摘要（ADR-013）。
+
+    摘要按**节点** memoize："root → 该节点的路径摘要"。分支共享祖先
+    节点的摘要（写一次，兄弟分支直接继承），各自分岔后独立续写——
+    这是 SillyTavern 摘要跨分支错乱（issue #3945）的反面设计。
+    """
+
+    user_id: str
+    node_id: str
+    summary: str
+    agent_id: str = ""
+    covered_message_count: int = 0
+    updated_at: float = field(default_factory=time.time)
+
+
+@dataclass(frozen=True)
 class DocChunk:
     """文档知识库的一个分块（上传文件的文本切片 + 可选 embedding）。
 

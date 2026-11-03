@@ -1,10 +1,10 @@
-"""基座存储协议：线程索引与计划快照（与记忆子系统无关）。"""
+"""基座存储协议：线程索引、计划快照与会话消息树（与记忆子系统无关）。"""
 
 from __future__ import annotations
 
 from typing import Any, Protocol, runtime_checkable
 
-from agent_base.core.storage.models import ThreadIndex
+from agent_base.core.storage.models import MessageNode, ThreadIndex
 
 
 @runtime_checkable
@@ -52,7 +52,47 @@ class PlanRepo(Protocol):
     async def delete_plan(self, thread_id: str) -> None: ...
 
 
-class CoreStore(ThreadIndexRepo, PlanRepo, Protocol):
+@runtime_checkable
+class MessageNodeRepo(Protocol):
+    """会话消息树（message_nodes + tree_pointers 表，ADR-013 的数据面）。
+
+    树的写路径（append / 维护操作）都在会话锁内执行；导航与子树计算
+    是 ``tree.py`` 的纯函数，存储层只提供行集读写。``deleted_at`` 软删：
+    前端的"已删除"分组从这里恢复。
+    """
+
+    async def next_node_seq(self, thread_id: str) -> int: ...
+
+    async def append_node(self, node: MessageNode) -> None: ...
+
+    async def get_node(self, thread_id: str, node_id: str) -> MessageNode | None: ...
+
+    async def list_nodes(
+        self, thread_id: str, *, include_deleted: bool = False
+    ) -> list[MessageNode]: ...
+
+    async def update_node_meta(
+        self,
+        thread_id: str,
+        node_id: str,
+        *,
+        label: str | None = None,
+        starred: bool | None = None,
+        archived: bool | None = None,
+    ) -> bool: ...
+
+    async def set_nodes_deleted(
+        self, thread_id: str, node_ids: list[str], *, deleted: bool
+    ) -> int: ...
+
+    async def set_current_node(self, thread_id: str, node_id: str | None) -> bool: ...
+
+    async def get_current_node(self, thread_id: str) -> str | None: ...
+
+    async def delete_nodes_for_thread(self, thread_id: str) -> None: ...
+
+
+class CoreStore(ThreadIndexRepo, PlanRepo, MessageNodeRepo, Protocol):
     """基座存储：线程索引 + 计划快照，外加连接释放。"""
 
     async def aclose(self) -> None: ...

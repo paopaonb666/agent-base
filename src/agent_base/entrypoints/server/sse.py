@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 
+from agent_base.core.context import is_injected_system
 from agent_base.core.contracts import MemoryServicePort
 from agent_base.core.memory_scope import set_memory_scope
 from agent_base.core.threads import ThreadId
@@ -146,19 +147,28 @@ def _build_capture_hook(
     user_thread_id: str,
     graph: Any,
     config: RunnableConfig,
+    *,
+    tree_store: Any = None,
+    full_thread_id: str = "",
+    turn_node_id: str | None = None,
 ) -> Coroutine[Any, Any, None] | None:
-    """构造轮次完成后的记忆形成回调（M6c）；管线不可用时返回 None。
+    """构造轮次完成后的回调（M6c + ADR-013）；两条管线都不可用时 None。
 
-    回调从 checkpointer 快照取本轮完整消息（含工具轮次），交给
-    ``capture_turn``——形成管线内部失败安全，这里再兜一层异常。
-    user_id 取自 config（invoke 端点已从 X-User-Id 头写入 configurable）。
+    回调做两件事（都失败安全，互不影响）：
 
-    返回的是**已创建的协程对象**：仅当本轮正常完成时才由 ``_produce``
-    经 ``spawn_background`` 调度——流异常/客户端断开路径下它从未 await，
-    也不会产生 "coroutine was never awaited" 警告（H4）。
+    - **树回写**（tree_store 在场时）：从 checkpointer 快照取本轮完整
+      消息，按消息 id 把新增的 AI/tool 消息追加回消息树（幂等——审批
+      恢复轮与中断轮的重叠自动跳过），指针推进到本轮真实叶子；
+    - **记忆形成**（管线可用时）：同一次快照交给 ``capture_turn``，
+      树模式下摘要键控到本轮叶子节点、先近后远地继承祖先摘要。
+
+    返回的是**已创建的协程对象**：仅当本轮正常完成（含审批暂停）时才
+    由 ``_produce`` 经 ``spawn_background`` 调度——流异常/客户端断开
+    路径下它从未 await（H4）；此时树少一轮尾巴，下轮物化自愈。
     """
     memory = runtime_memory
-    if memory is None or not memory.capture_ready():
+    memory_ready = memory is not None and memory.capture_ready()
+    if not memory_ready and tree_store is None:
         return None
 
     async def _capture() -> None:
@@ -169,12 +179,33 @@ def _build_capture_hook(
                 return
             raw_user = (config.get("configurable") or {}).get("user_id")
             user_id = raw_user if isinstance(raw_user, str) and raw_user else "default"
-            await memory.capture_turn(
-                user_id=user_id,
-                agent_id=module,
-                thread_id=str(ThreadId(module=module, raw=user_thread_id)),
-                messages=messages,
-            )
+            leaf_node_id = turn_node_id
+            prior_nodes: list[str] = []
+            covered: int | None = None
+            if tree_store is not None:
+                from agent_base.core.storage import tree as tree_mod
+
+                leaf_node_id = await tree_mod.append_turn_tail(
+                    tree_store, full_thread_id, messages, after_node_id=turn_node_id
+                )
+                if leaf_node_id is not None:
+                    context = await tree_mod.tree_turn_context(
+                        tree_store, full_thread_id, leaf_node_id
+                    )
+                    prior_nodes = list(context.get("ancestors") or [])
+                    covered = len(
+                        [m for m in messages if not is_injected_system(m)]
+                    )
+            if memory is not None and memory_ready:
+                await memory.capture_turn(
+                    user_id=user_id,
+                    agent_id=module,
+                    thread_id=str(ThreadId(module=module, raw=user_thread_id)),
+                    messages=messages,
+                    summary_node=leaf_node_id,
+                    prior_summary_nodes=prior_nodes,
+                    covered_message_count=covered,
+                )
         except Exception:
             logger.warning("memory: 后台记忆形成失败（不影响对话）", exc_info=True)
 

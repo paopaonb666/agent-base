@@ -247,6 +247,9 @@ def create_app(
         return response
 
     app.include_router(agents_routes.router)
+    from agent_base.entrypoints.server.routes import tree as tree_routes
+
+    app.include_router(tree_routes.router)
     app.include_router(files_routes.router)
     app.include_router(system_routes.router)
     from agent_base.entrypoints.server.routes import triggers as triggers_routes

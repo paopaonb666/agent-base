@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-base"
-version = "0.4.0"
+version = "0.5.0"
 description = "Agent software foundation: LangGraph runtime + module registry + config + entrypoints; business capabilities plug in later as modules"
 readme = "README.md"
 license = { text = "Apache-2.0" }

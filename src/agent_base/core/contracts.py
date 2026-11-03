@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, runtime_checkable
 
@@ -46,7 +47,13 @@ class MemoryPort(Protocol):
     ) -> Any: ...
 
     async def compose_context(
-        self, *, user_id: str, agent_id: str, thread_id: str, query: str
+        self,
+        *,
+        user_id: str,
+        agent_id: str,
+        thread_id: str,
+        query: str,
+        summary_nodes: Sequence[str] = (),
     ) -> str | None: ...
 
     async def capture_turn(
@@ -57,6 +64,9 @@ class MemoryPort(Protocol):
         thread_id: str,
         messages: list[Any],
         force: bool = False,
+        summary_node: str | None = None,
+        prior_summary_nodes: Sequence[str] = (),
+        covered_message_count: int | None = None,
     ) -> Any: ...
 
     async def aclose(self) -> None: ...

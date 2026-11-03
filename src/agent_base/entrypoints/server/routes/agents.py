@@ -26,6 +26,8 @@ from pydantic import BaseModel, Field
 from agent_base.core.bootstrap import UnknownModuleError
 from agent_base.core.context import ATTACHMENT_CONTEXT_PREFIX
 from agent_base.core.storage import ThreadIndex
+from agent_base.core.storage import tree as tree_mod
+from agent_base.core.storage.tree import TreeBusyError, tree_write_lock
 from agent_base.core.threads import ThreadId
 from agent_base.entrypoints.server.deps import (
     get_current_user,
@@ -70,6 +72,12 @@ class InvokeRequest(BaseModel):
     thread_id: str | None = Field(
         default=None, max_length=128, pattern=r"^[\w.-]+$"
     )  # None -> 创建一个新 thread
+    # 消息树分岔（ADR-013）：新消息挂在哪个节点之下。缺省挂在当前活跃
+    # 叶子后（正常续聊）；指定某个历史节点即"从此分岔"。
+    parent_node_id: str | None = Field(default=None, max_length=32)
+    # 重新生成（ADR-013）：不追加新的 human 节点，在 parent_node_id（一
+    # 条既有 human 消息）之下重新跑一轮，产生新的 AI 兄弟分支。
+    regenerate: bool = False
     # 附件对话（M4b）：本条消息引用的上传文件 id（≤5 个），服务端把解析
     # 文本作为 SystemMessage 注入上下文——用户气泡保持干净。
     attachments: list[str] = Field(default_factory=list, max_length=5)
@@ -132,7 +140,20 @@ async def resume_thread(
         call_id: {"action": d.action, "args": d.args} for call_id, d in body.decisions.items()
     }
     memory = memory_or_none(rt)
-    on_complete = _build_capture_hook(memory, module, thread_id, graph, config)
+    # 树回写（ADR-013）：恢复轮的尾部挂在中断轮的 human 节点之下——
+    # 回写按消息 id 判重，中断时已落树的前缀自动跳过；锚点缺失（指针
+    # 漂移/树被并发改动）时回写自弃，下轮物化自愈。
+    turn_node_id = await _interrupt_turn_anchor(rt, full_thread_id)
+    on_complete = _build_capture_hook(
+        memory,
+        module,
+        thread_id,
+        graph,
+        config,
+        tree_store=rt.thread_index,
+        full_thread_id=full_thread_id,
+        turn_node_id=turn_node_id,
+    )
     return StreamingResponse(
         _event_stream(
             graph, Command(resume=resume_value), config, thread_id, on_complete, bus=rt.redis
@@ -140,6 +161,26 @@ async def resume_thread(
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
     )
+
+
+async def _interrupt_turn_anchor(rt: Any, full_thread_id: str) -> str | None:
+    """审批恢复轮的树回写锚点：指针节点向上最近的 human 节点（中断轮
+    的用户消息）。树不在位或路径断裂时返回 None（回写自弃）。"""
+    store = rt.thread_index
+    if store is None:
+        return None
+    nodes = await store.list_nodes(full_thread_id)
+    pointer = await store.get_current_node(full_thread_id)
+    if not pointer:
+        return nodes[-1].node_id if nodes and getattr(nodes[-1], "role", "") == "human" else None
+    try:
+        path = tree_mod.build_path(nodes, pointer)
+    except tree_mod.TreeError:
+        return None
+    for node in reversed(path):
+        if node.role == "human":
+            return node.node_id
+    return None
 
 
 def _graph_or_404(rt: Any, module: str) -> Any:
@@ -150,6 +191,35 @@ def _graph_or_404(rt: Any, module: str) -> Any:
     except UnknownModuleError as exc:
         detail = exc.args[0] if exc.args else "unknown module"
         raise HTTPException(status_code=404, detail=str(detail)) from exc
+
+
+async def _resolve_tree_parent(
+    store: Any,
+    full_thread_id: str,
+    nodes: list[Any],
+    parent_node_id: str | None,
+    *,
+    require_role: str | None = None,
+) -> Any:
+    """解析新消息的挂载父节点：显式指定即"从此分岔"（校验存在性与角
+    色），缺省为当前活跃叶子（指针优先，退化为 seq 最大的存活节点——
+    树按 seq 单调追加，最大 seq 即最新消息）。空树返回 None（新根）。"""
+    if parent_node_id is None:
+        pointer = await store.get_current_node(full_thread_id)
+        if pointer:
+            node = next((n for n in nodes if n.node_id == pointer and not n.deleted), None)
+            if node is not None:
+                return node
+        return nodes[-1] if nodes else None
+    node = next((n for n in nodes if n.node_id == parent_node_id), None)
+    if node is None or node.deleted:
+        raise HTTPException(status_code=404, detail=f"分岔节点不存在：{parent_node_id}")
+    if require_role is not None and node.role != require_role:
+        raise HTTPException(
+            status_code=400,
+            detail=f"重新生成的挂载点必须是用户消息（节点 {parent_node_id} 不是）",
+        )
+    return node
 
 
 async def _thread_owner_or_404(rt: Any, module: str, thread_id: str, user_id: str) -> None:
@@ -217,19 +287,14 @@ async def invoke(module: str, body: InvokeRequest, request: Request) -> Streamin
     # 本轮 human——头部稳定保前缀缓存，尾部变化不伤历史缓存。
     # 任何一段失败都静默降级。
     memory = memory_or_none(rt)
-    if memory is not None:
-        context_block = await memory.compose_context(
-            user_id=user_id,
-            agent_id=module,
-            thread_id=full_thread_id,
-            query=body.message,
-        )
-        recall_block = await memory.recall_context(user_id=user_id, query=body.message)
-        for block in (context_block, recall_block):
-            if block:
-                messages_input.append(SystemMessage(content=block))
-    # 附件（M4b）：解析引用的 file_id → 取记录 → 校验属主（S1：可用的
-    # file_id 不能是别人的——IDOR 组合链的入口）→ 绑定线程 → 注入。
+    # ── 消息树（ADR-013）：树模式的分岔语义与执行物化 ──────────────────
+    # 树在位（thread_index 即基座存储）时：新 human 消息先落树（客户端
+    # 断开也不丢消息）、指针推进；物化把父链写进 checkpointer（切分支
+    # 后的 state 重写）；turn 结束后的回写由捕获钩子完成。
+    store = rt.thread_index
+    turn_node_id: str | None = None
+    summary_nodes: list[str] = []
+    human_message: HumanMessage | None = None
     if body.attachments:
         file_store = rt.file_store
         if file_store is None:
@@ -284,14 +349,87 @@ async def invoke(module: str, body: InvokeRequest, request: Request) -> Streamin
                 )
             human_content = content
         attachments_meta = [info.meta() for info in attachment_infos]
-        messages_input.append(
-            HumanMessage(
-                content=human_content,
-                additional_kwargs={"attachments": attachments_meta},
-            )
+        human_message = HumanMessage(
+            content=human_content,
+            additional_kwargs={"attachments": attachments_meta},
         )
     else:
-        messages_input.append(HumanMessage(content=body.message))
+        human_message = HumanMessage(content=body.message)
+    # 消息 id 必须在落树前就位（ADR-013）：树的 msg_id 判重、物化重建、
+    # checkpointer 消息身份全靠它——id 缺席时 langgraph 入 state 才另发
+    # 新 id，树与 state 就对不上了（human 会被重复落树）。
+    if not human_message.id:
+        human_message.id = tree_mod.new_node_id()
+    if store is not None:
+        # 树写临界区（ADR-013）：落 human 节点 + 推指针。Redis 在场用
+        # 分布式锁，缺席退化进程内锁（本地开发 / 测试语义）。
+        try:
+            async with tree_write_lock(rt.redis, full_thread_id):
+                nodes = await tree_mod.ensure_thread_tree(store, graph, config, full_thread_id)
+                if body.regenerate:
+                    # 重新生成：不追加 human，在既有 human 节点下重跑——
+                    # 输入消息从节点重建（id 与节点 msg_id 一致，checkpointer
+                    # 里的消息身份稳定）。
+                    parent_node = await _resolve_tree_parent(
+                        store, full_thread_id, nodes, body.parent_node_id, require_role="human"
+                    )
+                    if parent_node is None:
+                        raise HTTPException(
+                            status_code=400, detail="会话还没有消息，无法重新生成"
+                        )
+                    human_message = tree_mod.node_to_message(parent_node)
+                else:
+                    parent_node = await _resolve_tree_parent(
+                        store, full_thread_id, nodes, body.parent_node_id
+                    )
+                    seq = await store.next_node_seq(full_thread_id)
+                    human_node = tree_mod.message_to_node(
+                        human_message, thread_id=full_thread_id, parent_id=parent_node.node_id
+                        if parent_node is not None else None,
+                        seq=seq,
+                    )
+                    assert human_node is not None  # human 消息恒可入树
+                    if human_message.id:
+                        human_node = replace(human_node, msg_id=str(human_message.id))
+                    await store.append_node(human_node)
+                    nodes.append(human_node)  # 锁内的路径构建需要它（避免重读）
+                    turn_node_id = human_node.node_id
+                    parent_node = human_node
+                await store.set_current_node(
+                    full_thread_id,
+                    turn_node_id
+                    or (parent_node.node_id if parent_node is not None else None),
+                )
+        except TreeBusyError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        # 摘要候选（先近后远）：冻结段的会话摘要按"当前分支最近的祖先
+        # 摘要"取——分支各自的摘要独立演进。
+        if parent_node is not None:
+            summary_nodes = list(
+                reversed(
+                    [
+                        node.node_id
+                        for node in tree_mod.build_path(nodes, parent_node.node_id)[:-1]
+                    ]
+                )
+            )
+            # 物化父链（root→parent）：state 与目标分支不一致时全量替换。
+            await tree_mod.materialize_branch(
+                graph, config, tree_mod.build_path(nodes, parent_node.node_id)[:-1]
+            )
+    messages_input.append(human_message)
+    if memory is not None:
+        context_block = await memory.compose_context(
+            user_id=user_id,
+            agent_id=module,
+            thread_id=full_thread_id,
+            query=body.message,
+            summary_nodes=summary_nodes,
+        )
+        recall_block = await memory.recall_context(user_id=user_id, query=body.message)
+        for block in (context_block, recall_block):
+            if block:
+                messages_input.insert(-1, SystemMessage(content=block))
     # 会话索引 upsert（S1）：属主/模块/标题（首条用户消息前 60 字符）。
     if rt.thread_index is not None:
         now = time.time()
@@ -308,9 +446,18 @@ async def invoke(module: str, body: InvokeRequest, request: Request) -> Streamin
         else:
             entry = replace(existing, updated_at=now)
         await rt.thread_index.upsert_thread_index(entry)
-    # 记忆形成（M6c）：轮次正常完成后在后台跑抽取/整合/画像/摘要。
-    # 需要形成管线可用（llm 已装配）且记忆系统启用。
-    on_complete = _build_capture_hook(memory, module, user_thread_id, graph, config)
+    # 记忆形成（M6c + ADR-013）：轮次正常完成后在后台跑树回写与
+    # 抽取/整合/画像/摘要。需要形成管线可用（llm 已装配）或树在位。
+    on_complete = _build_capture_hook(
+        memory,
+        module,
+        user_thread_id,
+        graph,
+        config,
+        tree_store=rt.thread_index,
+        full_thread_id=full_thread_id,
+        turn_node_id=turn_node_id,
+    )
     return StreamingResponse(
         _event_stream(
             graph,
@@ -469,14 +616,35 @@ async def get_thread_history(
     request: Request,
     user_id: str = Depends(get_current_user),
 ) -> dict[str, Any]:
-    """返回某会话已持久化的消息历史（供前端恢复会话显示）。"""
+    """返回某会话沿当前活跃分支的消息历史（供前端恢复会话显示）。
+
+    树在位（ADR-013）时从 ``message_nodes`` 沿活跃指针读——树是会话的
+    唯一事实源，每条消息带 ``node_id``（前端树交互的锚点）；遗留线程
+    首次访问时从 checkpointer 幂等迁移。树缺席（存储后端不可用）时
+    降级为旧版 checkpointer 快照读取（本地开发语义）。
+    """
     rt = get_runtime(request)
     graph = _graph_or_404(rt, module)
     await _thread_owner_or_404(rt, module, thread_id, user_id)
     # thread id 按模块划分命名空间，与 invoke 端点保持一致。
-    config: RunnableConfig = {
-        "configurable": {"thread_id": str(ThreadId(module=module, raw=thread_id))}
-    }
+    full_thread_id = str(ThreadId(module=module, raw=thread_id))
+    config: RunnableConfig = {"configurable": {"thread_id": full_thread_id}}
+    store = rt.thread_index
+    if store is not None:
+        nodes = await tree_mod.ensure_thread_tree(store, graph, config, full_thread_id)
+        pointer = await store.get_current_node(full_thread_id)
+        path: list[Any] = []
+        if pointer:
+            try:
+                path = tree_mod.build_path(nodes, pointer)
+            except tree_mod.TreeError:
+                path = []
+        messages = [
+            serialized
+            for serialized in (tree_mod.serialize_history_node(node) for node in path)
+            if serialized is not None
+        ]
+        return {"thread_id": thread_id, "module": module, "messages": messages}
     snapshot = await graph.aget_state(config)
     raw_messages = (snapshot.values or {}).get("messages", []) if snapshot else []
     messages = [
@@ -575,7 +743,13 @@ async def delete_thread(
     await rt.checkpointer.adelete_thread(full_thread_id)
     if rt.file_store is not None:
         await rt.file_store.delete_for_thread(full_thread_id)
+    # 消息树的节点 id 先取后删：记忆侧的节点摘要级联需要它（ADR-013）。
+    tree_node_ids: list[str] = []
     if rt.thread_index is not None:
+        tree_node_ids = [
+            node.node_id for node in await rt.thread_index.list_nodes(full_thread_id)
+        ]
+        await rt.thread_index.delete_nodes_for_thread(full_thread_id)
         # 索引行随线程消亡（store.delete_for_thread 也会清，这里显式
         # 覆盖 memory 未启用、purge_thread 不可用的部署形态）；计划
         # 快照同属线程作用域数据面（M10）。
@@ -584,6 +758,10 @@ async def delete_thread(
     memory = memory_or_none(rt)
     if memory is not None:
         # 记忆级联（M6）：清该线程的滚动摘要与知识库分块；跨会话
-        # 记忆刻意保留（出处仍在 source_thread_id）。
+        # 记忆刻意保留（出处仍在 source_thread_id）。树模式下摘要
+        # 键控到节点，按节点 id 级联（ADR-013）。
         await memory.purge_thread(full_thread_id)
+        purge_nodes = getattr(memory, "purge_nodes", None)
+        if tree_node_ids and callable(purge_nodes):
+            await purge_nodes(tree_node_ids)
     return {"deleted": True}

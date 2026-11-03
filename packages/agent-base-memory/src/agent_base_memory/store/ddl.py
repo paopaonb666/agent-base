@@ -56,6 +56,17 @@ _SQLITE_DDLS: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS node_summaries (
+      user_id VARCHAR(64) NOT NULL,
+      node_id VARCHAR(32) NOT NULL,
+      summary TEXT NOT NULL,
+      agent_id VARCHAR(64) NOT NULL DEFAULT '',
+      covered_message_count INTEGER NOT NULL DEFAULT 0,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (user_id, node_id)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS doc_chunks (
       chunk_id VARCHAR(40) PRIMARY KEY,
       file_id VARCHAR(32) NOT NULL,
@@ -151,6 +162,17 @@ _MYSQL_DDLS: tuple[str, ...] = (
       covered_message_count INT NOT NULL DEFAULT 0,
       updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (user_id, thread_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS node_summaries (
+      user_id VARCHAR(64) NOT NULL,
+      node_id VARCHAR(32) NOT NULL,
+      summary LONGTEXT NOT NULL,
+      agent_id VARCHAR(64) NOT NULL DEFAULT '',
+      covered_message_count INT NOT NULL DEFAULT 0,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (user_id, node_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
     """

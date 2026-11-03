@@ -22,6 +22,7 @@ from agent_base_memory.store.models import (
     MemoryRecord,
     MemoryStoreError,
     MemoryVersion,
+    NodeSummary,
     SessionSummary,
 )
 
@@ -121,6 +122,19 @@ class _SqlMemoryStoreBase(_CoreSqlStoreBase):
         return SessionSummary(
             user_id=row[0],
             thread_id=row[1],
+            summary=row[2],
+            agent_id=row[3] or "",
+            covered_message_count=int(row[4] or 0),
+            updated_at=self._from_sql_ts(row[5]),
+        )
+
+    # -- node summaries（ADR-013：树叶子节点的滚动摘要） ---------------------------
+    _NODE_SUMMARY_COLUMNS = "user_id, node_id, summary, agent_id, covered_message_count, updated_at"
+
+    def _node_summary_from_row(self, row: tuple[Any, ...]) -> NodeSummary:
+        return NodeSummary(
+            user_id=row[0],
+            node_id=row[1],
             summary=row[2],
             agent_id=row[3] or "",
             covered_message_count=int(row[4] or 0),
@@ -371,6 +385,47 @@ class _SqlMemoryStoreBase(_CoreSqlStoreBase):
                 summary.covered_message_count,
                 self._to_sql_ts(summary.updated_at),
             ),
+        )
+
+    async def get_node_summary(self, user_id: str, node_id: str) -> NodeSummary | None:
+        rows = await self._fetch_all(
+            f"SELECT {self._NODE_SUMMARY_COLUMNS} FROM node_summaries"
+            " WHERE user_id = ? AND node_id = ?",
+            (user_id, node_id),
+        )
+        return self._node_summary_from_row(rows[0]) if rows else None
+
+    async def upsert_node_summary(self, summary: NodeSummary) -> None:
+        await self._execute(
+            self._replace_into(
+                "node_summaries",
+                (
+                    "user_id",
+                    "node_id",
+                    "summary",
+                    "agent_id",
+                    "covered_message_count",
+                    "updated_at",
+                ),
+            ),
+            (
+                summary.user_id,
+                summary.node_id,
+                summary.summary,
+                summary.agent_id,
+                summary.covered_message_count,
+                self._to_sql_ts(summary.updated_at),
+            ),
+        )
+
+    async def purge_nodes(self, node_ids: Sequence[str]) -> int:
+        """按节点 id 清摘要（会话删除的树模式级联，ADR-013）。"""
+        if not node_ids:
+            return 0
+        marks = ", ".join("?" for _ in node_ids)
+        return await self._execute(
+            f"DELETE FROM node_summaries WHERE node_id IN ({marks})",
+            tuple(node_ids),
         )
 
     # -- doc chunks ----------------------------------------------------------------
