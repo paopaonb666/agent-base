@@ -256,7 +256,9 @@ def test_untrusted_request_id_is_replaced() -> None:
 
 def test_invoke_rejects_empty_message_and_bad_thread_id() -> None:
     with _client() as client:
-        assert client.post("/v1/agents/chat/invoke", json={"message": ""}).status_code == 422
+        # 空 message 在 handler 层显式拒绝（400）——pydantic 的 min_length
+        # 无法按模式豁免 regenerate（ADR-013：重生成发空串）。
+        assert client.post("/v1/agents/chat/invoke", json={"message": ""}).status_code == 400
         assert (
             client.post(
                 "/v1/agents/chat/invoke", json={"message": "hi", "thread_id": "../escape"}

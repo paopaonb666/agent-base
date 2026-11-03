@@ -66,7 +66,10 @@ _ThreadPathParam = Annotated[str, Path(max_length=128, pattern=r"^[\w.-]+$")]
 class InvokeRequest(BaseModel):
     """一次对话轮。"""
 
-    message: str = Field(min_length=1, max_length=100_000)
+    # regenerate 模式（ADR-013）忽略本字段（重发既有 human 节点的原文），
+    # 因此放宽到空串、由 handler 按模式显式校验——pydantic 的 min_length
+    # 无法按模式豁免（前端重新生成发空串，真实 E2E 踩过 422）。
+    message: str = Field(default="", max_length=100_000)
     # thread_id 是 checkpointer 的一部分键：限定字符集与长度，避免任意
     # 字符串直接落库/进日志。
     thread_id: str | None = Field(
@@ -271,6 +274,8 @@ async def invoke(module: str, body: InvokeRequest, request: Request) -> Streamin
             detail='LLM_FAST_* 未配置：profile="fast" 不可用（配置快速档或使用默认档）',
         )
     graph = _graph_or_404(view, "planner" if use_plan else module)
+    if not body.message.strip() and not body.regenerate:
+        raise HTTPException(status_code=400, detail="消息不能为空")
     user_thread_id = body.thread_id or new_request_id()
     user_id = await get_current_user(request)
     # 按模块划分的 thread id：图共用一个 checkpointer；未划分命名空间

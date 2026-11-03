@@ -161,6 +161,39 @@ def test_regenerate_requires_human_parent() -> None:
         assert response.status_code == 400
 
 
+def test_regenerate_at_root_human_materializes_empty_path() -> None:
+    """回归（E2E 抓到的真实 500）：在根 human 上重新生成时物化目标路径
+    为空——清空写入若默认归因到带条件边的节点，tools_condition 对空
+    state 抛 ValueError。修复后应正常完成并产生 AI 兄弟分支。"""
+    runtime = _runtime()
+    with TestClient(create_app(runtime=runtime)) as client:
+        thread_id, human_id = _start_thread(client)
+        # 先分岔一轮，让 state 里残留另一分支的消息。
+        _invoke(
+            client,
+            {"message": "岔路", "thread_id": thread_id, "parent_node_id": human_id},
+        )
+        # 在根 human 上重新生成：物化目标 = 空路径（清空后由输入补齐）。
+        events = _invoke(
+            client,
+            {"message": "x", "thread_id": thread_id,
+             "parent_node_id": human_id, "regenerate": True},
+        )
+        assert events["thread_id"] == thread_id
+        tree = client.get(f"/v1/agents/chat/threads/{thread_id}/tree", headers=ALICE).json()
+        ai_siblings = [n for n in tree["nodes"]
+                       if n["parent_id"] == human_id and n["role"] == "assistant"]
+        assert len(ai_siblings) == 2  # 原"回复一" + 重新生成的
+        # 模型输入不含另一分支的残留：state 由物化清空 + 重建的父消息构成
+        # （重生成语义 = 重发原问题，body.message 被忽略）。
+        messages = _state_messages(
+            runtime.graph("chat"), {"configurable": {"thread_id": f"chat:{thread_id}"}}
+        )
+        contents = [str(m.content) for m in messages]
+        assert contents[0] == "第一问"  # 重建的父消息（原问题重发）
+        assert all("岔路" not in c for c in contents)  # 另一分支无残留
+
+
 def test_unknown_branch_node_rejected() -> None:
     with TestClient(create_app(runtime=_runtime())) as client:
         thread_id, _ = _start_thread(client)

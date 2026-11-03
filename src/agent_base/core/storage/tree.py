@@ -412,11 +412,24 @@ async def materialize_branch(graph: Any, config: Any, path_nodes: list[MessageNo
     path_ids = [node.msg_id for node in path_nodes]
     if state_ids == path_ids:
         return
-    rebuilt = [node_to_message(node) for node in path_nodes]
-    rebuilt = [message for message in rebuilt if message is not None]
     from langchain_core.messages import RemoveMessage
+    from langgraph.graph import START
     from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
+    if not path_nodes:
+        # 目标路径为空（挂载点是根 human：path[:-1] == []）——只需要清空
+        # 上一分支的残留。清空写入**必须归因到 START**：默认归因会落到
+        # 带条件边的节点上，LangGraph 在写入后立刻做条件路由，
+        # tools_condition 对空 messages 直接抛
+        # "No messages found in input state to tool_edge"（真实 500，E2E
+        # 抓到）。START 无条件边，路由安全；空 state 由紧随的 astream
+        # 输入（注入 + 重建的 human）补齐。
+        await graph.aupdate_state(
+            config, {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES)]}, as_node=START
+        )
+        return
+    rebuilt = [node_to_message(node) for node in path_nodes]
+    rebuilt = [message for message in rebuilt if message is not None]
     await graph.aupdate_state(
         config, {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *rebuilt]}
     )
