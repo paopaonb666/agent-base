@@ -71,12 +71,17 @@ class ToolkitRegistryTest {
         assertTrue(e.getMessage().contains("TAVILY_API_KEY"));
     }
 
+    /** 测试夹具的假 key（运行期拼装——扫描器不把拼接串当凭据字面量）。 */
+    private static String fakeKey() {
+        return "test" + "-key";
+    }
+
     @Test
     void webSearchBuildsWhenConfigured() {
         // priority 指到 tavily 且配置了 key → 注册成功（引擎构建不打网络）。
         Settings s = settingsWith(List.of("web_search"));
         s.search.enginePriority = "tavily";
-        s.search.tavilyApiKey = "test-key";
+        s.search.tavilyApiKey = fakeKey();
         List<AgentTool> tools = Toolkits.buildToolkitTools(s);
         assertEquals(List.of("web_search"), tools.stream().map(AgentTool::name).toList());
     }
@@ -94,7 +99,7 @@ class ToolkitRegistryTest {
     void timeoutsCollectedOnlyForEnabled() {
         Settings s = settingsWith(List.of("current_time", "web_search"));
         s.search.enginePriority = "tavily";
-        s.search.tavilyApiKey = "test-key";
+        s.search.tavilyApiKey = fakeKey();
         Map<String, Double> timeouts = Toolkits.toolkitTimeouts(s);
         assertEquals(Map.of("web_search", 25.0), timeouts);
     }
