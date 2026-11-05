@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 项目级 Maven 设置：全局 settings.xml 里的 alimaven 镜像指向已停用的
+     http nexus 地址；本文件把 central 镜像到阿里云的 https 端点。
+     构建命令：mvn -s java/mvn-settings.xml ...（或 mvnw）。
+     不修改用户全局 ~/.m2/settings.xml。 -->
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 https://maven.apache.org/xsd/settings-1.0.0.xsd">
+  <!-- 覆盖全局 settings 里指向 Maven conf 目录的 localRepository。 -->
+  <localRepository>c:/Users/Administrator/.m2/repository</localRepository>
+  <mirrors>
+    <mirror>
+      <id>aliyun-https</id>
+      <mirrorOf>central</mirrorOf>
+      <name>aliyun maven (https public)</name>
+      <url>https://maven.aliyun.com/repository/public</url>
+    </mirror>
+  </mirrors>
+</settings>

@@ -1,0 +1,741 @@
+package io.github.paopaonb666.agentbase.memory.service;
+
+import dev.langchain4j.data.message.ChatMessage;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
+
+import io.github.paopaonb666.agentbase.core.AgentModule;
+import io.github.paopaonb666.agentbase.core.config.Settings;
+import io.github.paopaonb666.agentbase.core.llm.ModelRuntime;
+import io.github.paopaonb666.agentbase.extensions.Metrics;
+import io.github.paopaonb666.agentbase.memory.context.MemoryContext;
+import io.github.paopaonb666.agentbase.memory.embeddings.EmbeddingClient;
+import io.github.paopaonb666.agentbase.memory.embeddings.Embeddings;
+import io.github.paopaonb666.agentbase.memory.pipeline.MemoryPipeline;
+import io.github.paopaonb666.agentbase.memory.retrieval.Retrieval;
+import io.github.paopaonb666.agentbase.memory.store.MemoryStore;
+import io.github.paopaonb666.agentbase.memory.store.MemoryStores;
+import io.github.paopaonb666.agentbase.memory.store.Models;
+import io.github.paopaonb666.agentbase.memory.store.Models.DocChunk;
+import io.github.paopaonb666.agentbase.memory.store.Models.MemoryBlock;
+import io.github.paopaonb666.agentbase.memory.store.Models.MemoryOp;
+import io.github.paopaonb666.agentbase.memory.store.Models.MemoryRecord;
+import io.github.paopaonb666.agentbase.memory.store.Models.MemoryStoreError;
+import io.github.paopaonb666.agentbase.memory.store.Models.MemoryVersion;
+import io.github.paopaonb666.agentbase.memory.store.Models.SessionSummary;
+import io.github.paopaonb666.agentbase.memory.textkit.TextKit;
+
+/**
+ * 记忆系统门面：一个实例服务整个运行时（三种后端一致）。
+ *
+ * <p>持有四个子域并委托——记忆 CRUD + 混合检索、知识库（切块摄取/
+ * 检索/撤销）、画像（结构化 JSON 读写）、形成管线编排（capture 锁 +
+ * 冻结注入快照缓存）。对应 Python 侧 service.py + orchestrator.py +
+ * profile.py + knowledge.py + audit.py 的合并门面（Java 侧按模块内聚
+ * 收敛，行为一一对应）。
+ */
+public final class MemoryService implements AgentModule.MemoryServicePort {
+
+    private static final Logger LOG = LoggerFactory.getLogger(MemoryService.class);
+
+    private final MemoryStore store;
+    private final EmbeddingClient embedder;
+    private final Settings settings;
+    private final MemoryPipeline pipeline;
+    private final ModelRuntime llm;
+
+    /** 按 user_id 的捕获串行化锁（锐评 #10：并发轮次重复 ADD 防护）。 */
+    private final Map<String, ReentrantLock> locks = new ConcurrentHashMap<>();
+
+    /** 线程级冻结注入段的 LRU 缓存（成本治理 T2.1），键 (user,agent,thread)。 */
+    private final LinkedHashMap<List<String>, String> snapshots = new LinkedHashMap<>(16, 0.75f, false);
+    private final Object snapshotLock = new Object();
+
+    public MemoryService(MemoryStore store, EmbeddingClient embedder, Settings settings,
+                         ModelRuntime llm, AgentModule.ChatInvokerPort fastLlm) {
+        this.store = store;
+        this.embedder = embedder;
+        this.settings = settings;
+        this.llm = llm;
+        this.pipeline = llm == null ? null : new MemoryPipeline(llm, fastLlm, settings, new Ops());
+    }
+
+    /** 按配置装配；未启用或后端不可用返回 null（对应 build_memory_service）。 */
+    public static MemoryService build(Settings settings, ModelRuntime llm,
+                                      AgentModule.ChatInvokerPort fastLlm) {
+        if (!settings.memory.enabled) {
+            LOG.info("memory: 记忆系统已禁用（MEMORY_ENABLED=false）");
+            return null;
+        }
+        MemoryStore store = MemoryStores.build(settings);
+        if (store == null) {
+            return null;
+        }
+        return new MemoryService(store, Embeddings.build(settings), settings, llm, fastLlm);
+    }
+
+    public MemoryStore store() {
+        return store;
+    }
+
+    // ── 审计与版本（失败安全旁路写入） ──────────────────────────────────
+
+    /** 写一条操作审计（成功与失败都记录）；审计失败只记日志。 */
+    public void recordOp(String op, String userId, String agentId, String threadId,
+                         Map<String, Object> detail, String status, String errorText, long durationMs) {
+        try {
+            store.recordOp(new MemoryOp(io.github.paopaonb666.agentbase.memory.store.Models.newMemoryId(),
+                    op, userId == null ? "" : userId, agentId == null ? "" : agentId,
+                    threadId == null ? "" : threadId, detail, status, errorText, (int) durationMs,
+                    Models.now()));
+        } catch (Exception e) {
+            LOG.warn("memory: 审计写入失败（不影响主路径）：{}", e.toString());
+        }
+    }
+
+    private void recordVersionSafe(MemoryVersion version) {
+        try {
+            store.recordVersion(version);
+        } catch (Exception e) {
+            LOG.warn("memory: 版本史写入失败（不影响主写入路径）：{}", e.toString());
+        }
+    }
+
+    // ── 写路径 ──────────────────────────────────────────────────────────
+
+    private List<Float> embedOne(String text) {
+        List<List<Float>> vectors = embedder.embed(List.of(text));
+        if (vectors == null || vectors.isEmpty()) {
+            return null;
+        }
+        return vectors.get(0);
+    }
+
+    /** 写入一条记忆；向量尽力而为（不可用就存纯文本）。 */
+    public MemoryRecord addMemory(String userId, String agentId, String content, String kind,
+                                  List<String> tags, double salience, String sourceThreadId) {
+        if (!Models.KNOWN_MEMORY_KINDS.contains(kind)) {
+            throw new MemoryStoreError("unknown memory kind '" + kind + "'; expected one of "
+                    + Models.KNOWN_MEMORY_KINDS);
+        }
+        long started = System.nanoTime();
+        double now = Models.now();
+        List<Float> embedding = embedOne(content);
+        MemoryRecord record = new MemoryRecord(Models.newMemoryId(), userId, agentId, kind,
+                content, tags == null ? List.of() : tags,
+                embedding == null ? null : Models.encodeEmbedding(embedding),
+                embedding == null ? null : embedder.dims(),
+                Math.min(Math.max(salience, 0.0), 1.0), "active",
+                sourceThreadId == null ? "" : sourceThreadId, List.of(), now, now, null, 0);
+        store.upsertMemory(record);
+        recordVersionSafe(new MemoryVersion(Models.newMemoryId(), record.memoryId(), userId,
+                "create", content, ""));
+        Metrics.memory().observe("add", "ok", (System.nanoTime() - started) / 1_000_000_000.0);
+        return record;
+    }
+
+    /** 更新一条记忆；内容变化时重新向量化。{@code versionOp}: update/restore。 */
+    public MemoryRecord updateMemory(String memoryId, String content, List<String> tags,
+                                     Double salience, String status, String versionOp) {
+        MemoryRecord existing = store.getMemory(memoryId);
+        if (existing == null) {
+            return null;
+        }
+        if (status != null && !Models.KNOWN_MEMORY_STATUSES.contains(status)) {
+            throw new MemoryStoreError("unknown memory status '" + status + "'; expected one of "
+                    + Models.KNOWN_MEMORY_STATUSES);
+        }
+        long started = System.nanoTime();
+        String newContent = content != null ? content : existing.content();
+        boolean reembed = content != null && !content.equals(existing.content());
+        List<Float> embedding = reembed ? embedOne(newContent) : null;
+        MemoryRecord updated = new MemoryRecord(existing.memoryId(), existing.userId(),
+                existing.agentId(), existing.kind(), newContent,
+                tags != null ? tags : existing.tags(),
+                embedding != null ? Models.encodeEmbedding(embedding) : existing.embedding(),
+                embedding != null ? embedder.dims() : existing.embeddingDim(),
+                salience != null ? Math.min(Math.max(salience, 0.0), 1.0) : existing.salience(),
+                status != null ? status : existing.status(),
+                existing.sourceThreadId(), existing.sourceRefs(), existing.createdAt(),
+                Models.now(), existing.lastAccessedAt(), existing.accessCount());
+        store.upsertMemory(updated);
+        boolean changed = !updated.content().equals(existing.content())
+                || !updated.tags().equals(existing.tags())
+                || updated.salience() != existing.salience()
+                || !updated.status().equals(existing.status());
+        if (changed) {
+            recordVersionSafe(new MemoryVersion(Models.newMemoryId(), memoryId, existing.userId(),
+                    versionOp, updated.content(), existing.content()));
+        }
+        Metrics.memory().observe("update", "ok", (System.nanoTime() - started) / 1_000_000_000.0);
+        return updated;
+    }
+
+    public boolean deleteMemory(String memoryId) {
+        long started = System.nanoTime();
+        MemoryRecord existing = store.getMemory(memoryId);
+        boolean deleted = store.deleteMemory(memoryId);
+        if (deleted && existing != null) {
+            // 墓碑版本：内容差分的终点（previous_content 保留最后内容）。
+            recordVersionSafe(new MemoryVersion(Models.newMemoryId(), memoryId, existing.userId(),
+                    "delete", "", existing.content()));
+        }
+        Metrics.memory().observe("delete", "ok", (System.nanoTime() - started) / 1_000_000_000.0);
+        return deleted;
+    }
+
+    // ── 版本史 ──────────────────────────────────────────────────────────
+
+    public List<MemoryVersion> listVersions(String memoryId, int limit) {
+        return store.listVersions(memoryId, limit);
+    }
+
+    /**
+     * 把记忆内容恢复到指定版本（产生一条 op=restore 的新版本）。仅对
+     * 仍然存在的记忆有效——恢复已删除的记忆需要重建完整记录，返回 null。
+     */
+    public MemoryRecord restoreVersion(String memoryId, String versionId) {
+        MemoryRecord existing = store.getMemory(memoryId);
+        if (existing == null) {
+            return null;
+        }
+        MemoryVersion version = store.getVersion(versionId);
+        if (version == null || !version.memoryId().equals(memoryId) || version.content().isEmpty()) {
+            return null;
+        }
+        return updateMemory(memoryId, version.content(), null, null, null, "restore");
+    }
+
+    // ── 读路径 ──────────────────────────────────────────────────────────
+
+    public MemoryRecord getMemory(String memoryId) {
+        return store.getMemory(memoryId);
+    }
+
+    /** 浏览列表（管理端点用）：默认排除画像记录。 */
+    public List<MemoryRecord> listMemories(String userId, String agentId, boolean includeGlobal,
+                                           List<String> kinds, List<String> statuses, int limit,
+                                           boolean excludeProfile) {
+        return store.listMemories(userId, agentId, includeGlobal, kinds,
+                statuses == null ? List.of() : statuses, limit, excludeProfile);
+    }
+
+    /** 混合检索（注入路径与搜索端点共用）——内部打分视图。 */
+    public List<Retrieval.ScoredMemory> searchScored(String userId, String agentId, String query,
+                                                     Integer topK) {
+        long started = System.nanoTime();
+        boolean hasEmbedding = embedder.dims() != null;
+        double minScore = settings.memory.recallMinScore;
+        if (!hasEmbedding && minScore > 0) {
+            // 降级关键词路径：混合分缺向量主力分量（权重 0.4），硬门槛会误杀
+            // 老而准的关键词命中——阈值放宽一半。
+            minScore = minScore / 2;
+        }
+        List<Retrieval.ScoredMemory> results = Retrieval.recallMemories(store, embedder, userId,
+                agentId, query, topK != null ? topK : settings.memory.recallTopK, minScore, settings);
+        Metrics.memory().observe("search", "ok", (System.nanoTime() - started) / 1_000_000_000.0);
+        return results;
+    }
+
+    @Override
+    public List<Map<String, Object>> search(String userId, String agentId, String query,
+                                            Integer topK) {
+        // 端口契约：跨边界载荷是 Map（score + meta + expired 标志）。
+        List<Retrieval.ScoredMemory> scored = searchScored(userId, agentId, query, topK);
+        List<Map<String, Object>> out = new ArrayList<>(scored.size());
+        for (Retrieval.ScoredMemory item : scored) {
+            Map<String, Object> view = new LinkedHashMap<>(item.record().meta());
+            view.put("score", Math.round(item.score() * 10000.0) / 10000.0);
+            view.put("expired", isExpired(item.record()));
+            out.add(view);
+        }
+        return out;
+    }
+
+    /** episodic 记忆的 TTL 过期标志（0 天 = 不过期；其余类别恒 false）。 */
+    public boolean isExpired(MemoryRecord record) {
+        int ttl = settings.memory.episodicTtlDays;
+        return "episodic".equals(record.kind()) && ttl > 0
+                && (Models.now() - record.updatedAt()) > ttl * 86400.0;
+    }
+
+    // ── 知识库 ──────────────────────────────────────────────────────────
+
+    @Override
+    public int ingestDocument(String fileId, String userId, String agentId, String text,
+                              String threadId) {
+        if (text == null || text.strip().isEmpty()) {
+            return 0;
+        }
+        long started = System.nanoTime();
+        try {
+            List<io.github.paopaonb666.agentbase.memory.textkit.TextKit.ChunkSpan> parts =
+                    TextKit.chunkText(text, settings.memory.docChunkChars, settings.memory.docChunkOverlap);
+            // 幂等：同一 file_id 重复摄取先清旧分块。
+            store.deleteChunksForFile(fileId);
+            List<List<Float>> vectors = embedder.embed(parts.stream()
+                    .map(TextKit.ChunkSpan::text).toList());
+            List<DocChunk> chunks = new ArrayList<>(parts.size());
+            for (int i = 0; i < parts.size(); i++) {
+                var span = parts.get(i);
+                chunks.add(new DocChunk(Models.newMemoryId(), fileId,
+                        threadId == null ? "" : threadId, userId, agentId, i, span.text(),
+                        span.segments(), vectors != null ? Models.encodeEmbedding(vectors.get(i)) : null,
+                        vectors != null ? embedder.dims() : null, Models.now()));
+            }
+            store.putChunks(chunks);
+            long durationMs = (System.nanoTime() - started) / 1_000_000;
+            Metrics.memory().observe("ingest", "ok", durationMs / 1000.0);
+            recordOp("ingest", userId, agentId, threadId,
+                    Map.of("file_id", fileId, "chunks", chunks.size()), "ok", "", durationMs);
+            return chunks.size();
+        } catch (Exception exc) {
+            LOG.warn("memory: 文档摄取失败（不影响上传）：{}", exc.toString());
+            Metrics.memory().observe("ingest", "error",
+                    (System.nanoTime() - started) / 1_000_000_000.0);
+            recordOp("ingest", userId, agentId, threadId, Map.of("file_id", fileId), "error",
+                    (exc.getClass().getSimpleName() + ": " + exc.getMessage()).length() > 300
+                            ? (exc.getClass().getSimpleName() + ": " + exc.getMessage()).substring(0, 300)
+                            : exc.getClass().getSimpleName() + ": " + exc.getMessage(),
+                    (System.nanoTime() - started) / 1_000_000);
+            return 0;
+        }
+    }
+
+    @Override
+    public List<Map<String, Object>> searchKnowledge(String userId, String agentId, String query,
+                                                     Integer topK) {
+        List<DocChunk> chunks = store.listChunks(userId, agentId, null, 2000);
+        if (chunks.size() >= 2000) {
+            LOG.warn("memory: 知识库候选分块达到上限 2000（user='{}'）——更早的文件不参与本轮检索", userId);
+        }
+        if (chunks.isEmpty()) {
+            return List.of();
+        }
+        List<List<Float>> vectors = embedder.embed(List.of(query));
+        List<Float> queryEmbedding = vectors == null || vectors.isEmpty() ? null : vectors.get(0);
+        List<Retrieval.ScoredChunk> scored = Retrieval.scoreChunks(chunks, query, queryEmbedding,
+                Models.now(), settings.memory.timeDecayHalfLifeDays,
+                Retrieval.Weights.fromSettings(settings));
+        double minScore = settings.memory.recallMinScore;
+        if (embedder.dims() == null && minScore > 0) {
+            // 降级关键词路径与 search 同规则：放宽一半。
+            minScore = minScore / 2;
+        }
+        List<Retrieval.ScoredChunk> filtered = new ArrayList<>();
+        for (Retrieval.ScoredChunk item : scored) {
+            if (item.score() >= minScore
+                    && (item.components().getOrDefault("keyword", 0.0) > 0
+                            || item.components().getOrDefault("vector", 0.0) > 0)) {
+                filtered.add(item);
+            }
+        }
+        int limit = Math.max(1, topK != null ? topK : settings.memory.recallTopK);
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (Retrieval.ScoredChunk item : filtered.subList(0, Math.min(filtered.size(), limit))) {
+            DocChunk chunk = item.chunk();
+            Map<String, Object> view = new LinkedHashMap<>();
+            view.put("score", Math.round(item.score() * 10000.0) / 10000.0);
+            view.put("file_id", chunk.fileId());
+            view.put("chunk_id", chunk.chunkId());
+            view.put("ordinal", chunk.ordinal());
+            view.put("text", chunk.text());
+            view.put("offsets", chunk.offsets().isEmpty() ? null
+                    : chunk.offsets().stream().map(seg -> List.of(seg[0], seg[1])).toList());
+            view.put("has_embedding", chunk.embedding().length > 0);
+            out.add(view);
+        }
+        return out;
+    }
+
+    @Override
+    public int revokeDocument(String fileId, String userId) {
+        long started = System.nanoTime();
+        int deleted = store.deleteChunksForFile(fileId);
+        Metrics.memory().observe("revoke", "ok", (System.nanoTime() - started) / 1_000_000_000.0);
+        recordOp("revoke", userId, "", "", Map.of("file_id", fileId, "chunks", deleted), "ok", "", 0);
+        return deleted;
+    }
+
+    @Override
+    public List<Map<String, Object>> listFileChunks(String userId, String fileId, int limit) {
+        List<DocChunk> chunks = store.listChunks(userId, null, fileId, Math.max(1, Math.min(limit, 2000)));
+        List<Map<String, Object>> out = new ArrayList<>(chunks.size());
+        for (DocChunk chunk : chunks) {
+            Map<String, Object> view = new LinkedHashMap<>();
+            view.put("chunk_id", chunk.chunkId());
+            view.put("ordinal", chunk.ordinal());
+            view.put("text", chunk.text());
+            view.put("offsets", chunk.offsets().isEmpty() ? null
+                    : chunk.offsets().stream()
+                            .map(seg -> List.of(seg[0], seg[1])).toList());
+            view.put("char_len", chunk.text().length());
+            view.put("has_embedding", chunk.embedding().length > 0);
+            view.put("embedding_dim", chunk.embeddingDim());
+            out.add(view);
+        }
+        return out;
+    }
+
+    @Override
+    public Map<String, Integer> chunkCountsByFile(String userId) {
+        return store.chunkCountsByFile(userId);
+    }
+
+    // ── 生命周期 ────────────────────────────────────────────────────────
+
+    @Override
+    public boolean captureReady() {
+        return pipeline != null;
+    }
+
+    @Override
+    public String healthProbe() {
+        try {
+            store.listOps(null, 1);
+        } catch (Exception e) {
+            LOG.warn("memory: health probe failed", e);
+            return "error";
+        }
+        // embedding 端点不可达 = degraded（检索自动降级 BM25，服务仍在）。
+        if (!embedder.probe()) {
+            return "degraded";
+        }
+        return "ok";
+    }
+
+    /**
+     * 为向量缺失/维度不符的 active 记忆回填 embedding（换模型后运行）。
+     * 回填保持原 updated_at——维护操作不刷时间衰减分。
+     */
+    public int backfillEmbeddings(int batch) {
+        if (embedder.dims() == null) {
+            LOG.info("memory: 未配置 embedding，回填无事可做");
+            return 0;
+        }
+        int total = 0;
+        while (true) {
+            List<MemoryRecord> records = store.listMemoriesNeedingEmbedding(embedder.dims(), batch);
+            if (records.isEmpty()) {
+                break;
+            }
+            List<List<Float>> vectors = embedder.embed(records.stream()
+                    .map(MemoryRecord::content).toList());
+            if (vectors == null) {
+                LOG.warn("memory: embedding 服务不可用，回填中断（已回填 {} 条）", total);
+                break;
+            }
+            for (int i = 0; i < records.size(); i++) {
+                MemoryRecord record = records.get(i);
+                store.upsertMemory(new MemoryRecord(record.memoryId(), record.userId(),
+                        record.agentId(), record.kind(), record.content(), record.tags(),
+                        Models.encodeEmbedding(vectors.get(i)), embedder.dims(), record.salience(),
+                        record.status(), record.sourceThreadId(), record.sourceRefs(),
+                        record.createdAt(), record.updatedAt(), record.lastAccessedAt(),
+                        record.accessCount()));
+                total++;
+            }
+            if (records.size() < batch) {
+                break;
+            }
+        }
+        while (true) {
+            List<DocChunk> chunks = store.listChunksNeedingEmbedding(embedder.dims(), batch);
+            if (chunks.isEmpty()) {
+                break;
+            }
+            List<List<Float>> vectors = embedder.embed(chunks.stream().map(DocChunk::text).toList());
+            if (vectors == null) {
+                LOG.warn("memory: embedding 服务不可用，分块回填中断（已回填 {} 条）", total);
+                break;
+            }
+            for (int i = 0; i < chunks.size(); i++) {
+                DocChunk chunk = chunks.get(i);
+                store.putChunks(List.of(new DocChunk(chunk.chunkId(), chunk.fileId(),
+                        chunk.threadId(), chunk.userId(), chunk.agentId(), chunk.ordinal(),
+                        chunk.text(), chunk.offsets(), Models.encodeEmbedding(vectors.get(i)),
+                        embedder.dims(), chunk.createdAt())));
+                total++;
+            }
+            if (chunks.size() < batch) {
+                break;
+            }
+        }
+        LOG.info("memory: 向量回填完成，共 {} 条（含知识库分块）", total);
+        return total;
+    }
+
+    // ── 用户画像 ────────────────────────────────────────────────────────
+
+    /** 读取结构化用户画像（JSON dict）；不存在或畸形返回 null。 */
+    public Map<String, Object> getProfile(String userId) {
+        MemoryRecord record = store.getMemory(Models.profileMemoryId(userId));
+        if (record == null) {
+            return null;
+        }
+        try {
+            Object parsed = new com.fasterxml.jackson.databind.ObjectMapper()
+                    .readValue(record.content(), Object.class);
+            return parsed instanceof Map<?, ?> map ? asStringMap(map) : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * 整包保存用户画像：不需要向量（整体注入不走召回），保存前做结构级
+     * 硬截断，每次演化写版本快照。
+     */
+    public void saveProfile(String userId, Map<String, Object> profile) {
+        String memoryId = Models.profileMemoryId(userId);
+        MemoryRecord existing = store.getMemory(memoryId);
+        double now = Models.now();
+        Map<String, Object> trimmed = TextKit.trimProfileToChars(profile, settings.memory.profileMaxChars);
+        String content;
+        try {
+            content = new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(trimmed);
+        } catch (Exception e) {
+            content = "{}";
+        }
+        store.upsertMemory(new MemoryRecord(memoryId, userId, "*", "semantic", content,
+                List.of("profile"), null, null, 1.0, "active", "", List.of("profile"),
+                existing != null ? existing.createdAt() : now, now,
+                existing != null ? existing.lastAccessedAt() : null,
+                existing != null ? existing.accessCount() : 0));
+        recordVersionSafe(new MemoryVersion(Models.newMemoryId(), memoryId, userId,
+                existing != null ? "update" : "create", content,
+                existing != null ? existing.content() : ""));
+    }
+
+    // ── 记忆块 ──────────────────────────────────────────────────────────
+
+    public List<MemoryBlock> listBlocks(String userId, String agentId) {
+        return store.listBlocks(userId, agentId);
+    }
+
+    public MemoryBlock getBlock(String userId, String agentId, String label) {
+        return store.getBlock(userId, agentId, label);
+    }
+
+    /** 手工写块（覆盖式，版本递增）。 */
+    public MemoryBlock putBlock(String userId, String agentId, String label, String content,
+                                int charLimit) {
+        MemoryBlock existing = store.getBlock(userId, agentId, label);
+        int version = existing != null ? existing.version() + 1 : 1;
+        MemoryBlock block = new MemoryBlock(userId, agentId, label,
+                content.substring(0, Math.min(content.length(), charLimit)), charLimit, version,
+                Models.now());
+        store.upsertBlock(block);
+        return block;
+    }
+
+    public boolean deleteBlock(String userId, String agentId, String label) {
+        return store.deleteBlock(userId, agentId, label);
+    }
+
+    // ── 审计查询 ────────────────────────────────────────────────────────
+
+    public List<MemoryOp> listOps(String userId, int limit) {
+        return store.listOps(userId, limit);
+    }
+
+    // ── 形成管线编排（M6c） ─────────────────────────────────────────────
+
+    @Override
+    public Map<String, Object> captureTurn(String userId, String agentId, String threadId,
+                                           List<ChatMessage> messages) {
+        return captureTurn(userId, agentId, threadId, messages, false);
+    }
+
+    /**
+     * 一轮对话结束后的记忆形成（后台调用；绝不抛异常）。消息是该线程的
+     * 全部持久化消息（checkpointer 快照）；force 旁路门控（夜间批脚本）。
+     */
+    public Map<String, Object> captureTurn(String userId, String agentId, String threadId,
+                                           List<ChatMessage> messages, boolean force) {
+        if (pipeline == null) {
+            return null;
+        }
+        int humanCount = 0;
+        for (ChatMessage message : messages) {
+            if (message instanceof dev.langchain4j.data.message.UserMessage) {
+                humanCount++;
+            }
+        }
+        List<ChatMessage> window = messages.subList(
+                Math.max(0, messages.size() - settings.memory.extractionMaxMessages), messages.size());
+        String transcript = MemoryPipeline.renderTranscript(window, settings.memory.extractionMaxInputChars);
+        if (transcript.strip().isEmpty()) {
+            return null;
+        }
+        ReentrantLock lock = locks.computeIfAbsent(userId, k -> new ReentrantLock());
+        lock.lock();
+        try {
+            return pipeline.captureTurn(userId, agentId, threadId, transcript, humanCount, force);
+        } catch (Exception e) {
+            // 管线内部已逐步失败安全；这里兜底防任何漏网异常干扰调用方。
+            LOG.error("memory: capture_turn 意外失败", e);
+            return null;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    // ── 上下文注入（M6d + T2.1） ────────────────────────────────────────
+
+    @Override
+    public String composeContext(String userId, String agentId, String threadId, String query) {
+        // 线程级冻结注入段（画像+记忆块+摘要快照）：同线程返回逐字节相同的
+        // 缓存内容（供应商前缀缓存的地基）；逐轮变化的召回走 recallContext。
+        return composeFrozen(userId, agentId, threadId);
+    }
+
+    /** 线程级冻结注入段：同线程返回逐字节相同的缓存内容。 */
+    public String composeFrozen(String userId, String agentId, String threadId) {
+        List<String> key = List.of(userId, agentId, threadId);
+        synchronized (snapshotLock) {
+            String cached = snapshots.get(key);
+            if (cached != null) {
+                synchronized (snapshots) { /* LRU touch */ }
+                return cached;
+            }
+        }
+        String frozen;
+        try {
+            List<MemoryBlock> globalBlocks = store.listBlocks(userId, "*");
+            List<MemoryBlock> agentBlocks = store.listBlocks(userId, agentId);
+            Map<String, Object> profile = settings.memory.profileEnabled ? getProfile(userId) : null;
+            SessionSummary summaryRecord = store.getSummary(userId, threadId);
+            List<MemoryBlock> blocks = new ArrayList<>(globalBlocks);
+            blocks.addAll(agentBlocks);
+            frozen = MemoryContext.composeFrozenContext(profile, blocks,
+                    summaryRecord != null ? summaryRecord.summary() : null,
+                    settings.memory.contextMaxChars);
+        } catch (Exception e) {
+            LOG.warn("memory: 冻结注入段组装失败（本轮不注入）", e);
+            return null;
+        }
+        if (frozen != null) {
+            synchronized (snapshotLock) {
+                snapshots.put(key, frozen);
+                while (snapshots.size() > settings.memory.contextSnapshotMax) {
+                    IteratorRemoveFirst();
+                }
+            }
+        }
+        return frozen;
+    }
+
+    private void IteratorRemoveFirst() {
+        List<String> eldest = snapshots.keySet().iterator().next();
+        snapshots.remove(eldest);
+    }
+
+    @Override
+    public String recallContext(String userId, String query) {
+        try {
+            List<Retrieval.ScoredMemory> recalled = searchScored(userId, null, query, null);
+            return MemoryContext.composeRecallContext(recalled, settings.memory.contextMaxChars);
+        } catch (Exception e) {
+            LOG.warn("memory: 召回注入段组装失败（本轮不注入召回）", e);
+            return null;
+        }
+    }
+
+    @Override
+    public void purgeThread(String threadId) {
+        // 线程删除的级联清理（滚动摘要 + 知识库分块 + 注入快照；跨会话记忆保留）。
+        store.deleteForThread(threadId);
+        synchronized (snapshotLock) {
+            snapshots.keySet().removeIf(key -> key.size() == 3 && key.get(2).equals(threadId));
+        }
+    }
+
+    private List<MemoryBlock> listBlocksFor(String agentId, String userId) {
+        List<MemoryBlock> blocks = new ArrayList<>(store.listBlocks(userId, "*"));
+        blocks.addAll(store.listBlocks(userId, agentId));
+        return blocks;
+    }
+
+    private String getSummaryText(String userId, String threadId) {
+        SessionSummary summary = store.getSummary(userId, threadId);
+        return summary == null ? null : summary.summary();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> asStringMap(Map<?, ?> map) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        for (Map.Entry<?, ?> e : map.entrySet()) {
+            out.put(String.valueOf(e.getKey()), e.getValue());
+        }
+        return out;
+    }
+
+    @Override
+    public void close() {
+        try {
+            store.close();
+        } catch (Exception ignored) {
+            // 存储关闭失败不影响进程退出。
+        }
+    }
+
+    /** 管线操作适配器（MemoryPipeline.MemoryOps → 门面方法）。 */
+    private class Ops implements MemoryPipeline.MemoryOps {
+        @Override
+        public List<Retrieval.ScoredMemory> search(String userId, String agentId, String query,
+                                                   Integer topK) {
+            return MemoryService.this.searchScored(userId, agentId, query, topK);
+        }
+
+        @Override
+        public void addMemory(String userId, String agentId, String content, String kind,
+                              List<String> tags, double salience, String sourceThreadId) {
+            MemoryService.this.addMemory(userId, agentId, content, kind, tags, salience, sourceThreadId);
+        }
+
+        @Override
+        public boolean updateMemory(String memoryId, String content) {
+            return MemoryService.this.updateMemory(memoryId, content, null, null, null, "update") != null;
+        }
+
+        @Override
+        public boolean deleteMemory(String memoryId) {
+            return MemoryService.this.deleteMemory(memoryId);
+        }
+
+        @Override
+        public Map<String, Object> getProfile(String userId) {
+            return MemoryService.this.getProfile(userId);
+        }
+
+        @Override
+        public void saveProfile(String userId, Map<String, Object> profile) {
+            MemoryService.this.saveProfile(userId, profile);
+        }
+
+        @Override
+        public SessionSummary getSummary(String userId, String threadId) {
+            return store.getSummary(userId, threadId);
+        }
+
+        @Override
+        public void upsertSummary(SessionSummary summary) {
+            store.upsertSummary(summary);
+        }
+
+        @Override
+        public void recordOp(String op, String userId, String agentId, String threadId,
+                             Map<String, Object> detail, String status, String errorText,
+                             long durationMs) {
+            MemoryService.this.recordOp(op, userId, agentId, threadId, detail, status, errorText, durationMs);
+        }
+    }
+}

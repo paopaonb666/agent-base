@@ -1,0 +1,210 @@
+package io.github.paopaonb666.agentbase.extensions;
+
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * 带路由模板 label 的请求指标。
+ *
+ * <p>继承自 chat-agent 评审中的 B4/B5：计数器和直方图的 label 使用路由
+ * 模板（{@code /v1/agents/{module}/invoke}），绝不用原始请求路径——按
+ * 对话划分的路径会为每个 id 创建一条时间序列，让 Prometheus 基数爆炸。
+ *
+ * <p>刻意不引入依赖：渲染 Prometheus 文本展示格式只要几十行。
+ *
+ * <p><b>语义与口径声明</b>：{@code *_total} 是进程启动以来的累计计数；
+ * {@code *_count} / bucket 反映滑动窗口（每序列最近
+ * {@link #MAX_SAMPLES_PER_ROUTE} 个样本）——两者分母口径不同是有意为之
+ * 的内存权衡。所有指标都是<b>单进程</b>口径，多实例部署下各自计数。
+ *
+ * <p>对应 Python 侧 {@code extensions/metrics.py}；渲染结果逐字节对齐
+ * （含空指标时 HTTP 段多一个换行的历史行为）。
+ */
+public final class Metrics {
+
+    private Metrics() {}
+
+    public static final double[] BUCKETS = {0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0};
+
+    /** 每条序列保留的延迟样本上限：直方图只反映最近的窗口。 */
+    public static final int MAX_SAMPLES_PER_ROUTE = 1000;
+
+    /** 工具执行结果的封闭枚举（label 不接纳任意字符串，防基数爆炸）。 */
+    public static final List<String> TOOL_OUTCOMES = List.of("ok", "timeout", "error");
+
+    /** 记忆系统操作的封闭枚举（M6）。 */
+    public static final List<String> MEMORY_OUTCOMES = List.of("ok", "error", "degraded");
+
+    /** 计数器 + 滑动窗口延迟直方图的公共基类。 */
+    abstract static class LabeledHistogram {
+        private final Map<List<String>, Long> counts = new ConcurrentHashMap<>();
+        private final Map<String, Deque<Double>> durations = new ConcurrentHashMap<>();
+        private final Object lock = new Object();
+
+        abstract String totalName();
+
+        abstract String bucketPrefix();
+
+        void record(List<String> key, String series, double duration) {
+            counts.merge(key, 1L, Long::sum);
+            synchronized (lock) {
+                Deque<Double> window = durations.computeIfAbsent(series, k -> new ArrayDeque<>());
+                window.addLast(duration);
+                while (window.size() > MAX_SAMPLES_PER_ROUTE) {
+                    window.removeFirst();
+                }
+            }
+        }
+
+        String render(
+                java.util.function.Function<List<String>, String> counterLabels,
+                java.util.function.Function<String, String> seriesLabels,
+                boolean trailingNewlineWhenEmpty) {
+            List<String> lines = new ArrayList<>();
+            // sorted(...)：Python 侧按键排序渲染，Java 用 TreeMap 对齐。
+            Map<List<String>, Long> sortedCounts = new TreeMap<>(counts);
+            for (Map.Entry<List<String>, Long> e : sortedCounts.entrySet()) {
+                lines.add("%s{%s} %d".formatted(totalName(), counterLabels.apply(e.getKey()), e.getValue()));
+            }
+            Map<String, Deque<Double>> sortedDurations = new TreeMap<>(durations);
+            for (Map.Entry<String, Deque<Double>> e : sortedDurations.entrySet()) {
+                String lab = seriesLabels.apply(e.getKey());
+                List<Double> samples;
+                synchronized (lock) {
+                    samples = new ArrayList<>(e.getValue());
+                }
+                for (double bound : BUCKETS) {
+                    long cum = samples.stream().filter(d -> d <= bound).count();
+                    lines.add("%s_bucket{%s,le=\"%s\"} %d".formatted(bucketPrefix(), lab, bound, cum));
+                }
+                lines.add("%s_bucket{%s,le=\"+Inf\"} %d".formatted(bucketPrefix(), lab, samples.size()));
+                double sum = samples.stream().mapToDouble(Double::doubleValue).sum();
+                lines.add("%s_sum{%s} %.6f".formatted(bucketPrefix(), lab, sum));
+                lines.add("%s_count{%s} %d".formatted(bucketPrefix(), lab, samples.size()));
+            }
+            if (lines.isEmpty()) {
+                return trailingNewlineWhenEmpty ? "\n" : "";
+            }
+            return String.join("\n", lines) + "\n";
+        }
+    }
+
+    /** 进程内的请求计数器 + 延迟直方图。 */
+    public static final class HttpMetrics extends LabeledHistogram {
+        @Override
+        String totalName() { return "http_requests_total"; }
+
+        @Override
+        String bucketPrefix() { return "http_request_duration_seconds"; }
+
+        /** 在其路由模板下记录一个已完成的请求。 */
+        public void observe(String method, String route, int status, double duration) {
+            record(List.of(method, route, String.valueOf(status)), route, duration);
+        }
+
+        /** 渲染 Prometheus 文本展示格式。 */
+        public String render() {
+            return render(
+                    key -> "method=\"%s\",route=\"%s\",status=\"%s\"".formatted(key.get(0), key.get(1), key.get(2)),
+                    route -> "route=\"%s\"".formatted(route),
+                    true);
+        }
+    }
+
+    /** 进程内的工具执行计数器 + 延迟直方图。 */
+    public static final class ToolMetrics extends LabeledHistogram {
+        @Override
+        String totalName() { return "tool_executions_total"; }
+
+        @Override
+        String bucketPrefix() { return "tool_duration_seconds"; }
+
+        /** 记录一次已完成的工具执行；outcome 必须属于 TOOL_OUTCOMES。 */
+        public void observeTool(String name, String outcome, double duration) {
+            if (!TOOL_OUTCOMES.contains(outcome)) {
+                throw new IllegalArgumentException(
+                        "unknown tool outcome '%s'; expected %s".formatted(outcome, TOOL_OUTCOMES));
+            }
+            record(List.of(name, outcome), name, duration);
+        }
+
+        /** 渲染工具指标的 Prometheus 文本展示格式（与 HttpMetrics.render 拼接）。 */
+        public String renderToolMetrics() {
+            return render(
+                    key -> "tool=\"%s\",outcome=\"%s\"".formatted(key.get(0), key.get(1)),
+                    name -> "tool=\"%s\"".formatted(name),
+                    false);
+        }
+    }
+
+    /** 进程内的记忆操作计数器 + 延迟直方图。 */
+    public static final class MemoryMetricsImpl extends LabeledHistogram {
+        @Override
+        String totalName() { return "memory_operations_total"; }
+
+        @Override
+        String bucketPrefix() { return "memory_duration_seconds"; }
+
+        /** 记录一次已完成的记忆操作；outcome 必须属于 MEMORY_OUTCOMES。 */
+        public void observe(String op, String outcome, double duration) {
+            if (!MEMORY_OUTCOMES.contains(outcome)) {
+                throw new IllegalArgumentException(
+                        "unknown memory outcome '%s'; expected %s".formatted(outcome, MEMORY_OUTCOMES));
+            }
+            record(List.of(op, outcome), op, duration);
+        }
+
+        /** 渲染记忆指标的 Prometheus 文本展示格式。 */
+        public String renderMemoryMetrics() {
+            return render(
+                    key -> "op=\"%s\",outcome=\"%s\"".formatted(key.get(0), key.get(1)),
+                    op -> "op=\"%s\"".formatted(op),
+                    false);
+        }
+    }
+
+    /** 进程内的 LLM 用量计数器（T4.1 成本治理）。 */
+    public static final class CostMetrics {
+        private final Map<List<String>, Long> tokens = new ConcurrentHashMap<>();
+        private volatile double costCnyTotal = 0.0;
+
+        public void observeTokens(String model, String profile, String kind, long amount) {
+            tokens.merge(List.of(model, profile, kind), amount, Long::sum);
+        }
+
+        public synchronized void observeCost(double costCny) {
+            costCnyTotal += costCny;
+        }
+
+        public String renderCostMetrics() {
+            List<String> lines = new ArrayList<>();
+            for (Map.Entry<List<String>, Long> e : new TreeMap<>(tokens).entrySet()) {
+                lines.add("llm_tokens_total{model=\"%s\",profile=\"%s\",kind=\"%s\"} %d"
+                        .formatted(e.getKey().get(0), e.getKey().get(1), e.getKey().get(2), e.getValue()));
+            }
+            lines.add("llm_cost_cny_total %.6f".formatted(costCnyTotal));
+            return String.join("\n", lines) + "\n";
+        }
+    }
+
+    // ── 进程级单例（对应 Python 的 TOOL_METRICS / MEMORY_METRICS / COST_METRICS） ──
+
+    private static final HttpMetrics HTTP = new HttpMetrics();
+    private static final ToolMetrics TOOL = new ToolMetrics();
+    private static final MemoryMetricsImpl MEMORY = new MemoryMetricsImpl();
+    private static final CostMetrics COST = new CostMetrics();
+
+    public static HttpMetrics http() { return HTTP; }
+
+    public static ToolMetrics tool() { return TOOL; }
+
+    public static MemoryMetricsImpl memory() { return MEMORY; }
+
+    public static CostMetrics cost() { return COST; }
+}

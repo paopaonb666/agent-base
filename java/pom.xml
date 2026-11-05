@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  agent-base Java 重构（feat/java-rewrite）：父 POM。
+
+  与 Python 侧的对应关系：
+  - agent-base/      对应 src/agent_base（基座：图运行时/契约/服务入口/治理扩展）
+  - agent-base-memory/ 对应 packages/agent-base-memory（记忆子系统独立发行包）
+
+  版本地板原则与 Python 侧一致：依赖版本集中在此管理，子模块不重复声明版本。
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>io.github.paopaonb666</groupId>
+  <artifactId>agent-base-java</artifactId>
+  <version>0.3.0</version>
+  <packaging>pom</packaging>
+  <name>agent-base-java</name>
+  <description>agent-base 的 Java 重构：LangGraph 语义迷你运行时 + 模块注册表 + 配置契约 + 服务入口</description>
+
+  <modules>
+    <module>agent-base</module>
+    <module>agent-base-memory</module>
+  </modules>
+
+  <properties>
+    <maven.compiler.release>21</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <spring-boot.version>3.3.12</spring-boot.version>
+    <langchain4j.version>1.4.0</langchain4j.version>
+    <sqlite-jdbc.version>3.46.1.3</sqlite-jdbc.version>
+    <mysql-connector-j.version>8.4.0</mysql-connector-j.version>
+    <pdfbox.version>2.0.31</pdfbox.version>
+    <poi.version>5.2.5</poi.version>
+    <junit.version>5.10.2</junit.version>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-dependencies</artifactId>
+        <version>${spring-boot.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>dev.langchain4j</groupId>
+        <artifactId>langchain4j-bom</artifactId>
+        <version>${langchain4j.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>org.junit</groupId>
+        <artifactId>junit-bom</artifactId>
+        <version>${junit.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>org.xerial</groupId>
+        <artifactId>sqlite-jdbc</artifactId>
+        <version>${sqlite-jdbc.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.mysql</groupId>
+        <artifactId>mysql-connector-j</artifactId>
+        <version>${mysql-connector-j.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.pdfbox</groupId>
+        <artifactId>pdfbox</artifactId>
+        <version>${pdfbox.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.poi</groupId>
+        <artifactId>poi-ooxml</artifactId>
+        <version>${poi.version}</version>
+      </dependency>
+      <!-- 内部模块 -->
+      <dependency>
+        <groupId>io.github.paopaonb666</groupId>
+        <artifactId>agent-base</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <build>
+    <pluginManagement>
+      <plugins>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-surefire-plugin</artifactId>
+          <version>3.2.5</version>
+          <!-- 中文断言消息在 GBK 控制台不乱码；file.encoding 统一 UTF-8。 -->
+          <configuration>
+            <argLine>-Dfile.encoding=UTF-8</argLine>
+          </configuration>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+  </build>
+</project>

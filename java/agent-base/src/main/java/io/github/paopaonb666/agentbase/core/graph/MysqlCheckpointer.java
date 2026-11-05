@@ -1,0 +1,171 @@
+package io.github.paopaonb666.agentbase.core.graph;
+
+import io.github.paopaonb666.agentbase.core.config.Settings;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * MySQL 后端的对话状态存储：每操作一条 {@code DriverManager} 短连接。
+ *
+ * <p>连接模型（与 Python 侧的差异及依据）：Python 用 aiomysql 持有一条
+ * 长驻连接，因此需要周期性 keepalive ping 规避 {@code wait_timeout} 掐断
+ * （extensions/memory.py 的 {@code _mysql_keepalive}，30 分钟一次）。基座
+ * 对状态表的访问是低频的（每轮一到两次 upsert/get），Java 侧改为每操作
+ * 开一条短连接、用完即关——连接根本不会存活到 {@code wait_timeout}，
+ * keepalive 机制随之不需要。自有表 {@code ab_thread_states}，不与官方
+ * langgraph saver 的表互通。
+ */
+public final class MysqlCheckpointer implements Checkpointer {
+
+    private static final Logger LOG = LoggerFactory.getLogger(MysqlCheckpointer.class);
+
+    private static final String DDL = """
+            CREATE TABLE IF NOT EXISTS ab_thread_states (
+              thread_id VARCHAR(190) PRIMARY KEY,
+              state_json LONGTEXT,
+              updated_at DATETIME
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""";
+
+    private static final String UPSERT = """
+            REPLACE INTO ab_thread_states (thread_id, state_json, updated_at)
+            VALUES (?, ?, ?)""";
+
+    private final String url;
+    private final String user;
+    private final String password;
+    /** 建表是否已就绪（惰性执行一次；DDL 幂等，并发重复执行无害）。 */
+    private volatile boolean tableReady = false;
+
+    /** 连接参数全部来自配置节 {@code CHECKPOINTER_MYSQL_*}。 */
+    public MysqlCheckpointer(Settings.CheckpointerSettings s) {
+        this.url = ("jdbc:mysql://%s:%d/%s?useUnicode=true&characterEncoding=utf8"
+                + "&allowPublicKeyRetrieval=true&useSSL=false")
+                .formatted(s.mysqlHost, s.mysqlPort, s.mysqlDatabase);
+        this.user = s.mysqlUser;
+        this.password = s.mysqlPassword;
+    }
+
+    /**
+     * 启动期自检：建连 + 建表，失败立即抛出（对应 Python 构建期的
+     * {@code connect + saver.setup()}——坏配置在启动时快速失败，而不是
+     * 会话中途以原始的 SQLException 爆出）。
+     */
+    public void init() {
+        try (Connection conn = open()) {
+            ensureTable(conn);
+        } catch (SQLException e) {
+            throw new IllegalStateException(
+                    "mysql checkpointer: 启动自检失败（建连或建表不可用）", e);
+        }
+    }
+
+    private Connection open() throws SQLException {
+        return DriverManager.getConnection(url, user, password);
+    }
+
+    private void ensureTable(Connection conn) throws SQLException {
+        if (tableReady) {
+            return;
+        }
+        try (Statement st = conn.createStatement()) {
+            st.execute(DDL);
+        }
+        tableReady = true;
+    }
+
+    @Override
+    public void put(String threadId, GraphState state) {
+        String json = GraphStateJson.toJson(state);
+        LocalDateTime updatedAt = LocalDateTime.now();
+        try (Connection conn = open()) {
+            ensureTable(conn);
+            try (PreparedStatement ps = conn.prepareStatement(UPSERT)) {
+                ps.setString(1, threadId);
+                ps.setString(2, json);
+                ps.setObject(3, updatedAt);
+                ps.executeUpdate();
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("mysql checkpointer: 状态写入失败", e);
+        }
+    }
+
+    @Override
+    public GraphState get(String threadId) {
+        try (Connection conn = open()) {
+            ensureTable(conn);
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT state_json FROM ab_thread_states WHERE thread_id = ?")) {
+                ps.setString(1, threadId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        return null;
+                    }
+                    // 损坏行（非法 JSON）返回 null：旧行当作缺失处理。
+                    return GraphStateJson.fromJson(rs.getString(1));
+                }
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("mysql checkpointer: 状态读取失败", e);
+        }
+    }
+
+    @Override
+    public void deleteThread(String threadId) {
+        try (Connection conn = open()) {
+            ensureTable(conn);
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "DELETE FROM ab_thread_states WHERE thread_id = ?")) {
+                ps.setString(1, threadId);
+                ps.executeUpdate();
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("mysql checkpointer: 线程删除失败", e);
+        }
+    }
+
+    @Override
+    public List<String> listThreadIds() {
+        try (Connection conn = open()) {
+            ensureTable(conn);
+            try (Statement st = conn.createStatement();
+                 ResultSet rs = st.executeQuery("SELECT thread_id FROM ab_thread_states")) {
+                List<String> ids = new ArrayList<>();
+                while (rs.next()) {
+                    ids.add(rs.getString(1));
+                }
+                return ids;
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("mysql checkpointer: 线程列举失败", e);
+        }
+    }
+
+    @Override
+    public boolean healthy() {
+        // 探一次读：任何 SQLException 都按不可读处理（health degraded，不崩溃）。
+        try (Connection conn = open();
+             Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("SELECT 1")) {
+            return rs.next();
+        } catch (SQLException e) {
+            return false;
+        }
+    }
+
+    /** 无常驻资源可释放（每操作短连接用完即关）。 */
+    @Override
+    public void close() {
+        LOG.debug("mysql checkpointer: close（无常驻连接，空操作）");
+    }
+}
