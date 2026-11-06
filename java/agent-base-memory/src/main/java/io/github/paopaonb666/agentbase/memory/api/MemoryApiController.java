@@ -336,4 +336,38 @@ public class MemoryApiController {
                 .toList();
         return Map.of("ops", ops);
     }
+
+    // ── 向量回填（#164：换 embedding 模型后的迁移入口） ─────────────────
+
+    /**
+     * 启动异步回填（进程内单飞；重复启动 409）。维护级操作：鉴权与其他
+     * 记忆端点同一层（HMAC 头），无额外 per-user 作用域——回填对象是
+     * 全库向量，不是发起用户的数据。
+     */
+    @PostMapping("/backfill")
+    public Map<String, Object> startBackfill(@RequestParam(value = "batch", required = false) Integer batch,
+                                             @RequestHeader(value = "X-User-Id", required = false) String userIdHeader,
+                                             @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
+                                             @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,
+                                             @RequestHeader(value = "X-User-Nonce", required = false) String nonceHeader) {
+        MemoryService memory = service();
+        user(userIdHeader, sigHeader, tsHeader, nonceHeader);
+        boolean started = memory.startBackfill(batch == null ? 64 : batch);
+        if (!started) {
+            throw new HttpError(409, "回填任务已在运行中（见 GET /v1/memory/backfill/status）");
+        }
+        return Map.of("started", true, "status", memory.backfillStatus());
+    }
+
+    /** 回填进度查询。 */
+    @GetMapping("/backfill/status")
+    public Map<String, Object> backfillStatus(
+            @RequestHeader(value = "X-User-Id", required = false) String userIdHeader,
+            @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
+            @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,
+            @RequestHeader(value = "X-User-Nonce", required = false) String nonceHeader) {
+        MemoryService memory = service();
+        user(userIdHeader, sigHeader, tsHeader, nonceHeader);
+        return memory.backfillStatus();
+    }
 }

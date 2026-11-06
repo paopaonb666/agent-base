@@ -450,6 +450,11 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
      * 回填保持原 updated_at——维护操作不刷时间衰减分。
      */
     public int backfillEmbeddings(int batch) {
+        return backfillEmbeddings(batch, null);
+    }
+
+    /** 回填（带进度回调，每批回调一次已处理条数；#164 端点进度查询用）。 */
+    public int backfillEmbeddings(int batch, java.util.function.IntConsumer progress) {
         if (embedder.dims() == null) {
             LOG.info("memory: 未配置 embedding，回填无事可做");
             return 0;
@@ -475,6 +480,9 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
                         record.createdAt(), record.updatedAt(), record.lastAccessedAt(),
                         record.accessCount()));
                 total++;
+                if (progress != null) {
+                    progress.accept(total);
+                }
             }
             if (records.size() < batch) {
                 break;
@@ -504,6 +512,56 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
         }
         LOG.info("memory: 向量回填完成，共 {} 条（含知识库分块）", total);
         return total;
+    }
+
+    // ── 向量回填任务（#164：管理端点入口） ──────────────────────────────
+
+    /** 单飞保证 + 进度状态（进程内口径；重启即清，对维护任务足够）。 */
+    private final java.util.concurrent.atomic.AtomicBoolean backfillRunning =
+            new java.util.concurrent.atomic.AtomicBoolean();
+    private final java.util.concurrent.atomic.AtomicInteger backfillProcessed =
+            new java.util.concurrent.atomic.AtomicInteger();
+    private volatile String backfillState = "idle"; // idle | running | done | error
+
+    /**
+     * 启动异步回填任务（换 embedding 模型后的迁移入口）。进程内同时只允许
+     * 一个任务：已有任务在跑返回 false（端点转 409）。嵌入未配置抛
+     * {@link Models.MemoryStoreError}（端点转 400）。
+     */
+    public boolean startBackfill(int batch) {
+        if (embedder.dims() == null) {
+            throw new Models.MemoryStoreError("未配置 embedding（MEMORY_EMBEDDING_*），回填不可用");
+        }
+        if (!backfillRunning.compareAndSet(false, true)) {
+            return false;
+        }
+        backfillState = "running";
+        backfillProcessed.set(0);
+        int boundedBatch = Math.min(Math.max(batch, 1), 512);
+        Thread worker = new Thread(() -> {
+            try {
+                int total = backfillEmbeddings(boundedBatch, backfillProcessed::set);
+                backfillState = "done";
+                backfillProcessed.set(total);
+                LOG.info("memory: 异步回填任务结束，共 {} 条", total);
+            } catch (Exception e) {
+                backfillState = "error";
+                LOG.warn("memory: 异步回填任务失败：{}", e.toString());
+            } finally {
+                backfillRunning.set(false);
+            }
+        }, "memory-backfill");
+        worker.setDaemon(true);
+        worker.start();
+        return true;
+    }
+
+    /** 回填任务状态（#164 端点查询面）。 */
+    public Map<String, Object> backfillStatus() {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("state", backfillState);
+        out.put("processed", backfillProcessed.get());
+        return out;
     }
 
     // ── 用户画像 ────────────────────────────────────────────────────────
