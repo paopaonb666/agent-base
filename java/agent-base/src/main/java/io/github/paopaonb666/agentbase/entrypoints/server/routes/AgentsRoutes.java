@@ -23,6 +23,7 @@ import dev.langchain4j.data.message.UserMessage;
 
 import io.github.paopaonb666.agentbase.core.AgentRuntime;
 import io.github.paopaonb666.agentbase.core.ThreadId;
+import io.github.paopaonb666.agentbase.core.text.CharMetrics;
 import io.github.paopaonb666.agentbase.core.context.ContextEngine;
 import io.github.paopaonb666.agentbase.core.graph.CompiledGraph;
 import io.github.paopaonb666.agentbase.core.graph.GraphState;
@@ -110,8 +111,10 @@ public class AgentsRoutes {
                              @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
                              @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,
                              @RequestHeader(value = "X-User-Nonce", required = false) String nonceHeader) {
-        // 请求体校验（422 优先，对齐 FastAPI 校验层）。
-        if (body.message() == null || body.message().isEmpty() || body.message().length() > 100_000) {
+        // 请求体校验（422 优先，对齐 FastAPI 校验层）。长度按码点计数
+        // （Pydantic max_length 语义），代理对内容与 Python 侧同界。
+        if (body.message() == null || body.message().isEmpty()
+                || CharMetrics.len(body.message()) > 100_000) {
             throw new HttpError(422, "message 必须是 1..100000 字符");
         }
         if (body.threadId() != null && (body.threadId().length() > 128
@@ -142,7 +145,7 @@ public class AgentsRoutes {
         // 难度分流（M9）：mode 只决定调哪张图——thread 前缀、记忆 agent_id、
         // 属主、附件绑定、形成钩子全部维持请求模块不变（决策 5）。
         boolean usePlan = "plan".equals(mode)
-                || ("auto".equals(mode) && (body.message().length() > 200
+                || ("auto".equals(mode) && (CharMetrics.len(body.message()) > 200
                         || (body.attachments() != null && !body.attachments().isEmpty())));
         if (usePlan && !runtime.modules().containsKey("planner")) {
             if ("plan".equals(mode)) {

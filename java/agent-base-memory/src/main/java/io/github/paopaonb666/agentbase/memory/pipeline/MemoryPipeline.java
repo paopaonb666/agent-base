@@ -17,6 +17,7 @@ import java.util.function.BiConsumer;
 import io.github.paopaonb666.agentbase.core.AgentModule;
 import io.github.paopaonb666.agentbase.core.config.Settings;
 import io.github.paopaonb666.agentbase.core.llm.ModelRuntime;
+import io.github.paopaonb666.agentbase.core.text.CharMetrics;
 import io.github.paopaonb666.agentbase.extensions.Metrics;
 
 /**
@@ -235,15 +236,16 @@ public final class MemoryPipeline {
                 lines.add("助手：" + text);
             } else if (message instanceof ToolExecutionResultMessage tool) {
                 lines.add("工具[" + tool.toolName() + "]："
-                        + text.substring(0, Math.min(text.length(), 300)));
+                        + CharMetrics.head(text, 300));
             }
         }
         String transcript = String.join("\n", lines);
-        if (transcript.length() <= maxChars) {
+        if (CharMetrics.len(transcript) <= maxChars) {
             return transcript;
         }
-        // 保尾部：最近的内容对记忆形成更重要。
-        return "……（前文截断）\n" + transcript.substring(transcript.length() - maxChars);
+        // 保尾部：最近的内容对记忆形成更重要。截断按码点（Python len/
+        // 切片语义），代理对不劈半。
+        return "……（前文截断）\n" + CharMetrics.tail(transcript, maxChars);
     }
 
     private static String textOf(ChatMessage message) {

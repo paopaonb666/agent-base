@@ -199,6 +199,26 @@ class MemoryPipelineTest {
         assertTrue(transcript.endsWith("尾巴"));
     }
 
+    @Test
+    void renderTranscriptCountsCodePointsNotUtf16Units() {
+        // #138：emoji（代理对）按 1 个码点计，截断不劈半——代理对恰好
+        // 骑在 300 码点边界上时，UTF-16 substring 会留下半个代理对。
+        String emoji = "😀";
+        String body = "a".repeat(299) + emoji + "b".repeat(10);
+        String transcript = MemoryPipeline.renderTranscript(List.of(
+                ToolExecutionResultMessage.from("c1", "web_search", body)),
+                10_000);
+        String line = List.of(transcript.split("\n")).get(0);
+        String prefix = "工具[web_search]：";
+        assertEquals(300, line.codePointCount(0, line.length()) - prefix.length());
+        assertTrue(line.endsWith(emoji), "第 300 个码点是完整 emoji，UTF-16 截断会劈半");
+        // 尾部保码点：budget 4 → 保留最后 4 个码点（UTF-16 截断会只留 2 前 + emoji）。
+        String tail = MemoryPipeline.renderTranscript(List.of(
+                UserMessage.from("前".repeat(300) + emoji)),
+                4);
+        assertEquals("……（前文截断）\n前前前" + emoji, tail);
+    }
+
     // ── extractCandidates ────────────────────────────────────────────────
 
     private static MemoryPipeline pipelineWith(ScriptedMain main, ScriptedFast fast,

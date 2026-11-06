@@ -10,6 +10,7 @@ import java.util.Map;
 
 import io.github.paopaonb666.agentbase.core.MemoryScope;
 import io.github.paopaonb666.agentbase.core.ThreadId;
+import io.github.paopaonb666.agentbase.core.text.CharMetrics;
 import io.github.paopaonb666.agentbase.core.tools.AgentTool;
 import io.github.paopaonb666.agentbase.memory.service.MemoryService;
 import io.github.paopaonb666.agentbase.memory.store.Models.MemoryBlock;
@@ -107,7 +108,7 @@ public final class MemoryTools {
                         // 越界抛错走 ToolPool 归一（Python 侧 ValidationError
                         // 同样变成错误反馈），而不是静默钳制。
                         String query = str(a, "query", "");
-                        if (query.isEmpty() || query.length() > 2000) {
+                        if (query.isEmpty() || CharMetrics.len(query) > 2000) {
                             throw new IllegalArgumentException("query 必须是 1..2000 字符");
                         }
                         int limit = intOf(a, "limit", 5);
@@ -163,7 +164,7 @@ public final class MemoryTools {
                         Map<String, Object> a = args(argsJson);
                         // 约束对应 Python _MemorySaveArgs：content 1..2000、tags ≤ 10。
                         String content = str(a, "content", "");
-                        if (content.isEmpty() || content.length() > 2000) {
+                        if (content.isEmpty() || CharMetrics.len(content) > 2000) {
                             throw new IllegalArgumentException("content 必须是 1..2000 字符");
                         }
                         List<String> tags = a.get("tags") instanceof List<?> raw
@@ -210,13 +211,13 @@ public final class MemoryTools {
                         // ^[\w.-]+$（(?U) 使 \w 支持unicode——Python re 的 \w
                         // 默认 unicode 语义），content 1..4000。
                         String label = str(a, "label", "");
-                        if (label.isEmpty() || label.length() > 64
+                        if (label.isEmpty() || CharMetrics.len(label) > 64
                                 || !label.matches("(?U)^[\\w.-]+$")) {
                             throw new IllegalArgumentException(
                                     "label 必须是 1..64 字符且匹配 [\\w.-]+");
                         }
                         String content = str(a, "content", "");
-                        if (content.isEmpty() || content.length() > 4000) {
+                        if (content.isEmpty() || CharMetrics.len(content) > 4000) {
                             throw new IllegalArgumentException("content 必须是 1..4000 字符");
                         }
                         String operation = str(a, "operation", "append");
@@ -233,18 +234,19 @@ public final class MemoryTools {
                         } else {
                             merged = content;
                         }
-                        if (merged.length() > charLimit) {
+                        if (CharMetrics.len(merged) > charLimit) {
                             // 保尾部：最近写入的内容通常更重要（Letta 同语义）。
                             // 前缀计入预算，保证结果不超过 char_limit。
+                            // 截断按码点（Python len/切片语义），代理对不劈半。
                             String note = "……（较早内容已截断）\n";
-                            merged = note + merged.substring(merged.length() - (charLimit - note.length()));
+                            merged = note + CharMetrics.tail(merged, charLimit - note.length());
                         }
                         int version = (existing != null ? existing.version() : 0) + 1;
                         memory.store().upsertBlock(new MemoryBlock(scope.userId(), agent, label,
                                 merged, charLimit, version,
                                 io.github.paopaonb666.agentbase.memory.store.Models.now()));
                         return "记忆块 '" + label + "' 已更新（v" + version + "，"
-                                + merged.length() + "/" + charLimit + " 字符）";
+                                + CharMetrics.len(merged) + "/" + charLimit + " 字符）";
                     }
                 },
                 new AgentTool() {
@@ -272,7 +274,7 @@ public final class MemoryTools {
                     public String call(String argsJson, ToolContext ctx) {
                         // 约束对应 Python _MemoryDeleteArgs：4..64 且 ^[\w.-]+$。
                         String memoryId = str(args(argsJson), "memory_id", "");
-                        if (memoryId.length() < 4 || memoryId.length() > 64
+                        if (CharMetrics.len(memoryId) < 4 || CharMetrics.len(memoryId) > 64
                                 || !memoryId.matches("(?U)^[\\w.-]+$")) {
                             throw new IllegalArgumentException(
                                     "memory_id 必须是 4..64 字符且匹配 [\\w.-]+");
@@ -287,7 +289,7 @@ public final class MemoryTools {
                         }
                         boolean deleted = memory.deleteMemory(memoryId);
                         return deleted
-                                ? "已删除：" + record.content().substring(0, Math.min(60, record.content().length()))
+                                ? "已删除：" + CharMetrics.head(record.content(), 60)
                                 : "删除失败（记录已不存在）";
                     }
                 },
@@ -317,7 +319,7 @@ public final class MemoryTools {
                         // 约束对应 Python _KnowledgeSearchArgs：query 1..2000、
                         // limit 1..20（越界报错而非钳制）。
                         String query = str(a, "query", "");
-                        if (query.isEmpty() || query.length() > 2000) {
+                        if (query.isEmpty() || CharMetrics.len(query) > 2000) {
                             throw new IllegalArgumentException("query 必须是 1..2000 字符");
                         }
                         int limit = intOf(a, "limit", 5);
@@ -335,7 +337,7 @@ public final class MemoryTools {
                             String text = String.valueOf(item.get("text"));
                             sb.append("\n-（相关度 ")
                                     .append(String.format(java.util.Locale.ROOT, "%.2f", ((Number) item.get("score")).doubleValue()))
-                                    .append("）").append(text, 0, Math.min(text.length(), KNOWLEDGE_SNIPPET_CHARS));
+                                    .append("）").append(CharMetrics.head(text, KNOWLEDGE_SNIPPET_CHARS));
                         }
                         return sb.toString();
                     }
