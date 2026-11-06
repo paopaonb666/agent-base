@@ -274,7 +274,10 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
         List<Retrieval.ScoredMemory> results = Retrieval.recallMemories(store, embedder, userId,
                 agentId, query, topK != null ? topK : settings.memory.recallTopK, minScore, settings,
                 vectorIndex);
-        Metrics.memory().observe("search", "ok", (System.nanoTime() - started) / 1_000_000_000.0);
+        // 降级观测（#195）：embedding 缺席的检索打 degraded（纯 BM25 路径
+        // 与正常混合召回在监控上可区分），而不是一律 ok。
+        Metrics.memory().observe("search", hasEmbedding ? "ok" : "degraded",
+                (System.nanoTime() - started) / 1_000_000_000.0);
         return results;
     }
 
@@ -352,6 +355,7 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
     /** #184：file_id 下推——指定单文件时候选集在存储层收窄。 */
     public List<Map<String, Object>> searchKnowledge(String userId, String agentId, String query,
                                                      Integer topK, String fileId) {
+        long started = System.nanoTime();
         List<DocChunk> chunks = store.listChunks(userId, agentId, fileId, 2000);
         if (chunks.size() >= 2000) {
             LOG.warn("memory: 知识库候选分块达到上限 2000（user='{}', file='{}'）——更早的文件不参与本轮检索",
@@ -379,6 +383,10 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
             }
         }
         int limit = Math.max(1, topK != null ? topK : settings.memory.recallTopK);
+        // 降级观测（#195）：知识库检索与主检索同口径——embedding 缺席打
+        // degraded（此前该路径完全不发指标，降级不可见）。
+        Metrics.memory().observe("search_knowledge", embedder.dims() != null ? "ok" : "degraded",
+                (System.nanoTime() - started) / 1_000_000_000.0);
         List<Map<String, Object>> out = new ArrayList<>();
         for (Retrieval.ScoredChunk item : filtered.subList(0, Math.min(filtered.size(), limit))) {
             DocChunk chunk = item.chunk();
