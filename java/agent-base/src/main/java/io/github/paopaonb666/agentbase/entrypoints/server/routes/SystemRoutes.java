@@ -124,6 +124,13 @@ public class SystemRoutes {
         if (memory != null) {
             components.put("memory", memory.healthProbe());
         }
+        // 快照欠账（#198）：put 失败重试后仍失败的步在内存续跑——这里让
+        // 欠账可见（不参与 ok/degraded 判定：存储健康已由 checkpointer 组件
+        // 报告，欠账是存储故障的下游痕迹）。
+        if (io.github.paopaonb666.agentbase.core.graph.CompiledGraph.persistInDebt()) {
+            components.put("snapshot",
+                    "debt:" + io.github.paopaonb666.agentbase.core.graph.CompiledGraph.persistDebtSteps());
+        }
         // 成本治理：仅在 COST_ENABLED=true 时出现；warn/blocked → degraded。
         if (governor != null) {
             components.put("cost", governor.status());

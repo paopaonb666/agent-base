@@ -11,6 +11,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -147,14 +148,18 @@ class CompiledGraphTest {
     }
 
     @Test
-    void checkpointerPutFailureAbortsRunAndKeepsLastGoodSnapshot() {
-        // #198 基线：put 失败（磁盘满/连接抖动）向上传播中断整轮——
-        // 已产出 token 全部浪费，且上一轮快照保持原样（不会写坏）。
+    void checkpointerPutFailureRetriesOnceThenContinuesInMemory() {
+        // #198：put 失败先重试 1 次，仍失败则内存续跑——整轮已产出的
+        // token 不再因快照欠账报废；欠账计入 /health 可见的进程级计数。
+        long debtBefore = CompiledGraph.persistDebtSteps();
         InMemoryCheckpointer good = new InMemoryCheckpointer();
         good.put("chat:t1", new GraphState(List.of(UserMessage.from("old")), Map.of()));
-        Checkpointer failing = new Checkpointer() {
+        AtomicInteger putAttempts = new AtomicInteger();
+        Checkpointer flaky = new Checkpointer() {
             @Override
             public void put(String threadId, GraphState state) {
+                // 恒失败（磁盘满不因重试恢复）——验证重试只发生一次。
+                putAttempts.incrementAndGet();
                 throw new IllegalStateException("checkpoint put failed: disk full");
             }
 
@@ -184,16 +189,69 @@ class CompiledGraphTest {
         };
         CompiledGraph graph = GraphBuilder.singleNode("echo",
                 (state, ctx) -> Map.of(GraphState.MESSAGES, List.of(AiMessage.from("new"))),
-                failing);
+                flaky);
 
-        RuntimeException error = assertThrows(RuntimeException.class,
-                () -> graph.invoke(new GraphState(), RunConfig.of("chat:t1", "u1")));
-        assertTrue(error.getMessage().contains("disk full"), error.getMessage());
-        // 快照停在上一次成功写入的状态。
-        GraphState persisted = failing.get("chat:t1");
+        // run 正常完成（内存续跑）——不再抛错中断整轮；本轮消息在内存态完整。
+        GraphState out = graph.invoke(new GraphState(), RunConfig.of("chat:t1", "u1"));
+        assertEquals(2, out.messages().size());
+        assertEquals("new", ((AiMessage) out.messages().get(1)).text());
+        // 3 个落盘点（终态 1 步……单节点图 1 步 = 1 次 persist × 首次+重试 = 2 次尝试）。
+        assertEquals(2, putAttempts.get(), "每步落盘恰一次重试");
+        // 欠账计数对 /health 可见。
+        assertTrue(CompiledGraph.persistInDebt());
+        assertEquals(debtBefore + 1, CompiledGraph.persistDebtSteps());
+        // 上一轮快照保持原样（不会写坏）。
+        GraphState persisted = flaky.get("chat:t1");
         assertNotNull(persisted);
-        assertEquals(1, persisted.messages().size());
         assertEquals("old", ((UserMessage) persisted.messages().get(0)).singleText());
+    }
+
+    @Test
+    void checkpointerPutRecoversOnRetry() {
+        // 抖动语义：第一次 put 失败、重试成功——run 正常、欠账不累积。
+        InMemoryCheckpointer good = new InMemoryCheckpointer();
+        AtomicInteger putAttempts = new AtomicInteger();
+        Checkpointer flaky = new Checkpointer() {
+            @Override
+            public void put(String threadId, GraphState state) {
+                if (putAttempts.incrementAndGet() == 1) {
+                    throw new IllegalStateException("transient lock contention");
+                }
+                good.put(threadId, state);
+            }
+
+            @Override
+            public GraphState get(String threadId) {
+                return good.get(threadId);
+            }
+
+            @Override
+            public void deleteThread(String threadId) {
+                good.deleteThread(threadId);
+            }
+
+            @Override
+            public List<String> listThreadIds() {
+                return good.listThreadIds();
+            }
+
+            @Override
+            public boolean healthy() {
+                return true;
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        CompiledGraph graph = GraphBuilder.singleNode("echo",
+                (state, ctx) -> Map.of(GraphState.MESSAGES, List.of(AiMessage.from("new"))),
+                flaky);
+        GraphState out = graph.invoke(new GraphState(), RunConfig.of("chat:t1", "u1"));
+        assertEquals(1, out.messages().size());
+        assertEquals(2, putAttempts.get());
+        // 重试成功后快照在库。
+        assertNotNull(flaky.get("chat:t1"));
     }
 
     @Test

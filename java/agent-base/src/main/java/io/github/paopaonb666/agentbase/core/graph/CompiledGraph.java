@@ -200,9 +200,56 @@ public final class CompiledGraph {
     }
 
     private void persistState(RunConfig config, GraphState state) {
-        if (checkpointer != null) {
-            checkpointer.put(config.threadId(), state.copy());
+        if (checkpointer == null) {
+            return;
         }
+        try {
+            checkpointer.put(config.threadId(), state.copy());
+            recoverPersistDebt();
+            return;
+        } catch (RuntimeException first) {
+            // put 失败重试 1 次（#198）：连接抖动/锁竞争多为一过性。
+            try {
+                checkpointer.put(config.threadId(), state.copy());
+                recoverPersistDebt();
+                LOG.warn("graph: 快照落盘重试成功：thread={}", config.threadId());
+                return;
+            } catch (RuntimeException second) {
+                second.addSuppressed(first);
+                recordPersistDebt(second);
+            }
+        }
+        // 内存续跑：run 循环里的 state 本就是内存对象，这里只跳过持久化
+        // ——绝不因快照欠账把整轮已产出的 token 报废（#198）。
+    }
+
+    /** 快照欠账（#198）：进程级计数——/health 据此报告快照积压。 */
+    private static final java.util.concurrent.atomic.AtomicLong PERSIST_DEBT_STEPS =
+            new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicBoolean PERSIST_IN_DEBT =
+            new java.util.concurrent.atomic.AtomicBoolean();
+
+    private static void recordPersistDebt(RuntimeException cause) {
+        PERSIST_IN_DEBT.set(true);
+        PERSIST_DEBT_STEPS.incrementAndGet();
+        LOG.error("graph: 快照落盘失败（重试后仍失败）——本轮内存续跑，快照欠账累计 {} 步: {}",
+                PERSIST_DEBT_STEPS.get(), cause.toString());
+    }
+
+    private static void recoverPersistDebt() {
+        if (PERSIST_IN_DEBT.compareAndSet(true, false)) {
+            LOG.warn("graph: 快照落盘恢复（欠账期间被跳过的历史步不会补写）");
+        }
+    }
+
+    /** /health 组件（#198）：true = 存在未持久化的快照步（内存续跑中）。 */
+    public static boolean persistInDebt() {
+        return PERSIST_IN_DEBT.get();
+    }
+
+    /** /health 组件（#198）：启动以来被跳过的快照步累计数。 */
+    public static long persistDebtSteps() {
+        return PERSIST_DEBT_STEPS.get();
     }
 
     /** 图步数超限（对应 LangGraph GraphRecursionError；SSE 层转 ErrorEvent）。 */
