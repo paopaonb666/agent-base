@@ -443,6 +443,10 @@ public final class MemoryPipeline {
         detail.put("forced", force);
 
         // 单步包装：计时 + 失败审计 + 指标，异常绝不向上抛（对应 _run）。
+        // 审计 detail 对齐 Python（#135）：成功分支按结果形状记录——dict
+        // 原样、list 取 content 前 120 字摘要、其余包一层 {"result": …}；
+        // 之前恒写 {"human_count": N}，审计端点无法回答「这轮抽出了什么/
+        // 整合了什么」。失败分支维持 human_count。
         class Step<T> {
             T run(String op, java.util.function.Supplier<T> body) {
                 long started = System.nanoTime();
@@ -450,7 +454,7 @@ public final class MemoryPipeline {
                     T result = body.get();
                     long durationMs = (System.nanoTime() - started) / 1_000_000;
                     ops.recordOp(op, userId, agentId, threadId,
-                            Map.of("human_count", humanCount), "ok", "", durationMs);
+                            detailOf(result), "ok", "", durationMs);
                     Metrics.memory().observe(op, "ok", durationMs / 1000.0);
                     return result;
                 } catch (Exception exc) {
@@ -465,6 +469,30 @@ public final class MemoryPipeline {
                     Metrics.memory().observe(op, "error", durationMs / 1000.0);
                     return null;
                 }
+            }
+
+            /** 结果 → 审计 detail（对齐 Python _run 的三种形状）。 */
+            private Map<String, Object> detailOf(Object result) {
+                if (result instanceof Map<?, ?> map) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> cast = (Map<String, Object>) map;
+                    return cast;
+                }
+                if (result instanceof List<?> list) {
+                    // 候选记忆等数据列表：取可读摘要（content 前 120 码点）。
+                    List<String> summary = new ArrayList<>();
+                    for (Object item : list) {
+                        String text = item instanceof Candidate c
+                                ? c.content() : String.valueOf(item);
+                        summary.add(io.github.paopaonb666.agentbase.core.text.CharMetrics
+                                .head(text, 120));
+                    }
+                    Map<String, Object> wrapped = new LinkedHashMap<>();
+                    wrapped.put("result", summary);
+                    return wrapped;
+                }
+                // singletonMap 允许 null 值（result 本身可能为 null）。
+                return java.util.Collections.singletonMap("result", result);
             }
         }
         Step<Object> step = new Step<>();

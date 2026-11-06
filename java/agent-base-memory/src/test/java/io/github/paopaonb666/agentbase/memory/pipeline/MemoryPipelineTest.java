@@ -85,6 +85,7 @@ class MemoryPipelineTest {
     /** MemoryOps 记录桩。 */
     private static final class RecordingOps implements MemoryPipeline.MemoryOps {
         final List<String> calls = new ArrayList<>();
+        final Map<String, Map<String, Object>> opDetails = new LinkedHashMap<>();
         Map<String, Object> profileToReturn = null;
         Models.SessionSummary summaryToReturn = null;
         boolean updateResult = true;
@@ -142,6 +143,7 @@ class MemoryPipelineTest {
                              Map<String, Object> detail, String status, String errorText,
                              long durationMs) {
             calls.add("op:" + op + "|" + status);
+            opDetails.put(op + "|" + status, detail);
         }
     }
 
@@ -420,6 +422,14 @@ class MemoryPipelineTest {
         for (String step : List.of("extract", "consolidate", "profile", "summary")) {
             assertTrue(ops.calls.contains("op:" + step + "|ok"), ops.calls.toString());
         }
+        // #135：成功审计 detail 按结果形状记录，不再恒写 human_count——
+        // 抽取=list 摘要（content 前 120 码点）、整合=op 字符串、
+        // 画像/摘要=布尔，全部包一层 {"result": …}。
+        assertEquals(Map.of("result", List.of("用户在杭州")),
+                ops.opDetails.get("extract|ok"));
+        assertEquals(Map.of("result", "ADD"), ops.opDetails.get("consolidate|ok"));
+        assertEquals(Map.of("result", Boolean.TRUE), ops.opDetails.get("profile|ok"));
+        assertEquals(Map.of("result", Boolean.TRUE), ops.opDetails.get("summary|ok"));
     }
 
     @Test
@@ -437,6 +447,9 @@ class MemoryPipelineTest {
         assertEquals(Boolean.TRUE, detail.get("summary_updated"));
         assertTrue(ops.calls.contains("op:extract|error"));
         assertTrue(ops.calls.contains("op:summary|ok"));
+        // 失败分支维持 {"human_count": N}；成功分支不受失败影响。
+        assertEquals(Map.of("human_count", 20), ops.opDetails.get("extract|error"));
+        assertEquals(Map.of("result", Boolean.TRUE), ops.opDetails.get("summary|ok"));
         // 失败审计绝不向上抛：captureTurn 正常返回。
     }
 
