@@ -300,10 +300,7 @@ public class FilesRoutes {
         }
         List<Map<String, Object>> scored =
                 new ArrayList<>(memory.searchKnowledge(userId, null, query,
-                        Math.max(1, Math.min(limit, 20))));
-        if (fileId != null) {
-            scored.removeIf(item -> !fileId.equals(String.valueOf(item.get("file_id"))));
-        }
+                        Math.max(1, Math.min(limit, 20)), fileId));
         // 文件名补全（尽力而为）：分块已按 user_id 隔离，名字只做展示。
         Map<String, String> names = new LinkedHashMap<>();
         if (runtime.fileStore() != null && !scored.isEmpty()) {

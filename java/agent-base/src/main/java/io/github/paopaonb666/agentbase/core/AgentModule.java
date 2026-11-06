@@ -110,6 +110,16 @@ public interface AgentModule {
         /** 知识库混合检索；返回切片视图列表。 */
         List<Map<String, Object>> searchKnowledge(String userId, String agentId, String query, Integer topK);
 
+        /**
+         * 知识库混合检索（#184：file_id 下推）：{@code fileId} 非空时候选
+         * 集在存储层收窄到该文件——单文件检索不再对全库 2000 候选白算。
+         * 默认忽略 fileId 委托 4 参版（装饰器/替身无需逐个跟进）。
+         */
+        default List<Map<String, Object>> searchKnowledge(String userId, String agentId,
+                                                          String query, Integer topK, String fileId) {
+            return searchKnowledge(userId, agentId, query, topK);
+        }
+
         /** 文件切片视图列表（M7 可视化）。 */
         List<Map<String, Object>> listFileChunks(String userId, String fileId, int limit);
 

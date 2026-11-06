@@ -346,9 +346,16 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
     @Override
     public List<Map<String, Object>> searchKnowledge(String userId, String agentId, String query,
                                                      Integer topK) {
-        List<DocChunk> chunks = store.listChunks(userId, agentId, null, 2000);
+        return searchKnowledge(userId, agentId, query, topK, null);
+    }
+
+    /** #184：file_id 下推——指定单文件时候选集在存储层收窄。 */
+    public List<Map<String, Object>> searchKnowledge(String userId, String agentId, String query,
+                                                     Integer topK, String fileId) {
+        List<DocChunk> chunks = store.listChunks(userId, agentId, fileId, 2000);
         if (chunks.size() >= 2000) {
-            LOG.warn("memory: 知识库候选分块达到上限 2000（user='{}'）——更早的文件不参与本轮检索", userId);
+            LOG.warn("memory: 知识库候选分块达到上限 2000（user='{}', file='{}'）——更早的文件不参与本轮检索",
+                    userId, fileId);
         }
         if (chunks.isEmpty()) {
             return List.of();
