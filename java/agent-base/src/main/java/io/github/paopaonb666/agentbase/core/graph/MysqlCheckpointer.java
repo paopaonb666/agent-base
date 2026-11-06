@@ -111,8 +111,16 @@ public final class MysqlCheckpointer implements Checkpointer {
                     if (!rs.next()) {
                         return null;
                     }
-                    // 损坏行（非法 JSON）返回 null：旧行当作缺失处理。
-                    return GraphStateJson.fromJson(rs.getString(1));
+                    // 分类解析（#200/#235）：损坏/未知版本返回 null 当缺失，
+                    // 但 ERROR 可见（MySQL 侧隔离表随后续迁移机制一起做）。
+                    String raw = rs.getString(1);
+                    GraphStateJson.ParseResult parsed = GraphStateJson.fromJsonDetail(raw);
+                    if (GraphStateJson.ParseResult.OK.equals(parsed.kind())) {
+                        return parsed.state();
+                    }
+                    LOG.error("mysql checkpointer: 快照无法解析（thread={}，kind={}，{}）"
+                            + "——原行保留", threadId, parsed.kind(), parsed.detail());
+                    return null;
                 }
             }
         } catch (SQLException e) {

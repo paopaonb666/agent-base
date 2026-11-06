@@ -35,6 +35,19 @@ public final class SqliteCheckpointer implements Checkpointer {
               updated_at TEXT NOT NULL
             )""";
 
+    /**
+     * 损坏快照隔离表（#235）：损坏行移出主表（不再每次 get 都重新炸）
+     * 但保留原文供人工核查/工具恢复——静默当「无历史」会让用户会话无声
+     * 丢失。unknown 版本的行不进隔离表（拒载保留原行，等迁移函数）。
+     */
+    private static final String QUARANTINE_DDL = """
+            CREATE TABLE IF NOT EXISTS ab_thread_states_quarantine (
+              thread_id TEXT NOT NULL,
+              state_json TEXT NOT NULL,
+              reason TEXT NOT NULL,
+              detected_at TEXT NOT NULL
+            )""";
+
     private static final String UPSERT = """
             INSERT OR REPLACE INTO ab_thread_states (thread_id, state_json, updated_at)
             VALUES (?, ?, ?)""";
@@ -54,6 +67,7 @@ public final class SqliteCheckpointer implements Checkpointer {
         this.conn = connection;
         try (Statement st = conn.createStatement()) {
             st.execute(DDL);
+            st.execute(QUARANTINE_DDL);
         } catch (SQLException e) {
             closeQuietly();
             throw new IllegalStateException("sqlite checkpointer: 建表失败", e);
@@ -86,12 +100,50 @@ public final class SqliteCheckpointer implements Checkpointer {
                     if (!rs.next()) {
                         return null;
                     }
-                    // 损坏行（非法 JSON）返回 null：旧行当作缺失处理。
-                    return GraphStateJson.fromJson(rs.getString(1));
+                    String raw = rs.getString(1);
+                    GraphStateJson.ParseResult parsed = GraphStateJson.fromJsonDetail(raw);
+                    switch (parsed.kind()) {
+                        case GraphStateJson.ParseResult.OK -> {
+                            return parsed.state();
+                        }
+                        case GraphStateJson.ParseResult.VERSION_REFUSED -> {
+                            // 未知版本：拒载但保留原行（等迁移函数处理），ERROR 可见。
+                            LOG.error("sqlite checkpointer: 快照版本拒载（thread={}，{}）"
+                                    + "——原行保留，等待迁移", threadId, parsed.detail());
+                            return null;
+                        }
+                        default -> {
+                            // 损坏行（非法 JSON）：隔离到 quarantine 表并从主表
+                            // 移除（#235）——不再每次 get 都命中，原文可查。
+                            quarantine(threadId, raw, parsed.detail());
+                            return null;
+                        }
+                    }
                 }
             } catch (SQLException e) {
                 throw new IllegalStateException("sqlite checkpointer: 状态读取失败", e);
             }
+        }
+    }
+
+    /** 损坏行隔离（#235）：入 quarantine 表 + 从主表删除；失败仅告警（读路径不炸）。 */
+    private void quarantine(String threadId, String raw, String reason) {
+        LOG.error("sqlite checkpointer: 快照损坏已隔离（thread={}，reason={}）"
+                + "——原文保留在 ab_thread_states_quarantine", threadId, reason);
+        try (PreparedStatement insert = conn.prepareStatement(
+                "INSERT INTO ab_thread_states_quarantine (thread_id, state_json, reason, detected_at)"
+                        + " VALUES (?, ?, ?, ?)");
+             PreparedStatement delete = conn.prepareStatement(
+                     "DELETE FROM ab_thread_states WHERE thread_id = ?")) {
+            insert.setString(1, threadId);
+            insert.setString(2, raw);
+            insert.setString(3, reason);
+            insert.setString(4, LocalDateTime.now().toString());
+            insert.executeUpdate();
+            delete.setString(1, threadId);
+            delete.executeUpdate();
+        } catch (SQLException e) {
+            LOG.error("sqlite checkpointer: 损坏行隔离失败（主表行保留）：{}", e.toString());
         }
     }
 

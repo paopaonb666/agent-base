@@ -124,26 +124,55 @@ class GraphStateJsonTest {
 
     @Test
     void corruptedJsonLineReturnsNull() {
-        // #200/#235 基线：损坏 JSON → null，调用方按"无历史"处理（静默
-        // 变新对话）。版本字段落地时这里的断言要改为拒绝加载并告警。
+        // #200/#235：损坏 JSON → null（调用方按"无历史"处理）；分类细节
+        // 由 fromJsonDetail 提供（checkpointer 据此隔离）。
         assertNull(GraphStateJson.fromJson("{not json at all"));
         assertNull(GraphStateJson.fromJson(""));
         assertNull(GraphStateJson.fromJson(null));
+        assertEquals(GraphStateJson.ParseResult.CORRUPT,
+                GraphStateJson.fromJsonDetail("{not json at all").kind());
     }
 
     @Test
-    void unknownMessageTypeIsDropped() {
-        // #201 基线：未知 type → null 丢弃，其余消息保留（丢失无计数）。
+    void snapshotsCarryAVersionFieldAndUnknownVersionsAreRefused() throws Exception {
+        // #200：写侧带 v=1；读侧未知版本拒载（返回 null），无 v 的存量行
+        // （v1 兼容格式）照常解析。
+        String json = GraphStateJson.toJson(new GraphState(
+                List.of(UserMessage.from("hi")), Map.of()));
+        assertEquals(1, MAPPER.readTree(json).get("v").asInt());
+        assertEquals("hi", ((UserMessage) GraphStateJson.fromJson(json).messages().get(0)).singleText());
+        // 存量行（无 v）兼容。
+        GraphState legacy = GraphStateJson.fromJson(
+                "{\"messages\":[{\"type\":\"human\",\"content\":\"old\"}],\"extra\":{}}");
+        assertEquals("old", ((UserMessage) legacy.messages().get(0)).singleText());
+        // 未知版本拒载。
+        assertNull(GraphStateJson.fromJson(
+                "{\"v\":99,\"messages\":[],\"extra\":{}}"));
+        assertEquals(GraphStateJson.ParseResult.VERSION_REFUSED,
+                GraphStateJson.fromJsonDetail("{\"v\":99,\"messages\":[],\"extra\":{}}").kind());
+        assertTrue(GraphStateJson.fromJsonDetail(
+                "{\"v\":99,\"messages\":[],\"extra\":{}}").detail().contains("99"));
+    }
+
+    @Test
+    void unknownMessageTypeIsDroppedAndCounted() {
+        // #201：未知 type → null 丢弃，其余消息保留；丢弃按 type 计数
+        // （丢失可观测，不再静默）。
+        long before = GraphStateJson.unknownMessageTypeCounts()
+                .getOrDefault("future_kind", 0L);
         GraphState restored = GraphStateJson.fromJson("""
                 {"messages":[
                   {"type":"human","content":"before"},
                   {"type":"future_kind","content":"mystery"},
-                  {"type":"human","content":"after"}
+                  {"type":"human","content":"after"},
+                  {"type":"future_kind","content":"mystery-2"}
                 ],"extra":{}}
                 """);
         assertEquals(2, restored.messages().size());
         assertEquals("before", ((UserMessage) restored.messages().get(0)).singleText());
         assertEquals("after", ((UserMessage) restored.messages().get(1)).singleText());
+        assertEquals(before + 2, GraphStateJson.unknownMessageTypeCounts()
+                .getOrDefault("future_kind", 0L), "未知 type 丢弃应累计计数");
     }
 
     @Test

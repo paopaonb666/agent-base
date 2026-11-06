@@ -27,13 +27,35 @@ import java.util.Map;
  */
 public final class GraphStateJson {
 
+    private static final org.slf4j.Logger LOG =
+            org.slf4j.LoggerFactory.getLogger(GraphStateJson.class);
+
     private GraphStateJson() {}
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    /** 序列化图状态为 JSON 字符串。 */
+    /**
+     * 存储格式版本（#200）：升级改序列化格式时递增，并在
+     * {@link #fromJsonDetail} 里按旧版本写迁移分支——未知版本拒载并
+     * 告警，绝不把升级中的旧快照静默解析成「无历史」。
+     */
+    public static final int VERSION = 1;
+
+    /** 未知消息 type 的丢弃计数（#201）：丢失可观测。 */
+    private static final java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicLong>
+            UNKNOWN_TYPE_COUNTS = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** 快照解析结果分类（#235）：checkpointer 据此隔离/告警。 */
+    public record ParseResult(GraphState state, String kind, String detail) {
+        public static final String OK = "ok";
+        public static final String CORRUPT = "corrupt";
+        public static final String VERSION_REFUSED = "version";
+    }
+
+    /** 序列化图状态为 JSON 字符串（带版本字段 v）。 */
     public static String toJson(GraphState state) {
         ObjectNode root = MAPPER.createObjectNode();
+        root.put("v", VERSION);
         ArrayNode messages = root.putArray("messages");
         for (ChatMessage message : state.messages()) {
             messages.add(messageToJson(message));
@@ -45,31 +67,55 @@ public final class GraphStateJson {
         return root.toString();
     }
 
-    /** 反序列化；损坏的 JSON 返回 null（旧行当作缺失处理）。 */
+    /** 反序列化；损坏的 JSON / 被拒版本返回 null（旧行当作缺失处理）。 */
     public static GraphState fromJson(String json) {
+        return fromJsonDetail(json).state();
+    }
+
+    /**
+     * 分类解析（#200/#235）：ok（含空值/无 v 的存量行——v1 兼容）/
+     * corrupt（JSON 损坏）/ version（未知版本，拒载保留行等迁移）。
+     */
+    public static ParseResult fromJsonDetail(String json) {
         if (json == null || json.isEmpty()) {
-            return null;
+            return new ParseResult(null, ParseResult.OK, "empty");
         }
+        JsonNode root;
         try {
-            JsonNode root = MAPPER.readTree(json);
-            List<ChatMessage> messages = new ArrayList<>();
-            if (root.has("messages") && root.get("messages").isArray()) {
-                for (JsonNode node : root.get("messages")) {
-                    ChatMessage message = messageFromJson(node);
-                    if (message != null) {
-                        messages.add(message);
-                    }
+            root = MAPPER.readTree(json);
+        } catch (JsonProcessingException e) {
+            return new ParseResult(null, ParseResult.CORRUPT, String.valueOf(e.getMessage()));
+        }
+        if (root.has("v")) {
+            JsonNode v = root.get("v");
+            if (!v.canConvertToInt() || v.asInt() != VERSION) {
+                return new ParseResult(null, ParseResult.VERSION_REFUSED,
+                        "snapshot v=" + v + " (supported: " + VERSION + ")");
+            }
+        }
+        // 无 v 的存量行是 v1 兼容格式，照常解析。
+        List<ChatMessage> messages = new ArrayList<>();
+        if (root.has("messages") && root.get("messages").isArray()) {
+            for (JsonNode node : root.get("messages")) {
+                ChatMessage message = messageFromJson(node);
+                if (message != null) {
+                    messages.add(message);
                 }
             }
-            Map<String, Object> extra = new LinkedHashMap<>();
-            if (root.has("extra") && root.get("extra").isObject()) {
-                extra.putAll(MAPPER.convertValue(root.get("extra"),
-                        new com.fasterxml.jackson.core.type.TypeReference<Map<String, Object>>() {}));
-            }
-            return new GraphState(messages, extra);
-        } catch (JsonProcessingException e) {
-            return null;
         }
+        Map<String, Object> extra = new LinkedHashMap<>();
+        if (root.has("extra") && root.get("extra").isObject()) {
+            extra.putAll(MAPPER.convertValue(root.get("extra"),
+                    new com.fasterxml.jackson.core.type.TypeReference<Map<String, Object>>() {}));
+        }
+        return new ParseResult(new GraphState(messages, extra), ParseResult.OK, "");
+    }
+
+    /** 未知消息 type 的累计丢弃数（按 type 分桶；#201 可观测性）。 */
+    public static Map<String, Long> unknownMessageTypeCounts() {
+        Map<String, Long> out = new LinkedHashMap<>();
+        UNKNOWN_TYPE_COUNTS.forEach((type, count) -> out.put(type, count.get()));
+        return out;
     }
 
     /** 单条消息 → JSON 节点。 */
@@ -167,6 +213,15 @@ public final class GraphStateJson {
                         node.path("content").asText(""));
             }
             default -> {
+                // 未知 type（#201）：丢弃但 WARN + 计数——升级新增消息类型
+                // 后旧代码读新快照的静默丢消息变成可观测事件。
+                java.util.concurrent.atomic.AtomicLong count =
+                        UNKNOWN_TYPE_COUNTS.computeIfAbsent(type, t -> new java.util.concurrent.atomic.AtomicLong());
+                long seen = count.incrementAndGet();
+                if (seen == 1) {
+                    LOG.warn("graph state: 未知消息 type '{}' 被丢弃（快照兼容读取；"
+                            + "该 type 累计计数可见 unknownMessageTypeCounts）", type);
+                }
                 return null;
             }
         }

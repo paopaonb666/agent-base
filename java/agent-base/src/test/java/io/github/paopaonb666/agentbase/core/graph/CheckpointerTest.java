@@ -113,6 +113,58 @@ class CheckpointerTest {
         }
     }
 
+    @Test
+    void corruptedRowIsQuarantinedNotRehit() throws SQLException {
+        // #235：损坏行隔离到 quarantine 表并移出主表——后续 get 不再命中，
+        // 原文可查（静默当「无历史」变成留痕的显式事件）。
+        Path db = tempDir.resolve("quarantine.db");
+        try (SqliteCheckpointer checkpointer = new SqliteCheckpointer(db.toString())) {
+            try (var conn = DriverManager.getConnection("jdbc:sqlite:" + db);
+                 Statement st = conn.createStatement()) {
+                st.execute("INSERT INTO ab_thread_states (thread_id, state_json, updated_at) "
+                        + "VALUES ('chat:bad', '{broken', '2026-01-01T00:00:00')");
+            }
+            assertNull(checkpointer.get("chat:bad"));
+            try (var conn = DriverManager.getConnection("jdbc:sqlite:" + db);
+                 Statement stMain = conn.createStatement();
+                 Statement stQuar = conn.createStatement();
+                 var main = stMain.executeQuery(
+                         "SELECT COUNT(*) FROM ab_thread_states WHERE thread_id='chat:bad'");
+                 var quar = stQuar.executeQuery(
+                         "SELECT thread_id, state_json FROM ab_thread_states_quarantine "
+                                 + "WHERE thread_id='chat:bad'")) {
+                main.next();
+                assertEquals(0, main.getInt(1), "损坏行应移出主表");
+                quar.next();
+                assertEquals("chat:bad", quar.getString(1));
+                assertEquals("{broken", quar.getString(2), "原文保留在隔离表");
+            }
+        }
+    }
+
+    @Test
+    void unknownVersionSnapshotRefusesToLoadAndKeepsTheRow() throws SQLException {
+        // #200：未知版本拒载（返回 null）但原行保留——升级窗口里旧代码
+        // 不把新格式快照静默当「无历史」覆盖掉。
+        Path db = tempDir.resolve("version.db");
+        try (SqliteCheckpointer checkpointer = new SqliteCheckpointer(db.toString())) {
+            checkpointer.put("chat:t1", sampleState());
+            try (var conn = DriverManager.getConnection("jdbc:sqlite:" + db);
+                 Statement st = conn.createStatement()) {
+                st.execute("UPDATE ab_thread_states SET state_json='{\"v\":99,\"messages\":[],\"extra\":{}}' "
+                        + "WHERE thread_id='chat:t1'");
+            }
+            assertNull(checkpointer.get("chat:t1"), "未知版本拒载");
+            try (var conn = DriverManager.getConnection("jdbc:sqlite:" + db);
+                 Statement st = conn.createStatement();
+                 var rs = st.executeQuery(
+                         "SELECT COUNT(*) FROM ab_thread_states WHERE thread_id='chat:t1'")) {
+                rs.next();
+                assertEquals(1, rs.getInt(1), "原行保留等迁移");
+            }
+        }
+    }
+
     // ── 共享断言 ─────────────────────────────────────────────────────
 
     private void roundtripAndLifecycle(Checkpointer checkpointer) {
