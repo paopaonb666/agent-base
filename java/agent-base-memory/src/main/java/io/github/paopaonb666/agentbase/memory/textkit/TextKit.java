@@ -121,10 +121,11 @@ public final class TextKit {
         return fallback;
     }
 
-    /** 对应 Python {@code len(json.dumps(trimmed, ensure_ascii=False))}。 */
+    /** 对应 Python {@code len(json.dumps(trimmed, ensure_ascii=False))}：
+     * 默认分隔符（", "/": "）计入长度——Jackson 紧凑输出会让截断时机漂移。 */
     private static int jsonLength(Map<String, Object> value) {
         try {
-            String json = JSON.writeValueAsString(value);
+            String json = PyJson.dumps(value);
             return json.codePointCount(0, json.length());
         } catch (Exception e) {
             // 序列化失败（不可编码对象等）：视为超长，继续收缩。绝不抛错。

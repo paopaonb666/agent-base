@@ -85,6 +85,14 @@ public final class CompiledGraph {
                 sink.accept(io.github.paopaonb666.agentbase.extensions.events.Events.StepEvent.running(current));
             }
             Map<String, Object> update = executeNode(node, state, config, sink);
+            if (sink != null && sink.cancelled()) {
+                // 节点已在途执行完（无法回滚），但取消后不再把这一步落盘：
+                // 对应 Python asyncio 任务在节点 await 点被取消——中断的
+                // superstep 不会进 checkpoint，恢复后看不到这半步。
+                LOG.debug("图执行被取消（客户端断开）：thread={}，丢弃步骤 {} 的快照",
+                        config.threadId(), current);
+                break;
+            }
             state.apply(update);
             if (sink != null) {
                 sink.accept(io.github.paopaonb666.agentbase.extensions.events.Events.StepEvent.completed(current));

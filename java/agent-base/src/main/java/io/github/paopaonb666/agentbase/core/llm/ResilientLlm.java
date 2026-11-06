@@ -112,27 +112,31 @@ public final class ResilientLlm implements AgentModule.ChatInvokerPort {
         int attempts = maxRetries + 1;
         RuntimeException lastError = null;
         for (int attempt = 0; attempt < attempts; attempt++) {
-            boolean acquired = false;
+            RuntimeException failure = null;
             try {
                 semaphore.acquire();
-                acquired = true;
-                return invokeText(primary, messages);
+                try {
+                    return invokeText(primary, messages);
+                } finally {
+                    semaphore.release();
+                }
             } catch (InterruptedException interrupted) {
                 // 信号量等待被中断：恢复标志并中止（对应 asyncio 取消传播）。
                 Thread.currentThread().interrupt();
                 throw interruptedWait(interrupted, lastError);
             } catch (RuntimeException exc) {
+                failure = exc;
                 lastError = exc;
-                if (attempt < attempts - 1) {
-                    long delayMillis = baseDelayMillis * (1L << attempt);
-                    LOG.warn("llm: 快速档调用失败（第 {}/{} 次），{}s 后重试: {}",
-                            attempt + 1, attempts, delayMillis / 1000.0, exc.toString());
-                    sleepBeforeRetry(delayMillis, lastError);
-                }
-            } finally {
-                if (acquired) {
-                    semaphore.release();
-                }
+            }
+            // 退避等待在信号量之外（对应 Python：async with 块随异常传播
+            // 先退出，asyncio.sleep 在许可已归还后执行）——重试背压不占用
+            // 并发额度，否则 LLM_FAST_CONCURRENCY=1 时后续调用会被
+            // 睡眠中的线程白白串行化。
+            if (attempt < attempts - 1) {
+                long delayMillis = baseDelayMillis * (1L << attempt);
+                LOG.warn("llm: 快速档调用失败（第 {}/{} 次），{}s 后重试: {}",
+                        attempt + 1, attempts, delayMillis / 1000.0, failure.toString());
+                sleepBeforeRetry(delayMillis, lastError);
             }
         }
         if (fallback != null) {

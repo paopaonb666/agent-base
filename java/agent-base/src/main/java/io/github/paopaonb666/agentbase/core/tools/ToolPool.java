@@ -226,11 +226,14 @@ public final class ToolPool {
     /**
      * 把任何工具失败归一成模型可读的反馈：URL 脱敏 + 长度封顶。基座的
      * 契约是"坏掉的工具绝不能打断对话"——每个异常都被转换为模型能够
-     * 回应的文本。
+     * 回应的文本。对应 Python {@code _normalize_tool_error}：str(exc)
+     * 对无消息异常是空串（不是 "null"），且 300 字符上限包含前缀整体。
      */
     public static String handleToolError(Exception exc) {
-        String text = TOOL_ERROR_URL_RE.matcher(String.valueOf(exc.getMessage())).replaceAll("<redacted-url>");
-        return ("tool execution failed: " + text);
+        String raw = exc.getMessage() == null ? "" : exc.getMessage();
+        String text = TOOL_ERROR_URL_RE.matcher(raw).replaceAll("<redacted-url>");
+        String out = "tool execution failed: " + text;
+        return out.length() > TOOL_ERROR_MAX_CHARS ? out.substring(0, TOOL_ERROR_MAX_CHARS) : out;
     }
 
     /** 把工具参数转成可 JSON 序列化的形式；解析失败降级为 {"_raw": ...}。 */

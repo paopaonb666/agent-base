@@ -78,7 +78,10 @@ public final class WebFilters {
         private static String routeOf(HttpServletRequest req) {
             Object pattern = req.getAttribute(
                     org.springframework.web.servlet.HandlerMapping.BEST_MATCHING_PATTERN_ATTRIBUTE);
-            return pattern instanceof String template ? template : req.getRequestURI();
+            // 未匹配路由（404/405）恒用 "unmatched"（对应 Python server/__init__
+            // 的 route template 回退）——原始 URI 会让扫描器打出的每个路径都
+            // 成为独立 Prometheus 序列，基数爆炸。
+            return pattern instanceof String template ? template : "unmatched";
         }
     }
 }

@@ -156,10 +156,11 @@ class TextKitTest {
         profile.put("log", new ArrayList<>(List.of("x".repeat(40))));
 
         Map<String, Object> trimmed = TextKit.trimProfileToChars(profile, 30);
-        // 最后一个分节 log 整体丢弃；facts 仍超长则从尾部逐条丢。
+        // 长度按 Python json.dumps 默认分隔符（", "/": "）计——30 字符预算下
+        // log 整体丢弃后 facts 仍超长、逐条丢尽（Python 侧实测同一输入输出
+        // {'name': '小明'}）。
         Map<String, Object> expected = new LinkedHashMap<>();
         expected.put("name", "小明");
-        expected.put("facts", List.of("喜欢猫"));
         assertEquals(expected, trimmed);
         assertTrue(jsonLen(trimmed) <= 30);
         // 原 profile 不被改动。

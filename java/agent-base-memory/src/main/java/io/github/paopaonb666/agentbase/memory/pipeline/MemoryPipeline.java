@@ -115,7 +115,7 @@ public final class MemoryPipeline {
 
     /** 画像分节（Python PROFILE_SECTIONS）。 */
     public static final List<String> PROFILE_SECTIONS =
-            List.of("身份", "偏好", "目标", "约束", "事件");
+            List.of("基本信息", "偏好", "工作背景", "沟通风格", "长期目标");
 
     /** 一条抽取候选。 */
     public record Candidate(String content, String kind, double salience, List<String> tags) {}
@@ -320,8 +320,12 @@ public final class MemoryPipeline {
         }
         String candidateJson;
         try {
-            candidateJson = new com.fasterxml.jackson.databind.ObjectMapper()
-                    .writeValueAsString(Map.of("content", candidate.content(), "kind", candidate.kind()));
+            // json.dumps({...}, ensure_ascii=False) 形态（默认分隔符，键序
+            // content→kind 与 Python dict 字面量一致）。
+            java.util.Map<String, Object> candidateMap = new java.util.LinkedHashMap<>();
+            candidateMap.put("content", candidate.content());
+            candidateMap.put("kind", candidate.kind());
+            candidateJson = io.github.paopaonb666.agentbase.memory.textkit.PyJson.dumps(candidateMap);
         } catch (Exception e) {
             candidateJson = "{\"content\": \"" + candidate.content() + "\"}";
         }
@@ -383,8 +387,9 @@ public final class MemoryPipeline {
         }
         String profileJson;
         try {
-            profileJson = new com.fasterxml.jackson.databind.ObjectMapper()
-                    .writerWithDefaultPrettyPrinter().writeValueAsString(profile);
+            // json.dumps(profile, ensure_ascii=False, indent=1) 形态（1 空格
+            // 缩进 + ",\n" + ": "），与 Python pipeline.py 的 merge prompt 逐位一致。
+            profileJson = io.github.paopaonb666.agentbase.memory.textkit.PyJson.dumpsIndent(profile, 1);
         } catch (Exception e) {
             profileJson = "{}";
         }

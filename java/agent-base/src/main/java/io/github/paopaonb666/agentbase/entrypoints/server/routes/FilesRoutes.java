@@ -90,19 +90,22 @@ public class FilesRoutes {
                                           @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
                                           @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,
                                           @RequestHeader(value = "X-User-Nonce", required = false) String nonceHeader) throws IOException {
+        // 鉴权先行（对应 Python get_current_user 依赖先于一切处理逻辑）。
+        String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         requireModule(module);
         UploadedFileStore fileStore = runtime.fileStore();
         if (fileStore == null) {
             throw new HttpError(503, "附件存储未启用（存储后端不可用）");
         }
-        String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
-        // 流式分块读取，边读边判大小（M5）：超限立即 413。
+        // 大小上限（M5）：Python 边读边判、超限立即 413；Java 的 multipart
+        // 已由容器落盘，这里至少在堆拷贝（getBytes 的整份复制）之前拒绝，
+        // 避免超大附件把内存放大一倍。文案与 Python 413 一致。
         Settings settings = runtime.settings();
         int maxBytes = settings.docParse.maxInputBytes;
-        byte[] data = file.getBytes();
-        if (data.length > maxBytes) {
+        if (file.getSize() > maxBytes) {
             throw new HttpError(413, "文件超出大小上限：> " + maxBytes + " 字节");
         }
+        byte[] data = file.getBytes();
         if (data.length == 0) {
             throw new HttpError(400, "上传文件为空");
         }
@@ -159,8 +162,10 @@ public class FilesRoutes {
                                           @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
                                           @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,
                                           @RequestHeader(value = "X-User-Nonce", required = false) String nonceHeader) {
-        requireModule(module);
+        // 鉴权先行（对应 Python get_current_user 作为 FastAPI 依赖在任何
+        // 处理逻辑之前解析——未签名请求一律 401，不给存在性探测留口子）。
         String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
+        requireModule(module);
         ownedFile(fileId, userId); // 属主校验（不存在/非属主即 404）
         UploadedFileStore fileStore = runtime.fileStore();
         boolean deleted = fileStore.deleteFile(fileId);
@@ -182,8 +187,10 @@ public class FilesRoutes {
                                            @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
                                            @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,
                                            @RequestHeader(value = "X-User-Nonce", required = false) String nonceHeader) {
-        requireModule(module);
+        // 鉴权先行（对应 Python get_current_user 作为 FastAPI 依赖在任何
+        // 处理逻辑之前解析——未签名请求一律 401，不给存在性探测留口子）。
         String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
+        requireModule(module);
         UploadedFileInfo info = ownedFile(fileId, userId);
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("file_id", info.fileId());
@@ -209,8 +216,10 @@ public class FilesRoutes {
                                           @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
                                           @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,
                                           @RequestHeader(value = "X-User-Nonce", required = false) String nonceHeader) {
-        requireModule(module);
+        // 鉴权先行（对应 Python get_current_user 作为 FastAPI 依赖在任何
+        // 处理逻辑之前解析——未签名请求一律 401，不给存在性探测留口子）。
         String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
+        requireModule(module);
         ownedFile(fileId, userId);
         var memory = runtime.memory();
         List<Map<String, Object>> chunks = memory != null
@@ -229,8 +238,10 @@ public class FilesRoutes {
             @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
             @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,
             @RequestHeader(value = "X-User-Nonce", required = false) String nonceHeader) {
-        requireModule(module);
+        // 鉴权先行（对应 Python get_current_user 作为 FastAPI 依赖在任何
+        // 处理逻辑之前解析——未签名请求一律 401，不给存在性探测留口子）。
         String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
+        requireModule(module);
         UploadedFileInfo info = ownedFile(fileId, userId);
         if (info.content() == null || info.content().length == 0) {
             throw new HttpError(404, "文件内容不可用");
@@ -261,11 +272,12 @@ public class FilesRoutes {
             @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
             @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,
             @RequestHeader(value = "X-User-Nonce", required = false) String nonceHeader) {
+        // 鉴权先行（对应 Python get_current_user 依赖）。
+        String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         var memory = runtime.memory();
         if (memory == null) {
             throw new HttpError(503, "记忆系统未启用（MEMORY_ENABLED=false）");
         }
-        String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         String query = q == null ? "" : q.strip();
         if (query.isEmpty()) {
             throw new HttpError(422, "q 不能为空");
@@ -309,11 +321,12 @@ public class FilesRoutes {
             @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
             @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,
             @RequestHeader(value = "X-User-Nonce", required = false) String nonceHeader) {
+        // 鉴权先行（对应 Python get_current_user 依赖）。
+        String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         UploadedFileStore fileStore = runtime.fileStore();
         if (fileStore == null) {
             throw new HttpError(503, "附件存储未启用（存储后端不可用）");
         }
-        String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         List<UploadedFileInfo> files = fileStore.listForUser(userId);
         Map<String, Integer> counts = Map.of();
         var memory = runtime.memory();

@@ -54,8 +54,10 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
     /** 按 user_id 的捕获串行化锁（锐评 #10：并发轮次重复 ADD 防护）。 */
     private final Map<String, ReentrantLock> locks = new ConcurrentHashMap<>();
 
-    /** 线程级冻结注入段的 LRU 缓存（成本治理 T2.1），键 (user,agent,thread)。 */
-    private final LinkedHashMap<List<String>, String> snapshots = new LinkedHashMap<>(16, 0.75f, false);
+    /** 线程级冻结注入段的 LRU 缓存（成本治理 T2.1），键 (user,agent,thread)。
+     * accessOrder=true：get 即 touch（对应 Python orchestrator 的
+     * move_to_end + popitem(last=False)——驱逐最近未用，而不是最早写入）。 */
+    private final LinkedHashMap<List<String>, String> snapshots = new LinkedHashMap<>(16, 0.75f, true);
     private final Object snapshotLock = new Object();
 
     public MemoryService(MemoryStore store, EmbeddingClient embedder, Settings settings,
@@ -136,7 +138,7 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
                 sourceThreadId == null ? "" : sourceThreadId, List.of(), now, now, null, 0);
         store.upsertMemory(record);
         recordVersionSafe(new MemoryVersion(Models.newMemoryId(), record.memoryId(), userId,
-                "create", content, ""));
+                "create", content, "", record.status()));
         Metrics.memory().observe("add", "ok", (System.nanoTime() - started) / 1_000_000_000.0);
         return record;
     }
@@ -172,7 +174,7 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
                 || !updated.status().equals(existing.status());
         if (changed) {
             recordVersionSafe(new MemoryVersion(Models.newMemoryId(), memoryId, existing.userId(),
-                    versionOp, updated.content(), existing.content()));
+                    versionOp, updated.content(), existing.content(), updated.status()));
         }
         Metrics.memory().observe("update", "ok", (System.nanoTime() - started) / 1_000_000_000.0);
         return updated;
@@ -185,7 +187,7 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
         if (deleted && existing != null) {
             // 墓碑版本：内容差分的终点（previous_content 保留最后内容）。
             recordVersionSafe(new MemoryVersion(Models.newMemoryId(), memoryId, existing.userId(),
-                    "delete", "", existing.content()));
+                    "delete", "", existing.content(), existing.status()));
         }
         Metrics.memory().observe("delete", "ok", (System.nanoTime() - started) / 1_000_000_000.0);
         return deleted;
@@ -500,7 +502,9 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
         Map<String, Object> trimmed = TextKit.trimProfileToChars(profile, settings.memory.profileMaxChars);
         String content;
         try {
-            content = new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(trimmed);
+            // json.dumps(profile, ensure_ascii=False) 形态（默认分隔符），
+            // 与 Python profile.save_profile 的存储字节逐位一致。
+            content = io.github.paopaonb666.agentbase.memory.textkit.PyJson.dumps(trimmed);
         } catch (Exception e) {
             content = "{}";
         }
@@ -527,11 +531,13 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
     /** 手工写块（覆盖式，版本递增）。 */
     public MemoryBlock putBlock(String userId, String agentId, String label, String content,
                                 int charLimit) {
+        // 对应 Python api.py put_memory_block：content 原样入库，不做截断
+        // （char_limit 只是块的声明容量，注入组装时才按预算裁剪——在这里
+        // 截断会永久丢字，版本号还照常递增）。
         MemoryBlock existing = store.getBlock(userId, agentId, label);
         int version = existing != null ? existing.version() + 1 : 1;
         MemoryBlock block = new MemoryBlock(userId, agentId, label,
-                content.substring(0, Math.min(content.length(), charLimit)), charLimit, version,
-                Models.now());
+                content, charLimit, version, Models.now());
         store.upsertBlock(block);
         return block;
     }
@@ -601,9 +607,8 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
     public String composeFrozen(String userId, String agentId, String threadId) {
         List<String> key = List.of(userId, agentId, threadId);
         synchronized (snapshotLock) {
-            String cached = snapshots.get(key);
+            String cached = snapshots.get(key); // accessOrder=true：get 即 LRU touch
             if (cached != null) {
-                synchronized (snapshots) { /* LRU touch */ }
                 return cached;
             }
         }

@@ -53,9 +53,12 @@ public final class AgentRuntime {
     private final AgentModule.MemoryServicePort memory;
     private final CoreStore threadIndex;
     private final AgentModule.PlanStorePort planStore;
-    private final Map<String, CompiledGraph> graphs = new LinkedHashMap<>();
-    private CompiledGraph supervisor;
-    private final Map<String, AgentRuntime> profileViews = new LinkedHashMap<>();
+    // 惰性缓存被并发 HTTP 请求线程读写（Python dict 有事件循环串行化 +
+    // GIL 兜底；Java 侧必须自己保证并发安全——LinkedHashMap 并发 put 可
+    // 能丢条目甚至损坏结构）。
+    private final Map<String, CompiledGraph> graphs = new java.util.concurrent.ConcurrentHashMap<>();
+    private volatile CompiledGraph supervisor;
+    private final Map<String, AgentRuntime> profileViews = new java.util.concurrent.ConcurrentHashMap<>();
 
     AgentRuntime(Settings settings, ModelRuntime llm, Map<String, AgentModule> modules,
                  ToolPool tools, Checkpointer checkpointer, ToolCallRecorder toolRecorder,
@@ -129,8 +132,13 @@ public final class AgentRuntime {
         if (!settings.llmFast.isConfigured()) {
             return null;
         }
+        // 快档视图的计量独立挂（对应 Python build_llm(profile="fast") 在
+        // cost.enabled 时同样挂 CostMeterHandler(profile="fast")）——图执行
+        // 走视图自己的 runtime，不会经过主 sink。
         ModelRuntime fastLlm = LlmFactory.buildLlm(settings, "fast",
-                (model, usage) -> { /* 快档视图计量跟随主 sink（LlmFactory 内部接） */ });
+                settings.cost.enabled
+                        ? io.github.paopaonb666.agentbase.core.llm.UsageSinks.costMeterSink("fast")
+                        : ModelRuntime.noopUsageSink());
         AgentRuntime view = new AgentRuntime(settings, fastLlm, modules, tools, checkpointer,
                 toolRecorder, fileStore, memory, threadIndex, planStore);
         profileViews.put(profile, view);
@@ -168,10 +176,18 @@ public final class AgentRuntime {
         }
         AgentModule module = modules.get(moduleName);
         if (module == null) {
-            String available = String.join(", ", modules.keySet()) + ", " + SUPERVISOR_MODULE;
+            // 对应 Python bootstrap.graph：available 按 sorted 排序、空清单
+            // 回退 "(none)"。
+            java.util.List<String> available = new java.util.ArrayList<>(modules.keySet());
+            java.util.Collections.sort(available);
+            available.add(SUPERVISOR_MODULE);
+            String availableText = String.join(", ", available);
+            if (modules.isEmpty()) {
+                availableText = "(none)";
+            }
             throw new UnknownModuleError(
                     "module '%s' is not enabled; available: %s. Add it to AGENT_MODULES."
-                            .formatted(moduleName, available));
+                            .formatted(moduleName, availableText));
         }
         CompiledGraph graph = module.buildGraph(context());
         // 共享池覆写：图的工具执行统一走共享池（超时 + 审计 + 指标收口）。
@@ -221,8 +237,13 @@ public final class AgentRuntime {
                     "MCP_ENABLED=true 但 MCP 工具源第一期未迁移（Java 版）：关闭 MCP_ENABLED 或等待后续版本。"
                             + "启用即承诺：拒绝静默忽略该配置。");
         }
+        // usage 采集（T4.1）：cost.enabled 时挂成本计量 sink，未启用时完全不
+        // 挂（对应 Python build_llm 的条件挂载——否则 pending 队列没有
+        // flusher 消费、metrics 也会泄漏 Python 不会输出的指标）。
         ModelRuntime llm = LlmFactory.buildLlm(resolved, "main",
-                io.github.paopaonb666.agentbase.core.llm.UsageSinks.costMeterSink("main"));
+                resolved.cost.enabled
+                        ? io.github.paopaonb666.agentbase.core.llm.UsageSinks.costMeterSink("main")
+                        : ModelRuntime.noopUsageSink());
         Map<String, AgentModule> modules = ModuleRegistry.loadModules(
                 resolved.agentModules, null,
                 resolved.agentModulePackages.stream().map(ModuleRegistry::normalizePackage).toList());
@@ -246,7 +267,9 @@ public final class AgentRuntime {
                 && resolved.llmFast.isConfigured()) {
             fastLlm = new ResilientLlm(
                     LlmFactory.buildLlm(resolved, "fast",
-                            io.github.paopaonb666.agentbase.core.llm.UsageSinks.costMeterSink("fast")),
+                            resolved.cost.enabled
+                                    ? io.github.paopaonb666.agentbase.core.llm.UsageSinks.costMeterSink("fast")
+                                    : ModelRuntime.noopUsageSink()),
                     llm,
                     resolved.llmFast.concurrency);
         }

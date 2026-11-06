@@ -33,7 +33,9 @@
     <sqlite-jdbc.version>3.46.1.3</sqlite-jdbc.version>
     <mysql-connector-j.version>8.4.0</mysql-connector-j.version>
     <pdfbox.version>2.0.31</pdfbox.version>
-    <poi.version>5.2.5</poi.version>
+    <!-- ≥5.4.0：CVE-2025-31672（OOXML 解析输入校验缺陷）修复版；DocxParser
+         解析用户上传的 DOCX，不能停在存在已知漏洞的 5.2.5。 -->
+    <poi.version>5.4.0</poi.version>
     <junit.version>5.10.2</junit.version>
   </properties>
 

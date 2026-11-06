@@ -314,6 +314,12 @@ public final class Settings {
                 out.put(key, out.remove(up));
             }
         }
+        if (!out.isEmpty()) {
+            // 根级字段挂在 "" 伪节上：applyFlat 对每个节先做根级字段检查，
+            // "" 又不匹配任何 switch 分支——与 Python 把 out 与 lifted 合并
+            // 返回的语义一致（丢掉 out 会让 ENV/AGENT_MODULES 等静默失效）。
+            lifted.computeIfAbsent("", k -> new LinkedHashMap<>()).putAll(out);
+        }
         return lifted;
     }
 

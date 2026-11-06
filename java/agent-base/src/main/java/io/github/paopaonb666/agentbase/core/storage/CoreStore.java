@@ -44,9 +44,9 @@ public interface CoreStore extends AutoCloseable {
                   int cursor, int replans);
 
     /**
-     * 读取快照：{@code {tasks: List&lt;Map&gt;, cursor: int, replans: int,
-     * module: String, updated_at}}；缺席返回 null。损坏的 tasks_json 按
-     * 空清单处理（宽容语义，对应 Python json.loads 失败 → {@code []}）。
+     * 读取快照：{@code {thread_id, module, tasks: List&lt;Map&gt;, cursor: int,
+     * replans: int}}（与 Python get_plan 逐键一致）；缺席返回 null。损坏的
+     * tasks_json 按空清单处理（宽容语义，对应 Python json.loads 失败 → {@code []}）。
      */
     Map<String, Object> getPlan(String threadId);
 

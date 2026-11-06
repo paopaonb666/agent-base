@@ -85,17 +85,30 @@ public final class LlmFactory {
                 apiKey = ambient.strip();
             }
         }
+        if (apiKey.isEmpty()) {
+            // Python 侧 ChatOpenAI 在没有任何 key 时构造即抛 OpenAIError，
+            // 这里显式转成同文案的 SettingsError——langchain4j 会接受空白
+            // key 并把错误推迟到首次调用（401），fail-fast 语义就丢了。
+            throw new Settings.SettingsError(
+                    "LLM_API_KEY is not configured and no ambient OPENAI_API_KEY is set; "
+                            + "copy .env.example to .env, set LLM_API_KEY, then retry");
+        }
 
         try {
+            // 读超时对齐 Python openai SDK 默认（600s）：不设的话 langchain4j
+            // 默认 60s，长生成/长停顿的流会在 Java 侧被提前掐断。
+            java.time.Duration timeout = java.time.Duration.ofSeconds(600);
             OpenAiChatModel chat = OpenAiChatModel.builder()
                     .baseUrl(baseUrl)
                     .apiKey(apiKey)
                     .modelName(model)
+                    .timeout(timeout)
                     .build();
             OpenAiStreamingChatModel streaming = OpenAiStreamingChatModel.builder()
                     .baseUrl(baseUrl)
                     .apiKey(apiKey)
                     .modelName(model)
+                    .timeout(timeout)
                     .build();
             return new LangChain4jRuntime(chat, streaming, model, toolSafeStreaming, usageSink);
         } catch (RuntimeException exc) {

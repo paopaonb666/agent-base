@@ -24,8 +24,9 @@ import java.util.List;
  * 短连接、用完即关：低频语义下开销等价，且免去连接池的维护。
  *
  * <p>建表惰性执行一次（{@code CREATE TABLE IF NOT EXISTS} 幂等，并发重复
- * 执行无害）；构造期做一次建连+建表探测，让"连不上/建不了表"在装配期
- * 就暴露——降级（返回 null）由 {@code CoreStores.build} 统一实现。
+ * 执行无害）。构造期<b>不</b>建连——对应 Python 侧连接池与建表都在首个
+ * 操作上惰性发生：装配期网络抖动只会让首个操作失败重试，而不会把线程
+ * 索引/计划快照永久降级到重启。
  */
 public final class MysqlCoreStore extends AbstractSqlCoreStore {
 
@@ -45,16 +46,8 @@ public final class MysqlCoreStore extends AbstractSqlCoreStore {
                 .formatted(s.mysqlHost, s.mysqlPort, s.mysqlDatabase);
         this.user = s.mysqlUser;
         this.password = s.mysqlPassword;
-        probeAndEnsureTables();
-    }
-
-    /** 装配期探测：建连 + 惰性建表，失败抛出（CoreStores.build 捕获后降级）。 */
-    private void probeAndEnsureTables() {
-        try (Connection conn = open()) {
-            ensureTables(conn);
-        } catch (SQLException e) {
-            throw new IllegalStateException("mysql core store: 建连或建表失败", e);
-        }
+        // 不在构造期建连：惰性建表挂在 execute/fetchAll 的 ensureTables 上
+        // （Python 语义——首个操作自愈，装配永远成功）。
     }
 
     private Connection open() throws SQLException {

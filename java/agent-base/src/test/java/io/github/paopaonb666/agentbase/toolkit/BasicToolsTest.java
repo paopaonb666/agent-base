@@ -136,6 +136,50 @@ class BasicToolsTest {
     }
 
     @Test
+    void calculatorIntegralFloatPrintsExactBinaryTruncation() {
+        // Python str(int(float)) 截断的是 double 的精确二进制值，不是
+        // Double.toString 的最短十进制（回归：1e23 曾打印成 10^23）。
+        assertEquals("99999999999999991611392", call(tool(), "{\"expression\": \"1e23\"}"));
+        assertEquals("200000000000000000000", call(tool(), "{\"expression\": \"2.0e20\"}"));
+    }
+
+    @Test
+    void calculatorIntStrHasCpython4300DigitLimit() {
+        // CPython str(int) 的默认上限：超限抛错而不是把 3 万位数字塞进
+        // 模型上下文（回归：曾无上限输出）。文案与 CPython ValueError 一致。
+        assertEquals(4300, call(tool(), "{\"expression\": \"10 ** 4299\"}").length());
+        ArithmeticException e = assertThrows(ArithmeticException.class,
+                () -> call(tool(), "{\"expression\": \"2 ** 100000\"}"));
+        assertEquals("Exceeds the limit (4300 digits) for integer string conversion; "
+                + "use sys.set_int_max_str_digits() to increase the limit", e.getMessage());
+    }
+
+    @Test
+    void calculatorFloatPowOverflowAndComplexFollowPythonErrors() {
+        // 浮点 ** 溢出：Python 抛 OverflowError（errno 元组文案）；负底数
+        // 非整数指数返回 complex → isinstance 断言失败（无消息）。
+        ArithmeticException overflow = assertThrows(ArithmeticException.class,
+                () -> call(tool(), "{\"expression\": \"2.5 ** 1000\"}"));
+        assertEquals("(34, 'Result too large')", overflow.getMessage());
+        ArithmeticException complex = assertThrows(ArithmeticException.class,
+                () -> call(tool(), "{\"expression\": \"(-2.0) ** 0.5\"}"));
+        assertEquals("", complex.getMessage());
+    }
+
+    @Test
+    void calculatorHugeExponentRejectedBeforeComputing() {
+        // 2 ** 2147483647 这类表达式 bitLength 守卫拦不住（恰为 31），
+        // 必须在分配结果前拒绝——否则 BigInteger.pow 撑爆堆。
+        ArithmeticException e = assertThrows(ArithmeticException.class,
+                () -> call(tool(), "{\"expression\": \"9 ** 2147483647\"}"));
+        assertEquals("幂运算结果过大，已拒绝求值", e.getMessage());
+    }
+
+    private static CalculatorTool tool() {
+        return new CalculatorTool();
+    }
+
+    @Test
     void calculatorRejectsMissingArgument() {
         expectError(() -> call(new CalculatorTool(), "{}"), "expression");
     }

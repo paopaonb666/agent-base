@@ -57,11 +57,12 @@ public final class MemoryCoreStore implements CoreStore {
             taskCopies.add(new LinkedHashMap<>(task));
         }
         Map<String, Object> snapshot = new LinkedHashMap<>();
+        // 载荷与 Python get_plan 逐键一致：{thread_id, module, tasks, cursor, replans}。
+        snapshot.put("thread_id", threadId);
         snapshot.put("module", module);
         snapshot.put("tasks", taskCopies);
         snapshot.put("cursor", cursor);
         snapshot.put("replans", replans);
-        snapshot.put("updated_at", System.currentTimeMillis() / 1000.0);
         plans.put(threadId, snapshot);
     }
 

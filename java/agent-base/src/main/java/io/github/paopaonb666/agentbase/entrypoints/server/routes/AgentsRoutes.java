@@ -105,6 +105,7 @@ public class AgentsRoutes {
     @PostMapping("/{module}/invoke")
     public SseEmitter invoke(@PathVariable("module") String module,
                              @RequestBody InvokeRequest body,
+                             jakarta.servlet.http.HttpServletResponse response,
                              @RequestHeader(value = "X-User-Id", required = false) String userIdHeader,
                              @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
                              @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,
@@ -114,7 +115,9 @@ public class AgentsRoutes {
             throw new HttpError(422, "message 必须是 1..100000 字符");
         }
         if (body.threadId() != null && (body.threadId().length() > 128
-                || !body.threadId().matches("^[\\w.-]+$"))) {
+                // (?U)：Python re 的 \w 是 unicode 语义（中文 thread id 合法），
+                // Java 默认 ASCII——不加标志会把 Python 接受的 id 422 掉。
+                || !body.threadId().matches("(?U)^[\\w.-]+$"))) {
             throw new HttpError(422, "thread_id 格式非法（[\\w.-]{1,128}）");
         }
         if (body.attachments() != null && body.attachments().size() > 5) {
@@ -238,18 +241,24 @@ public class AgentsRoutes {
             // 元数据随本轮输入合并进状态（execute 后由 GraphState extras 承载）。
             Map<String, Object> inputExtra = new LinkedHashMap<>();
             inputExtra.put("attachments", Map.of(String.valueOf(messagesInput.size() - 1), attachmentsMeta));
-            return startStream(graph, messagesInput, inputExtra, config, userThreadId, userId, module);
+            return startStream(graph, messagesInput, inputExtra, config, userThreadId, userId, module, response);
         }
         messagesInput.add(UserMessage.from(body.message()));
         // 会话索引 upsert（S1）：属主/模块/标题（首条用户消息前 60 字符）。
         upsertThreadIndex(module, fullThreadId, userId, body.message());
-        return startStream(graph, messagesInput, Map.of(), config, userThreadId, userId, module);
+        return startStream(graph, messagesInput, Map.of(), config, userThreadId, userId, module, response);
     }
 
     /** 打开 SSE 流（挂记忆形成钩子；附件分支的索引 upsert 在此共用）。 */
     private SseEmitter startStream(CompiledGraph graph, List<ChatMessage> messagesInput,
                                    Map<String, Object> extra, RunConfig config,
-                                   String userThreadId, String userId, String module) {
+                                   String userThreadId, String userId, String module,
+                                   jakarta.servlet.http.HttpServletResponse response) {
+        // SSE 代理头（对应 Python sse.py _SSE_HEADERS 挂在 StreamingResponse
+        // 上）：no-cache 防中间层缓存事件流；X-Accel-Buffering 关掉 nginx 的
+        // proxy_buffering——缺了它 delta 会被缓冲到流结束才一次性下发。
+        response.setHeader("Cache-Control", "no-cache");
+        response.setHeader("X-Accel-Buffering", "no");
         // 会话索引 upsert（S1）：标题取首条 human 消息前 60 字符。
         if (runtime.threadIndex() != null) {
             String title = messagesInput.stream()
@@ -270,7 +279,35 @@ public class AgentsRoutes {
         }
         // 记忆形成（M6c）：轮次正常完成后在后台跑抽取/整合/画像/摘要。
         Runnable onComplete = buildCaptureHook(module, userThreadId, graph, config);
-        return SseStreams.open(graph, messagesInput, config, userThreadId, onComplete);
+        // 附件元数据并入状态 extras（对应 Python 把 meta 挂在
+        // HumanMessage.additional_kwargs 随 checkpoint 持久化；langchain4j
+        // 消息对象无元数据承载，改由 extras 承载）。键用“绝对消息下标”
+        // （历史消息数 + 本轮输入下标）——按本轮下标键控会在第二轮起错位；
+        // attachments 键整表替换（extras 通道语义），所以先并入历史表。
+        Map<String, Object> attachmentsByIndex = new LinkedHashMap<>();
+        GraphState prior = graph.getState(config);
+        int base = prior == null ? 0 : prior.messages().size();
+        if (prior != null && prior.extra().get("attachments") instanceof Map<?, ?> priorAtt) {
+            for (Map.Entry<?, ?> e : priorAtt.entrySet()) {
+                attachmentsByIndex.put(String.valueOf(e.getKey()), e.getValue());
+            }
+        }
+        if (extra.get("attachments") instanceof Map<?, ?> newAtt) {
+            for (Map.Entry<?, ?> e : newAtt.entrySet()) {
+                int inputIdx;
+                try {
+                    inputIdx = Integer.parseInt(String.valueOf(e.getKey()));
+                } catch (NumberFormatException nfe) {
+                    continue;
+                }
+                attachmentsByIndex.put(String.valueOf(base + inputIdx), e.getValue());
+            }
+        }
+        Map<String, Object> effectiveExtra = new LinkedHashMap<>();
+        if (!attachmentsByIndex.isEmpty()) {
+            effectiveExtra.put("attachments", attachmentsByIndex);
+        }
+        return SseStreams.open(graph, messagesInput, effectiveExtra, config, userThreadId, onComplete);
     }
 
     /** 会话索引 upsert（S1）：属主/模块/标题（首条用户消息前 60 字符）。 */
@@ -329,11 +366,12 @@ public class AgentsRoutes {
                                            @RequestHeader(value = "X-User-Id", required = false) String userIdHeader,
                                            @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
                                            @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,
-                                           @RequestHeader(value = "X-User-Nonce", required = false) String nonceHeader) {
+                                            @RequestHeader(value = "X-User-Nonce", required = false) String nonceHeader) {
+        // 鉴权先行（对应 Python get_current_user 依赖）。
+        String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         if (!knownModule(module)) {
             throw new HttpError(404, "unknown module '" + module + "'");
         }
-        String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         var index = runtime.threadIndex();
         if (index != null) {
             List<Map<String, Object>> threads = new ArrayList<>();
@@ -409,9 +447,10 @@ public class AgentsRoutes {
                                              @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
                                              @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,
                                              @RequestHeader(value = "X-User-Nonce", required = false) String nonceHeader) {
+        // 鉴权先行（对应 Python get_current_user 依赖先于一切处理逻辑）。
+        String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         validateThreadId(threadId);
         CompiledGraph graph = graphOr404(module);
-        String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         threadOwnerOr404(module, threadId, userId);
         GraphState snapshot = graph.getState(new RunConfig(new ThreadId(module, threadId).toString(),
                 userId, runtime.settings().agentRecursionLimit));
@@ -446,11 +485,12 @@ public class AgentsRoutes {
                                          @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
                                          @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,
                                          @RequestHeader(value = "X-User-Nonce", required = false) String nonceHeader) {
+        // 鉴权先行（对应 Python get_current_user 依赖）。
+        String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         validateThreadId(threadId);
         if (!knownModule(module)) {
             throw new HttpError(404, "unknown module '" + module + "'");
         }
-        String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         threadOwnerOr404(module, threadId, userId);
         var recorder = runtime.toolRecorder();
         if (recorder == null) {
@@ -469,6 +509,8 @@ public class AgentsRoutes {
                                           @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
                                           @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,
                                           @RequestHeader(value = "X-User-Nonce", required = false) String nonceHeader) {
+        // 鉴权先行（对应 Python get_current_user 依赖）。
+        String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         validateThreadId(threadId);
         if (!knownModule(module)) {
             throw new HttpError(404, "unknown module '" + module + "'");
@@ -476,7 +518,6 @@ public class AgentsRoutes {
         if (!runtime.modules().containsKey("planner")) {
             throw new HttpError(503, "planner 模块未启用，无计划状态可读");
         }
-        String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         threadOwnerOr404(module, threadId, userId);
         String fullThreadId = new ThreadId(module, threadId).toString();
         if (runtime.planStore() != null) {
@@ -512,11 +553,12 @@ public class AgentsRoutes {
                                             @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
                                             @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,
                                             @RequestHeader(value = "X-User-Nonce", required = false) String nonceHeader) {
+        // 鉴权先行（对应 Python get_current_user 依赖）。
+        String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         validateThreadId(threadId);
         if (!knownModule(module)) {
             throw new HttpError(404, "unknown module '" + module + "'");
         }
-        String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         threadOwnerOr404(module, threadId, userId);
         if (runtime.checkpointer() == null) {
             return Map.of("deleted", false, "reason", "checkpointer unconfigured");

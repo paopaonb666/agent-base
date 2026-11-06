@@ -139,7 +139,8 @@ public interface AgentModule {
         void savePlan(String threadId, String module, List<Map<String, Object>> tasks,
                       int cursor, int replans);
 
-        /** 读取快照：{@code {tasks, cursor, replans, module, updated_at}}；缺席返回 null。 */
+        /** 读取快照：{@code {thread_id, module, tasks, cursor, replans}}（与
+         * Python get_plan 逐键一致）；缺席返回 null。 */
         Map<String, Object> getPlan(String threadId);
 
         /** 删除快照。 */

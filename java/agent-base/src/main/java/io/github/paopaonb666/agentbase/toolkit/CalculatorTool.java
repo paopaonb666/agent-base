@@ -2,6 +2,7 @@ package io.github.paopaonb666.agentbase.toolkit;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.math.RoundingMode;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -495,7 +496,14 @@ public final class CalculatorTool implements AgentTool {
             throw new ArithmeticException("float modulo");
         }
         double d0 = dbl(a);
-        return d0 - Math.floor(d0 / d1) * d1;
+        // CPython float % = C fmod（Java 的 % 同为截断余数、结果精确），
+        // 再按除数符号修正——不能走 floor 公式：大操作数下先做除法会丢
+        // 精度（1e22 % 3 公式得 0.0，fmod 得精确的 1.0）。
+        double r = d0 % d1;
+        if (r != 0.0 && (r < 0) != (d1 < 0)) {
+            r += d1;
+        }
+        return r;
     }
 
     private static Object pow(Object a, Object b) {
@@ -506,7 +514,16 @@ public final class CalculatorTool implements AgentTool {
                     // 直接拒绝（超出 int 指数范围的表达式没有实际用途）。
                     throw new ArithmeticException("幂运算指数过大，已拒绝求值");
                 }
-                return x.pow(y.intValueExact());
+                int exp = y.intValueExact();
+                if (x.abs().compareTo(BigInteger.ONE) > 0
+                        && (long) x.bitLength() * exp > 10_000_000L) {
+                    // 结果位数上限（~1.25MB）：2 ** 2147483647 这类表达式
+                    // bitLength 守卫拦不住（2147483647 的 bitLength 恰为
+                    // 31），BigInteger.pow 会撑爆堆——Python 侧同样算不出
+                    // 结果（MemoryError / 30s 工具超时），这里给出快速错误。
+                    throw new ArithmeticException("幂运算结果过大，已拒绝求值");
+                }
+                return x.pow(exp);
             }
             // 负指数：Python 返回 float（2 ** -1 == 0.5）。
             if (x.signum() == 0) {
@@ -520,7 +537,18 @@ public final class CalculatorTool implements AgentTool {
             // 文案与 Python 的 ZeroDivisionError 一致。
             throw new ArithmeticException("0.0 cannot be raised to a negative power");
         }
-        return Math.pow(d0, d1);
+        if (d0 < 0 && d1 != Math.rint(d1)) {
+            // Python 负底数非整数指数返回 complex，_safe_eval 的 isinstance
+            // 断言随后失败——AssertionError 无消息，错误文本保持为空串。
+            throw new ArithmeticException("");
+        }
+        double result = Math.pow(d0, d1);
+        if (Double.isInfinite(result) && Double.isFinite(d0) && Double.isFinite(d1)) {
+            // Python 浮点 ** 溢出抛 OverflowError（文案为 errno 元组）；
+            // 返回 inf 会把 "inf" 当普通数值喂给模型。
+            throw new ArithmeticException("(34, 'Result too large')");
+        }
+        return result;
     }
 
     private static Object negate(Object v) {
@@ -541,18 +569,36 @@ public final class CalculatorTool implements AgentTool {
         return v instanceof BigInteger x ? x.doubleValue() : (Double) v;
     }
 
-    /** 对齐 Python {@code _format_number}：浮点整值打印为整数。 */
+    /** 对齐 Python {@code _format_number}：浮点整值打印为整数；int→str
+     * 受 CPython 的 4300 位上限（超限抛错，文案与 Python ValueError 一致）。 */
     static String format(Object value) {
+        BigInteger big;
         if (value instanceof BigInteger x) {
-            return x.toString();
+            big = x;
+        } else {
+            double d = (Double) value;
+            if (Double.isFinite(d) && d == Math.rint(d)) {
+                // Python int(float) 截断的是 double 的精确二进制值（BigDecimal(double)
+                // 精确构造 + 向零截断），不是 Double.toString 的最短十进制——
+                // 1e23 → 99999999999999991611392 而非 100000000000000000000000。
+                big = new BigDecimal(d).setScale(0, RoundingMode.DOWN).toBigInteger();
+            } else {
+                // inf/nan 与非整值浮点走 repr 对齐（2.5 ** 1000 的溢出在
+                // pow 处已被拒绝，这里只兜底乘除溢出等路径）。
+                return PyText.floatRepr(d);
+            }
         }
-        double d = (Double) value;
-        if (d == Math.rint(d)) {
-            // int(2.0e20) 与 Python 的 str(int(float)) 一致（按最短十进制
-            // 表示还原整值，BigDecimal.valueOf 走 Double.toString）。
-            return BigDecimal.valueOf(d).toBigInteger().toString();
+        String s = big.toString();
+        int digits = s.startsWith("-") ? s.length() - 1 : s.length();
+        if (digits > 4300) {
+            // CPython str(int) 的默认上限（sys.set_int_max_str_digits）：
+            // 2 ** 100000 这类结果 Python 会报错而不是把 3 万位数字塞进
+            // 模型上下文——文案逐字一致。
+            throw new ArithmeticException(
+                    "Exceeds the limit (4300 digits) for integer string conversion; "
+                            + "use sys.set_int_max_str_digits() to increase the limit");
         }
-        return PyText.floatRepr(d);
+        return s;
     }
 
     private static JsonNode parseArgs(String argsJson) {

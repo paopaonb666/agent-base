@@ -72,11 +72,16 @@ public final class ModuleRegistry {
     }
 
     private static List<String> searchPackages(String prefix, List<String> packages) {
-        List<String> candidates = prefix != null
-                ? List.of(prefix)
-                : (packages == null || packages.isEmpty()
-                        ? List.of(DEFAULT_MODULE_PACKAGE)
-                        : List.copyOf(packages));
+        // 对应 Python _search_packages：仅 packages == null（未提供）走默认；
+        // 显式空列表是配置错误，必须 fail-fast（注册成"什么都没有"）。
+        List<String> candidates;
+        if (prefix != null) {
+            candidates = List.of(prefix);
+        } else if (packages != null) {
+            candidates = List.copyOf(packages);
+        } else {
+            candidates = List.of(DEFAULT_MODULE_PACKAGE);
+        }
         if (candidates.isEmpty()) {
             throw new RegistryError("no module packages configured (AGENT_MODULE_PACKAGES is empty)");
         }

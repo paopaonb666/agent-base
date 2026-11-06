@@ -90,13 +90,16 @@ public final class CurrentTimeTool implements AgentTool {
             // 逐字对齐 Python：本地挂钟时间 + "(UTC)" 后缀（见类注释）。
             return isoformat(LocalDateTime.now()) + " (UTC)";
         }
-        ZoneId zone;
-        try {
-            zone = ZoneId.of(tz.strip());
-        } catch (DateTimeException e) {
+        // Python ZoneInfo 只接受 tz 数据库里的精确键名（区分大小写）：
+        // "+08:00"/"GMT+8"/"Z" 这类偏移形式抛 ZoneInfoNotFoundError → 由
+        // 工具转成"未知时区"提示。ZoneId.of 会全盘接受，这里先做键名
+        // 成员检查对齐行为。
+        String zoneName = tz.strip();
+        if (!java.time.zone.ZoneRulesProvider.getAvailableZoneIds().contains(zoneName)) {
             throw new IllegalArgumentException(
                     "未知时区 '" + tz + "'：请使用 IANA 时区名（如 Asia/Shanghai）或 'local'/'UTC'");
         }
+        ZoneId zone = ZoneId.of(zoneName);
         ZonedDateTime now = ZonedDateTime.now(zone);
         // Python: f"{now.isoformat()} ({zone.key}，{now.tzname()})" —— 区名与
         // 时区名之间是全角逗号。

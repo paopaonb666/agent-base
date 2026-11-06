@@ -70,11 +70,11 @@ public final class SseStreams {
      * @param onComplete    轮次正常完成后的回调（记忆形成管线）；可为 null
      */
     public static SseEmitter open(CompiledGraph graph, java.util.List<dev.langchain4j.data.message.ChatMessage> messagesInput,
-                                  RunConfig config, String userThreadId, Runnable onComplete) {
+                                  java.util.Map<String, Object> extra, RunConfig config, String userThreadId, Runnable onComplete) {
         SseEmitter emitter = new SseEmitter(0L); // 不超时（Python 无超时语义）
         BlockingQueue<Object> queue = new ArrayBlockingQueue<>(SSE_QUEUE_MAXSIZE);
         AtomicBoolean cancelled = new AtomicBoolean(false);
-        Thread producer = new Thread(() -> produce(queue, graph, messagesInput, config,
+        Thread producer = new Thread(() -> produce(queue, graph, messagesInput, extra, config,
                 userThreadId, onComplete, cancelled), "sse-producer");
         producer.setDaemon(true);
         Thread heartbeat = new Thread(() -> heartbeat(queue, cancelled), "sse-heartbeat");
@@ -102,6 +102,7 @@ public final class SseStreams {
     /** 生产者：把图事件推入队列；哨兵 null 终止（对应 _produce）。 */
     private static void produce(BlockingQueue<Object> queue, CompiledGraph graph,
                                 java.util.List<dev.langchain4j.data.message.ChatMessage> messagesInput,
+                                java.util.Map<String, Object> extra,
                                 RunConfig config, String userThreadId, Runnable onComplete,
                                 AtomicBoolean cancelled) {
         // 记忆作用域（M6e）：图节点与记忆工具在本线程运行，据此拿到
@@ -120,7 +121,7 @@ public final class SseStreams {
                             return; // 首见去重（对应 Python running 集合）
                         }
                     }
-                    putUninterruptibly(queue, event);
+                    putUninterruptibly(queue, event, cancelled);
                 }
 
                 @Override
@@ -128,8 +129,12 @@ public final class SseStreams {
                     return cancelled.get();
                 }
             };
-            graph.stream(new GraphState(messagesInput, java.util.Map.of()), config, sink);
-            putUninterruptibly(queue, new Events.DoneEvent(userThreadId));
+            // 输入 extras（附件元数据等）随首轮输入进入状态通道：extras 按
+            // 键合并（apply 语义），缺席的键保留历史值——对应 Python 输入
+            // dict 只提供 messages 时其余通道保持原值。
+            graph.stream(new GraphState(messagesInput,
+                    extra == null ? java.util.Map.of() : extra), config, sink);
+            putUninterruptibly(queue, new Events.DoneEvent(userThreadId), cancelled);
             if (onComplete != null) {
                 // 独立任务：随后的哨兵与 finally 取消都不影响它跑完。
                 Background.spawn(onComplete, "memory-capture");
@@ -138,14 +143,15 @@ public final class SseStreams {
             // 客户端断开：不发终止事件（连接已关）。
         } catch (Exception exc) {
             LOG.error("sse: stream failed", exc);
-            putUninterruptibly(queue, new Events.ErrorEvent(safeErrorText(exc)));
+            putUninterruptibly(queue, new Events.ErrorEvent(safeErrorText(exc)), cancelled);
         } finally {
-            putUninterruptibly(queue, SENTINEL); // 哨兵必须送达
+            putUninterruptibly(queue, SENTINEL, cancelled); // 哨兵必须送达
             MemoryScope.clear();
         }
     }
 
-    private static void putUninterruptibly(BlockingQueue<Object> queue, Object event) {
+    private static void putUninterruptibly(BlockingQueue<Object> queue, Object event,
+                                           AtomicBoolean cancelled) {
         boolean interrupted = false;
         try {
             while (true) {
@@ -154,6 +160,14 @@ public final class SseStreams {
                     return;
                 } catch (InterruptedException e) {
                     interrupted = true;
+                    if (cancelled.get()) {
+                        // 消费者已死（断连/超时/错误触发 shutdown）：满队列上
+                        // 的 put 永远无人接收——继续重试会让生产者线程卡死、
+                        // graph.stream 不返回、在途的 LLM 工作被拖住（对应
+                        // Python 侧断连即取消生产者任务）。
+                        throw new java.util.concurrent.CancellationException(
+                                "client disconnected");
+                    }
                 }
             }
         } finally {

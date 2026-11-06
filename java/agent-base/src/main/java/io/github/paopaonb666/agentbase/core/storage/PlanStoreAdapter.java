@@ -10,9 +10,9 @@ import java.util.Map;
  * {@link AgentModule.PlanStorePort}（依赖倒置——core 契约不 import 存储
  * 层的实现，存储后端替换时模块与契约都不动）。
  *
- * <p>载荷形态（{@code getPlan}）：{@code {tasks: List&lt;Map&gt;,
- * cursor: int, replans: int, module: String, updated_at}}；缺席返回 null。
- * {@code updated_at} 是 epoch 秒（对应 Python {@code time.time()}）。
+ * <p>载荷形态（{@code getPlan}）：{@code {thread_id, module, tasks:
+ * List&lt;Map&gt;, cursor: int, replans: int}}——与 Python get_plan 逐键
+ * 一致；缺席返回 null。
  */
 public final class PlanStoreAdapter implements AgentModule.PlanStorePort {
 

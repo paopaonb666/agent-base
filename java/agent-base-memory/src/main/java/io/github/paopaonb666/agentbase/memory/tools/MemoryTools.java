@@ -103,10 +103,19 @@ public final class MemoryTools {
                     @Override
                     public String call(String argsJson, ToolContext ctx) {
                         Map<String, Object> a = args(argsJson);
+                        // 参数约束对应 Python _MemorySearchArgs（Pydantic）：
+                        // 越界抛错走 ToolPool 归一（Python 侧 ValidationError
+                        // 同样变成错误反馈），而不是静默钳制。
+                        String query = str(a, "query", "");
+                        if (query.isEmpty() || query.length() > 2000) {
+                            throw new IllegalArgumentException("query 必须是 1..2000 字符");
+                        }
+                        int limit = intOf(a, "limit", 5);
+                        if (limit < 1 || limit > 20) {
+                            throw new IllegalArgumentException("limit 必须在 1..20 之间");
+                        }
                         // 检索是用户级的（S1）：跨模块可见；user 隔离是硬边界。
                         String userId = Scope.current().userId();
-                        int limit = Math.min(Math.max(intOf(a, "limit", 5), 1), 20);
-                        String query = str(a, "query", "");
                         var scored = memory.searchScored(userId, null, query, limit);
                         if (scored.isEmpty()) {
                             return "（没有找到相关记忆）";
@@ -115,7 +124,7 @@ public final class MemoryTools {
                         StringBuilder sb = new StringBuilder("找到的相关记忆：");
                         for (var item : scored) {
                             MemoryRecord record = item.record();
-                            sb.append("\n-（相关度 ").append(String.format("%.2f", item.score()))
+                            sb.append("\n-（相关度 ").append(String.format(java.util.Locale.ROOT, "%.2f", item.score()))
                                     .append("）[id=")
                                     .append(record.memoryId(), 0, Math.min(12, record.memoryId().length()))
                                     .append("] ").append(record.content());
@@ -152,11 +161,19 @@ public final class MemoryTools {
                     @Override
                     public String call(String argsJson, ToolContext ctx) {
                         Map<String, Object> a = args(argsJson);
-                        Scope scope = Scope.current();
+                        // 约束对应 Python _MemorySaveArgs：content 1..2000、tags ≤ 10。
+                        String content = str(a, "content", "");
+                        if (content.isEmpty() || content.length() > 2000) {
+                            throw new IllegalArgumentException("content 必须是 1..2000 字符");
+                        }
                         List<String> tags = a.get("tags") instanceof List<?> raw
                                 ? raw.stream().map(String::valueOf).toList() : List.of();
+                        if (tags.size() > 10) {
+                            throw new IllegalArgumentException("tags 最多 10 个");
+                        }
+                        Scope scope = Scope.current();
                         MemoryRecord record = memory.addMemory(scope.userId(), scope.agentId(),
-                                str(a, "content", ""), str(a, "kind", "semantic"), tags, 0.5,
+                                content, str(a, "kind", "semantic"), tags, 0.5,
                                 scope.threadId());
                         return "已记住（memory_id="
                                 + record.memoryId().substring(0, Math.min(12, record.memoryId().length()))
@@ -189,10 +206,21 @@ public final class MemoryTools {
                     @Override
                     public String call(String argsJson, ToolContext ctx) {
                         Map<String, Object> a = args(argsJson);
-                        Scope scope = Scope.current();
+                        // 约束对应 Python _MemoryBlockArgs：label 1..64 且
+                        // ^[\w.-]+$（(?U) 使 \w 支持unicode——Python re 的 \w
+                        // 默认 unicode 语义），content 1..4000。
                         String label = str(a, "label", "");
+                        if (label.isEmpty() || label.length() > 64
+                                || !label.matches("(?U)^[\\w.-]+$")) {
+                            throw new IllegalArgumentException(
+                                    "label 必须是 1..64 字符且匹配 [\\w.-]+");
+                        }
                         String content = str(a, "content", "");
+                        if (content.isEmpty() || content.length() > 4000) {
+                            throw new IllegalArgumentException("content 必须是 1..4000 字符");
+                        }
                         String operation = str(a, "operation", "append");
+                        Scope scope = Scope.current();
                         String agent = scope.agentId();
                         if (!"append".equals(operation) && !"replace".equals(operation)) {
                             return "未知 operation '" + operation + "'（只支持 append / replace）";
@@ -242,7 +270,13 @@ public final class MemoryTools {
 
                     @Override
                     public String call(String argsJson, ToolContext ctx) {
+                        // 约束对应 Python _MemoryDeleteArgs：4..64 且 ^[\w.-]+$。
                         String memoryId = str(args(argsJson), "memory_id", "");
+                        if (memoryId.length() < 4 || memoryId.length() > 64
+                                || !memoryId.matches("(?U)^[\\w.-]+$")) {
+                            throw new IllegalArgumentException(
+                                    "memory_id 必须是 4..64 字符且匹配 [\\w.-]+");
+                        }
                         // user 隔离：只能删自己的记忆。
                         MemoryRecord record = memory.getMemory(memoryId);
                         if (record == null) {
@@ -280,10 +314,19 @@ public final class MemoryTools {
                     @Override
                     public String call(String argsJson, ToolContext ctx) {
                         Map<String, Object> a = args(argsJson);
+                        // 约束对应 Python _KnowledgeSearchArgs：query 1..2000、
+                        // limit 1..20（越界报错而非钳制）。
+                        String query = str(a, "query", "");
+                        if (query.isEmpty() || query.length() > 2000) {
+                            throw new IllegalArgumentException("query 必须是 1..2000 字符");
+                        }
+                        int limit = intOf(a, "limit", 5);
+                        if (limit < 1 || limit > 20) {
+                            throw new IllegalArgumentException("limit 必须在 1..20 之间");
+                        }
                         // 同 memory_search：知识库检索为用户级——文档是用户的知识资产。
                         String userId = Scope.current().userId();
-                        int limit = Math.min(Math.max(intOf(a, "limit", 5), 1), 20);
-                        var scored = memory.searchKnowledge(userId, null, str(a, "query", ""), limit);
+                        var scored = memory.searchKnowledge(userId, null, query, limit);
                         if (scored.isEmpty()) {
                             return "（知识库中没有相关内容）";
                         }
@@ -291,7 +334,7 @@ public final class MemoryTools {
                         for (Map<String, Object> item : scored) {
                             String text = String.valueOf(item.get("text"));
                             sb.append("\n-（相关度 ")
-                                    .append(String.format("%.2f", ((Number) item.get("score")).doubleValue()))
+                                    .append(String.format(java.util.Locale.ROOT, "%.2f", ((Number) item.get("score")).doubleValue()))
                                     .append("）").append(text, 0, Math.min(text.length(), KNOWLEDGE_SNIPPET_CHARS));
                         }
                         return sb.toString();

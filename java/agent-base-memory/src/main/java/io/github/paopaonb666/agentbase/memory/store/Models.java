@@ -148,8 +148,8 @@ public final class Models {
         }
 
         public Map<String, Object> toDict() {
+            // 键集与 Python api.py 的 blocks 载荷逐项一致（不含 user_id）。
             Map<String, Object> out = new LinkedHashMap<>();
-            out.put("user_id", userId);
             out.put("agent_id", agentId);
             out.put("label", label);
             out.put("content", content);
@@ -262,14 +262,21 @@ public final class Models {
             this(versionId, memoryId, userId, op, content, previousContent, "active", now());
         }
 
+        /** 带真实 status 的版本快照（对应 Python 各记录点的 status=… 语义）。 */
+        public MemoryVersion(String versionId, String memoryId, String userId, String op,
+                             String content, String previousContent, String status) {
+            this(versionId, memoryId, userId, op, content, previousContent, status, now());
+        }
+
         public Map<String, Object> toDict() {
+            // 键集与 Python api.py 的 versions 载荷逐项一致（不含
+            // memory_id/user_id；previous_content 空串归 null）。
             Map<String, Object> out = new LinkedHashMap<>();
             out.put("version_id", versionId);
-            out.put("memory_id", memoryId);
-            out.put("user_id", userId);
             out.put("op", op);
             out.put("content", content);
-            out.put("previous_content", previousContent);
+            out.put("previous_content", previousContent == null || previousContent.isEmpty()
+                    ? null : previousContent);
             out.put("status", status);
             out.put("created_at", createdAt);
             return out;

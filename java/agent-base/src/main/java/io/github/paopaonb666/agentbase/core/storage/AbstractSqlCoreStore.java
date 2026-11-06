@@ -237,21 +237,20 @@ abstract class AbstractSqlCoreStore implements CoreStore {
     @Override
     public Map<String, Object> getPlan(String threadId) {
         List<Object[]> rows = fetchAll(
-                "SELECT module, tasks_json, cursor, replans, updated_at"
-                        + " FROM plan_snapshots WHERE thread_id = ?",
+                "SELECT module, tasks_json, cursor, replans FROM plan_snapshots WHERE thread_id = ?",
                 threadId);
         if (rows.isEmpty()) {
             return null;
         }
         Object[] row = rows.get(0);
-        // 与 Python sql_base.get_plan 的差异：按 Java 端契约补上 updated_at
-        // （memory 后端本就返回），不再冗余返回 thread_id（调用方已知）。
+        // 载荷与 Python sql_base.get_plan 逐键一致：
+        // {thread_id, module, tasks, cursor, replans}（不外露 updated_at）。
         Map<String, Object> out = new LinkedHashMap<>();
+        out.put("thread_id", threadId);
         out.put("module", str(row[0]));
         out.put("tasks", parseTasks(row[1]));
         out.put("cursor", toInt(row[2]));
         out.put("replans", toInt(row[3]));
-        out.put("updated_at", fromSqlTs(row[4]));
         return out;
     }
 

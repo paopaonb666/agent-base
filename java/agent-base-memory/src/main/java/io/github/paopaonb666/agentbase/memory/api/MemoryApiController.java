@@ -86,12 +86,24 @@ public class MemoryApiController {
             throw new HttpError(422, "content 必须是 1..20000 字符");
         }
         String kind = body.kind() == null ? "semantic" : body.kind();
+        // 对应 Python api.py create_memory：kind 白名单校验（400）。
+        if (!io.github.paopaonb666.agentbase.memory.store.Models.KNOWN_MEMORY_KINDS.contains(kind)) {
+            throw new HttpError(400, "kind 非法：'" + kind
+                    + "'；允许 ['semantic', 'episodic', 'procedural']");
+        }
         List<String> tags = body.tags() == null ? List.of() : body.tags();
         if (tags.size() > 10) {
             throw new HttpError(422, "tags 最多 10 个");
         }
+        if (body.agentId() != null && body.agentId().length() > 64) {
+            throw new HttpError(422, "agent_id 最多 64 字符");
+        }
         String agentId = body.agentId() == null || body.agentId().isEmpty() ? "*" : body.agentId();
         double salience = body.salience() == null ? 0.5 : body.salience();
+        // Pydantic ge=0.0 le=1.0：越界 422，而不是静默钳制。
+        if (salience < 0.0 || salience > 1.0) {
+            throw new HttpError(422, "salience 必须在 0.0..1.0 之间");
+        }
         MemoryRecord record = memory.addMemory(userId, agentId, body.content(), kind, tags, salience, "");
         return record.meta();
     }
@@ -104,18 +116,34 @@ public class MemoryApiController {
             @RequestParam(value = "module", required = false) String module,
             @RequestParam(value = "kind", required = false) String kind,
             @RequestParam(value = "status", required = false) String status,
-            @RequestParam(value = "limit", defaultValue = "50") int limit,
+            @RequestParam(value = "limit", defaultValue = "20") int limit,
             @RequestHeader(value = "X-User-Id", required = false) String userIdHeader,
             @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
             @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,
             @RequestHeader(value = "X-User-Nonce", required = false) String nonceHeader) {
         MemoryService memory = service();
         String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
+        // 对应 Python search_memory：kind/status 白名单校验（400）——null 视为
+        // 缺省，其余任何值（含空串）都必须在已知集合内。
+        if (kind != null && !io.github.paopaonb666.agentbase.memory.store.Models.KNOWN_MEMORY_KINDS.contains(kind)) {
+            throw new HttpError(400, "kind 非法：'" + kind
+                    + "'；允许 ['semantic', 'episodic', 'procedural']");
+        }
+        if (status != null && !io.github.paopaonb666.agentbase.memory.store.Models.KNOWN_MEMORY_STATUSES.contains(status)) {
+            throw new HttpError(400, "status 非法：'" + status
+                    + "'；允许 ['active', 'superseded', 'archived']");
+        }
+        // 对应 Python api.py search_memory：limit 两个分支共用同一钳制
+        // （1..100），q 分支同样吃 module（agent 作用域收窄）与 kind 过滤。
+        int clampedLimit = Math.max(1, Math.min(limit, 100));
         Map<String, Object> out = new LinkedHashMap<>();
         if (q != null && !q.isEmpty()) {
             out.put("query", q);
             List<Map<String, Object>> memories = new ArrayList<>();
-            for (var item : memory.searchScored(userId, null, q, limit)) {
+            for (var item : memory.searchScored(userId, module, q, clampedLimit)) {
+                if (kind != null && !kind.isEmpty() && !kind.equals(item.record().kind())) {
+                    continue;
+                }
                 Map<String, Object> view = new LinkedHashMap<>(item.record().meta());
                 view.put("score", Math.round(item.score() * 10000.0) / 10000.0);
                 view.put("expired", memory.isExpired(item.record()));
@@ -128,7 +156,7 @@ public class MemoryApiController {
         List<String> kinds = kind == null || kind.isEmpty() ? null : List.of(kind);
         List<Map<String, Object>> memories = new ArrayList<>();
         for (MemoryRecord record : memory.listMemories(userId, module, true, kinds, statuses,
-                Math.min(Math.max(limit, 1), 500), true)) {
+                clampedLimit, true)) {
             Map<String, Object> view = new LinkedHashMap<>(record.meta());
             view.put("expired", memory.isExpired(record));
             memories.add(view);
@@ -149,6 +177,18 @@ public class MemoryApiController {
                                      @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
                                      @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,
                                      @RequestHeader(value = "X-User-Nonce", required = false) String nonceHeader) {
+        // 字段约束对应 Python MemoryPatchRequest（Pydantic）：
+        // content 1..20000、tags ≤ 10、salience 0..1——越界 422 而不是静默
+        // 接受（content:"" 曾会覆盖成空内容）。
+        if (body.content() != null && (body.content().isEmpty() || body.content().length() > 20_000)) {
+            throw new HttpError(422, "content 必须是 1..20000 字符");
+        }
+        if (body.tags() != null && body.tags().size() > 10) {
+            throw new HttpError(422, "tags 最多 10 个");
+        }
+        if (body.salience() != null && (body.salience() < 0.0 || body.salience() > 1.0)) {
+            throw new HttpError(422, "salience 必须在 0.0..1.0 之间");
+        }
         MemoryService memory = service();
         String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         owned(memory, memoryId, userId);
@@ -207,7 +247,8 @@ public class MemoryApiController {
         owned(memory, memoryId, userId);
         MemoryRecord restored = memory.restoreVersion(memoryId, versionId);
         if (restored == null) {
-            throw new HttpError(404, "版本不存在或不可恢复：" + versionId);
+            // 400 而非 404：对应 Python api.py restore_memory_version。
+            throw new HttpError(400, "版本不可恢复：version_id 无效或对应删除墓碑");
         }
         return restored.meta();
     }
@@ -283,7 +324,7 @@ public class MemoryApiController {
     // ── GET /v1/memory/audit：记忆操作审计 ──────────────────────────────
 
     @GetMapping("/audit")
-    public Map<String, Object> audit(@RequestParam(value = "limit", defaultValue = "100") int limit,
+    public Map<String, Object> audit(@RequestParam(value = "limit", defaultValue = "50") int limit,
                                      @RequestHeader(value = "X-User-Id", required = false) String userIdHeader,
                                      @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
                                      @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,

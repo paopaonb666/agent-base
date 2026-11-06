@@ -137,13 +137,15 @@ class CoreStoreTest {
 
         Map<String, Object> plan = store.getPlan("chat:p");
         assertNotNull(plan);
+        // 载荷与 Python get_plan 逐键一致：thread_id/module/tasks/cursor/replans。
+        assertEquals("chat:p", plan.get("thread_id"));
         assertEquals("planner", plan.get("module"));
         assertEquals(0, ((Number) plan.get("cursor")).intValue());
         assertEquals(0, ((Number) plan.get("replans")).intValue());
         assertEquals(2, ((List<?>) plan.get("tasks")).size());
         assertEquals("查天气",
                 ((Map<?, ?>) ((List<?>) plan.get("tasks")).get(0)).get("goal"));
-        assertTrue(((Number) plan.get("updated_at")).doubleValue() > 0);
+        assertEquals(5, plan.size());
 
         // 推进 cursor 后再次保存（upsert 覆盖）。
         store.savePlan("chat:p", "planner", tasks, 1, 0);
@@ -172,13 +174,14 @@ class CoreStoreTest {
 
         port.savePlan("chat:p", "planner", List.of(task(1, "查天气")), 0, 1);
         Map<String, Object> plan = port.getPlan("chat:p");
-        // 契约形态：tasks(List<Map>)/cursor(int)/replans(int)/module/updated_at。
+        // 契约形态（与 Python get_plan 逐键一致）：
+        // thread_id/module/tasks(List<Map>)/cursor(int)/replans(int)。
         assertEquals(5, plan.size());
+        assertEquals("chat:p", plan.get("thread_id"));
         assertEquals(1, ((List<?>) plan.get("tasks")).size());
         assertEquals(0, ((Number) plan.get("cursor")).intValue());
         assertEquals(1, ((Number) plan.get("replans")).intValue());
         assertEquals("planner", plan.get("module"));
-        assertTrue(((Number) plan.get("updated_at")).doubleValue() > 0);
 
         port.deletePlan("chat:p");
         assertNull(port.getPlan("chat:p"));
