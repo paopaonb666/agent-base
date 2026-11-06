@@ -76,7 +76,19 @@ class AgentsRoutesTest {
                                              Object memory,
                                              Object planStore,
                                              Object toolRecorder) throws Exception {
-        Settings settings = Settings.load(Map.of("ENV", "development"));
+        return buildRuntime(Settings.load(Map.of("ENV", "development")), modules,
+                checkpointer, threadIndex, fileStore, memory, planStore, toolRecorder);
+    }
+
+    /** 同上，但显式指定 Settings（production 守门测试用）。 */
+    private static AgentRuntime buildRuntime(Settings settings,
+                                             Map<String, AgentModule> modules,
+                                             Object checkpointer,
+                                             Object threadIndex,
+                                             Object fileStore,
+                                             Object memory,
+                                             Object planStore,
+                                             Object toolRecorder) throws Exception {
         Constructor<AgentRuntime> ctor = AgentRuntime.class.getDeclaredConstructor(
                 Settings.class, io.github.paopaonb666.agentbase.core.llm.ModelRuntime.class,
                 Map.class, io.github.paopaonb666.agentbase.core.tools.ToolPool.class,
@@ -489,6 +501,44 @@ class AgentsRoutesTest {
         invoke(routes, "chat", invokeBody("第一条消息", "t1", null, null, null), "u1");
         assertEquals(1, calls.stream().filter("upsertThreadIndex"::equals).count(),
                 "一次 invoke 恰一次 upsert：" + calls);
+    }
+
+    @Test
+    void degradedPathsRefuseInProductionAndKeepLocalDevSemantics() throws Exception {
+        // #82：索引缺席时 production 拒绝降级服务（无属主校验=越权暴露面，
+        // fail-safe 而非 fail-open）；development 保留全库扫描旧行为。
+        Settings production = Settings.load(Map.of(
+                "ENV", "production",
+                "LLM_API_KEY", "sk-test",
+                "MEMORY_AUTH_SECRET", "s",
+                "MEMORY_ENABLED", "false"));
+        AgentRuntime prodRuntime = buildRuntime(production, Map.of("chat", stubModule("chat")),
+                new InMemoryCheckpointer(), null, null, null, null, null);
+        AgentsRoutes prodRoutes = new AgentsRoutes(prodRuntime, PASS_THROUGH_AUTH, providerOf(null));
+
+        HttpError history = httpErrorOf(() ->
+                prodRoutes.threadHistory("chat", "t1", "u1", null, null, null));
+        assertEquals(503, history.status());
+        assertTrue(history.getMessage().contains("fail-safe"), history.getMessage());
+        HttpError list = httpErrorOf(() ->
+                prodRoutes.listThreads("chat", "u1", null, null, null));
+        assertEquals(503, list.status());
+        HttpError delete = httpErrorOf(() ->
+                prodRoutes.deleteThread("chat", "t1", "u1", null, null, null));
+        assertEquals(503, delete.status());
+
+        // development：降级路径可用（列表能扫到 checkpointer 里的线程）。
+        AgentRuntime devRuntime = buildRuntime(Map.of("chat", stubModule("chat")),
+                new InMemoryCheckpointer(), null, null, null, null, null);
+        devRuntime.checkpointer().put("chat:t1",
+                new io.github.paopaonb666.agentbase.core.graph.GraphState(
+                        List.of(dev.langchain4j.data.message.UserMessage.from("本地")), Map.of()));
+        Map<String, Object> out = new AgentsRoutes(devRuntime, PASS_THROUGH_AUTH,
+                providerOf(null)).listThreads("chat", "u1", null, null, null);
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> threads = (List<Map<String, Object>>) out.get("threads");
+        assertEquals(1, threads.size());
+        assertEquals("t1", threads.get(0).get("thread_id"));
     }
 
     @Test

@@ -43,14 +43,19 @@ import io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStore;
  * 对话与会话线程端点：invoke（SSE）、线程列表/历史/删除、工具审计、
  * 计划状态。S1 线程作用域：每个线程在 thread_index 表里有属主记录
  * （invoke 时 upsert）；列表只返回当前用户的线程；历史/删除/审计端点
- * 校验属主（404 掩蔽）。索引缺席（后端不可用）时降级为旧行为——全库
- * 扫描 + 无属主校验，仅限本地开发。
+ * 校验属主（404 掩蔽）。索引缺席（后端不可用）时：<b>production 拒绝
+ * 降级服务</b>（#82 fail-safe 而非 fail-open——无索引即无属主校验，
+ * 功能降级不能悄悄变成越权数据暴露面，503 + 修复指引）；development
+ * 保留旧行为（全库扫描 + 无属主校验，本地开发豁免）并 WARN。
  *
  * <p>对应 Python 侧 {@code routes/agents.py}，端点/状态码/文案逐条对齐。
  */
 @RestController
 @RequestMapping("/v1/agents")
 public class AgentsRoutes {
+
+    private static final org.slf4j.Logger LOG =
+            org.slf4j.LoggerFactory.getLogger(AgentsRoutes.class);
 
     // 线程列表端点的扫描/数量上限（旧版回退路径仍用）。
     private static final int THREAD_LIST_SCAN_LIMIT = 2000;
@@ -86,10 +91,26 @@ public class AgentsRoutes {
         return runtime.modules().containsKey(module) || AgentRuntime.SUPERVISOR_MODULE.equals(module);
     }
 
+    /**
+     * 降级守门（#82）：线程索引缺席且 env=production 时以 503 拒绝——
+     * 降级路径没有属主信息，静默放宽安全边界会把「功能降级」变成
+     * 「越权数据暴露」；development 显式豁免（本地开发）并 WARN。
+     */
+    private void requireIndexForDegradedPath(String operation) {
+        if ("production".equals(runtime.settings().env)) {
+            throw new HttpError(503, "线程索引不可用，生产环境拒绝降级" + operation
+                    + "：无索引即无属主校验（fail-safe 而非 fail-open）；"
+                    + "请修复索引存储后重启，本地调试请用 ENV=development");
+        }
+        LOG.warn("线程索引缺席，{} 走无属主校验的降级路径（仅限本地开发，"
+                + "production 会拒绝服务）", operation);
+    }
+
     /** 线程属主校验（S1）：索引在位时，非属主一律 404 掩蔽。 */
     private void threadOwnerOr404(String module, String threadId, String userId) {
         var index = runtime.threadIndex();
         if (index == null) {
+            requireIndexForDegradedPath("线程读取端点");
             return;
         }
         var entry = index.getThreadIndex(new ThreadId(module, threadId).toString());
@@ -372,7 +393,8 @@ public class AgentsRoutes {
             }
             return Map.of("threads", threads);
         }
-        // 降级：checkpointer 扫描（仅本地开发语义）。
+        // 降级：checkpointer 扫描（#82：production 拒绝，development 豁免）。
+        requireIndexForDegradedPath("线程列表");
         if (runtime.checkpointer() == null) {
             return Map.of("threads", List.of());
         }
