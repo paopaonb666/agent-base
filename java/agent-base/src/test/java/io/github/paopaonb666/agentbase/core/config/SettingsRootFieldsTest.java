@@ -1,6 +1,9 @@
 package io.github.paopaonb666.agentbase.core.config;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
 import java.util.Map;
@@ -38,5 +41,27 @@ class SettingsRootFieldsTest {
     void uppercaseRootKeysNormalizeToLowercase() {
         Settings s = Settings.load(Map.of("ENV", "production"), null);
         assertEquals("production", s.env);
+    }
+
+    @Test
+    void healthProbeKeyControlsTheProbeSwitch() {
+        // #101：正确键 HEALTH_PROBE_MODEL → observability.healthProbeModel。
+        Settings on = Settings.load(Map.of("HEALTH_PROBE_MODEL", "true"), null);
+        assertTrue(on.observability.healthProbeModel);
+        Settings off = Settings.load(Map.of("HEALTH_PROBE_MODEL", "false"), null);
+        assertFalse(off.observability.healthProbeModel);
+    }
+
+    @Test
+    void staleLlmHealthProbeKeyIsRejectedNotSwallowed() {
+        // #101：旧写法 LLM_HEALTH_PROBE_MODEL 会被 llm_ 前缀抬进 llm 节后
+        // 被 applyLlm 静默丢弃（「照文档配置不生效」）——现在显式拒绝并指路。
+        Settings.SettingsError error = assertThrows(Settings.SettingsError.class,
+                () -> Settings.load(Map.of("LLM_HEALTH_PROBE_MODEL", "false"), null));
+        assertTrue(error.getMessage().contains("HEALTH_PROBE_MODEL"),
+                "拒绝文案要指路正确键：" + error.getMessage());
+        // 小写同拒（lift 内部先归一小写）。
+        assertThrows(Settings.SettingsError.class,
+                () -> Settings.load(Map.of("llm_health_probe_model", "false"), null));
     }
 }

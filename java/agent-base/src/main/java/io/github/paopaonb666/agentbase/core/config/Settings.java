@@ -258,6 +258,16 @@ public final class Settings {
      * 对应 Python 侧 {@code Settings._lift_legacy_flat_fields}。
      * 注意 {@code llm_fast_} 必须排在 {@code llm_} 之前。
      */
+    /**
+     * 照旧文档/记忆写的平铺键会被更宽的前缀吞进错误配置节后被静默丢弃
+     * （#101：LLM_HEALTH_PROBE_MODEL 被 {@code llm_} 前缀抬进 llm 节，
+     * applyLlm 不认识它——「照文档配置不生效」且无从排查）。对这类键
+     * 显式拒绝并指路。
+     */
+    private static final Map<String, String> STALE_FLAT_KEYS = Map.of(
+            "llm_health_probe_model",
+            "HEALTH_PROBE_MODEL（observability 节：/health 的 LLM 探活开关）");
+
     static Map<String, Map<String, String>> liftLegacyFlatFields(Map<String, String> data) {
         // 有序：前缀匹配按声明顺序（llm_fast_ 先于 llm_）。
         List<Map.Entry<String, String>> prefixes = List.of(
@@ -288,6 +298,12 @@ public final class Settings {
         for (Map.Entry<String, String> e : data.entrySet()) {
             String key = e.getKey();
             String lower = key.toLowerCase(Locale.ROOT);
+            String stale = STALE_FLAT_KEYS.get(lower);
+            if (stale != null) {
+                throw new SettingsError(
+                        ("配置键 '%s' 不存在（会被 llm_ 前缀规则吞进 LLM 节后静默丢弃）；"
+                                + "正确键为 %s").formatted(key, stale));
+            }
             String matchedPrefix = "";
             String target = "";
             for (Map.Entry<String, String> p : prefixes) {
