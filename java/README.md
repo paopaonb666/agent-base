@@ -77,7 +77,7 @@ tool_call/plan/sources/done/error`）、端点路径与状态码语义与 Python
 | 对话状态存储 | Java 用自有 `ab_thread_states` JSON 快照表（checkpointer SPI 三后端：memory/sqlite/mysql），不读写 LangGraph 的 msgpack superstep 表。HTTP 行为等价：历史回放/恢复/删除/线程列表一致；业务表（tool_call_records / uploaded_files / thread_index / plan_snapshots / cost_usage / 六张记忆表）DDL 逐条一致，可与 Python 版共用同一 MySQL 库（checkpointer 表除外，两版各自管理各自的表） |
 | 运行时 | 自建迷你图运行时复刻本项目实际用到的 LangGraph 语义子集（节点/条件边/三通道流式/按线程状态快照/recursion limit）；supervisor 以 handoff 工具模式自实现（对应 langgraph-supervisor 行为） |
 | MCP | 第一期未迁移：`MCP_ENABLED=true` 启动即报错（启用即承诺的契约语义保留），默认 false 不受影响 |
-| python_repl | 未迁移：`TOOLKIT_ENABLED` 含 `python_repl` 时启动报「未知工具」；合法名：`current_time/calculator/json_query/web_search` |
+| python_repl | 未迁移：`TOOLKIT_ENABLED` 含 `python_repl` 时启动即报专用「未迁移」错误（说明 exec 级隔离语义未承诺，并指引从 TOOLKIT_ENABLED 移除该条目）；不是泛化的「未知工具」报错。合法名：`current_time/calculator/json_query/web_search` |
 | DuckDuckGo 引擎 | 未迁移：`SEARCH_ENGINE_PRIORITY` 含 `duckduckgo` 且被选中时构建期报错；Tavily 完整可用 |
 | 日志 | SLF4J/Logback 实现，`LOG_JSON=true` 输出与 Python 版同字段的 JSON 行（ts/level/logger/request_id/message） |
 | 多进程口径 | 与 Python 版一致：metrics / 预算 / nonce 防重放缓存均为单进程口径，多实例部署需在采集/网关侧聚合 |
