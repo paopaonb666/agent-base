@@ -66,6 +66,31 @@ class MemoryStoreBackendTest {
         }
     }
 
+    @Test
+    void corruptedTagsColumnDegradesToEmptyWithRowIntact() throws Exception {
+        // #169：畸形 tags_json 按空处理但行不丢——之前静默退化无告警，
+        // 现在存储层 WARN（含 memory_id，日志侧验证）。
+        Path db = tempDir.resolve("tags-" + System.nanoTime() + ".db");
+        try (SqliteMemoryStore store = new SqliteMemoryStore(db.toString())) {
+            // 绕过写路径校验直接注入存量坏数据。
+            try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + db);
+                 Statement st = conn.createStatement()) {
+                st.execute("""
+                        INSERT INTO memories (memory_id, user_id, agent_id, kind, content,
+                          tags_json, salience, status, source_thread_id, source_refs_json,
+                          created_at, updated_at, access_count)
+                        VALUES ('mbad', 'u1', 'chat', 'semantic', '坏标签行',
+                          'not-json', 0.5, 'active', '', '[{"ref":"a"}]', 1.0, 1.0, 0)
+                        """);
+            }
+            Models.MemoryRecord got = store.getMemory("mbad");
+            assertEquals("坏标签行", got.content());
+            assertEquals(List.of(), got.tags(), "畸形 tags 按空处理，行不丢");
+            // 源引用列合法 JSON 不受影响（同口径解析）。
+            assertEquals(1, got.sourceRefs().size());
+        }
+    }
+
     /** 旧库补列：缺 offsets_json 列的 doc_chunks 在打开时被补上（M7 自迁移）。 */
     @Test
     void sqliteLegacyDbAddsOffsetsColumn() throws Exception {

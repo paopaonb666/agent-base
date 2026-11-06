@@ -5,6 +5,9 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.time.Instant;
@@ -167,17 +170,23 @@ abstract class AbstractSqlMemoryStore implements MemoryStore {
         return value instanceof byte[] bytes ? bytes : null;
     }
 
+    private static final Logger LOG = LoggerFactory.getLogger(AbstractSqlMemoryStore.class);
+
     /**
-     * 容错解析 JSON 字符串列表：畸形/空值一律返回空表（审计可查，不抛错）。
-     * 对应 Python 侧 {@code _json_list}。
+     * 容错解析 JSON 字符串列表：空值返回空表；畸形/非数组（损坏的
+     * tags/引用列）返回空表但 WARN（#169）——静默丢 tags 让记忆行以
+     * 「无标签」形态继续使用，是查不到原因的数据退化。读路径不抛错
+     * （一条坏行不该打断检索）。对应 Python 侧 {@code _json_list}。
      */
-    private static List<String> jsonList(Object value) {
+    private static List<String> jsonList(Object value, String memoryId, String column) {
         if (value == null || value.toString().isEmpty()) {
             return List.of();
         }
         try {
             JsonNode parsed = JSON.readTree(value.toString());
             if (!parsed.isArray()) {
+                LOG.warn("memory store: {} 列不是 JSON 数组（memory_id={}），按空处理：{}",
+                        column, memoryId, value);
                 return List.of();
             }
             List<String> out = new ArrayList<>();
@@ -187,6 +196,8 @@ abstract class AbstractSqlMemoryStore implements MemoryStore {
             }
             return out;
         } catch (JsonProcessingException e) {
+            LOG.warn("memory store: {} 列 JSON 解析失败（memory_id={}），按空处理：{}",
+                    column, memoryId, value);
             return List.of();
         }
     }
@@ -313,13 +324,13 @@ abstract class AbstractSqlMemoryStore implements MemoryStore {
                 str(row[2]),
                 str(row[3]),
                 str(row[4]),
-                jsonList(row[5]),
+                jsonList(row[5], str(row[0]), "tags"),
                 toBlob(row[6]),
                 row[7] == null ? null : Integer.valueOf(toInt(row[7])),
                 toDouble(row[8], 0.5),
                 str(row[9]),
                 str(row[10]),
-                jsonList(row[11]),
+                jsonList(row[11], str(row[0]), "source_refs"),
                 fromSqlTs(row[12]),
                 fromSqlTs(row[13]),
                 row[14] == null ? null : Double.valueOf(fromSqlTs(row[14])),
