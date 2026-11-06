@@ -97,15 +97,31 @@ public class FilesRoutes {
         if (fileStore == null) {
             throw new HttpError(503, "附件存储未启用（存储后端不可用）");
         }
-        // 大小上限（M5）：Python 边读边判、超限立即 413；Java 的 multipart
-        // 已由容器落盘，这里至少在堆拷贝（getBytes 的整份复制）之前拒绝，
-        // 避免超大附件把内存放大一倍。文案与 Python 413 一致。
+        // 大小上限（M5/#144）：声明 size（getSize）只是早退优化——容器
+        // 解析前不可信，真正的大小约束在流式读取里边读边判（分块
+        // UPLOAD_CHUNK_BYTES）：超限立即 413，堆内存上限钉在 maxBytes
+        // 而不是 getBytes() 的整份复制。文案与 Python 413 一致。
         Settings settings = runtime.settings();
         int maxBytes = settings.docParse.maxInputBytes;
         if (file.getSize() > maxBytes) {
             throw new HttpError(413, "文件超出大小上限：> " + maxBytes + " 字节");
         }
-        byte[] data = file.getBytes();
+        byte[] data;
+        try (java.io.InputStream in = file.getInputStream()) {
+            java.io.ByteArrayOutputStream buffer =
+                    new java.io.ByteArrayOutputStream(Math.min(maxBytes, UPLOAD_CHUNK_BYTES));
+            byte[] chunk = new byte[UPLOAD_CHUNK_BYTES];
+            long total = 0;
+            int read;
+            while ((read = in.read(chunk)) != -1) {
+                total += read;
+                if (total > maxBytes) {
+                    throw new HttpError(413, "文件超出大小上限：> " + maxBytes + " 字节");
+                }
+                buffer.write(chunk, 0, read);
+            }
+            data = buffer.toByteArray();
+        }
         if (data.length == 0) {
             throw new HttpError(400, "上传文件为空");
         }
