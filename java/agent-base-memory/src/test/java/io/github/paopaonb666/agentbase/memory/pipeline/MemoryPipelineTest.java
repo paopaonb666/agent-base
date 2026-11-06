@@ -29,7 +29,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * 审计调用面。抽取/整合输出按生产 prompt 的 JSON 契约脚本化。
  *
  * <p>#134/#136 的裁决基线在此锁定：字面 "null" 候选在抽取侧被跳过（Java
- * 语义保留），ADD 侧字面 "null" 回落 candidate.content。
+ * 语义保留）；落库回落规则在 ADD/UPDATE 两口统一——null/空串/字面
+ * "null" content 一律回落 candidate.content。
  */
 class MemoryPipelineTest {
 
@@ -288,15 +289,38 @@ class MemoryPipelineTest {
     void consolidateAddFallsBackToCandidateContent() {
         ScriptedMain main = new ScriptedMain();
         main.responses.add("{\"op\": \"ADD\", \"content\": null}");
+        main.responses.add("{\"op\": \"ADD\", \"content\": \"\"}");
+        main.responses.add("{\"op\": \"ADD\", \"content\": \"null\"}");
         RecordingOps ops = new RecordingOps();
         MemoryPipeline pipeline = pipelineWith(main, new ScriptedFast(), ops);
 
-        String op = pipeline.consolidate(
-                new MemoryPipeline.Candidate("候选内容", "semantic", 0.5, List.of("t")),
-                "u1", "chat", "chat:tt");
-        assertEquals("ADD", op);
-        // #136 基线：ADD 的字面 null/空串 content 回落 candidate.content。
-        assertTrue(ops.calls.contains("addMemory:候选内容|semantic|[t]"), ops.calls.toString());
+        for (int i = 0; i < 3; i++) {
+            assertEquals("ADD", pipeline.consolidate(
+                    new MemoryPipeline.Candidate("候选内容", "semantic", 0.5, List.of("t")),
+                    "u1", "chat", "chat:tt"));
+        }
+        // #136 统一回落：ADD 的 null/空串/字面 "null" content 一律回落
+        // candidate.content（LLM null 序列化产物与缺失等同）。
+        assertEquals(3, ops.calls.stream().filter(c -> c.equals("addMemory:候选内容|semantic|[t]")).count());
+    }
+
+    @Test
+    void consolidateUpdateFallsBackToCandidateContent() {
+        // #136：UPDATE 与 ADD 同一回落规则（修复前 UPDATE 不查字面 "null"，
+        // 会把 "null" 原样落库）。
+        ScriptedMain main = new ScriptedMain();
+        main.responses.add("{\"op\": \"UPDATE\", \"memory_id\": \"m1\", \"content\": \"null\"}");
+        main.responses.add("{\"op\": \"UPDATE\", \"memory_id\": \"m1\", \"content\": \"\"}");
+        RecordingOps ops = new RecordingOps();
+        MemoryPipeline pipeline = pipelineWith(main, new ScriptedFast(), ops);
+
+        for (int i = 0; i < 2; i++) {
+            assertEquals("UPDATE", pipeline.consolidate(
+                    new MemoryPipeline.Candidate("候选内容", "semantic", 0.5, List.of()),
+                    "u1", "chat", "t"));
+        }
+        assertEquals(2, ops.calls.stream()
+                .filter(c -> c.equals("updateMemory:m1|候选内容")).count());
     }
 
     @Test

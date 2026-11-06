@@ -347,15 +347,13 @@ public final class MemoryPipeline {
         Object content = map.get("content");
         switch (op) {
             case "ADD" -> ops.addMemory(userId, agentId,
-                    content == null || "null".equals(String.valueOf(content)) || String.valueOf(content).isEmpty()
-                            ? candidate.content() : String.valueOf(content),
+                    contentOrFallback(content, candidate),
                     candidate.kind(), candidate.tags(), candidate.salience(), threadId);
             case "UPDATE" -> {
                 if (memoryId == null) {
                     op = "NONE";
                 } else if (!ops.updateMemory(String.valueOf(memoryId),
-                        content == null || String.valueOf(content).isEmpty()
-                                ? candidate.content() : String.valueOf(content))) {
+                        contentOrFallback(content, candidate))) {
                     op = "NONE";
                 }
             }
@@ -367,6 +365,20 @@ public final class MemoryPipeline {
             default -> { /* NONE */ }
         }
         return op;
+    }
+
+    /**
+     * 整合落库 content 的统一回落（#136）：LLM 把 null 序列化成字面
+     * "null" 或空串时与缺失等同，两个落库口（ADD/UPDATE）同一规则——
+     * 之前 ADD 多回落字面 "null"、UPDATE 不查，会产出与 Python 不同的
+     * 记忆行。非字符串值按 str() 口径转字符串。
+     */
+    private static String contentOrFallback(Object content, Candidate candidate) {
+        if (content == null) {
+            return candidate.content();
+        }
+        String text = String.valueOf(content);
+        return (text.isEmpty() || "null".equals(text)) ? candidate.content() : text;
     }
 
     // ── 画像 ─────────────────────────────────────────────────────────────
