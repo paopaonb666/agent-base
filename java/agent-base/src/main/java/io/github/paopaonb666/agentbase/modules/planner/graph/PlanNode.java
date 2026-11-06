@@ -13,8 +13,6 @@ import io.github.paopaonb666.agentbase.core.graph.NodeContext;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 /**
  * plan 节点（B2）：把用户目标拆解为有界 JSON 子任务清单——对应 Python 侧
@@ -32,9 +30,6 @@ import java.util.regex.Pattern;
  * {@code ModelRuntime.invoke}），不向 UI 发 token 增量。
  */
 public final class PlanNode {
-
-    /** 模型输出中的 JSON 数组（贪婪匹配首 [ 到末 ]，对应 Python re DOTALL）。 */
-    private static final Pattern JSON_ARRAY = Pattern.compile("\\[.*\\]", Pattern.DOTALL);
 
     /** 解析失败反馈在重试 prompt 里引用的上次输出截断长度（raw[:200]）。 */
     private static final int RETRY_ECHO_MAX_CHARS = 200;
@@ -81,18 +76,21 @@ public final class PlanNode {
     /**
      * 模型输出 → 规范化 Task 列表；任何解析失败都降级为单任务。
      *
-     * <p>对齐 Python {@code _parse_tasks}：正则抽 {@code [.*]}（贪婪到末
-     * ]，DOTALL）；非数组 / 空数组 / 无可用 goal 都算失败；goals 截断到
+     * <p>抽取用平衡括号扫描（#258，{@code JsonBlocks.firstBalancedArray}）：
+     * 取<b>首个</b>完整 JSON 数组、字符串字面量内的括号不计数——贪婪
+     * DOTALL 正则（{@code \[.*\]}）会把「多 JSON 块 + 尾注」的输出误取到
+     * 最后一段括号。非数组 / 空数组 / 无可用 goal 都算失败；goals 截断到
      * {@code max_subtasks}；重排 id 1..n、全部 pending、空摘要、0 次尝试。
      */
     static List<Map<String, Object>> parseTasks(String raw, int maxSubtasks, String fallbackGoal) {
         List<String> goals = new ArrayList<>();
         try {
-            Matcher matcher = JSON_ARRAY.matcher(raw == null ? "" : raw);
-            if (!matcher.find()) {
+            String block = io.github.paopaonb666.agentbase.core.text.JsonBlocks
+                    .firstBalancedArray(raw == null ? "" : raw);
+            if (block == null) {
                 throw new IllegalStateException("no JSON array found");
             }
-            JsonNode parsed = MAPPER.readTree(matcher.group(0));
+            JsonNode parsed = MAPPER.readTree(block);
             if (!parsed.isArray() || parsed.isEmpty()) {
                 throw new IllegalStateException("JSON array empty or not a list");
             }
