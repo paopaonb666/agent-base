@@ -26,13 +26,32 @@ public class SystemRoutes {
 
     private static final Logger LOG = LoggerFactory.getLogger(SystemRoutes.class);
 
-    // 模型端点探活（/health）：结果 TTL 缓存，避免每个探活请求都打真实网络。
+    // 模型端点探活（/health）：成功结果 TTL 缓存 30s，避免每个探活请求
+    // 都打真实网络；失败结果不缓存（#206「或穿透」口径——provider 刚挂
+    // 时 /health 没有说谎窗口，每次 health 都复检）。
     private static final double MODEL_PROBE_TTL_SECONDS = 30.0;
     private static final double MODEL_PROBE_TIMEOUT_SECONDS = 3.0;
 
     /** 探活结果缓存：{base_url: (monotonic 时间, 结果)}（进程级单例口径）。 */
     private static final Map<String, Map.Entry<Double, String>> MODEL_PROBE_CACHE =
             new LinkedHashMap<>();
+
+    /** /models 拉取器（可测性分离：测试注入假应答）。 */
+    interface ModelsFetcher {
+        java.net.http.HttpResponse<String> fetch(String url, String apiKey) throws Exception;
+    }
+
+    private static final ModelsFetcher DEFAULT_FETCHER = (url, apiKey) -> {
+        java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder()
+                .connectTimeout(java.time.Duration.ofSeconds((long) MODEL_PROBE_TIMEOUT_SECONDS))
+                .build();
+        java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+                .uri(java.net.URI.create(url))
+                .header("Authorization", "Bearer " + apiKey)
+                .timeout(java.time.Duration.ofSeconds((long) MODEL_PROBE_TIMEOUT_SECONDS))
+                .GET().build();
+        return client.send(request, java.net.http.HttpResponse.BodyHandlers.ofString());
+    };
 
     private final AgentRuntime runtime;
     private final CostGovernor governor;
@@ -45,37 +64,59 @@ public class SystemRoutes {
     }
 
     /**
-     * 探测 openai 兼容端点的网络可达性（带 TTL 缓存）。只证明"端点在
-     * 网络层可达"——任何 HTTP 应答（含 401/404）都算 ok。
+     * 探测 openai 兼容端点（成功 TTL 缓存，失败穿透）。ok 需要同时满足：
+     * 2xx 且响应体是含 {@code data} 数组的 JSON（#205——200 错误页/网关
+     * 502/404 都不再冒充健康）；失败结果带原因（错误页/网关故障/网络
+     * 异常三类可区分，进 health 明细）且不缓存——故障恢复立即可见。
      */
     static String probeModel(Settings settings) {
+        return probeModel(settings, DEFAULT_FETCHER);
+    }
+
+    static String probeModel(Settings settings, ModelsFetcher fetcher) {
         String baseUrl = settings.llm.baseUrl;
         double now = System.nanoTime() / 1_000_000_000.0;
         synchronized (MODEL_PROBE_CACHE) {
             var hit = MODEL_PROBE_CACHE.get(baseUrl);
-            if (hit != null && now - hit.getKey() < MODEL_PROBE_TTL_SECONDS) {
+            if (hit != null && "ok".equals(hit.getValue())
+                    && now - hit.getKey() < MODEL_PROBE_TTL_SECONDS) {
                 return hit.getValue();
             }
         }
-        String status = "error";
+        String url = baseUrl.replaceAll("/+$", "") + "/models";
+        String status;
         try {
-            java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder()
-                    .connectTimeout(java.time.Duration.ofSeconds((long) MODEL_PROBE_TIMEOUT_SECONDS))
-                    .build();
-            java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
-                    .uri(java.net.URI.create(baseUrl.replaceAll("/+$", "") + "/models"))
-                    .header("Authorization", "Bearer " + settings.llm.apiKey)
-                    .timeout(java.time.Duration.ofSeconds((long) MODEL_PROBE_TIMEOUT_SECONDS))
-                    .GET().build();
-            client.send(request, java.net.http.HttpResponse.BodyHandlers.discarding());
-            status = "ok"; // 任何 HTTP 应答都证明可达
+            java.net.http.HttpResponse<String> response = fetcher.fetch(url, settings.llm.apiKey);
+            if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                status = "error:http:" + response.statusCode();
+            } else if (!modelsShapeValid(response.body())) {
+                status = "error:shape:not-openai-models";
+            } else {
+                status = "ok";
+            }
         } catch (Exception e) {
-            LOG.warn("health: model endpoint probe failed for {}", baseUrl);
+            status = "error:net:" + e.getClass().getSimpleName();
         }
-        synchronized (MODEL_PROBE_CACHE) {
-            MODEL_PROBE_CACHE.put(baseUrl, Map.entry(now, status));
+        if (!"ok".equals(status)) {
+            LOG.warn("health: model endpoint probe failed for {}: {}", baseUrl, status);
+        } else {
+            // 只缓存成功结果（#206 失败穿透）。
+            synchronized (MODEL_PROBE_CACHE) {
+                MODEL_PROBE_CACHE.put(baseUrl, Map.entry(now, status));
+            }
         }
         return status;
+    }
+
+    /** OpenAI 兼容 /models 契约：JSON 对象且含 data 数组。 */
+    private static boolean modelsShapeValid(String body) {
+        try {
+            com.fasterxml.jackson.databind.JsonNode root =
+                    new com.fasterxml.jackson.databind.ObjectMapper().readTree(body);
+            return root.isObject() && root.has("data") && root.get("data").isArray();
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     // ── GET /v1/modules：已注册模块清单 ─────────────────────────────────
