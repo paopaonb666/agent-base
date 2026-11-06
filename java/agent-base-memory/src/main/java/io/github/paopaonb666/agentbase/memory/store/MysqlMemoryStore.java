@@ -63,7 +63,35 @@ public final class MysqlMemoryStore extends AbstractSqlMemoryStore {
                 st.execute(ddl);
             }
         }
+        ensureIndex(conn, "memories", "idx_mem_user_updated",
+                MemoryDdl.MYSQL_INDEX_MEM_USER_UPDATED);
         tableReady = true;
+    }
+
+    /**
+     * 存量表补索引（#159）：内联 KEY 只对新建表生效，MySQL 又没有
+     * CREATE INDEX IF NOT EXISTS——查 information_schema 后按需 ALTER。
+     * 索引缺失只影响性能，ALTER 失败按 WARN 降级（不挡存储可用）。
+     */
+    private void ensureIndex(Connection conn, String table, String indexName, String alter) {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT COUNT(*) FROM information_schema.statistics "
+                        + "WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?")) {
+            ps.setString(1, table);
+            ps.setString(2, indexName);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next() && rs.getInt(1) > 0) {
+                    return;
+                }
+            }
+            try (Statement st = conn.createStatement()) {
+                st.execute(alter);
+                LOG.info("mysql memory store: 索引 {}.{} 已补齐（#159）", table, indexName);
+            }
+        } catch (SQLException e) {
+            LOG.warn("mysql memory store: 补建索引 {}.{} 失败（不影响存储可用）：{}",
+                    table, indexName, e.toString());
+        }
     }
 
     @Override

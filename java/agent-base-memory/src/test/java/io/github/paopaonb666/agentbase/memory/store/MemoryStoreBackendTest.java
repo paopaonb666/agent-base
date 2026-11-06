@@ -42,6 +42,30 @@ class MemoryStoreBackendTest {
         }
     }
 
+    @Test
+    void sqliteCreatesRetrievalIndexOnMemories() throws Exception {
+        // #159：检索主路径 WHERE user_id=? ORDER BY updated_at DESC 需要
+        // (user_id, updated_at) 索引——建库即建，且重开幂等（存量库下次
+        // 打开自动补齐）。
+        Path db = tempDir.resolve("idx-" + System.nanoTime() + ".db");
+        try (SqliteMemoryStore store = new SqliteMemoryStore(db.toString())) {
+            assertTrue(indexExists(db, "idx_mem_user_updated"));
+        }
+        try (SqliteMemoryStore store = new SqliteMemoryStore(db.toString())) {
+            assertTrue(indexExists(db, "idx_mem_user_updated"));
+        }
+    }
+
+    private static boolean indexExists(Path db, String name) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + db);
+             Statement st = conn.createStatement();
+             var rs = st.executeQuery("SELECT COUNT(*) FROM sqlite_master "
+                     + "WHERE type='index' AND name='" + name + "'")) {
+            rs.next();
+            return rs.getInt(1) > 0;
+        }
+    }
+
     /** 旧库补列：缺 offsets_json 列的 doc_chunks 在打开时被补上（M7 自迁移）。 */
     @Test
     void sqliteLegacyDbAddsOffsetsColumn() throws Exception {

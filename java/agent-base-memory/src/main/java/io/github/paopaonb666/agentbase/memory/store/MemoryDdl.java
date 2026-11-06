@@ -107,19 +107,35 @@ public final class MemoryDdl {
             )
             """);
 
-    /** sqlite 索引（与 Python _SQLITE_INDEXES 逐条一致）。 */
+    /**
+     * sqlite 索引（与 Python _SQLITE_INDEXES 逐条一致，外加 #159 的检索
+     * 索引）：memories 的检索主路径按 {@code WHERE user_id=? … ORDER BY
+     * updated_at DESC} 查询，没有 (user_id, updated_at) 索引万级记忆即
+     * 全表排序劣化。IF NOT EXISTS 幂等——存量库下次打开自动补齐。
+     */
     public static final List<String> SQLITE_INDEXES = List.of(
             "CREATE INDEX IF NOT EXISTS idx_mem_scope ON memories (user_id, status)",
             "CREATE INDEX IF NOT EXISTS idx_mem_agent ON memories (user_id, agent_id)",
+            "CREATE INDEX IF NOT EXISTS idx_mem_user_updated ON memories (user_id, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_chunks_user ON doc_chunks (user_id)",
             "CREATE INDEX IF NOT EXISTS idx_chunks_file ON doc_chunks (file_id)",
             "CREATE INDEX IF NOT EXISTS idx_chunks_thread ON doc_chunks (thread_id)",
             "CREATE INDEX IF NOT EXISTS idx_versions_memory ON memory_versions (memory_id, created_at)");
 
     /**
-     * MySQL 建表语句（与 Python _MYSQL_DDLS 逐条一致）：LONGTEXT、内联
-     * KEY、显式 ENGINE/CHARSET；memory_ops / memory_versions 的 seq 为
-     * AUTO_INCREMENT（同秒并列时用 seq 而非 rowid 做稳定次序）。
+     * MySQL 侧为存量表补 #159 索引的守卫 ALTER（内联 KEY 只对新建表
+     * 生效——CREATE TABLE IF NOT EXISTS 不会给已存在的表补索引；MySQL
+     * 8.0 又没有 CREATE INDEX IF NOT EXISTS）。列定义与 memories 的
+     * 内联 KEY 一致。
+     */
+    public static final String MYSQL_INDEX_MEM_USER_UPDATED =
+            "ALTER TABLE memories ADD KEY idx_mem_user_updated (user_id, updated_at)";
+
+    /**
+     * MySQL 建表语句（与 Python _MYSQL_DDLS 逐条一致 + #159 检索索引）：
+     * LONGTEXT、内联 KEY、显式 ENGINE/CHARSET；memory_ops /
+     * memory_versions 的 seq 为 AUTO_INCREMENT（同秒并列时用 seq 而非
+     * rowid 做稳定次序）。
      */
     public static final List<String> MYSQL_DDLS = List.of(
             """
@@ -141,7 +157,8 @@ public final class MemoryDdl {
               last_accessed_at TIMESTAMP NULL,
               access_count INT NOT NULL DEFAULT 0,
               KEY idx_mem_scope (user_id, status),
-              KEY idx_mem_agent (user_id, agent_id)
+              KEY idx_mem_agent (user_id, agent_id),
+              KEY idx_mem_user_updated (user_id, updated_at)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """,
             """
