@@ -3,7 +3,9 @@ package io.github.paopaonb666.agentbase.entrypoints.server;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * HMAC 身份鉴权的跨语言 golden 向量：期望签名由 Python 侧
@@ -38,5 +40,23 @@ class AuthGoldenVectorsTest {
                 () -> auth.authenticate("alice", "deadbeef", null, null, settings));
         // 窗口=0 的旧方案无 nonce 记账：合法签名可重复使用（无防重放）。
         assertEquals("alice", auth.authenticate("alice", sig, null, null, settings));
+    }
+
+    @Test
+    void unauthenticatedDeploymentIsFlaggedForTheStartupBanner() {
+        // #196：memory 启用 + secret 空 = 无鉴权部署（全部请求落 default
+        // 用户，共享记忆）——组合根以横幅提示；配置了 secret 或 memory
+        // 关闭则不是无鉴权部署。
+        io.github.paopaonb666.agentbase.core.config.Settings bare =
+                new io.github.paopaonb666.agentbase.core.config.Settings();
+        assertTrue(AuthBackends.unauthenticatedDeployment(bare),
+                "默认配置（memory.enabled=true、secret 空）即无鉴权部署");
+        assertEquals(true, AuthBackends.unauthenticatedBanner().contains("default"));
+        bare.memory.authSecret = "s";
+        assertFalse(AuthBackends.unauthenticatedDeployment(bare));
+        io.github.paopaonb666.agentbase.core.config.Settings memoryOff =
+                new io.github.paopaonb666.agentbase.core.config.Settings();
+        memoryOff.memory.enabled = false;
+        assertFalse(AuthBackends.unauthenticatedDeployment(memoryOff));
     }
 }

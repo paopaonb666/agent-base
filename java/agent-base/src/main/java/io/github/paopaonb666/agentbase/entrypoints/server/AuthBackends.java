@@ -52,6 +52,28 @@ public final class AuthBackends {
                             String nonceHeader, Settings settings);
     }
 
+    /**
+     * 无鉴权部署判定（#196/旧 #224）：MEMORY_AUTH_SECRET 为空时 HMAC
+     * 整层跳过，所有请求都落 default 用户、共享同一份记忆/画像/知识库
+     * ——本机开发无感，端口一旦暴露即隐私事故。production 已由
+     * ensureProductionReady 强制 secret；development 启动时必须以醒目
+     * 横幅提示（组合根调用，这里只给判定，方便测试锁定条件）。
+     */
+    public static boolean unauthenticatedDeployment(Settings settings) {
+        return settings.memory.enabled && settings.memory.authSecret.strip().isEmpty();
+    }
+
+    /** 无鉴权部署的启动横幅文案（醒目、可执行）。 */
+    public static String unauthenticatedBanner() {
+        return """
+                ----------------------------------------------------------------------
+                ⚠ 鉴权未配置（MEMORY_AUTH_SECRET 为空）：所有请求都按 default 用户
+                  处理，共享同一份记忆/画像/知识库。本机开发无碍；端口一旦对外
+                  暴露即隐私事故。生产部署必须设置 MEMORY_AUTH_SECRET（客户端
+                  需带 X-User-Sig = HMAC-SHA256(user_id\\ntimestamp\\nnonce, secret)）。
+                ----------------------------------------------------------------------""";
+    }
+
     /** 默认实现：X-User-Id + X-User-Sig HMAC 校验（含时间戳/nonce 防重放）。 */
     public static final class HmacHeaderAuth implements AuthBackend {
 

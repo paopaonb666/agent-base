@@ -231,6 +231,14 @@ public final class AgentRuntime {
     /** 根据 settings 创建运行时；配置错误时快速失败。 */
     public static AgentRuntime create(Settings resolved) {
         resolved.ensureProductionReady();
+        // 无鉴权部署横幅（#196）：secret 空时 HMAC 整层跳过、全部请求落
+        // default 用户——development 默认配置就是如此，必须醒目提示而不是
+        // 让暴露面静默存在（production 已被 ensureProductionReady 拦下）。
+        if (io.github.paopaonb666.agentbase.entrypoints.server.AuthBackends
+                .unauthenticatedDeployment(resolved)) {
+            LOG.warn("\n{}", io.github.paopaonb666.agentbase.entrypoints.server.AuthBackends
+                    .unauthenticatedBanner());
+        }
         // MCP（第一期未迁移）：启用即承诺——配置打开而能力未迁移时拒绝启动。
         if (resolved.mcp.enabled) {
             throw new IllegalStateException(
