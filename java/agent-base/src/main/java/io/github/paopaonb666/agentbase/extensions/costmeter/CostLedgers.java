@@ -122,6 +122,10 @@ public final class CostLedgers {
 
     /** pending 队列的公共骨架：append 缓冲、flush 批量交给后端落库。 */
     abstract static class BufferedCostLedger implements CostLedger {
+
+        /** 失败重放缓冲上限（#262）：存储长期不可用时防爆内存，超限丢最老。 */
+        static final int RETRY_BUFFER_LIMIT = 10_000;
+
         private final List<UsageRecord> pending = new ArrayList<>();
 
         @Override
@@ -136,11 +140,25 @@ public final class CostLedgers {
             }
             List<UsageRecord> rows = new ArrayList<>(pending);
             pending.clear();
-            insertRows(rows);
+            if (insertRows(rows)) {
+                return;
+            }
+            // 落库失败（#262）：批次还回队列头部，下轮 flush 重放——存储
+            // 抖动窗口内的用量计量不再永久丢失（少记→漏熔断的账面失真）。
+            pending.addAll(0, rows);
+            if (pending.size() > RETRY_BUFFER_LIMIT) {
+                int dropped = pending.size() - RETRY_BUFFER_LIMIT;
+                LOG.error("cost: 账本重放缓冲超限（{} > {}）——丢弃最老 {} 行",
+                        pending.size(), RETRY_BUFFER_LIMIT, dropped);
+                pending.subList(0, dropped).clear();
+            }
         }
 
-        /** 批量落库一批明细（实现抛出的异常由调用方决定是否吞掉）。 */
-        protected abstract void insertRows(List<UsageRecord> rows);
+        /**
+         * 批量落库一批明细；返回是否成功（失败时调用方重放该批次）。
+         * 实现内部吞掉异常（失败语义经返回值传达，不向上抛）。
+         */
+        protected abstract boolean insertRows(List<UsageRecord> rows);
     }
 
     /** 内存账本（测试与 memory 后端：重启清零，方向安全——只会少记不会误熔断）。 */
@@ -148,8 +166,9 @@ public final class CostLedgers {
         private final List<UsageRecord> rows = new ArrayList<>();
 
         @Override
-        protected synchronized void insertRows(List<UsageRecord> newRows) {
+        protected synchronized boolean insertRows(List<UsageRecord> newRows) {
             rows.addAll(newRows);
+            return true;
         }
 
         @Override
@@ -192,7 +211,7 @@ public final class CostLedgers {
         }
 
         @Override
-        protected void insertRows(List<UsageRecord> rows) {
+        protected boolean insertRows(List<UsageRecord> rows) {
             try {
                 try (PreparedStatement ps = conn.prepareStatement(INSERT_SQL)) {
                     for (UsageRecord r : rows) {
@@ -202,8 +221,16 @@ public final class CostLedgers {
                     ps.executeBatch();
                 }
                 conn.commit();
+                return true;
             } catch (SQLException e) {
-                LOG.error("cost: sqlite insert failed", e);
+                // 回滚半批（autocommit=false），失败批次由骨架重放（#262）。
+                try {
+                    conn.rollback();
+                } catch (SQLException rollbackError) {
+                    LOG.warn("cost: sqlite rollback failed", rollbackError);
+                }
+                LOG.error("cost: sqlite insert failed——批次将重放", e);
+                return false;
             }
         }
 
@@ -271,7 +298,7 @@ public final class CostLedgers {
         }
 
         @Override
-        protected void insertRows(List<UsageRecord> rows) {
+        protected boolean insertRows(List<UsageRecord> rows) {
             try (Connection conn = connect()) {
                 ensureTable(conn);
                 try (PreparedStatement ps = conn.prepareStatement(INSERT_SQL)) {
@@ -281,8 +308,10 @@ public final class CostLedgers {
                     }
                     ps.executeBatch();
                 }
+                return true;
             } catch (SQLException e) {
-                LOG.error("cost: mysql insert failed", e);
+                LOG.error("cost: mysql insert failed——批次将重放", e);
+                return false;
             }
         }
 
