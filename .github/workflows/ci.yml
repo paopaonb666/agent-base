@@ -171,6 +171,21 @@ jobs:
           print("entry points found:", sorted(names))
           PY
 
+  java:
+    # Java 重构（feat/java-rewrite）：214 个 mvn 测试此前不在任何流水线。
+    # 与 Python 侧四道门并行跑；JDK 由 setup-java 固定为 21（本机默认
+    # JAVA_HOME 指向 JDK8 的问题在 CI 里不存在，本地跑需显式覆盖）。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Maven verify
+        run: mvn -B --file java/pom.xml verify
+
   docker:
     # Verify the container image still builds on every push/PR.
     runs-on: ubuntu-latest
