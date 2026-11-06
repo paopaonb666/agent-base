@@ -462,6 +462,27 @@ class AgentsRoutesTest {
     }
 
     @Test
+    void invokeUpsertsThreadIndexExactlyOnce() throws Exception {
+        // #141：索引 upsert 收敛到 startStream 单次执行——非附件分支不再
+        // 先行写一次（双写放大写入量，两次写之间失败会留下不一致标题）。
+        List<String> calls = new ArrayList<>();
+        Object index = Proxy.newProxyInstance(
+                io.github.paopaonb666.agentbase.core.storage.CoreStore.class.getClassLoader(),
+                new Class<?>[]{io.github.paopaonb666.agentbase.core.storage.CoreStore.class},
+                (proxy, method, args) -> {
+                    calls.add(method.getName());
+                    return defaultValue(method.getReturnType());
+                });
+        AgentRuntime runtime = buildRuntime(Map.of("chat", stubModule("chat")),
+                new InMemoryCheckpointer(), index, null, null, null, null);
+        AgentsRoutes routes = route(runtime);
+
+        invoke(routes, "chat", invokeBody("第一条消息", "t1", null, null, null), "u1");
+        assertEquals(1, calls.stream().filter("upsertThreadIndex"::equals).count(),
+                "一次 invoke 恰一次 upsert：" + calls);
+    }
+
+    @Test
     void planEndpointWithoutPlannerGives503() throws Exception {
         AgentRuntime runtime = buildRuntime(Map.of("chat", stubModule("chat")),
                 new InMemoryCheckpointer(), null, null, null, null, null);

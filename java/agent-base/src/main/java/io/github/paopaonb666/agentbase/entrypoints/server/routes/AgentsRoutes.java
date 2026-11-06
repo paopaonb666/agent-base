@@ -247,12 +247,13 @@ public class AgentsRoutes {
             return startStream(graph, messagesInput, inputExtra, config, userThreadId, userId, module, response);
         }
         messagesInput.add(UserMessage.from(body.message()));
-        // 会话索引 upsert（S1）：属主/模块/标题（首条用户消息前 60 字符）。
-        upsertThreadIndex(module, fullThreadId, userId, body.message());
+        // 会话索引 upsert（S1）由 startStream 统一执行（#141：非附件分支
+        // 不再先行写一次——双写既放大写入量，两次写之间失败还会留下
+        // 不一致标题；Python 侧恰一次）。
         return startStream(graph, messagesInput, Map.of(), config, userThreadId, userId, module, response);
     }
 
-    /** 打开 SSE 流（挂记忆形成钩子；附件分支的索引 upsert 在此共用）。 */
+    /** 打开 SSE 流（挂记忆形成钩子；索引 upsert 的唯一落点，所有分支共用）。 */
     private SseEmitter startStream(CompiledGraph graph, List<ChatMessage> messagesInput,
                                    Map<String, Object> extra, RunConfig config,
                                    String userThreadId, String userId, String module,
@@ -311,26 +312,6 @@ public class AgentsRoutes {
             effectiveExtra.put("attachments", attachmentsByIndex);
         }
         return SseStreams.open(graph, messagesInput, effectiveExtra, config, userThreadId, onComplete);
-    }
-
-    /** 会话索引 upsert（S1）：属主/模块/标题（首条用户消息前 60 字符）。 */
-    private void upsertThreadIndex(String module, String fullThreadId, String userId, String message) {
-        if (runtime.threadIndex() == null) {
-            return;
-        }
-        var existing = runtime.threadIndex().getThreadIndex(fullThreadId);
-        if (existing == null) {
-            runtime.threadIndex().upsertThreadIndex(
-                    io.github.paopaonb666.agentbase.core.storage.ThreadIndexRecord.create(
-                            fullThreadId, userId, module,
-                            message.substring(0, Math.min(60, message.length()))));
-        } else {
-            runtime.threadIndex().upsertThreadIndex(
-                    new io.github.paopaonb666.agentbase.core.storage.ThreadIndexRecord(
-                            existing.threadId(), existing.userId(), existing.module(),
-                            existing.title(), existing.createdAt(),
-                            System.currentTimeMillis() / 1000.0));
-        }
     }
 
     /** 构造轮次完成后的记忆形成回调（M6c）；管线不可用时返回 null。 */
