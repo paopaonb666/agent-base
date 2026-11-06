@@ -1,6 +1,7 @@
 package io.github.paopaonb666.agentbase.toolkit.search;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -11,6 +12,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -22,8 +24,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import io.github.paopaonb666.agentbase.core.config.Settings;
 import io.github.paopaonb666.agentbase.core.tools.AgentTool;
-import io.github.paopaonb666.agentbase.toolkit.ToolkitException;
 
 /**
  * web_search 与搜索管线的测试（对应 Python 侧 tests/test_search.py）：
@@ -245,13 +247,29 @@ class SearchToolTest {
     }
 
     @Test
-    void duckduckgoSelectionIsContractError() {
-        // 第一期契约：duckduckgo 引擎被选中构建时直接报错（说明未迁移）。
-        ToolkitException.SearchEngineError e = assertThrows(
-                ToolkitException.SearchEngineError.class,
-                () -> Engines.buildEngines(List.of("duckduckgo"), "", 15.0));
-        assertTrue(e.getMessage().contains("duckduckgo"));
-        assertTrue(e.getMessage().contains("第一期未迁移"));
+    void unknownEnginesAreSkippedNotContractErrors() {
+        // #276 终局：Java 侧搜索引擎清单收窄为 tavily；duckduckgo 等由
+        // Settings 启动校验拒绝，buildEngines 层对未知名字防御性跳过。
+        assertTrue(Engines.buildEngines(List.of("duckduckgo"), "", 15.0).isEmpty());
+        assertTrue(Engines.usableEngines(List.of("duckduckgo", "tavily"), "key")
+                .equals(List.of("tavily")));
+    }
+
+    @Test
+    void availabilityPredicateSharesTheEngineUsabilitySource() {
+        // #245：available() 与 buildEngines 同源（usableEngines）——
+        // key 有无不漂移；默认 priority（tavily）+ 无 key = 不可用。
+        Settings settings = Settings.load(Map.of("ENV", "development"), null);
+        assertEquals("tavily", settings.search.enginePriority);
+        assertFalse(WebSearchTool.available(settings));
+        assertTrue(Engines.buildEngines(
+                Engines.parsePriority(settings.search.enginePriority),
+                settings.search.tavilyApiKey, settings.search.timeoutSeconds).isEmpty());
+        settings.search.tavilyApiKey = "tvly-test";
+        assertTrue(WebSearchTool.available(settings));
+        assertEquals(1, Engines.buildEngines(
+                Engines.parsePriority(settings.search.enginePriority),
+                settings.search.tavilyApiKey, settings.search.timeoutSeconds).size());
     }
 
     @Test

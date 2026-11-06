@@ -11,6 +11,9 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 /**
  * agent 基座的配置，供运行时消费（按域嵌套的配置节）。
  *
@@ -35,14 +38,21 @@ import java.util.Set;
  */
 public final class Settings {
 
+    private static final Logger LOG = LoggerFactory.getLogger(Settings.class);
+
     // ── 合法取值集合（与 Python 侧常量一一对应） ──────────────────────
 
     /** 基座知道如何装配的 openai 兼容 provider（仅用于防止配置拼写错误）。 */
     public static final Set<String> KNOWN_PROVIDERS = Set.of("deepseek", "zhipu", "openai-compatible");
     /** 基座识别的 checkpointer 后端。 */
     public static final Set<String> KNOWN_CHECKPOINTER_BACKENDS = Set.of("memory", "sqlite", "mysql");
-    /** 工具库搜索引擎实现清单（SEARCH_ENGINE_PRIORITY 的合法取值）。 */
-    public static final Set<String> KNOWN_SEARCH_ENGINES = Set.of("tavily", "duckduckgo");
+    /**
+     * 工具库搜索引擎实现清单（SEARCH_ENGINE_PRIORITY 的合法取值，#276 终局）：
+     * Java 侧只实现了 tavily；duckduckgo 是 Python 侧的 ddgs 可选依赖引擎
+     * （{@code pip install 'agent-base[search]'}），Java 配它会在启动时
+     * 显式报错而不是构建途中炸出「第一期未迁移」。
+     */
+    public static final Set<String> KNOWN_SEARCH_ENGINES = Set.of("tavily");
     public static final Set<String> KNOWN_ENVIRONMENTS = Set.of("development", "production");
     /** 记忆形成管线的模型分派档位（MEMORY_PIPELINE_PROFILE 的合法取值）。 */
     public static final Set<String> KNOWN_PIPELINE_PROFILES = Set.of("split", "all_main", "all_fast");
@@ -130,12 +140,15 @@ public final class Settings {
 
     /** 网络搜索（tools/search）配置节：env 前缀 {@code SEARCH_} / {@code TAVILY_}。 */
     public static final class SearchSettings {
-        /** 搜索引擎优先级：按顺序依次尝试，任一成功即返回。 */
-        public String enginePriority = "duckduckgo";
+        /**
+         * 搜索引擎优先级：按顺序依次尝试，任一成功即返回。默认 tavily
+         * （#30/#276：Java 侧唯一已实现引擎——旧默认 duckduckgo 指向不存在的
+         * 引擎，照文档启用 web_search 必在启动时失败）。
+         */
+        public String enginePriority = "tavily";
         public String tavilyApiKey = "";
         public double timeoutSeconds = 15.0;
         public double cacheTtlSeconds = 300.0;
-        public String ddgsBackend = "duckduckgo";
     }
 
     /** 文档解析（tools/parsing）配置节：env 前缀 {@code DOC_PARSE_}。 */
@@ -566,7 +579,8 @@ public final class Settings {
             List<String> unknown = engines.stream().filter(e -> !KNOWN_SEARCH_ENGINES.contains(e)).toList();
             if (!unknown.isEmpty()) {
                 throw new SettingsError("unknown SEARCH_ENGINE_PRIORITY entries %s; expected subset of %s"
-                        .formatted(unknown, sorted(KNOWN_SEARCH_ENGINES)));
+                        .formatted(unknown, sorted(KNOWN_SEARCH_ENGINES))
+                        + "（duckduckgo 等 ddgs 引擎仅 Python 侧可用：pip install 'agent-base[search]'）");
             }
             t.enginePriority = value;
         }
@@ -586,12 +600,12 @@ public final class Settings {
             t.cacheTtlSeconds = value;
         }
         if (v.containsKey("ddgs_backend")) {
-            String backend = v.get("ddgs_backend").strip().toLowerCase(Locale.ROOT);
-            if (backend.isEmpty()) {
-                throw new SettingsError(
-                        "SEARCH_DDGS_BACKEND must name at least one ddgs engine (e.g. duckduckgo, bing)");
-            }
-            t.ddgsBackend = v.get("ddgs_backend");
+            // 幽灵配置收口（#104←#132/#276）：Java 侧无 ddgs 引擎，该键是
+            // Python 专属——不再解析成死字段，WARN 提示即可（Python 部署
+            // 带着这个键合法，不能报错）。
+            LOG.warn("SEARCH_DDGS_BACKEND 是 Python 侧（ddgs 引擎）专属配置，"
+                    + "Java 侧只实现 tavily，该键被忽略；Java 侧搜索引擎清单见 "
+                    + "SEARCH_ENGINE_PRIORITY（tavily）");
         }
     }
 

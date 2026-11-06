@@ -48,11 +48,10 @@ public final class WebSearchTool implements AgentTool {
             "未找到相关搜索结果。请检查搜索关键词：专有名词必须保持完整"
                     + "（不要拆成单字），并用空格组合多个关键词后重试。";
 
-    /** 至少一个配置的引擎可用时才可注册（第一期：duckduckgo 未迁移，只认 tavily+key）。 */
+    /** 至少一个配置的引擎可用时才可注册（终局：Java 侧只实现 tavily+key）。 */
     public static final String UNAVAILABLE_REASON =
-            "没有任何可用的搜索引擎：tavily 需要配置 TAVILY_API_KEY"
-                    + "（duckduckgo 引擎第一期未迁移，SEARCH_ENGINE_PRIORITY 里的"
-                    + " duckduckgo 会在构建时报错）";
+            "没有任何可用的搜索引擎：Java 侧只实现 tavily 引擎，"
+                    + "需要配置 TAVILY_API_KEY（duckduckgo 等 ddgs 引擎仅 Python 侧可用）";
 
     /** 给模型看的说明书（逐字复制 Python 版 docstring）。 */
     private static final String DESCRIPTION = """
@@ -88,13 +87,14 @@ public final class WebSearchTool implements AgentTool {
                 settings.search.timeoutSeconds);
     }
 
-    /** 可用性谓词：注册表据此决定 web_search 能否启用（对应 _web_search_available）。 */
+    /**
+     * 可用性谓词：注册表据此决定 web_search 能否启用（对应
+     * _web_search_available）。判定走 {@link Engines#usableEngines} 单源
+     * （#245）——与 build() 实际拿到的引擎集合同源，不会漂移。
+     */
     public static boolean available(Settings settings) {
-        List<String> priority = Engines.parsePriority(settings.search.enginePriority);
-        // Python 版还会看 duckduckgo（ddgs 已安装）；第一期未迁移，只认 tavily+key。
-        return priority.contains("tavily")
-                && settings.search.tavilyApiKey != null
-                && !settings.search.tavilyApiKey.isEmpty();
+        return !Engines.usableEngines(Engines.parsePriority(settings.search.enginePriority),
+                settings.search.tavilyApiKey).isEmpty();
     }
 
     /** 测试路径：注入替身引擎（对应 Python 的 engine_factory 注入点）。 */

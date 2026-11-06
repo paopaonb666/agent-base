@@ -88,4 +88,24 @@ class SettingsRootFieldsTest {
         // 未配置 → 空表。
         assertEquals(Map.of(), Settings.load(Map.of("ENV", "development"), null).prices());
     }
+
+    @Test
+    void searchEnginesNarrowToTavilyWithGhostConfigIgnored() {
+        // #30/#276 终局：默认 priority 指向真实存在的引擎（旧默认
+        // duckduckgo 指向未实现引擎——照文档启用 web_search 必失败）；
+        // duckduckgo 在启动时被显式拒绝；SEARCH_DDGS_BACKEND 是 Python
+        // 专属幽灵配置，Java 侧忽略（不报错，Python 部署合法）。
+        Settings defaults = Settings.load(Map.of("ENV", "development"), null);
+        assertEquals("tavily", defaults.search.enginePriority);
+        Settings.SettingsError rejected = assertThrows(Settings.SettingsError.class,
+                () -> Settings.load(Map.of(
+                        "ENV", "development",
+                        "SEARCH_ENGINE_PRIORITY", "duckduckgo"), null));
+        assertTrue(rejected.getMessage().contains("Python"), rejected.getMessage());
+        Settings withGhost = Settings.load(Map.of(
+                "ENV", "development",
+                "SEARCH_DDGS_BACKEND", "bing",
+                "SEARCH_ENGINE_PRIORITY", "tavily"), null);
+        assertEquals("tavily", withGhost.search.enginePriority);
+    }
 }
