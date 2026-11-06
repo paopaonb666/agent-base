@@ -69,6 +69,20 @@ public final class Embeddings {
         }
     }
 
+    /**
+     * 返回向量维度与配置不符（#165/旧 #60）：<b>不</b>走 {@link
+     * EmbeddingError} 的冷却降级——失配是配置错误不是端点故障，且降级
+     * 成「存纯文本」等于让换模型这件事静默发生；这里直接穿透到写路径
+     * 拒写（addMemory/updateMemory 抛出、ingest 记 error），混维度向量
+     * 绝不入库（混存后与历史向量永远算不出余弦相似，旧记忆静默退出
+     * 召回）。存量修复走 {@code backfillEmbeddings}（#164 回填入口）。
+     */
+    public static final class DimensionMismatchError extends RuntimeException {
+        public DimensionMismatchError(String message) {
+            super(message);
+        }
+    }
+
     // ── 降级实现 ─────────────────────────────────────────────────────
 
     /** 不向量化：embedding 未配置时的常驻实现，检索走关键词路径。 */
@@ -114,7 +128,6 @@ public final class Embeddings {
 
         private HttpClient client;
         private long blockedUntilNanos = 0L;
-        private boolean dimsWarned = false;
         private boolean probeDone = false;
         private boolean probeOk = false;
         private long probeAtNanos = 0L;
@@ -238,11 +251,15 @@ public final class Embeddings {
         }
 
         private void checkDims(int actual) {
-            // 配置维度与实际不符只告警一次：以实际维度为准（逐行记录）。
-            if (dims != null && actual != dims && !dimsWarned) {
-                dimsWarned = true;
-                LOG.warn("memory: embedding 维度与配置不符（配置 {}，实际 {}）——"
-                        + "历史向量如与新维度混存将无法做余弦相似，建议清库重建", dims, actual);
+            // 维度失配即拒写（#165/旧 #60）：以配置维度为准 fail-fast，
+            // 绝不让失配向量与历史向量混存（混存后余弦相似恒 null，旧
+            // 记忆静默退出召回）。抛 DimensionMismatchError 穿透 embed()
+            // 的冷却降级——这是配置错误，不是端点故障。
+            if (dims != null && actual != dims) {
+                throw new DimensionMismatchError(
+                        "embedding 维度与配置不符（配置 " + dims + "，实际 " + actual
+                                + "）——拒绝写入以防混维度向量静默失效；请核对 EMBEDDING_DIMS"
+                                + " 与模型输出，存量数据用 backfillEmbeddings 回填或清库重建");
             }
         }
 
