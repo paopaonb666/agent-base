@@ -124,6 +124,31 @@ public final class SqliteCheckpointer implements Checkpointer {
         }
     }
 
+    /**
+     * updated_at 列是 ISO 文本（{@code LocalDateTime.now().toString()}）：
+     * 解析回 epoch 毫秒（系统时区，对齐 Python naive fromisoformat 的
+     * timestamp() 语义）。解析失败/缺席返回 0（时间未知），不报错。
+     */
+    @Override
+    public long updatedAt(String threadId) {
+        synchronized (lock) {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT updated_at FROM ab_thread_states WHERE thread_id = ?")) {
+                ps.setString(1, threadId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        return 0L;
+                    }
+                    return LocalDateTime.parse(rs.getString(1))
+                            .atZone(java.time.ZoneId.systemDefault())
+                            .toInstant().toEpochMilli();
+                }
+            } catch (SQLException | java.time.format.DateTimeParseException e) {
+                return 0L;
+            }
+        }
+    }
+
     @Override
     public boolean healthy() {
         // 探一次读：任何 SQLException 都按不可读处理（health degraded，不崩溃）。

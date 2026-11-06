@@ -321,9 +321,9 @@ class AgentsRoutesTest {
     }
 
     @Test
-    void degradedListScanHasZeroUpdatedAtAndModuleFilter() throws Exception {
-        // #142/#218 基线：索引缺席时 updated_at 恒 0（排序失去时间语义）；
-        // 只扫描当前模块前缀。
+    void degradedListScanRestoresUpdatedAtAndModuleFilter() throws Exception {
+        // #142 修复后：索引缺席时 updated_at 取 checkpointer 最后落盘时刻
+        //（解析不了才退 0），列表时间语义恢复；只扫描当前模块前缀。
         InMemoryCheckpointer cp = new InMemoryCheckpointer();
         cp.put("chat:a", new io.github.paopaonb666.agentbase.core.graph.GraphState(
                 List.of(dev.langchain4j.data.message.UserMessage.from("问我任何问题")),
@@ -333,13 +333,22 @@ class AgentsRoutesTest {
                 cp, null, null, null, null, null);
         AgentsRoutes routes = route(runtime);
 
+        long before = System.currentTimeMillis();
         Map<String, Object> out = routes.listThreads("chat", "u1", null, null, null);
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> threads = (List<Map<String, Object>>) out.get("threads");
         assertEquals(1, threads.size());
         assertEquals("a", threads.get(0).get("thread_id"));
         assertEquals("问我任何问题", threads.get(0).get("title"));
-        assertEquals(0L, threads.get(0).get("updated_at"));
+        long updatedAt = (long) threads.get(0).get("updated_at");
+        assertTrue(updatedAt > 0, "#142 修复后 updated_at 不再恒 0");
+        assertTrue(updatedAt <= System.currentTimeMillis() && updatedAt >= before - 5_000,
+                "updated_at 应是最近落盘时刻（epoch 毫秒）: " + updatedAt);
+        // 未落盘的线程时间未知 → 0（降级口径，不报错）。
+        assertEquals(0L, cp.updatedAt("chat:ghost"));
+        // 删除线程后时间随行清除。
+        cp.deleteThread("chat:a");
+        assertEquals(0L, cp.updatedAt("chat:a"));
     }
 
     @Test

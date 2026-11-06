@@ -28,6 +28,15 @@ public interface Checkpointer extends AutoCloseable {
     List<String> listThreadIds();
 
     /**
+     * 线程最后一次落盘的时间（epoch 毫秒，对应 Python checkpoint.ts 的
+     * 列表时间语义）；未知/读取失败返回 0——调用方按「时间未知」降级，
+     * 不报错。
+     */
+    default long updatedAt(String threadId) {
+        return 0L;
+    }
+
+    /**
      * 健康探针：探一次存储可读性（对应 /health 的 checkpointer 组件
      * 探 aget_tuple）。不可读返回 false（health degraded，不崩溃）。
      */

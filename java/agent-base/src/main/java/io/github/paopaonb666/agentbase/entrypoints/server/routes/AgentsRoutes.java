@@ -411,7 +411,9 @@ public class AgentsRoutes {
             view.put("thread_id", shortId);
             view.put("module", module);
             view.put("title", title);
-            view.put("updated_at", 0L);
+            // 时间语义恢复（#142）：checkpointer 记录最后落盘时刻——
+            // 解析不了才退 0（对齐 Python checkpoint.ts 的降级口径）。
+            view.put("updated_at", runtime.checkpointer().updatedAt(fullId));
             threads.put(shortId, view);
             if (threads.size() >= THREAD_LIST_LIMIT) {
                 break;

@@ -14,10 +14,13 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class InMemoryCheckpointer implements Checkpointer {
 
     private final ConcurrentHashMap<String, GraphState> states = new ConcurrentHashMap<>();
+    /** 线程最后落盘时间（epoch 毫秒）：降级线程列表的时间语义来源。 */
+    private final ConcurrentHashMap<String, Long> updatedAtMs = new ConcurrentHashMap<>();
 
     @Override
     public void put(String threadId, GraphState state) {
         states.put(threadId, state.copy());
+        updatedAtMs.put(threadId, System.currentTimeMillis());
     }
 
     @Override
@@ -29,6 +32,13 @@ public final class InMemoryCheckpointer implements Checkpointer {
     @Override
     public void deleteThread(String threadId) {
         states.remove(threadId);
+        updatedAtMs.remove(threadId);
+    }
+
+    @Override
+    public long updatedAt(String threadId) {
+        Long ts = updatedAtMs.get(threadId);
+        return ts == null ? 0L : ts;
     }
 
     @Override

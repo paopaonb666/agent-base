@@ -151,6 +151,34 @@ public final class MysqlCheckpointer implements Checkpointer {
         }
     }
 
+    /**
+     * updated_at 是 DATETIME 列（put 写 LocalDateTime）：读回转 epoch
+     * 毫秒。缺席/读失败返回 0（时间未知），不报错——降级列表路径按
+     * 「时间未知」降级而不是把半截错误冒给用户。
+     */
+    @Override
+    public long updatedAt(String threadId) {
+        try (Connection conn = open()) {
+            ensureTable(conn);
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT updated_at FROM ab_thread_states WHERE thread_id = ?")) {
+                ps.setString(1, threadId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        return 0L;
+                    }
+                    java.time.LocalDateTime ts = rs.getObject("updated_at",
+                            java.time.LocalDateTime.class);
+                    return ts == null ? 0L
+                            : ts.atZone(java.time.ZoneId.systemDefault())
+                                    .toInstant().toEpochMilli();
+                }
+            }
+        } catch (SQLException e) {
+            return 0L;
+        }
+    }
+
     @Override
     public boolean healthy() {
         // 探一次读：任何 SQLException 都按不可读处理（health degraded，不崩溃）。
