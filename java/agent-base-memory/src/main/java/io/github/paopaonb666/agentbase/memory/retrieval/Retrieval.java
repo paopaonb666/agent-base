@@ -46,6 +46,9 @@ public final class Retrieval {
     /** 召回候选集上限（H2 容量契约）：与 store.listMemories 的默认上限一致。 */
     public static final int CANDIDATE_LIMIT = 2000;
 
+    /** 向量下推的 KNN 候选池大小（#323/#324 方案口径：KNN top-100 再混合打分）。 */
+    public static final int KNN_CANDIDATES = 100;
+
     // 混合权重默认值（和为 1）。向量是语义召回的主力，BM25 兜关键词，
     // 时间与显著度做轻量排序先验。可经 MEMORY_WEIGHT_* 配置覆盖
     // （Settings 校验和与范围）；调权是检索质量工程，改动应有评测依据。
@@ -489,6 +492,19 @@ public final class Retrieval {
                                                     String userId, String agentId, String query,
                                                     Integer topK, double minScore,
                                                     Settings config) {
+        return recallMemories(store, embedder, userId, agentId, query, topK, minScore, config, null);
+    }
+
+    /**
+     * 向量下推变体（#324）：vectorIndex 非空且查询向量可用、候选集存在
+     * 向量时，混合打分的候选池 = 向量 KNN top-N ∪ 无向量候选（关键词
+     * 路径不受下推挤压）。否则与基线完全一致——brute-force 默认实现下
+     * 排序逐条相同（#325 的语义基线）。
+     */
+    public static List<ScoredMemory> recallMemories(MemoryStore store, EmbeddingClient embedder,
+                                                    String userId, String agentId, String query,
+                                                    Integer topK, double minScore,
+                                                    Settings config, VectorIndexPort vectorIndex) {
         // 容量契约（H2）：候选集上限与 store 的列表上限一致。达到上限说明
         // 用户记忆量已超出当前"全量拉取 + 内存打分"实现的设计容量——更早
         // 的记忆本轮永远召不回，必须显式告警而不是静默截断。
@@ -518,6 +534,32 @@ public final class Retrieval {
             List<List<Float>> vectors = embedder.embed(List.of(query));
             if (vectors != null && !vectors.isEmpty()) {
                 queryEmbedding = vectors.get(0);
+            }
+        }
+        // 向量下推（#324）：仅在索引、查询向量与库内向量三者齐备时收窄
+        // 混合打分候选池——无向量的候选（关键词路径）永远保留。
+        if (vectorIndex != null && queryEmbedding != null) {
+            boolean anyEmbedded = false;
+            for (Models.MemoryRecord record : records) {
+                if (record.embedding() != null) {
+                    anyEmbedded = true;
+                    break;
+                }
+            }
+            if (anyEmbedded) {
+                List<VectorIndexPort.VectorHit> hits =
+                        vectorIndex.search(queryEmbedding, KNN_CANDIDATES);
+                java.util.Set<String> knnIds = new java.util.HashSet<>(hits.size());
+                for (VectorIndexPort.VectorHit hit : hits) {
+                    knnIds.add(hit.id());
+                }
+                List<Models.MemoryRecord> pooled = new ArrayList<>(records.size());
+                for (Models.MemoryRecord record : records) {
+                    if (record.embedding() == null || knnIds.contains(record.memoryId())) {
+                        pooled.add(record);
+                    }
+                }
+                records = pooled;
             }
         }
         List<ScoredMemory> scored = new ArrayList<>(scoreMemories(records, query, queryEmbedding,

@@ -20,6 +20,7 @@ import io.github.paopaonb666.agentbase.memory.embeddings.EmbeddingClient;
 import io.github.paopaonb666.agentbase.memory.embeddings.Embeddings;
 import io.github.paopaonb666.agentbase.memory.pipeline.MemoryPipeline;
 import io.github.paopaonb666.agentbase.memory.retrieval.Retrieval;
+import io.github.paopaonb666.agentbase.memory.retrieval.VectorIndexPort;
 import io.github.paopaonb666.agentbase.memory.store.MemoryStore;
 import io.github.paopaonb666.agentbase.memory.store.MemoryStores;
 import io.github.paopaonb666.agentbase.memory.store.Models;
@@ -50,6 +51,8 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
     private final Settings settings;
     private final MemoryPipeline pipeline;
     private final ModelRuntime llm;
+    /** 向量索引（#324）：vectorPushdown 开启时装配（默认 brute-force 基线）。 */
+    private final VectorIndexPort vectorIndex;
 
     /** 按 user_id 的捕获串行化锁（锐评 #10：并发轮次重复 ADD 防护）。 */
     private final Map<String, ReentrantLock> locks = new ConcurrentHashMap<>();
@@ -62,10 +65,18 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
 
     public MemoryService(MemoryStore store, EmbeddingClient embedder, Settings settings,
                          ModelRuntime llm, AgentModule.ChatInvokerPort fastLlm) {
+        this(store, embedder, settings, llm, fastLlm,
+                settings.memory.vectorPushdown ? VectorIndexPort.bruteForce() : null);
+    }
+
+    public MemoryService(MemoryStore store, EmbeddingClient embedder, Settings settings,
+                         ModelRuntime llm, AgentModule.ChatInvokerPort fastLlm,
+                         VectorIndexPort vectorIndex) {
         this.store = store;
         this.embedder = embedder;
         this.settings = settings;
         this.llm = llm;
+        this.vectorIndex = vectorIndex;
         this.pipeline = llm == null ? null : new MemoryPipeline(llm, fastLlm, settings, new Ops());
     }
 
@@ -137,6 +148,7 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
                 Math.min(Math.max(salience, 0.0), 1.0), "active",
                 sourceThreadId == null ? "" : sourceThreadId, List.of(), now, now, null, 0);
         store.upsertMemory(record);
+        indexUpsert(record.memoryId(), embedding);
         recordVersionSafe(new MemoryVersion(Models.newMemoryId(), record.memoryId(), userId,
                 "create", content, "", record.status()));
         Metrics.memory().observe("add", "ok", (System.nanoTime() - started) / 1_000_000_000.0);
@@ -168,6 +180,13 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
                 existing.sourceThreadId(), existing.sourceRefs(), existing.createdAt(),
                 Models.now(), existing.lastAccessedAt(), existing.accessCount());
         store.upsertMemory(updated);
+        // 向量索引跟随写路径（#324）：重嵌入后以新向量覆盖；降级为
+        // 无向量（cooldown）时移除旧条目，防止陈旧向量参与 KNN。
+        if (embedding != null) {
+            indexUpsert(updated.memoryId(), embedding);
+        } else if (reembed && vectorIndex != null) {
+            vectorIndex.delete(updated.memoryId());
+        }
         boolean changed = !updated.content().equals(existing.content())
                 || !updated.tags().equals(existing.tags())
                 || updated.salience() != existing.salience()
@@ -184,13 +203,25 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
         long started = System.nanoTime();
         MemoryRecord existing = store.getMemory(memoryId);
         boolean deleted = store.deleteMemory(memoryId);
-        if (deleted && existing != null) {
-            // 墓碑版本：内容差分的终点（previous_content 保留最后内容）。
-            recordVersionSafe(new MemoryVersion(Models.newMemoryId(), memoryId, existing.userId(),
-                    "delete", "", existing.content(), existing.status()));
+        if (deleted) {
+            if (vectorIndex != null) {
+                vectorIndex.delete(memoryId);
+            }
+            if (existing != null) {
+                // 墓碑版本：内容差分的终点（previous_content 保留最后内容）。
+                recordVersionSafe(new MemoryVersion(Models.newMemoryId(), memoryId, existing.userId(),
+                        "delete", "", existing.content(), existing.status()));
+            }
         }
         Metrics.memory().observe("delete", "ok", (System.nanoTime() - started) / 1_000_000_000.0);
         return deleted;
+    }
+
+    /** 向量索引跟随写路径（#324）：索引未装配或向量缺失为无操作。 */
+    private void indexUpsert(String memoryId, List<Float> embedding) {
+        if (vectorIndex != null && embedding != null) {
+            vectorIndex.upsert(memoryId, embedding);
+        }
     }
 
     // ── 版本史 ──────────────────────────────────────────────────────────
@@ -241,7 +272,8 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
             minScore = minScore / 2;
         }
         List<Retrieval.ScoredMemory> results = Retrieval.recallMemories(store, embedder, userId,
-                agentId, query, topK != null ? topK : settings.memory.recallTopK, minScore, settings);
+                agentId, query, topK != null ? topK : settings.memory.recallTopK, minScore, settings,
+                vectorIndex);
         Metrics.memory().observe("search", "ok", (System.nanoTime() - started) / 1_000_000_000.0);
         return results;
     }

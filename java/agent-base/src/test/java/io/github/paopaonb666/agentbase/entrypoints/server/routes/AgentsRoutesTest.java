@@ -407,8 +407,15 @@ class AgentsRoutesTest {
         assertNotNull(invoke(routes, "chat",
                 invokeBody("第一条消息", "中文线程", null, null, null), "u1"));
         // SSE 生产者线程依赖真实 servlet 异步上下文才能跑完落盘；测试里直接
-        // 同步驱动同一张图写快照（等价于正常完成的一轮对话）。
-        runtime.graph("chat").invoke(
+        // 同步驱动同一张图写快照（等价于正常完成的一轮对话）。#197 起同
+        // thread run 互斥：先等 invoke 触发的异步 producer 让出锁（它通常
+        // 因缺异步上下文立即终止），避免与同步驱动撞 ThreadBusy。
+        CompiledGraph graph = runtime.graph("chat");
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (graph.isThreadBusy("chat:中文线程") && System.currentTimeMillis() < deadline) {
+            Thread.sleep(10);
+        }
+        graph.invoke(
                 new io.github.paopaonb666.agentbase.core.graph.GraphState(
                         List.of(dev.langchain4j.data.message.UserMessage.from("第一条消息")), Map.of()),
                 new io.github.paopaonb666.agentbase.core.graph.RunConfig("chat:中文线程", "u1", 25));

@@ -197,6 +197,12 @@ public final class Settings {
         public int profileMaxChars = 1500;
         /** 遗忘策略：episodic 记忆的保留天数（0 表示不过期）。 */
         public int episodicTtlDays = 30;
+        /**
+         * 向量下推（#324/旧 #35）：启用后召回的混合打分候选池 = 向量 KNN
+         * top-100 ∪ 无向量候选（检索容量天花板的结构性出口）。默认关闭
+         * ——全量打分语义不变；sqlite-vec 真下推（#323）就绪后按需打开。
+         */
+        public boolean vectorPushdown = false;
         public double timeDecayHalfLifeDays = 14.0;
         public int extractionMaxInputChars = 8000;
         public int extractionMaxMessages = 24;
@@ -767,6 +773,9 @@ public final class Settings {
             double value = requireFloat("time_decay_half_life_days", v.get("time_decay_half_life_days"));
             if (!(value > 0)) throw new SettingsError("time_decay_half_life_days must be > 0, got %s".formatted(value));
             t.timeDecayHalfLifeDays = value;
+        }
+        if (v.containsKey("vector_pushdown")) {
+            t.vectorPushdown = requireBool("vector_pushdown", v.get("vector_pushdown"));
         }
         if (v.containsKey("extraction_max_input_chars")) {
             int value = requireInt("extraction_max_input_chars", v.get("extraction_max_input_chars"));

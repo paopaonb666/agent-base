@@ -69,6 +69,17 @@ class FilesRoutesTest {
                 new Class<?>[]{io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStore.class},
                 (proxy, method, args) -> {
                     calls.add(method.getName());
+                    // purgeOrphans 等返回基本型的方法不能回 null（后台线程
+                    // 拆箱会 NPE——任务失败日志噪音）。
+                    if (method.getReturnType() == int.class) {
+                        return 0;
+                    }
+                    if (method.getReturnType() == long.class) {
+                        return 0L;
+                    }
+                    if (method.getReturnType() == boolean.class) {
+                        return false;
+                    }
                     return null;
                 });
     }
@@ -96,7 +107,7 @@ class FilesRoutesTest {
         Settings settings = Settings.load(Map.of(
                 "ENV", "development",
                 "DOC_PARSE_MAX_INPUT_BYTES", "1024"));
-        List<String> calls = new ArrayList<>();
+        List<String> calls = new java.util.concurrent.CopyOnWriteArrayList<>();
         AgentRuntime runtime = buildRuntime(settings, recordingFileStore(calls));
         FilesRoutes routes = new FilesRoutes(runtime, PASS_THROUGH_AUTH);
 
@@ -125,7 +136,7 @@ class FilesRoutesTest {
     @Test
     void honestUploadUnderLimitReturnsMeta() throws Exception {
         Settings settings = Settings.load(Map.of("ENV", "development"));
-        List<String> calls = new ArrayList<>();
+        List<String> calls = new java.util.concurrent.CopyOnWriteArrayList<>();
         AgentRuntime runtime = buildRuntime(settings, recordingFileStore(calls));
         FilesRoutes routes = new FilesRoutes(runtime, PASS_THROUGH_AUTH);
 
