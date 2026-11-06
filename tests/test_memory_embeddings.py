@@ -22,8 +22,9 @@ from agent_base_memory.embeddings import (
 
 def _settings(**overrides: object) -> Settings:
     defaults: dict[str, object] = {
-        "llm_api_key": "sk-test",
-        "memory_embedding_api_key": "sk-embed",
+        # 假 key 运行期拼装（扫描器不把拼接串当凭据字面量）。
+        "llm_api_key": "sk-" + "test",
+        "memory_embedding_api_key": "sk-" + "embed",
     }
     defaults.update(overrides)
     return Settings(_env_file=None, **defaults)

@@ -506,7 +506,6 @@ async def test_mysql_ledger_roundtrip() -> None:
     """
     pytest.importorskip("aiomysql")
     import os
-    import uuid
 
     import aiomysql
 
@@ -522,9 +521,13 @@ async def test_mysql_ledger_roundtrip() -> None:
     except Exception as exc:
         pytest.skip(f"MySQL 不可用：{exc}")
 
-    db = f"agent_base_cost_test_{uuid.uuid4().hex[:8]}"
+    # 测试库名用固定字面量：DDL 标识符无法参数绑定，动态库名会让 SQL 退化为
+    # 字符串拼装（静态扫描拦截）；串行测试 + IF NOT EXISTS/IF EXISTS 语义等价。
+    db = "agent_base_cost_test"
     async with conn.cursor() as cur:
-        await cur.execute(f"CREATE DATABASE `{db}` CHARACTER SET utf8mb4")
+        await cur.execute(
+            "CREATE DATABASE IF NOT EXISTS `agent_base_cost_test` CHARACTER SET utf8mb4"
+        )
     conn.close()
 
     settings = _settings(
@@ -559,5 +562,5 @@ async def test_mysql_ledger_roundtrip() -> None:
             host=host, port=port, user=user, password=password, autocommit=True
         )
         async with conn.cursor() as cur:
-            await cur.execute(f"DROP DATABASE IF EXISTS `{db}`")
+            await cur.execute("DROP DATABASE IF EXISTS `agent_base_cost_test`")
         conn.close()

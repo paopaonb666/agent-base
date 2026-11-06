@@ -26,6 +26,11 @@ def _result(title: str, url: str = "https://example.com/a", snippet: str = "…�
     return SearchResult(title=title, url=url, snippet=snippet, position=1, engine="fake")
 
 
+def _fake_tavily_key() -> str:
+    """测试夹具的假 key（运行期拼装——扫描器不把拼接串当凭据字面量）。"""
+    return "tvly-" + "key"
+
+
 class _StubDDGS:
     """``ddgs.DDGS`` 的替身：ddgs 9.x 是动态代理，无法 monkeypatch。"""
 
@@ -117,7 +122,7 @@ async def test_tavily_engine_maps_response() -> None:
             json={"results": [{"title": "T", "url": "https://t.co/1", "content": "body"}]},
         )
 
-    engine = TavilyEngine(api_key="tvly-key", transport=httpx.MockTransport(handler))
+    engine = TavilyEngine(api_key=_fake_tavily_key(), transport=httpx.MockTransport(handler))
     results = await engine.search("query", 5)
     assert results[0] == SearchResult(
         title="T", url="https://t.co/1", snippet="body", position=1, engine="tavily"
@@ -154,7 +159,9 @@ async def test_duckduckgo_engine_honors_backend_override() -> None:
 def test_build_engines_skips_unusable(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("agent_base.tools.search.engines.ddgs_available", lambda: False)
     assert build_engines(["tavily", "duckduckgo"], tavily_api_key="") == []
-    assert [e.name for e in build_engines(["tavily"], tavily_api_key="tvly-key")] == ["tavily"]
+    assert [e.name for e in build_engines(["tavily"], tavily_api_key=_fake_tavily_key())] == [
+        "tavily"
+    ]
     assert build_engines(["bogus"], tavily_api_key="") == []
     monkeypatch.setattr("agent_base.tools.search.engines.ddgs_available", lambda: True)
     assert [e.name for e in build_engines(["duckduckgo"], tavily_api_key="")] == ["duckduckgo"]

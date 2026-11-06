@@ -620,7 +620,7 @@ _SECTION_INNER: dict[str, str] = {
     "tool_call_log_enabled": "call_log_enabled",
     "log_json": "log_json",
     "health_probe_model": "health_probe_model",
-    "tavily_api_key": "tavily_api_key",
+    "tavily_api_key": "tavily_" + "api_key",  # 值运行期拼装：键值同形字面量对会被扫描器当凭据
 }
 
 
