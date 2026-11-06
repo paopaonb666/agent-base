@@ -5,6 +5,8 @@ import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.ToolExecutionResultMessage;
 import dev.langchain4j.data.message.UserMessage;
+import io.github.paopaonb666.agentbase.core.text.EstimatingTokenCounter;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -18,8 +20,21 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * ContextEngine 边界测试（roadmap #287）：全部模块公共路径的注入去重、
  * 冻结提升、预算修剪与工具配对保护。算法与 Python core/context.py 逐条
  * 对齐（一致性佐证域），锁定后任一侧漂移即红。
+ *
+ * <p>#339 起默认计量器是真实 tokenizer（jtokkit cl100k）；预算边界类
+ * 测试显式注入字符系数估算器（确定性口径），结束恢复默认。
  */
 class ContextEngineTest {
+
+    @AfterEach
+    void restoreDefaultCounter() {
+        ContextEngine.setTokenCounter(null); // null → 默认（JTokkit cl100k）
+    }
+
+    /** 预算边界测试用确定性计量器（估算口径与注释里的手算一致）。 */
+    private static void useEstimator() {
+        ContextEngine.setTokenCounter(EstimatingTokenCounter.INSTANCE);
+    }
 
     private static SystemMessage memoryInjection(String body) {
         return SystemMessage.from(ContextEngine.MEMORY_CONTEXT_PREFIX + body);
@@ -129,6 +144,7 @@ class ContextEngineTest {
 
     @Test
     void budgetBoundaryExactlyAtLimitKeepsAll() {
+        useEstimator();
         // 3 条 × 9 token（估算 5 + 开销 4）：预算 27 恰好装下 → 全保留；
         // 预算 26 时头部消息被丢。
         List<ChatMessage> history = List.of(
@@ -141,6 +157,7 @@ class ContextEngineTest {
 
     @Test
     void singleMessageOverBudgetKeptVerbatim() {
+        useEstimator();
         // 单条超预算的极端情况：原样保留，绝不输出空输入。
         UserMessage huge = UserMessage.from("x".repeat(400)); // 100 tokens
         List<ChatMessage> input = ContextEngine.buildModelInput(List.of(huge), 10);
@@ -150,6 +167,7 @@ class ContextEngineTest {
 
     @Test
     void trimBoundaryNeverStartsWithToolResult() {
+        useEstimator();
         // 修剪边界安全：起点不得是 ToolMessage（拆散工具配对）——遇到
         // ToolMessage 就把它也丢掉，从下一条开始。
         List<ChatMessage> history = List.of(

@@ -43,25 +43,28 @@ public final class ContextEngine {
     public static final String MEMORY_CONTEXT_FROZEN_PREFIX = "【长期记忆上下文·固定】";
     public static final String ATTACHMENT_CONTEXT_PREFIX = "以下是用户上传的附件内容";
 
-    // token 近似估算系数（DeepSeek 系 tokenizer 的经验值：中文约 0.6 token/字，
-    // ASCII 约 0.25 token/字符，即 ~4 字符/token）。估算宁大勿小——宁可早
-    // 修剪也不要静默撑爆上下文。
-    private static final double CJK_TOKEN_PER_CHAR = 0.6;
-    private static final double ASCII_TOKEN_PER_CHAR = 0.25;
+    // token 计量（#339/旧 #2）：默认真实 tokenizer（jtokkit cl100k_base）
+    // ——上下文预算/压缩触发的口径；字符系数估算（±30% 误差）降级保留
+    // 在 EstimatingTokenCounter，测试与极端场景可注入。
+    private static volatile io.github.paopaonb666.agentbase.core.text.TokenCounter tokenCounter =
+            io.github.paopaonb666.agentbase.core.text.JTokkitTokenCounter.CL100K;
 
-    /** CJK 感知的粗略 token 估算（不引入分词器依赖）。 */
+    /** 当前 token 计量器（预算路径共用）。 */
+    public static io.github.paopaonb666.agentbase.core.text.TokenCounter tokenCounter() {
+        return tokenCounter;
+    }
+
+    /** 注入计量器（测试/装配）；null 回落默认。 */
+    public static void setTokenCounter(io.github.paopaonb666.agentbase.core.text.TokenCounter counter) {
+        tokenCounter = counter == null
+                ? io.github.paopaonb666.agentbase.core.text.JTokkitTokenCounter.CL100K
+                : counter;
+    }
+
+    /** CJK 感知的粗略 token 估算（降级口径，公共 API 保留）。 */
     public static int estimateTokens(String text) {
-        if (text == null || text.isEmpty()) {
-            return 0;
-        }
-        int cjk = 0;
-        for (int i = 0; i < text.length(); i++) {
-            char c = text.charAt(i);
-            if (c >= '\u4e00' && c <= '\u9fff') {
-                cjk++;
-            }
-        }
-        return (int) (cjk * CJK_TOKEN_PER_CHAR + (text.length() - cjk) * ASCII_TOKEN_PER_CHAR);
+        return io.github.paopaonb666.agentbase.core.text.EstimatingTokenCounter.INSTANCE
+                .countTokens(text);
     }
 
     /** 多段 content（部分 provider 的多模态结构）拼接出文本段。 */
@@ -175,7 +178,7 @@ public final class ContextEngine {
         int cut = 0; // kept_indices 里保留的起点
         for (int run = keptIndices.size() - 1; run >= 0; run--) {
             int index = keptIndices.get(run);
-            total += estimateTokens(contentText(messages.get(index))) + 4;
+            total += tokenCounter.countTokens(contentText(messages.get(index))) + 4;
             if (total > maxTokens && run < keptIndices.size() - 1) {
                 // 超预算且至少保住最后一条；从这个更早的消息开始丢弃。
                 cut = run + 1;

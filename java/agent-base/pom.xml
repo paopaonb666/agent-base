@@ -48,6 +48,11 @@
       <groupId>org.apache.poi</groupId>
       <artifactId>poi-ooxml</artifactId>
     </dependency>
+    <!-- 真 tokenizer 计量（#339）：上下文预算/压缩触发的口径。 -->
+    <dependency>
+      <groupId>com.knuddels</groupId>
+      <artifactId>jtokkit</artifactId>
+    </dependency>
     <!-- 测试。 -->
     <dependency>
       <groupId>org.junit.jupiter</groupId>
