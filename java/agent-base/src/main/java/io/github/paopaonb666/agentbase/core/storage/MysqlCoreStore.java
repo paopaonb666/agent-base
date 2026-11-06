@@ -51,7 +51,9 @@ public final class MysqlCoreStore extends AbstractSqlCoreStore {
     }
 
     private Connection open() throws SQLException {
-        return DriverManager.getConnection(url, user, password);
+        // #161：短连接换共享 HikariCP 池（与 checkpointer/记忆 store/工具
+        // 日志同批合并）。
+        return MySqlPools.pool(url, user, password).getConnection();
     }
 
     private void ensureTables(Connection conn) throws SQLException {

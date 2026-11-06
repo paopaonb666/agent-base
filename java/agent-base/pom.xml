@@ -53,6 +53,11 @@
       <groupId>com.knuddels</groupId>
       <artifactId>jtokkit</artifactId>
     </dependency>
+    <!-- MySQL 连接池（#161）：四处 MySQL 访问共享。 -->
+    <dependency>
+      <groupId>com.zaxxer</groupId>
+      <artifactId>HikariCP</artifactId>
+    </dependency>
     <!-- 测试。 -->
     <dependency>
       <groupId>org.junit.jupiter</groupId>

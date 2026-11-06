@@ -51,7 +51,10 @@ public final class MysqlMemoryStore extends AbstractSqlMemoryStore {
     }
 
     private Connection open() throws SQLException {
-        return DriverManager.getConnection(url, user, password);
+        // #161：短连接换共享 HikariCP 池（与基座 checkpointer/core store/
+        // 工具日志同批合并）。
+        return io.github.paopaonb666.agentbase.core.storage.MySqlPools
+                .pool(url, user, password).getConnection();
     }
 
     private void ensureTables(Connection conn) throws SQLException {

@@ -37,6 +37,7 @@
          解析用户上传的 DOCX，不能停在存在已知漏洞的 5.2.5。 -->
     <poi.version>5.4.0</poi.version>
     <jtokkit.version>1.1.0</jtokkit.version>
+    <hikaricp.version>5.1.0</hikaricp.version>
     <junit.version>5.10.2</junit.version>
   </properties>
 
@@ -88,6 +89,12 @@
         <groupId>com.knuddels</groupId>
         <artifactId>jtokkit</artifactId>
         <version>${jtokkit.version}</version>
+      </dependency>
+      <!-- MySQL 连接池（#161）：checkpointer/core store/memory/toollog 共享。 -->
+      <dependency>
+        <groupId>com.zaxxer</groupId>
+        <artifactId>HikariCP</artifactId>
+        <version>${hikaricp.version}</version>
       </dependency>
       <!-- 内部模块 -->
       <dependency>

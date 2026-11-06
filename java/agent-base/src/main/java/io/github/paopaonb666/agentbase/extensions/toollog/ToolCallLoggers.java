@@ -222,9 +222,11 @@ public final class ToolCallLoggers {
 
         private Connection connect() throws SQLException {
             var s = settings.checkpointer;
-            return java.sql.DriverManager.getConnection(
+            // #161：短连接换共享 HikariCP 池（与 checkpointer/core store/
+            // 记忆 store 同批合并）。
+            return io.github.paopaonb666.agentbase.core.storage.MySqlPools.pool(
                     "jdbc:mysql://%s:%d/%s".formatted(s.mysqlHost, s.mysqlPort, s.mysqlDatabase),
-                    s.mysqlUser, s.mysqlPassword);
+                    s.mysqlUser, s.mysqlPassword).getConnection();
         }
 
         @Override

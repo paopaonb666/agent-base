@@ -70,7 +70,10 @@ public final class MysqlCheckpointer implements Checkpointer {
     }
 
     private Connection open() throws SQLException {
-        return DriverManager.getConnection(url, user, password);
+        // #161：短连接换共享 HikariCP 池（与 core store/记忆 store/工具
+        // 日志同批合并——连接风暴与 max_connections 打爆的根因）。
+        return io.github.paopaonb666.agentbase.core.storage.MySqlPools
+                .pool(url, user, password).getConnection();
     }
 
     private void ensureTable(Connection conn) throws SQLException {
