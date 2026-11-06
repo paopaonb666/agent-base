@@ -508,16 +508,21 @@ public final class Retrieval {
         // 容量契约（H2）：候选集上限与 store 的列表上限一致。达到上限说明
         // 用户记忆量已超出当前"全量拉取 + 内存打分"实现的设计容量——更早
         // 的记忆本轮永远召不回，必须显式告警而不是静默截断。
+        double timestamp = Models.now();
+        // episodic TTL 下推（#180）：过期行在 SQL 层被排除，不再挤占候选
+        // 名额；内存侧 filterExpired 保留兜底（防未覆写下推的后端）。
+        Double episodicCutoff = config.memory.episodicTtlDays > 0
+                ? timestamp - config.memory.episodicTtlDays * DAY_SECONDS
+                : null;
         List<Models.MemoryRecord> records = store.listMemories(userId, agentId, true, null,
-                List.of("active"), CANDIDATE_LIMIT, false);
+                List.of("active"), CANDIDATE_LIMIT, false, episodicCutoff);
         if (records.size() >= CANDIDATE_LIMIT) {
             LOG.warn(
                     "memory: 召回候选达到上限 {}（user='{}', agent='{}'）——更早的记忆不参与本轮检索；"
                             + "请考虑分片或引入候选下推索引（见 README 容量契约）",
                     CANDIDATE_LIMIT, userId, agentId);
         }
-        double timestamp = Models.now();
-        records = filterExpired(records, config.memory.episodicTtlDays, timestamp);
+        records = filterExpired(records, config.memory.episodicTtlDays, timestamp); // 兜底（#180）
         // 用户画像不是可召回记忆：它由上下文组装单独、整体注入（M6d）。
         List<Models.MemoryRecord> visible = new ArrayList<>(records.size());
         for (Models.MemoryRecord record : records) {

@@ -408,17 +408,21 @@ class AgentsRoutesTest {
                 invokeBody("第一条消息", "中文线程", null, null, null), "u1"));
         // SSE 生产者线程依赖真实 servlet 异步上下文才能跑完落盘；测试里直接
         // 同步驱动同一张图写快照（等价于正常完成的一轮对话）。#197 起同
-        // thread run 互斥：先等 invoke 触发的异步 producer 让出锁（它通常
-        // 因缺异步上下文立即终止），避免与同步驱动撞 ThreadBusy。
+        // thread run 互斥：invoke 触发的异步 producer 与本线程存在获取锁的
+        // 竞态（无论谁先），撞 ThreadBusy 就让位重试。
         CompiledGraph graph = runtime.graph("chat");
-        long deadline = System.currentTimeMillis() + 5_000;
-        while (graph.isThreadBusy("chat:中文线程") && System.currentTimeMillis() < deadline) {
-            Thread.sleep(10);
+        io.github.paopaonb666.agentbase.core.graph.GraphState driven = null;
+        for (int i = 0; i < 200 && driven == null; i++) {
+            try {
+                driven = graph.invoke(
+                        new io.github.paopaonb666.agentbase.core.graph.GraphState(
+                                List.of(dev.langchain4j.data.message.UserMessage.from("第一条消息")), Map.of()),
+                        new io.github.paopaonb666.agentbase.core.graph.RunConfig("chat:中文线程", "u1", 25));
+            } catch (CompiledGraph.ThreadBusyError e) {
+                Thread.sleep(25);
+            }
         }
-        graph.invoke(
-                new io.github.paopaonb666.agentbase.core.graph.GraphState(
-                        List.of(dev.langchain4j.data.message.UserMessage.from("第一条消息")), Map.of()),
-                new io.github.paopaonb666.agentbase.core.graph.RunConfig("chat:中文线程", "u1", 25));
+        assertNotNull(driven, "同步驱动应在 producer 让出锁后成功");
 
         // 历史/工具审计/删除全部正常返回（修复前路径校验 422——创建后即失联）。
         Map<String, Object> history = routes.threadHistory("chat", "中文线程", "u1", null, null, null);

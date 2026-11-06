@@ -29,6 +29,19 @@ public interface MemoryStore extends AutoCloseable {
                                            List<String> kinds, List<String> statuses,
                                            int limit, boolean excludeProfile);
 
+    /**
+     * 带 episodic TTL 下推的变体（#180）：{@code episodicCutoffBefore}
+     * 为 unix 秒，过期 episodic 行在 SQL 层被排除（不再挤占候选名额）；
+     * null = 不过滤。默认实现忽略 cutoff 委托 7 参版本——TTL 仍由调用方
+     * 内存过滤兜底；SQL 后端应覆写以获得下推收益。
+     */
+    default List<Models.MemoryRecord> listMemories(String userId, String agentId, boolean includeGlobal,
+                                                   List<String> kinds, List<String> statuses,
+                                                   int limit, boolean excludeProfile,
+                                                   Double episodicCutoffBefore) {
+        return listMemories(userId, agentId, includeGlobal, kinds, statuses, limit, excludeProfile);
+    }
+
     /** 访问记账：批量更新 last_accessed_at + access_count。 */
     void touchMemories(List<String> memoryIds);
 

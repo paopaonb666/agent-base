@@ -478,6 +478,17 @@ abstract class AbstractSqlMemoryStore implements MemoryStore {
                                                   boolean includeGlobal, List<String> kinds,
                                                   List<String> statuses, int limit,
                                                   boolean excludeProfile) {
+        return listMemories(userId, agentId, includeGlobal, kinds, statuses, limit,
+                excludeProfile, null);
+    }
+
+    /** #180：episodic TTL 下推——过期行在 SQL 层被排除，不占候选名额。 */
+    @Override
+    public List<Models.MemoryRecord> listMemories(String userId, String agentId,
+                                                  boolean includeGlobal, List<String> kinds,
+                                                  List<String> statuses, int limit,
+                                                  boolean excludeProfile,
+                                                  Double episodicCutoffBefore) {
         StringBuilder sql = new StringBuilder("SELECT ").append(MEMORY_COLUMNS)
                 .append(" FROM memories WHERE user_id = ?");
         List<Object> params = new ArrayList<>();
@@ -494,6 +505,12 @@ abstract class AbstractSqlMemoryStore implements MemoryStore {
         if (kinds != null && !kinds.isEmpty()) {
             sql.append(" AND kind IN (").append(placeholders(kinds.size())).append(')');
             params.addAll(kinds);
+        }
+        if (episodicCutoffBefore != null) {
+            // 时间口径与列写入一致（toSqlTs），边界取 >=（与内存过滤一致：
+            // updatedAt >= cutoff 保留）。
+            sql.append(" AND (kind != 'episodic' OR updated_at >= ?)");
+            params.add(toSqlTs(episodicCutoffBefore));
         }
         if (agentId != null) {
             if (includeGlobal) {
