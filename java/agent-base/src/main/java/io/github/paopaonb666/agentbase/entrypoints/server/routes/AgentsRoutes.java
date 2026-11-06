@@ -586,7 +586,10 @@ public class AgentsRoutes {
     }
 
     private static void validateThreadId(String threadId) {
-        if (threadId.length() > 128 || !threadId.matches("^[\\w.-]+$")) {
+        // (?U)：Python re 的 \w 是 unicode 语义（中文 thread id 合法），
+        // Java 默认 ASCII——不加标志会把 invoke 创建的中文 id 在读侧 422 掉
+        // （创建后即失联）。与 invoke 请求体侧的校验（本文件上方）同标志。
+        if (threadId.length() > 128 || !threadId.matches("(?U)^[\\w.-]+$")) {
             throw new HttpError(422, "thread_id 格式非法（[\\w.-]{1,128}）");
         }
     }

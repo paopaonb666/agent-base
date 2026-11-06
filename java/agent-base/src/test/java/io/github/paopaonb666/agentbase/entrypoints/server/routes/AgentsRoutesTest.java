@@ -106,7 +106,9 @@ class AgentsRoutesTest {
 
             @Override
             public CompiledGraph buildGraph(ModuleContext ctx) {
-                return GraphBuilder.singleNode(name, (state, nodeCtx) -> Map.of(), null);
+                // 用 ModuleContext 携带的 checkpointer（与线上装配一致——
+                // 传 null 会让历史端点永远看不到快照）。
+                return GraphBuilder.singleNode(name, (state, nodeCtx) -> Map.of(), ctx.checkpointer());
             }
 
             @Override
@@ -370,15 +372,32 @@ class AgentsRoutesTest {
     }
 
     @Test
-    void threadPathEndpointsRejectChineseThreadId422() throws Exception {
-        // #121 基线：路径校验缺 (?U)——中文 id 在路径端点被 422（invoke 侧
-        // 却接受）。修复时本断言翻转为 200 往返。
+    void chineseThreadIdRoundTripsThroughPathEndpoints() throws Exception {
+        // #121 回归：中文 thread id 在 invoke 创建后在历史端点仍可读
+        // （路径校验 (?U) 与请求体侧同 unicode 语义，对齐 Python \w）。
+        InMemoryCheckpointer cp = new InMemoryCheckpointer();
         AgentRuntime runtime = buildRuntime(Map.of("chat", stubModule("chat")),
-                new InMemoryCheckpointer(), null, null, null, null, null);
+                cp, null, null, null, null, null);
         AgentsRoutes routes = route(runtime);
-        HttpError error = httpErrorOf(() ->
-                routes.threadHistory("chat", "中文线程", "u1", null, null, null));
-        assertEquals(422, error.status());
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        // invoke 校验链接受中文 id（修复前 create 成功是既态——问题在读侧）。
+        assertNotNull(invoke(routes, "chat",
+                invokeBody("第一条消息", "中文线程", null, null, null), "u1"));
+        // SSE 生产者线程依赖真实 servlet 异步上下文才能跑完落盘；测试里直接
+        // 同步驱动同一张图写快照（等价于正常完成的一轮对话）。
+        runtime.graph("chat").invoke(
+                new io.github.paopaonb666.agentbase.core.graph.GraphState(
+                        List.of(dev.langchain4j.data.message.UserMessage.from("第一条消息")), Map.of()),
+                new io.github.paopaonb666.agentbase.core.graph.RunConfig("chat:中文线程", "u1", 25));
+
+        // 历史/工具审计/删除全部正常返回（修复前路径校验 422——创建后即失联）。
+        Map<String, Object> history = routes.threadHistory("chat", "中文线程", "u1", null, null, null);
+        assertEquals("中文线程", history.get("thread_id"));
+        assertTrue(((List<?>) history.get("messages")).size() >= 1);
+        routes.toolCalls("chat", "中文线程", 100, "u1", null, null, null);
+        Map<String, Object> deleted = routes.deleteThread("chat", "中文线程", "u1", null, null, null);
+        assertEquals(Boolean.TRUE, deleted.get("deleted"));
     }
 
     @Test
