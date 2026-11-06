@@ -10,8 +10,10 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -255,47 +257,83 @@ class CompiledGraphTest {
     }
 
     @Test
-    void concurrentRunsOnSameThreadClobberSnapshot() throws Exception {
-        // #197 基线：同 thread 两个 run 无互斥——双方都在对方落盘前
-        // loadState，各自整行覆盖写，最后落盘的一方胜出，另一方消息丢失
-        // （last-writer-wins）。栅栏保证确定性复现。
+    void concurrentRunOnSameThreadFailsFastWithThreadBusy() throws Exception {
+        // #197：同 thread 第二个 run 快速失败（ThreadBusyError）——快照
+        // last-writer-wins 互踩从根上消除；先到的 run 正常完成。
         InMemoryCheckpointer cp = new InMemoryCheckpointer();
-        CyclicBarrier barrier = new CyclicBarrier(2);
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
         CompiledGraph graph = GraphBuilder.begin()
                 .addNode("agent", (state, ctx) -> {
-                    String tag = (String) state.get("tag");
-                    // 双方都进节点后才返回：确保两次 loadState 都发生在首次
-                    // persistState 之前。
-                    barrier.await();
-                    return Map.of(GraphState.MESSAGES,
-                            List.of(AiMessage.from("from-" + tag)));
+                    entered.countDown();
+                    // 持锁等放行：模拟在途长 run。
+                    release.await();
+                    return Map.of(GraphState.MESSAGES, List.of(AiMessage.from("from-a")));
                 })
                 .entry("agent")
                 .addEdge("agent", GraphBuilder.END)
                 .compile(cp, "chat");
 
+        AtomicReference<Throwable> failureB = new AtomicReference<>();
+        Thread a = new Thread(() -> graph.invoke(
+                new GraphState(List.of(), Map.of("tag", "a")), RunConfig.of("chat:t1", "u1")));
+        a.start();
+        assertTrue(entered.await(5, java.util.concurrent.TimeUnit.SECONDS), "A 应先进入节点");
+        // A 在途：探针为真；B 快速失败而不是交错执行。
+        assertTrue(graph.isThreadBusy("chat:t1"));
+        Thread b = new Thread(() -> {
+            try {
+                graph.invoke(new GraphState(List.of(), Map.of("tag", "b")),
+                        RunConfig.of("chat:t1", "u1"));
+            } catch (RuntimeException e) {
+                failureB.set(e);
+            }
+        });
+        b.start();
+        b.join(5000);
+        assertTrue(failureB.get() instanceof CompiledGraph.ThreadBusyError,
+                "第二个 run 应 ThreadBusyError：" + failureB.get());
+        // 释放 A 让它正常完成；不同 thread 的 run 不受影响。
+        release.countDown();
+        a.join(5000);
+        assertFalse(graph.isThreadBusy("chat:t1"), "A 完成后锁应释放");
+        GraphState finalState = cp.get("chat:t1");
+        assertNotNull(finalState);
+        assertEquals(1, finalState.messages().size());
+        assertEquals("from-a", ((AiMessage) finalState.messages().get(0)).text());
+    }
+
+    @Test
+    void concurrentRunsOnDifferentThreadsAreIndependent() throws Exception {
+        // 互斥按 threadId 键控：不同 thread 并发 run 互不阻塞。
+        InMemoryCheckpointer cp = new InMemoryCheckpointer();
+        CyclicBarrier barrier = new CyclicBarrier(2);
+        CompiledGraph graph = GraphBuilder.begin()
+                .addNode("agent", (state, ctx) -> {
+                    barrier.await();
+                    return Map.of(GraphState.MESSAGES,
+                            List.of(AiMessage.from("from-" + state.get("tag"))));
+                })
+                .entry("agent")
+                .addEdge("agent", GraphBuilder.END)
+                .compile(cp, "chat");
         List<Throwable> failures = new ArrayList<>();
-        Thread a = new Thread(() -> runQuietly(graph, "a", barrier, failures));
-        Thread b = new Thread(() -> runQuietly(graph, "b", barrier, failures));
+        Thread a = new Thread(() -> runQuietly(graph, "a", barrier, failures, "chat:ta"));
+        Thread b = new Thread(() -> runQuietly(graph, "b", barrier, failures, "chat:tb"));
         a.start();
         b.start();
         a.join(5000);
         b.join(5000);
         assertEquals(List.of(), failures);
-
-        GraphState finalState = cp.get("chat:t1");
-        assertNotNull(finalState);
-        // 整行覆盖：最终快照只剩最后写入方的一条消息（另一条被踩掉）。
-        assertEquals(1, finalState.messages().size());
-        String survivor = ((AiMessage) finalState.messages().get(0)).text();
-        assertTrue(survivor.startsWith("from-"), survivor);
+        assertNotNull(cp.get("chat:ta"));
+        assertNotNull(cp.get("chat:tb"));
     }
 
     private void runQuietly(CompiledGraph graph, String tag, CyclicBarrier barrier,
-                            List<Throwable> failures) {
+                            List<Throwable> failures, String threadId) {
         try {
             GraphState input = new GraphState(List.of(), Map.of("tag", tag));
-            graph.invoke(input, RunConfig.of("chat:t1", "u1"));
+            graph.invoke(input, new RunConfig(threadId, "u1", 25));
         } catch (RuntimeException e) {
             synchronized (failures) {
                 failures.add(e);

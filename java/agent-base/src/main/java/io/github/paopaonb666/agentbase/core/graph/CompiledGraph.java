@@ -24,6 +24,23 @@ public final class CompiledGraph {
 
     private static final Logger LOG = LoggerFactory.getLogger(CompiledGraph.class);
 
+    /**
+     * per-thread 执行互斥（#197）：同 thread 并发 run 会各自 loadState
+     * 起步、每步整行覆盖写快照——last-writer-wins 让历史错乱且无法诊断。
+     * 第二个 run 以 {@link ThreadBusyError} 快速失败（路由层转 409）。
+     * 锁对象按 threadId 常驻（不回收：ReentrantLock 很小，换取无竞态的
+     * 正确性——回收 map 条目会在 unlock/remove 窗口放进两个持有者）。
+     */
+    private static final java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.locks.ReentrantLock>
+            THREAD_LOCKS = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** 同 thread 已有进行中的 run（数据完整性保护，非暂时性错误）。 */
+    public static final class ThreadBusyError extends IllegalStateException {
+        public ThreadBusyError(String threadId) {
+            super("thread busy: " + threadId);
+        }
+    }
+
     private final String name;
     private final Map<String, GraphBuilder.Node> nodes;
     private final Map<String, GraphBuilder.Edge> edges;
@@ -48,6 +65,16 @@ public final class CompiledGraph {
     }
 
     /**
+     * 探针：该 thread 当前是否在跑（路由层用它把并发 invoke 提前转成
+     * 409，而不是等 SSE 流开始后才报错）。探针与真正加锁之间存在窗口，
+     * 权威判定在 {@link #run} 的 tryLock——探针只优化报错时机。
+     */
+    public boolean isThreadBusy(String threadId) {
+        java.util.concurrent.locks.ReentrantLock lock = THREAD_LOCKS.get(threadId);
+        return lock != null && lock.isLocked();
+    }
+
+    /**
      * 批量执行到终点，返回最终状态（对应 ainvoke）。
      * checkpointer 存在时从存储加载历史并回写。
      */
@@ -64,6 +91,21 @@ public final class CompiledGraph {
     }
 
     private GraphState run(GraphState input, RunConfig config, EventSink sink) {
+        // per-thread 互斥（#197）：拿不到锁说明同 thread 已有 run 在途——
+        // 快速失败（last-writer-wins 的快照互踩从根上消除）。
+        java.util.concurrent.locks.ReentrantLock lock =
+                THREAD_LOCKS.computeIfAbsent(config.threadId(), k -> new java.util.concurrent.locks.ReentrantLock());
+        if (!lock.tryLock()) {
+            throw new ThreadBusyError(config.threadId());
+        }
+        try {
+            return runLocked(input, config, sink);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private GraphState runLocked(GraphState input, RunConfig config, EventSink sink) {
         GraphState state = loadState(config);
         state.apply(input.updatePayload());
         String current = entry;

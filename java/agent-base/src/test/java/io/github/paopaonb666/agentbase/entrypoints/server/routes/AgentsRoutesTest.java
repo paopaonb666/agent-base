@@ -23,6 +23,7 @@ import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -539,6 +540,54 @@ class AgentsRoutesTest {
         List<Map<String, Object>> threads = (List<Map<String, Object>>) out.get("threads");
         assertEquals(1, threads.size());
         assertEquals("t1", threads.get(0).get("thread_id"));
+    }
+
+    @Test
+    void concurrentInvokeOnSameThreadGives409() throws Exception {
+        // #197：同 thread 并发 invoke → 409（探针在响应提交前报错），
+        // 不同 thread 不受影响。
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AgentModule blocking = new AgentModule() {
+            @Override public String name() { return "chat"; }
+            @Override public String description() { return "blocking stub"; }
+            @Override public io.github.paopaonb666.agentbase.core.graph.CompiledGraph buildGraph(
+                    AgentModule.ModuleContext ctx) {
+                return io.github.paopaonb666.agentbase.core.graph.GraphBuilder.begin()
+                        .addNode("agent", (state, nodeCtx) -> {
+                            entered.countDown();
+                            release.await();
+                            return Map.of();
+                        })
+                        .entry("agent")
+                        .addEdge("agent", io.github.paopaonb666.agentbase.core.graph.GraphBuilder.END)
+                        .compile(ctx.checkpointer(), "chat");
+            }
+            @Override public List<io.github.paopaonb666.agentbase.core.tools.AgentTool> getTools() {
+                return List.of();
+            }
+        };
+        AgentRuntime runtime = buildRuntime(Map.of("chat", blocking),
+                new InMemoryCheckpointer(), null, null, null, null, null);
+        AgentsRoutes routes = route(runtime);
+
+        // 在途 run：直接驱动图（与生产一致的 CompiledGraph 实例）。
+        Thread busy = new Thread(() -> runtime.graph("chat").invoke(
+                new io.github.paopaonb666.agentbase.core.graph.GraphState(
+                        List.of(dev.langchain4j.data.message.UserMessage.from("x")), Map.of()),
+                new io.github.paopaonb666.agentbase.core.graph.RunConfig("chat:t1", "u1", 25)));
+        busy.start();
+        assertTrue(entered.await(5, java.util.concurrent.TimeUnit.SECONDS));
+
+        HttpError conflict = httpErrorOf(() ->
+                invoke(routes, "chat", invokeBody("hi", "t1", null, null, null), "u1"));
+        assertEquals(409, conflict.status());
+        assertTrue(conflict.getMessage().contains("线程忙"), conflict.getMessage());
+
+        release.countDown();
+        busy.join(5000);
+        // 释放后同 thread 可再次 invoke（不再 409）。
+        assertNotNull(invoke(routes, "chat", invokeBody("hi", "t1", null, null, null), "u1"));
     }
 
     @Test

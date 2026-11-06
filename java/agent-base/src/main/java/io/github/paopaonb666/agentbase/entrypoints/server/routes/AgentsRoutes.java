@@ -185,6 +185,13 @@ public class AgentsRoutes {
                 : io.github.paopaonb666.agentbase.extensions.Observability.newRequestId();
         String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         String fullThreadId = new ThreadId(module, userThreadId).toString();
+        // 同 thread 并发 invoke → 409（#197）：权威判定在图执行的 tryLock，
+        // 探针只把报错时机提前到响应提交前（SSE 开始后只能以 error 事件收口）。
+        if (graph.isThreadBusy(fullThreadId)) {
+            response.setHeader("Retry-After", "5");
+            throw new HttpError(409, "线程忙：该 thread 已有进行中的对话（" + userThreadId
+                    + "），请等待当前轮完成或稍后重试");
+        }
         RunConfig config = new RunConfig(fullThreadId, userId, runtime.settings().agentRecursionLimit);
         List<ChatMessage> messagesInput = new ArrayList<>();
         // 记忆上下文注入（M6d + T2.1）：冻结段在前，召回段紧随其后；任何
