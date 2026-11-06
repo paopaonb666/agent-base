@@ -64,4 +64,28 @@ class SettingsRootFieldsTest {
         assertThrows(Settings.SettingsError.class,
                 () -> Settings.load(Map.of("llm_health_probe_model", "false"), null));
     }
+
+    @Test
+    void costPricesParseOnceAndNeverSilentlyZero() {
+        // #105：数值串按 Python float() 口径接受（"2" → 2.0，不是静默 0）。
+        Settings s = Settings.load(Map.of(
+                "ENV", "development",
+                "COST_PRICES_JSON", "{\"m\": {\"input_miss\": 2.5, \"input_hit\": \"1\", \"output\": 10}}"),
+                null);
+        assertEquals(Map.of("m", Map.of("input_miss", 2.5, "input_hit", 1.0, "output", 10.0)),
+                s.prices());
+        // 非数值 fail-fast（修复前 asDouble 静默回 0.0——白烧钱不可见）。
+        Settings.SettingsError bad = assertThrows(Settings.SettingsError.class,
+                () -> Settings.load(Map.of(
+                        "ENV", "development",
+                        "COST_PRICES_JSON", "{\"m\": {\"input_miss\": \"abc\"}}"), null));
+        assertTrue(bad.getMessage().contains("input_miss"), bad.getMessage());
+        // 结构错误照旧拒绝。
+        assertThrows(Settings.SettingsError.class,
+                () -> Settings.load(Map.of(
+                        "ENV", "development",
+                        "COST_PRICES_JSON", "[{\"m\": 1}]"), null));
+        // 未配置 → 空表。
+        assertEquals(Map.of(), Settings.load(Map.of("ENV", "development"), null).prices());
+    }
 }

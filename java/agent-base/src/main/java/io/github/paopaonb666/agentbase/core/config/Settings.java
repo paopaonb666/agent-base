@@ -214,6 +214,8 @@ public final class Settings {
         public String action = "block";
         /** 价目表 JSON（元/百万 tokens，手工维护）。 */
         public String pricesJson = "";
+        /** 解析后的价目表（load 期一次解析并校验，#105）。 */
+        public Map<String, Map<String, Double>> parsedPrices = Map.of();
     }
 
     /** MCP 工具来源配置节：env 前缀 {@code MCP_}（第一期未迁移：启用即报错）。 */
@@ -809,33 +811,59 @@ public final class Settings {
         if (v.containsKey("prices_json")) {
             String value = v.get("prices_json");
             if (!value.strip().isEmpty()) {
-                validatePricesJson(value);
+                t.parsedPrices = parsePricesJson(value);
             }
             t.pricesJson = value;
         }
     }
 
-    private static void validatePricesJson(String value) {
-        // 结构校验：{"model": {"input_miss": …, "input_hit": …, "output": …}}。
+    /**
+     * 价目表一次解析（#105）：load 期完成结构+数值校验并缓存进
+     * parsedPrices——之前 load 只查结构、prices() 读取时二次解析，且
+     * asDouble 对非数值叶子静默回 0.0（"2" 会被读成 0，白烧钱不可见）。
+     * 数值字符串按 Python float() 口径接受，非数值 fail-fast。
+     */
+    private static Map<String, Map<String, Double>> parsePricesJson(String value) {
+        // 结构契约：{"model": {"input_miss": …, "input_hit": …, "output": …}}。
+        String structureError =
+                "COST_PRICES_JSON must be a JSON object of {\"model\": {\"input_miss\": …, \"input_hit\": …, \"output\": …}}";
         String trimmed = value.strip();
         if (!trimmed.startsWith("{")) {
-            throw new SettingsError(
-                    "COST_PRICES_JSON must be a JSON object of {\"model\": {\"input_miss\": …, \"input_hit\": …, \"output\": …}}");
+            throw new SettingsError(structureError);
         }
-        // 委托 Jackson（已随 Spring 在类路径上）做完整合法性校验。
         try {
-            com.fasterxml.jackson.databind.JsonNode node =
+            com.fasterxml.jackson.databind.JsonNode root =
                     new com.fasterxml.jackson.databind.ObjectMapper().readTree(trimmed);
-            if (!node.isObject()) {
-                throw new SettingsError(
-                        "COST_PRICES_JSON must be a JSON object of {\"model\": {\"input_miss\": …, \"input_hit\": …, \"output\": …}}");
+            if (!root.isObject()) {
+                throw new SettingsError(structureError);
             }
-            node.fields().forEachRemaining(e -> {
-                if (!e.getValue().isObject()) {
-                    throw new SettingsError(
-                            "COST_PRICES_JSON must be a JSON object of {\"model\": {\"input_miss\": …, \"input_hit\": …, \"output\": …}}");
+            Map<String, Map<String, Double>> out = new LinkedHashMap<>();
+            root.fields().forEachRemaining(model -> {
+                if (!model.getValue().isObject()) {
+                    throw new SettingsError(structureError);
                 }
+                Map<String, Double> table = new LinkedHashMap<>();
+                model.getValue().fields().forEachRemaining(e -> {
+                    com.fasterxml.jackson.databind.JsonNode leaf = e.getValue();
+                    if (leaf.isNumber()) {
+                        table.put(e.getKey(), leaf.asDouble());
+                    } else if (leaf.isTextual()) {
+                        try {
+                            table.put(e.getKey(), Double.parseDouble(leaf.asText()));
+                        } catch (NumberFormatException ex) {
+                            throw new SettingsError(
+                                    "COST_PRICES_JSON: price for %s.%s must be a number, got '%s'"
+                                            .formatted(model.getKey(), e.getKey(), leaf.asText()));
+                        }
+                    } else {
+                        throw new SettingsError(
+                                "COST_PRICES_JSON: price for %s.%s must be a number"
+                                        .formatted(model.getKey(), e.getKey()));
+                    }
+                });
+                out.put(model.getKey(), table);
             });
+            return out;
         } catch (IOException ex) {
             throw new SettingsError("COST_PRICES_JSON is not valid JSON: %s".formatted(ex.getMessage()));
         }
@@ -847,25 +875,9 @@ public final class Settings {
         if (v.containsKey("servers_json")) t.serversJson = v.get("servers_json");
     }
 
-    /** 解析后的价目表（pricesJson 已由校验保证合法）。 */
+    /** 解析后的价目表（load 期一次解析缓存；未配置 → 空表）。 */
     public Map<String, Map<String, Double>> prices() {
-        if (cost.pricesJson.strip().isEmpty()) {
-            return Map.of();
-        }
-        try {
-            com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
-            com.fasterxml.jackson.databind.JsonNode root = mapper.readTree(cost.pricesJson);
-            Map<String, Map<String, Double>> out = new LinkedHashMap<>();
-            root.fields().forEachRemaining(model -> {
-                Map<String, Double> table = new LinkedHashMap<>();
-                model.getValue().fields().forEachRemaining(e ->
-                        table.put(e.getKey(), e.getValue().asDouble()));
-                out.put(model.getKey(), table);
-            });
-            return out;
-        } catch (IOException ex) {
-            throw new SettingsError("COST_PRICES_JSON is not valid JSON: %s".formatted(ex.getMessage()));
-        }
+        return cost.parsedPrices;
     }
 
     // ── 校验后的整体收敛 + 快速失败 ──────────────────────────────────
