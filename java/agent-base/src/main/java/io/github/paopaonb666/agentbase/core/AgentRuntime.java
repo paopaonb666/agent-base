@@ -261,6 +261,19 @@ public final class AgentRuntime {
                 resolved.agentModules, null,
                 resolved.agentModulePackages.stream().map(ModuleRegistry::normalizePackage).toList());
         validateModuleNames(modules);
+        // planner 递归预算推导（#229）：最坏步数（H5 公式）超过全局上限时
+        // 启动即提示——触顶从「首跑才炸、报错让用户翻文档」变成「启动横幅
+        // 给建议值」。全局上限仍只做兜底（H5 裁决），不自动放宽。
+        if (modules.containsKey("planner")) {
+            int worst = io.github.paopaonb666.agentbase.core.graphs.Graphs.plannerWorstSteps(resolved);
+            if (resolved.agentRecursionLimit < worst) {
+                LOG.warn("planner 递归预算不足（#229）：最坏步数 {} > AGENT_RECURSION_LIMIT={} "
+                                + "——极端输入下会先触递归上限而非优雅返回；"
+                                + "建议 AGENT_RECURSION_LIMIT >= {}，或调低 PLANNER_MAX_SUBTASKS/"
+                                + "PLANNER_SUBTASK_TOOL_ROUNDS/PLANNER_MAX_REPLANS",
+                        worst, resolved.agentRecursionLimit, worst);
+            }
+        }
         Checkpointer checkpointer = io.github.paopaonb666.agentbase.core.graph.CheckpointerFactory.build(resolved);
         UploadedFileStore fileStore = UploadedFileStores.build(resolved);
         // 基座自有存储（S1/M10）：线程索引与计划快照的数据面由基座自己拥有，

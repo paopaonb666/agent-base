@@ -3,6 +3,7 @@ package io.github.paopaonb666.agentbase.core.graph;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.UserMessage;
+import io.github.paopaonb666.agentbase.core.config.Settings;
 import io.github.paopaonb666.agentbase.extensions.events.Events;
 import org.junit.jupiter.api.Test;
 
@@ -83,7 +84,42 @@ class CompiledGraphTest {
         CompiledGraph.GraphRecursionError error = assertThrows(
                 CompiledGraph.GraphRecursionError.class,
                 () -> graph.invoke(new GraphState(), new RunConfig("chat:t1", "u1", 3)));
-        assertEquals("Recursion limit of 3 reached", error.getMessage());
+        // #229：错误带图名/节点数，可直接定位。
+        assertTrue(error.getMessage().contains("Recursion limit of 3 reached"),
+                error.getMessage());
+        assertTrue(error.getMessage().contains("graph 'loop'"), error.getMessage());
+        assertTrue(error.getMessage().contains("1 nodes"), error.getMessage());
+        // 非 planner 图不带 planner 公式。
+        assertFalse(error.getMessage().contains("PLANNER_MAX_SUBTASKS"), error.getMessage());
+    }
+
+    @Test
+    void plannerRecursionErrorCarriesTheBudgetFormula() {
+        // #229：planner 图触顶时错误信息附 H5 公式与建议配置。
+        CompiledGraph plannerGraph = GraphBuilder.begin()
+                .addNode("plan", (state, ctx) -> Map.of())
+                .entry("plan")
+                .addEdge("plan", "plan")
+                .compile(new InMemoryCheckpointer(), "planner");
+        CompiledGraph.GraphRecursionError error = assertThrows(
+                CompiledGraph.GraphRecursionError.class,
+                () -> plannerGraph.invoke(new GraphState(), new RunConfig("chat:t1", "u1", 3)));
+        assertTrue(error.getMessage().contains("PLANNER_MAX_SUBTASKS"), error.getMessage());
+        assertTrue(error.getMessage().contains("AGENT_RECURSION_LIMIT"), error.getMessage());
+    }
+
+    @Test
+    void plannerWorstStepsFormulaMatchesH5() {
+        // H5 口径：8 + 2*5*(8+1) = 98（默认配置）；配置推导跟随 PLANNER_*。
+        Settings defaults = Settings.load(Map.of("ENV", "development"), null);
+        assertEquals(98, io.github.paopaonb666.agentbase.core.graphs.Graphs
+                .plannerWorstSteps(defaults));
+        Settings tuned = Settings.load(Map.of(
+                "ENV", "development",
+                "PLANNER_MAX_SUBTASKS", "3",
+                "PLANNER_SUBTASK_TOOL_ROUNDS", "2"), null);
+        assertEquals(8 + 2 * 3 * 3, io.github.paopaonb666.agentbase.core.graphs.Graphs
+                .plannerWorstSteps(tuned));
     }
 
     @Test

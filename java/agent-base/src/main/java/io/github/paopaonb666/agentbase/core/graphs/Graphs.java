@@ -44,6 +44,17 @@ public final class Graphs {
     private Graphs() {}
 
     /**
+     * planner 最坏步数（H5 口径，#229 编译期推导）：固定壳 8 步 +
+     * 每子任务（执行 1 + 工具轮 rounds）× 重规划 2 轮。默认配置下
+     * 8+2*5*(8+1)=98 —— 远超 AGENT_RECURSION_LIMIT 默认 25，组合根在
+     * 启动时据此给出显式建议（全局上限仍只做兜底，不自动放宽）。
+     */
+    public static int plannerWorstSteps(io.github.paopaonb666.agentbase.core.config.Settings settings) {
+        var p = settings.planner;
+        return 8 + 2 * p.maxSubtasks * (p.subtaskToolRounds + 1);
+    }
+
+    /**
      * 构建并编译"单 LLM 节点 + 可选工具循环"的图。
      *
      * <p>{@code tools} 缺省用共享工具池（{@code ctx.tools()}）；传空列表

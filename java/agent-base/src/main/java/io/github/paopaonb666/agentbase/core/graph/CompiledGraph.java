@@ -116,8 +116,7 @@ public final class CompiledGraph {
                 break;
             }
             if (steps >= config.recursionLimit()) {
-                throw new GraphRecursionError(
-                        "Recursion limit of %d reached".formatted(config.recursionLimit()));
+                throw new GraphRecursionError(recursionMessage(config.recursionLimit()));
             }
             GraphBuilder.Node node = nodes.get(current);
             if (node == null) {
@@ -299,5 +298,19 @@ public final class CompiledGraph {
         public GraphRecursionError(String message) {
             super(message);
         }
+    }
+
+    /**
+     * 触顶错误带可定位信息（#229）：图名/节点数，planner 图附 H5 最坏
+     * 步数公式与建议值——报错直接给出「该调哪个配置」而不是让用户翻
+     * 文档反推。
+     */
+    private String recursionMessage(int limit) {
+        String advice = "planner".equals(name)
+                ? "；planner 最坏步数 ≈ 8 + 2*PLANNER_MAX_SUBTASKS*(PLANNER_SUBTASK_TOOL_ROUNDS+1)"
+                        + "——建议 AGENT_RECURSION_LIMIT ≥ 该值，或调低 PLANNER_* 预算"
+                : "";
+        return "Recursion limit of %d reached on graph '%s' (%d nodes)%s"
+                .formatted(limit, name, nodes.size(), advice);
     }
 }
