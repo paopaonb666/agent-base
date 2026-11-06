@@ -244,6 +244,11 @@ public final class AgentRuntime {
                 resolved.cost.enabled
                         ? io.github.paopaonb666.agentbase.core.llm.UsageSinks.costMeterSink("main")
                         : ModelRuntime.noopUsageSink());
+        // 主路径弹性包（#1/#10/#73/#75）：并发信号量 + 指数退避重试 +
+        // 滑窗重试预算，图执行节点经 ModuleContext.llm() 透明获得。usage
+        // 仍由内层 runtime 的 sink 按每次真实调用记账。
+        llm = new io.github.paopaonb666.agentbase.core.llm.ResilientModelRuntime(
+                llm, resolved.llm.mainRetries, resolved.llm.mainConcurrency);
         Map<String, AgentModule> modules = ModuleRegistry.loadModules(
                 resolved.agentModules, null,
                 resolved.agentModulePackages.stream().map(ModuleRegistry::normalizePackage).toList());

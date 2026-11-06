@@ -95,9 +95,12 @@ public final class LlmFactory {
         }
 
         try {
-            // 读超时对齐 Python openai SDK 默认（600s）：不设的话 langchain4j
-            // 默认 60s，长生成/长停顿的流会在 Java 侧被提前掐断。
-            java.time.Duration timeout = java.time.Duration.ofSeconds(600);
+            // 读超时：主档走 LLM_MAIN_TIMEOUT（#1，默认对齐 Python openai
+            // SDK 的 600s）——不设的话 langchain4j 默认 60s，长生成/长停顿
+            // 的流会在 Java 侧被提前掐断。快档无独立配置，沿用 600s。
+            java.time.Duration timeout = "main".equals(profile)
+                    ? java.time.Duration.ofMillis((long) (settings.llm.mainTimeoutSeconds * 1000))
+                    : java.time.Duration.ofSeconds(600);
             OpenAiChatModel chat = OpenAiChatModel.builder()
                     .baseUrl(baseUrl)
                     .apiKey(apiKey)

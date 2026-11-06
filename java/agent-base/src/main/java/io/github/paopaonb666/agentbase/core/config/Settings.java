@@ -98,6 +98,14 @@ public final class Settings {
         public String apiKey = "";
         public String baseUrl = "https://api.deepseek.com/v1";
         public String model = "deepseek-chat";
+        /**
+         * 主路径弹性包（#1/#73）：读超时（对齐 openai SDK 默认 600s）、
+         * 瞬时错误重试次数（指数退避，ResilientLlm 同默认 max_retries=2）
+         * 与全局并发信号量（防 429 连锁雪崩；快档独立信号量不受影响）。
+         */
+        public double mainTimeoutSeconds = 600.0;
+        public int mainRetries = 2;
+        public int mainConcurrency = 8;
     }
 
     /**
@@ -514,6 +522,27 @@ public final class Settings {
         if (v.containsKey("api_key")) t.apiKey = v.get("api_key");
         if (v.containsKey("base_url")) t.baseUrl = v.get("base_url");
         if (v.containsKey("model")) t.model = v.get("model");
+        if (v.containsKey("main_timeout")) {
+            double value = requireFloat("main_timeout", v.get("main_timeout"));
+            if (!(value > 0)) {
+                throw new SettingsError("LLM_MAIN_TIMEOUT must be > 0, got %s".formatted(value));
+            }
+            t.mainTimeoutSeconds = value;
+        }
+        if (v.containsKey("main_retries")) {
+            int value = requireInt("main_retries", v.get("main_retries"));
+            if (value < 0) {
+                throw new SettingsError("LLM_MAIN_RETRIES must be >= 0, got %d".formatted(value));
+            }
+            t.mainRetries = value;
+        }
+        if (v.containsKey("main_concurrency")) {
+            int value = requireInt("main_concurrency", v.get("main_concurrency"));
+            if (value < 1) {
+                throw new SettingsError("LLM_MAIN_CONCURRENCY must be >= 1, got %d".formatted(value));
+            }
+            t.mainConcurrency = value;
+        }
     }
 
     private static void applyLlmFast(Settings s, Map<String, String> v) {
