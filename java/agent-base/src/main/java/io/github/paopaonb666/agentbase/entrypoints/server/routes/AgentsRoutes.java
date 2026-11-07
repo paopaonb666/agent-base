@@ -232,21 +232,11 @@ public class AgentsRoutes {
                         + "；请重新上传");
             }
             fileStore.bindThread(body.attachments(), fullThreadId);
-            List<String> blocks = new ArrayList<>();
+            List<String> blocks = attachmentBlocks(attachmentInfos);
             List<UploadedFileInfo> imageParts = new ArrayList<>();
             for (UploadedFileInfo info : attachmentInfos) {
                 if (MessageSerializers.IMAGE_STORED_FORMATS.contains(info.format())) {
                     imageParts.add(info);
-                    continue;
-                }
-                if (!info.extractedText().strip().isEmpty()) {
-                    String pages = info.pages() != null ? info.pages() + " 页，" : "";
-                    blocks.add("[附件文件：" + info.filename() + "（" + info.format() + "，" + pages
-                            + info.textLen() + " 字符）]\n" + info.extractedText());
-                } else {
-                    String note = info.warning() == null || info.warning().isEmpty()
-                            ? "无法提取文本" : info.warning();
-                    blocks.add("[附件文件：" + info.filename() + "]（" + note + "）");
                 }
             }
             if (!blocks.isEmpty()) {
@@ -607,5 +597,34 @@ public class AgentsRoutes {
         if (threadId.length() > 128 || !threadId.matches("(?U)^[\\w.-]+$")) {
             throw new HttpError(422, "thread_id 格式非法（[\\w.-]{1,128}）");
         }
+    }
+
+    /**
+     * 附件注入块（文本类；图片走多模态分支不在此列）。
+     *
+     * <p>#250：截断发生在「附件全文注入」时用户与模型都不知情（模型拿到
+     * 半份文档）——truncated=true 时在块尾追加指路提示（完整内容走
+     * knowledge_search），而不是让模型把半份文档当成全文回答。
+     */
+    static List<String> attachmentBlocks(List<UploadedFileInfo> infos) {
+        List<String> blocks = new ArrayList<>();
+        for (UploadedFileInfo info : infos) {
+            if (MessageSerializers.IMAGE_STORED_FORMATS.contains(info.format())) {
+                continue;
+            }
+            if (!info.extractedText().strip().isEmpty()) {
+                String pages = info.pages() != null ? info.pages() + " 页，" : "";
+                String truncatedNote = info.truncated()
+                        ? "\n\n（注：以上内容因长度已截断，完整内容请用 knowledge_search 检索）"
+                        : "";
+                blocks.add("[附件文件：" + info.filename() + "（" + info.format() + "，" + pages
+                        + info.textLen() + " 字符）]\n" + info.extractedText() + truncatedNote);
+            } else {
+                String note = info.warning() == null || info.warning().isEmpty()
+                        ? "无法提取文本" : info.warning();
+                blocks.add("[附件文件：" + info.filename() + "]（" + note + "）");
+            }
+        }
+        return blocks;
     }
 }

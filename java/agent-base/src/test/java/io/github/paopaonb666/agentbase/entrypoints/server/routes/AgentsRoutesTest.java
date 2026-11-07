@@ -26,6 +26,7 @@ import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -255,6 +256,25 @@ class AgentsRoutesTest {
         HttpError error = httpErrorOf(() ->
                 invoke(routes, "chat", invokeBody("hi", null, List.of("f1"), null, null), "u1"));
         assertEquals(503, error.status());
+    }
+
+    @Test
+    void truncatedAttachmentInjectionCarriesGuidance() {
+        // #250：截断的附件全文注入时，块尾带指路提示（模型不再把半份文档
+        // 当全文回答）；未截断的不带。
+        List<UploadedFileInfo> infos = List.of(
+                new UploadedFileInfo("f1", "", "", "u1", "a.pdf", "pdf",
+                        10, null, true, 5000, null, "前半份内容", new byte[0]),
+                new UploadedFileInfo("f2", "", "", "u1", "b.txt", "txt",
+                        null, null, false, 100, null, "完整内容", new byte[0]),
+                new UploadedFileInfo("f3", "", "", "u1", "c.pdf", "pdf",
+                        null, null, true, 0, "扫描件无文本层", "", new byte[0]));
+        List<String> blocks = AgentsRoutes.attachmentBlocks(infos);
+        assertEquals(3, blocks.size());
+        assertTrue(blocks.get(0).contains("（注：以上内容因长度已截断，完整内容请用 knowledge_search 检索）"));
+        assertFalse(blocks.get(1).contains("knowledge_search"));
+        // 空提取走警告分支，不注入截断提示
+        assertTrue(blocks.get(2).contains("扫描件无文本层"));
     }
 
     @Test
