@@ -69,8 +69,11 @@ public final class Metrics {
                 java.util.function.Function<String, String> seriesLabels,
                 boolean trailingNewlineWhenEmpty) {
             List<String> lines = new ArrayList<>();
-            // sorted(...)：Python 侧按键排序渲染，Java 用 TreeMap 对齐。
-            Map<List<String>, Long> sortedCounts = new TreeMap<>(counts);
+            // sorted(...)：Python 侧按键排序渲染——Java 侧按键列表逐元素字典序
+            // 对齐（List 不是 Comparable，TreeMap 自然序会 CCE，#294 实测）。
+            Map<List<String>, Long> sortedCounts = new LinkedHashMap<>();
+            counts.entrySet().stream().sorted(Map.Entry.comparingByKey(KEY_ORDER))
+                    .forEach(e -> sortedCounts.put(e.getKey(), e.getValue()));
             for (Map.Entry<List<String>, Long> e : sortedCounts.entrySet()) {
                 lines.add("%s{%s} %d".formatted(totalName(), counterLabels.apply(e.getKey()), e.getValue()));
             }
@@ -87,7 +90,8 @@ public final class Metrics {
                 }
                 lines.add("%s_bucket{%s,le=\"+Inf\"} %d".formatted(bucketPrefix(), lab, samples.size()));
                 double sum = samples.stream().mapToDouble(Double::doubleValue).sum();
-                lines.add("%s_sum{%s} %.6f".formatted(bucketPrefix(), lab, sum));
+                lines.add(String.format(java.util.Locale.ROOT, "%s_sum{%s} %.6f",
+                        bucketPrefix(), lab, sum));
                 lines.add("%s_count{%s} %d".formatted(bucketPrefix(), lab, samples.size()));
             }
             if (lines.isEmpty()) {
@@ -96,6 +100,18 @@ public final class Metrics {
             return String.join("\n", lines) + "\n";
         }
     }
+
+    /** 计数器键（label 元组）的确定性排序：逐元素字典序，短键在前。 */
+    private static final java.util.Comparator<List<String>> KEY_ORDER = (a, b) -> {
+        int n = Math.min(a.size(), b.size());
+        for (int i = 0; i < n; i++) {
+            int c = a.get(i).compareTo(b.get(i));
+            if (c != 0) {
+                return c;
+            }
+        }
+        return Integer.compare(a.size(), b.size());
+    };
 
     /** 进程内的请求计数器 + 延迟直方图。 */
     public static final class HttpMetrics extends LabeledHistogram {
@@ -186,11 +202,13 @@ public final class Metrics {
 
         public String renderCostMetrics() {
             List<String> lines = new ArrayList<>();
-            for (Map.Entry<List<String>, Long> e : new TreeMap<>(tokens).entrySet()) {
+            for (Map.Entry<List<String>, Long> e : tokens.entrySet().stream()
+                    .sorted(Map.Entry.comparingByKey(KEY_ORDER))
+                    .collect(java.util.stream.Collectors.toList())) {
                 lines.add("llm_tokens_total{model=\"%s\",profile=\"%s\",kind=\"%s\"} %d"
                         .formatted(e.getKey().get(0), e.getKey().get(1), e.getKey().get(2), e.getValue()));
             }
-            lines.add("llm_cost_cny_total %.6f".formatted(costCnyTotal));
+            lines.add(String.format(java.util.Locale.ROOT, "llm_cost_cny_total %.6f", costCnyTotal));
             return String.join("\n", lines) + "\n";
         }
     }
