@@ -107,17 +107,20 @@ public final class ToolCallRecord {
 
     /** 行查询结果 → asDict 同构视图（sqlite/mysql 后端共用）。 */
     public static Map<String, Object> rowToDict(Object[] row) {
-        return new java.util.LinkedHashMap<>(java.util.Map.ofEntries(
-                java.util.Map.entry("call_id", row[0]),
-                java.util.Map.entry("thread_id", row[1]),
-                java.util.Map.entry("module", row[2]),
-                java.util.Map.entry("request_id", row[3]),
-                java.util.Map.entry("tool", row[4]),
-                java.util.Map.entry("args", loadsOrRaw((String) row[5])),
-                java.util.Map.entry("result", row[6]),
-                java.util.Map.entry("status", row[7]),
-                java.util.Map.entry("error", row[8] == null || String.valueOf(row[8]).isEmpty() ? null : row[8]),
-                java.util.Map.entry("duration_ms", row[9])));
+        // LinkedHashMap 而非 Map.entry/ofEntries：error 为 null（成功调用的
+        // 常态）时 Map.entry 会 NPE——与 #298 的 asDict 同病，读回路径漏改。
+        Map<String, Object> out = new java.util.LinkedHashMap<>();
+        out.put("call_id", row[0]);
+        out.put("thread_id", row[1]);
+        out.put("module", row[2]);
+        out.put("request_id", row[3]);
+        out.put("tool", row[4]);
+        out.put("args", loadsOrRaw((String) row[5]));
+        out.put("result", row[6]);
+        out.put("status", row[7]);
+        out.put("error", row[8] == null || String.valueOf(row[8]).isEmpty() ? null : row[8]);
+        out.put("duration_ms", row[9]);
+        return out;
     }
 
     /** INSERT 列清单（sqlite 与 MySQL 的占位符由各实现决定）。 */

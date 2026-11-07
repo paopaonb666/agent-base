@@ -14,8 +14,9 @@ import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicLong;
 
 import io.github.paopaonb666.agentbase.core.config.Settings;
 
@@ -24,7 +25,8 @@ import io.github.paopaonb666.agentbase.core.config.Settings;
  * {@code extensions/toollog.py} 的三个 Recorder 与
  * {@code build_tool_call_recorder}）。
  *
- * <p>memory → 进程内环形缓冲；sqlite → 专属写线程消化插入（与对话状态
+ * <p>memory → 进程内环形缓冲；sqlite → 专属写线程消化插入（写队列有界，
+ * 满即丢样本计数——审计丢样本方向：宁可丢也不打断调用线程；与对话状态
  * 同一文件）；mysql → 每次写一条短连接（对应 Python 侧的每次连接语义，
  * 审计是低频旁路流量）。总开关关闭或后端未知时工厂返回 null。
  */
@@ -111,9 +113,20 @@ public final class ToolCallLoggers {
         }
     }
 
-    /** sqlite 审计表：与对话状态同一文件，专属写线程消化插入。 */
+    /**
+     * sqlite 审计表：与对话状态同一文件，专属写线程消化插入。
+     *
+     * <p>写队列有界（#266）：{@code record()} 只 {@code offer}，队列满即
+     * 丢弃并计入 {@link #droppedRecordCount()}。审计是旁路数据，方向是
+     * <b>丢样本优于打断调用线程</b>——绝不阻塞、绝不抛错拖垮对话主链路。
+     */
     public static final class SqliteToolCallRecorder implements ToolCallRecorder {
-        private final BlockingQueue<ToolCallRecord> queue = new LinkedBlockingQueue<>();
+
+        /** 写队列容量（#266 有界化）：超限即丢（审计丢样本，不打断调用线程）。 */
+        public static final int QUEUE_CAPACITY = 1000;
+
+        private final BlockingQueue<ToolCallRecord> queue = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
+        private final AtomicLong droppedCount = new AtomicLong();
         private final Connection conn;
         private final Thread writer;
 
@@ -134,7 +147,16 @@ public final class ToolCallLoggers {
 
         @Override
         public void record(ToolCallRecord record) {
-            queue.add(record);
+            // offer 非阻塞：队列满即丢弃并计数（#266 审计丢样本方向），
+            // 绝不拖垮调用线程。
+            if (!queue.offer(record)) {
+                droppedCount.incrementAndGet();
+            }
+        }
+
+        /** 累计因队列满被丢弃的记录数（审计丢样本的可观测口径）。 */
+        public long droppedRecordCount() {
+            return droppedCount.get();
         }
 
         private void writerLoop() {
@@ -143,13 +165,28 @@ public final class ToolCallLoggers {
                 try {
                     record = queue.take();
                 } catch (InterruptedException e) {
+                    // close() 触发的退出：先尽力排空队列剩余再返回，
+                    // close 前已 record() 的尾部记录不因关闭丢失。
+                    drainRemaining();
                     return;
                 }
-                try {
-                    insert(record);
-                } catch (SQLException e) {
-                    LOG.error("toollog: sqlite insert failed", e);
-                }
+                insertQuietly(record);
+            }
+        }
+
+        /** 中断后的尽力排空：把队列剩余记录写完（写失败只记日志，不抛出）。 */
+        private void drainRemaining() {
+            ToolCallRecord record;
+            while ((record = queue.poll()) != null) {
+                insertQuietly(record);
+            }
+        }
+
+        private void insertQuietly(ToolCallRecord record) {
+            try {
+                insert(record);
+            } catch (SQLException e) {
+                LOG.error("toollog: sqlite insert failed", e);
             }
         }
 
@@ -201,8 +238,16 @@ public final class ToolCallLoggers {
 
         @Override
         public void close() {
-            // 哨兵 None：让写线程排空队列后退出（对应 aclose 语义）。
+            // 尽力排空再退（对应 Python 侧 aclose 的排空语义）：interrupt 让
+            // 写线程从 take() 退出，写线程退出前把队列剩余记录写完
+            // （见 writerLoop 的 drainRemaining）；join 限时 5s 兜底防卡死，
+            // 超时则放弃排空直接关连接（残余记录丢弃——丢样本优于挂死）。
             writer.interrupt();
+            try {
+                writer.join(5000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
             try {
                 conn.close();
             } catch (SQLException e) {
