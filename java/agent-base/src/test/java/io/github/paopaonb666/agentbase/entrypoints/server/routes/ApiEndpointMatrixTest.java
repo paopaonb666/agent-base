@@ -16,6 +16,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.http.ResponseEntity;
+import org.springframework.mock.web.MockMultipartFile;
 
 import java.lang.reflect.Constructor;
 import java.util.ArrayList;
@@ -33,11 +34,12 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * API 11 端点参数矩阵（roadmap #298）：覆盖既有测试组之外的端点参数面
- * ——线程列表（索引视图/降级）、历史序列化、计划状态（planStore 命中/
- * 缺席回退）、审计 limit 钳制、删除的 checkpointer 缺席分支、文件撤销/
- * 预览/切片/原始字节、知识检索与知识库文件列表。invoke 链 422 矩阵在
- * AgentsRoutesTest、上传 413/400 在 FilesRoutesTest，不在此重复。
+ * API 11 端点参数矩阵（roadmap #298/#290）：覆盖既有测试组之外的端点
+ * 参数面——线程列表（索引视图/降级）、历史序列化、计划状态（planStore
+ * 命中/缺席回退）、审计 limit 钳制、删除的 checkpointer 缺席分支、文件
+ * 撤销/预览/切片/原始字节、知识检索与知识库文件列表、文件端点的存储/
+ * 记忆缺席 503 与撤销级联数值。invoke 链 422 矩阵在 AgentsRoutesTest、
+ * 上传 413/400 在 FilesRoutesTest，不在此重复。
  */
 class ApiEndpointMatrixTest {
 
@@ -470,5 +472,44 @@ class ApiEndpointMatrixTest {
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> zeroFiles = (List<Map<String, Object>>) zeroCounts.get("files");
         assertEquals(0, zeroFiles.get(0).get("chunks"));
+    }
+
+    @Test
+    void fileEndpointsReport503WhenStoreAbsentAndRevokeWithoutMemoryKeepsZeroChunks() throws Exception {
+        // #290：存储/记忆后端缺席的降级矩阵——fileStore 缺席时上传与撤销
+        // 都 503（撤销在属主校验 ownedFile 先抛）；memory 缺席时撤销照常
+        // 成功但 chunks_removed=0（文件行照删，只是无知识库分块可撤）。
+        var fileStore = Mockito.mock(io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStore.class);
+        when(fileStore.getMany(List.of("f1"))).thenReturn(List.of(info("f1", "alice", "a.txt", "txt", new byte[1])));
+        when(fileStore.deleteFile("f1")).thenReturn(true);
+        var memory = Mockito.mock(AgentModule.MemoryServicePort.class);
+
+        // fileStore 缺席：上传 503（先于大小/解析检查），撤销 503。
+        AgentRuntime noStore = runtime(Map.of("chat", graphStub("chat")), null, null,
+                null, memory, null, null);
+        FilesRoutes noStoreRoutes = new FilesRoutes(noStore, PASS_THROUGH_AUTH);
+        assertEquals(503, statusOf(() -> noStoreRoutes.uploadFile("chat",
+                new MockMultipartFile("file", "a.txt", "text/plain",
+                        "正文".getBytes(java.nio.charset.StandardCharsets.UTF_8)),
+                "alice", null, null, null)));
+        assertEquals(503, statusOf(() -> noStoreRoutes.revokeFile("chat", "f1", "alice", null, null, null)));
+
+        // memory 缺席：撤销成功、chunks_removed 数值为 0。
+        AgentRuntime noMemory = runtime(Map.of("chat", graphStub("chat")), null, null,
+                fileStore, null, null, null);
+        Map<String, Object> out = mapOf(new FilesRoutes(noMemory, PASS_THROUGH_AUTH)
+                .revokeFile("chat", "f1", "alice", null, null, null));
+        assertEquals(true, out.get("deleted"));
+        assertEquals(0, out.get("chunks_removed"));
+        verify(fileStore).deleteFile("f1");
+
+        // 对照：memory 在 → 级联撤销的知识库分块数值原样透传（#290 级联）。
+        AgentRuntime withMemory = runtime(Map.of("chat", graphStub("chat")), null, null,
+                fileStore, memory, null, null);
+        when(memory.revokeDocument("f1", "alice")).thenReturn(7);
+        Map<String, Object> cascaded = mapOf(new FilesRoutes(withMemory, PASS_THROUGH_AUTH)
+                .revokeFile("chat", "f1", "alice", null, null, null));
+        assertEquals(7, cascaded.get("chunks_removed"));
+        verify(memory).revokeDocument("f1", "alice");
     }
 }

@@ -318,4 +318,64 @@ class FilesRoutesTest {
         awaitBackgroundDrain();
         assertTrue(!imgMemCalls.contains("ingestDocument"), imgMemCalls.toString());
     }
+
+    @Test
+    void uploadSizeBoundaryIsInclusiveAndStreamOverrunStill413() throws Exception {
+        // #290：413 边界恰好 = maxInputBytes 放行（上限是闭区间），+1 拒；
+        // 说谎 size 的 +1 由流式读取的边读边判拦下（早退只是优化不是唯一
+        // 检查点）。
+        Settings settings = Settings.load(Map.of(
+                "ENV", "development",
+                "DOC_PARSE_MAX_INPUT_BYTES", "1024"));
+
+        // 1) 声明 = 实际 = maxBytes → 恰好过（txt 解析成功入库）。
+        List<String> okCalls = new java.util.concurrent.CopyOnWriteArrayList<>();
+        AgentRuntime ok = buildRuntime(settings, recordingFileStore(okCalls));
+        byte[] exact = new byte[1024];
+        java.util.Arrays.fill(exact, (byte) 'x');
+        Map<String, Object> meta = new FilesRoutes(ok, PASS_THROUGH_AUTH)
+                .uploadFile("chat",
+                        new MockMultipartFile("file", "exact.txt", "text/plain", exact),
+                        "u1", null, null, null);
+        assertEquals("txt", meta.get("format"));
+        assertEquals(1024, meta.get("text_len"));
+        assertTrue(okCalls.contains("save"), okCalls.toString());
+
+        // 2) 声明 = 实际 = maxBytes + 1 → 早退 413，零落库。
+        List<String> overCalls = new java.util.concurrent.CopyOnWriteArrayList<>();
+        AgentRuntime over = buildRuntime(settings, recordingFileStore(overCalls));
+        HttpError early = httpErrorOf(() -> new FilesRoutes(over, PASS_THROUGH_AUTH)
+                .uploadFile("chat",
+                        new MockMultipartFile("file", "big.txt", "text/plain", new byte[1025]),
+                        "u1", null, null, null));
+        assertEquals(413, early.status());
+        assertTrue(early.getMessage().contains("1024"), early.getMessage());
+        assertTrue(!overCalls.contains("save"), overCalls.toString());
+
+        // 3) 声明 1、实际 maxBytes + 1 → 流中 413（早退被说谎绕过也不放行）。
+        HttpError midStream = httpErrorOf(() -> new FilesRoutes(over, PASS_THROUGH_AUTH)
+                .uploadFile("chat",
+                        new LyingSizeMultipartFile("big.bin", new byte[1025]),
+                        "u1", null, null, null));
+        assertEquals(413, midStream.status());
+        assertTrue(!overCalls.contains("save"), overCalls.toString());
+    }
+
+    @Test
+    void corruptPdfGivesParseFailure400WithoutSaving() throws Exception {
+        // #290：解析失败 400 的专属文案（PDF 损坏分支），且失败路径零落库
+        // （400 早退先于 fileStore.save）。
+        Settings settings = Settings.load(Map.of("ENV", "development"));
+        List<String> calls = new java.util.concurrent.CopyOnWriteArrayList<>();
+        AgentRuntime runtime = buildRuntime(settings, recordingFileStore(calls));
+        FilesRoutes routes = new FilesRoutes(runtime, PASS_THROUGH_AUTH);
+
+        byte[] garbage = new byte[]{(byte) 0xDE, (byte) 0xAD, (byte) 0xBE, (byte) 0xEF};
+        HttpError error = httpErrorOf(() -> routes.uploadFile("chat",
+                new MockMultipartFile("file", "broken.pdf", "application/pdf", garbage),
+                "u1", null, null, null));
+        assertEquals(400, error.status());
+        assertTrue(error.getMessage().contains("PDF 解析失败"), error.getMessage());
+        assertTrue(!calls.contains("save"), calls.toString());
+    }
 }
