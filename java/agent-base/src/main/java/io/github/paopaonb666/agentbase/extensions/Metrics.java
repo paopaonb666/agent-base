@@ -35,8 +35,10 @@ public final class Metrics {
     /** 每条序列保留的延迟样本上限：直方图只反映最近的窗口。 */
     public static final int MAX_SAMPLES_PER_ROUTE = 1000;
 
-    /** 工具执行结果的封闭枚举（label 不接纳任意字符串，防基数爆炸）。 */
-    public static final List<String> TOOL_OUTCOMES = List.of("ok", "timeout", "error");
+    /** 工具执行结果的封闭枚举（label 不接纳任意字符串，防基数爆炸）。
+     * invalid = 参数校验失败短路（#334/#335，工具未执行）。 */
+    public static final List<String> TOOL_OUTCOMES =
+            List.of("ok", "timeout", "error", "invalid");
 
     /** 记忆系统操作的封闭枚举（M6）。 */
     public static final List<String> MEMORY_OUTCOMES = List.of("ok", "error", "degraded");

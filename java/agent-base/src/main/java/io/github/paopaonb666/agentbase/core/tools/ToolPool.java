@@ -39,7 +39,8 @@ import io.github.paopaonb666.agentbase.extensions.toollog.ToolCallRecorder;
  * 方一侧得到遵守，超时后调用方立即收到超时文本；失控工具留在后台线程
  * 跑完直至自然结束（有界泄漏，已记录在案的权衡）。包装层同时是
  * <b>工具调用可观测的唯一收口</b>（M5）：执行前后发 {@code tool_call}
- * 流事件，完结时把记录交给 recorder 落库——成功、超时、异常三种结局
+ * 流事件，完结时把记录交给 recorder 落库——成功、超时、异常、参数校验
+ * 失败（outcome=invalid，#334/#335：不执行、回喂契约文本）四种结局
  * 都会被记录。
  *
  * <p>对应 Python 侧 {@code core/tools.py}。
@@ -148,6 +149,16 @@ public final class ToolPool {
         String resultText = "";
         String errorText = "";
         try {
+            // #334/#335：执行前对声明的参数面做轻校验，失败短路（不进工具
+            // 线程），回喂结构化错误让模型一轮自愈。契约见
+            // ToolArgsValidator.contractText，由 ToolPoolValidationTest 锁定。
+            java.util.List<String> validationErrors = validateArgs(entry.spec(), argsJson);
+            if (!validationErrors.isEmpty()) {
+                outcome = "invalid";
+                errorText = io.github.paopaonb666.agentbase.toolkit.ToolArgsValidator
+                        .contractText(validationErrors);
+                return errorText;
+            }
             Future<String> future = executor.submit(
                     (java.util.concurrent.Callable<String>) () ->
                             entry.inner().call(argsJson, new AgentTool.ToolContext(config, ctx)));
@@ -178,6 +189,19 @@ public final class ToolPool {
             long durationMs = (System.nanoTime() - started) / 1_000_000;
             track(ctx, callId, name, safeArgs, started, outcome, resultText, errorText, durationMs);
         }
+    }
+
+    /** 执行前校验：解析失败按一条结构化错误处理（空参视作 {}）。 */
+    private static java.util.List<String> validateArgs(ToolSpecification spec, String argsJson) {
+        com.fasterxml.jackson.databind.JsonNode parsed;
+        try {
+            parsed = MAPPER.readTree(argsJson == null || argsJson.strip().isEmpty()
+                    ? "{}" : argsJson);
+        } catch (Exception e) {
+            return java.util.List.of("参数必须是合法 JSON 对象（解析失败：" + e.getMessage() + "）");
+        }
+        return io.github.paopaonb666.agentbase.toolkit.ToolArgsValidator
+                .validate(spec.parameters(), parsed);
     }
 
     private static Exception asException(Throwable t) {
