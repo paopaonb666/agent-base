@@ -251,7 +251,8 @@ class BasicToolsTest {
     void jsonQueryMalformedPath() {
         String doc = "{\"json_text\": \"" + DOCUMENT.replace("\"", "\\\"") + "\", \"path\": \"%s\"}";
         expectError(() -> call(new JsonQueryTool(), doc.formatted("data[0")), "缺少右括号");
-        expectError(() -> call(new JsonQueryTool(), doc.formatted("data[x]")), "不是非负整数");
+        // #246：非整数下标报错放宽为"整数或引号键"（引号键是合法语法）
+        expectError(() -> call(new JsonQueryTool(), doc.formatted("data[x]")), "不是整数或引号键");
         expectError(() -> call(new JsonQueryTool(), doc.formatted("data..items")), "含空段");
     }
 
