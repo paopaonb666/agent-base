@@ -38,14 +38,29 @@ class MetricsRenderTest {
         assertTrue(body.contains(
                 "http_requests_total{method=\"GET\",route=\"" + route + "\",status=\"500\"} 1"));
         // 直方图按路由聚合（不分状态）：桶为累计口径（<= bound）。
+        // #265：逐 le 值 golden 断言覆盖全桶序列（含新增 30/60/120/300）。
         assertTrue(body.contains(
                 "http_request_duration_seconds_bucket{route=\"" + route + "\",le=\"0.01\"} 0"));
         assertTrue(body.contains(
                 "http_request_duration_seconds_bucket{route=\"" + route + "\",le=\"0.05\"} 1"));
         assertTrue(body.contains(
+                "http_request_duration_seconds_bucket{route=\"" + route + "\",le=\"0.1\"} 1"));
+        assertTrue(body.contains(
                 "http_request_duration_seconds_bucket{route=\"" + route + "\",le=\"0.5\"} 2"));
         assertTrue(body.contains(
                 "http_request_duration_seconds_bucket{route=\"" + route + "\",le=\"1.0\"} 3"));
+        assertTrue(body.contains(
+                "http_request_duration_seconds_bucket{route=\"" + route + "\",le=\"5.0\"} 3"));
+        assertTrue(body.contains(
+                "http_request_duration_seconds_bucket{route=\"" + route + "\",le=\"10.0\"} 3"));
+        assertTrue(body.contains(
+                "http_request_duration_seconds_bucket{route=\"" + route + "\",le=\"30.0\"} 3"));
+        assertTrue(body.contains(
+                "http_request_duration_seconds_bucket{route=\"" + route + "\",le=\"60.0\"} 3"));
+        assertTrue(body.contains(
+                "http_request_duration_seconds_bucket{route=\"" + route + "\",le=\"120.0\"} 3"));
+        assertTrue(body.contains(
+                "http_request_duration_seconds_bucket{route=\"" + route + "\",le=\"300.0\"} 3"));
         assertTrue(body.contains(
                 "http_request_duration_seconds_bucket{route=\"" + route + "\",le=\"+Inf\"} 3"));
         assertTrue(body.contains(
@@ -79,6 +94,27 @@ class MetricsRenderTest {
         assertTrue(http.render().contains(
                 "http_request_duration_seconds_count{route=\"" + route + "\"} "
                         + Metrics.MAX_SAMPLES_PER_ROUTE));
+    }
+
+    @Test
+    void extendedBucketsResolveLongToolDurations() {
+        // #265 分辨力用例：默认工具超时 30s、SSE 分钟级——旧上限 10.0 下
+        // 45s 样本只能落 +Inf。扩桶后 45s 落 60.0 桶（120/300 亦覆盖之），
+        // 不落 30.0 桶；+Inf 仍是样本总数口径。
+        String tool = uniq("slow");
+        Metrics.ToolMetrics toolMetrics = new Metrics.ToolMetrics();
+        toolMetrics.observeTool(tool, "ok", 45.0);
+        String body = toolMetrics.renderToolMetrics();
+        assertTrue(body.contains(
+                "tool_duration_seconds_bucket{tool=\"" + tool + "\",le=\"30.0\"} 0"));
+        assertTrue(body.contains(
+                "tool_duration_seconds_bucket{tool=\"" + tool + "\",le=\"60.0\"} 1"));
+        assertTrue(body.contains(
+                "tool_duration_seconds_bucket{tool=\"" + tool + "\",le=\"120.0\"} 1"));
+        assertTrue(body.contains(
+                "tool_duration_seconds_bucket{tool=\"" + tool + "\",le=\"300.0\"} 1"));
+        assertTrue(body.contains(
+                "tool_duration_seconds_bucket{tool=\"" + tool + "\",le=\"+Inf\"} 1"));
     }
 
     @Test

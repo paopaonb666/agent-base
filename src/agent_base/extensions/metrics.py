@@ -25,7 +25,11 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable
 
-BUCKETS: tuple[float, ...] = (0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0)
+# 延迟直方图共用桶（http/tool/memory 三段）：#265 扩展——旧上限 10.0 下，
+# 默认工具超时 30s 与 SSE 分钟级调用几乎全落 +Inf，直方图失去分辨力；
+# 30/60/120/300 覆盖长工具与流式调用。Java 侧 Metrics.BUCKETS 同值同步改，
+# 保渲染逐字节对齐。
+BUCKETS: tuple[float, ...] = (0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0)
 
 # 每条序列保留的延迟样本上限：长驻进程的直方图只反映最近的窗口，
 # 否则样本列表随请求数单调增长（内存 + 渲染成本）。
