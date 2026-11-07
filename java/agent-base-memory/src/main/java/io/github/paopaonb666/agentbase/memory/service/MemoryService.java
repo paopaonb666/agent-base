@@ -581,7 +581,9 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
 
     // ── 用户画像 ────────────────────────────────────────────────────────
 
-    /** 读取结构化用户画像（JSON dict）；不存在或畸形返回 null。 */
+    /**
+     * 读取结构化用户画像（JSON dict）；不存在或畸形返回 null。
+     */
     public Map<String, Object> getProfile(String userId) {
         MemoryRecord record = store.getMemory(Models.profileMemoryId(userId));
         if (record == null) {
@@ -765,10 +767,30 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
         }
     }
 
+    /**
+     * 线程删除的级联清理（#172 隐私语义）：默认 <b>保留跨会话记忆</b>——
+     * 随线程消亡的只有滚动摘要、知识库分块与注入快照；memories 表的行
+     * 独立于线程存活，出处字段 {@code source_thread_id} 原样保留，删除
+     * 线程不会抹掉用户攒下的长期记忆。与 Python 侧
+     * {@code service.py purge_thread} 同语义同保留（那边只删两表）。
+     */
     @Override
     public void purgeThread(String threadId) {
-        // 线程删除的级联清理（滚动摘要 + 知识库分块 + 注入快照；跨会话记忆保留）。
+        purgeThread(threadId, false);
+    }
+
+    /**
+     * #172 可选参数变体：{@code purgeMemories=true} 时连跨会话记忆一起删
+     * （按 {@code source_thread_id} 清理，出处字段随之消失）——供用户显式
+     * 要求彻底清除（如 GDPR 式删除）时使用。默认（false）行为与旧签名
+     * 完全一致，非 breaking；Python 端点暂未跟进该参数（行为分歧登记 #315）。
+     */
+    @Override
+    public void purgeThread(String threadId, boolean purgeMemories) {
         store.deleteForThread(threadId);
+        if (purgeMemories) {
+            store.deleteMemoriesForThread(threadId);
+        }
         synchronized (snapshotLock) {
             snapshots.keySet().removeIf(key -> key.size() == 3 && key.get(2).equals(threadId));
         }

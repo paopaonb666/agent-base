@@ -110,6 +110,16 @@ public interface AgentModule {
         /** 线程级联清理（摘要/分块/快照；跨会话记忆保留）。 */
         void purgeThread(String threadId);
 
+        /**
+         * #172 可选参数变体：{@code purgeMemories=true} 时连跨会话记忆一起删
+         * （按 source_thread_id 清理）——删除线程默认保留长期记忆，只有显式
+         * 彻底清除才置 true。默认忽略标记委托旧签名（保留记忆），装饰器/
+         * 替身无需逐个跟进（与下方 searchKnowledge 五参 default 同模式）。
+         */
+        default void purgeThread(String threadId, boolean purgeMemories) {
+            purgeThread(threadId);
+        }
+
         /** 文档入库：切块 + 向量化；返回写入的分块数。 */
         int ingestDocument(String fileId, String userId, String agentId, String text, String threadId);
 

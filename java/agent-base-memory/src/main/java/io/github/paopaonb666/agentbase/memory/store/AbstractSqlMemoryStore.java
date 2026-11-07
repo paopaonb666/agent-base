@@ -726,6 +726,12 @@ abstract class AbstractSqlMemoryStore implements MemoryStore {
         execute("DELETE FROM session_summaries WHERE thread_id = ?", threadId);
     }
 
+    /** #172：显式按线程清理跨会话记忆（purge_memories=true 才会走到）。 */
+    @Override
+    public int deleteMemoriesForThread(String threadId) {
+        return execute("DELETE FROM memories WHERE source_thread_id = ?", threadId);
+    }
+
     // ── 操作审计：memory_ops ─────────────────────────────────────────
 
     @Override

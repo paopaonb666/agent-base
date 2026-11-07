@@ -628,6 +628,10 @@ public class AgentsRoutes {
     }
 
     // ── DELETE /{module}/threads/{thread_id}：级联删除 ───────────────────
+    // 可选 ?purge_memories=true|1（#172，Java 单边增强，Python 端点未跟进
+    // ——行为分歧登记 #315）：删除线程默认保留跨会话记忆（删线程 ≠ 删记忆，
+    // memories 出处字段 source_thread_id 原样保留）；显式传 true 才连长期
+    // 记忆一起清（GDPR 式彻底删除）。
 
     @DeleteMapping("/{module}/threads/{thread_id}")
     public Map<String, Object> deleteThread(@PathVariable("module") String module,
@@ -635,7 +639,24 @@ public class AgentsRoutes {
                                             @RequestHeader(value = "X-User-Id", required = false) String userIdHeader,
                                             @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
                                             @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,
-                                            @RequestHeader(value = "X-User-Nonce", required = false) String nonceHeader) {
+                                            @RequestHeader(value = "X-User-Nonce", required = false) String nonceHeader,
+                                            @RequestParam(value = "purge_memories", required = false) String purgeMemories) {
+        // 缺省/非 true 值一律视为 false（保留记忆）；"1" 是惯用简写。
+        boolean purge = "true".equalsIgnoreCase(purgeMemories) || "1".equals(purgeMemories);
+        return deleteThread(module, threadId, userIdHeader, sigHeader, tsHeader, nonceHeader, purge);
+    }
+
+    /** 六参形态（purge_memories 缺省 false）：既有调用方/测试的兼容入口。 */
+    public Map<String, Object> deleteThread(String module, String threadId,
+                                            String userIdHeader, String sigHeader,
+                                            String tsHeader, String nonceHeader) {
+        return deleteThread(module, threadId, userIdHeader, sigHeader, tsHeader, nonceHeader, false);
+    }
+
+    public Map<String, Object> deleteThread(String module, String threadId,
+                                            String userIdHeader, String sigHeader,
+                                            String tsHeader, String nonceHeader,
+                                            boolean purgeMemories) {
         // 鉴权先行（对应 Python get_current_user 依赖）。
         String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         validateThreadId(threadId);
@@ -658,8 +679,10 @@ public class AgentsRoutes {
         }
         var memory = runtime.memory();
         if (memory != null) {
-            // 记忆级联（M6）：清摘要与知识库分块；跨会话记忆刻意保留。
-            memory.purgeThread(fullThreadId);
+            // 记忆级联（M6）：清摘要与知识库分块；跨会话记忆刻意保留
+            // （#172 隐私语义：删线程默认保留长期记忆）——purgeMemories=true
+            // 才按 source_thread_id 连 memories 一起删。
+            memory.purgeThread(fullThreadId, purgeMemories);
         }
         return Map.of("deleted", true);
     }

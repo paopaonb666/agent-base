@@ -536,6 +536,81 @@ class AgentsRoutesTest {
                 "memory:purgeThread"), calls);
     }
 
+    /** 记忆端口桩：purgeThread 记录两参重载的 purgeMemories 实参（keep/purge）。 */
+    private static Object purgeRecordingMemoryProxy(List<String> calls) {
+        return Proxy.newProxyInstance(
+                AgentModule.MemoryServicePort.class.getClassLoader(),
+                new Class<?>[]{AgentModule.MemoryServicePort.class},
+                (proxy, method, args) -> {
+                    if (method.getDeclaringClass() == Object.class) {
+                        return method.invoke(proxy, args);
+                    }
+                    if ("purgeThread".equals(method.getName())) {
+                        boolean purgeMemories = args != null && args.length == 2
+                                && Boolean.TRUE.equals(args[1]);
+                        calls.add("memory:purgeThread(" + (purgeMemories ? "purge" : "keep") + ")");
+                    } else {
+                        calls.add("memory:" + method.getName());
+                    }
+                    return defaultValue(method.getReturnType());
+                });
+    }
+
+    @Test
+    void deleteThreadPurgeMemoriesDefaultsToKeepAndOptInPurges() throws Exception {
+        // #172：删线程默认保留跨会话记忆（purge_memories 缺省 false）；
+        // "true"/"1" 才透传给 memory.purgeThread 两参重载（连 memories 一起
+        // 删），其余值与缺省一律视为 false。级联顺序不变（#213 基线）。
+        List<String> calls = new ArrayList<>();
+        Object index = Proxy.newProxyInstance(
+                io.github.paopaonb666.agentbase.core.storage.CoreStore.class.getClassLoader(),
+                new Class<?>[]{io.github.paopaonb666.agentbase.core.storage.CoreStore.class},
+                (proxy, method, args) -> {
+                    calls.add("index:" + method.getName());
+                    if ("getThreadIndex".equals(method.getName())) {
+                        return ThreadIndexRecord.create("chat:t1", "u1", "chat", "标题");
+                    }
+                    return defaultValue(method.getReturnType());
+                });
+        Object cp = recordingProxy(io.github.paopaonb666.agentbase.core.graph.Checkpointer.class,
+                calls, "cp");
+        Object fileStore = recordingProxy(
+                io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStore.class,
+                calls, "files");
+        Object memory = purgeRecordingMemoryProxy(calls);
+        AgentRuntime runtime = buildRuntime(Map.of("chat", stubModule("chat")),
+                cp, index, fileStore, memory, null, null);
+        AgentsRoutes routes = route(runtime);
+
+        // 缺省（六参兼容形态）：保留记忆。
+        routes.deleteThread("chat", "t1", "u1", null, null, null);
+        assertEquals(List.of(
+                "index:getThreadIndex",
+                "cp:deleteThread",
+                "files:deleteForThread",
+                "index:deleteThreadIndex",
+                "index:deletePlan",
+                "memory:purgeThread(keep)"), calls);
+
+        // purge_memories=true / "1"：透传 true，级联顺序不变。
+        for (String raw : new String[]{"true", "1"}) {
+            calls.clear();
+            routes.deleteThread("chat", "t1", "u1", null, null, null, raw);
+            assertEquals(List.of(
+                    "index:getThreadIndex",
+                    "cp:deleteThread",
+                    "files:deleteForThread",
+                    "index:deleteThreadIndex",
+                    "index:deletePlan",
+                    "memory:purgeThread(purge)"), calls, "purge_memories=" + raw);
+        }
+
+        // 其余值不误触发（仍是保留语义）。
+        calls.clear();
+        routes.deleteThread("chat", "t1", "u1", null, null, null, "yes");
+        assertEquals("memory:purgeThread(keep)", calls.get(calls.size() - 1));
+    }
+
     @Test
     void invokeUpsertsThreadIndexExactlyOnce() throws Exception {
         // #141：索引 upsert 收敛到 startStream 单次执行——非附件分支不再

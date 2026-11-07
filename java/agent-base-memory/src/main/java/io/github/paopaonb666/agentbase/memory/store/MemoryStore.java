@@ -122,6 +122,21 @@ public interface MemoryStore extends AutoCloseable {
     /** 线程级联清理（摘要/分块；跨会话记忆刻意保留——memories 不删）。 */
     void deleteForThread(String threadId);
 
+    /**
+     * #172 可选记忆清理：删除 {@code source_thread_id} 命中该线程的跨会话
+     * 记忆（含出处字段一并消失），返回删除的行数。普通级联清理
+     * ({@link #deleteForThread}) <b>刻意不删 memories</b>（删线程默认保留
+     * 长期记忆，隐私语义见 {@code MemoryService#purgeThread}）——只有调用方
+     * 显式要求彻底清除时才走本方法；{@code source_thread_id} 为空串的记忆
+     * （无线程出处）不受影响。默认抛 {@link UnsupportedOperationException}：
+     * 该操作是隐私语义的显式增强，静默返回 0 会让「彻底清除」变成无声空操作
+     * （API 仍报 deleted=true），fail-fast 优于假成功。
+     */
+    default int deleteMemoriesForThread(String threadId) {
+        throw new UnsupportedOperationException(
+                "deleteMemoriesForThread 未实现：本后端不支持按线程清理跨会话记忆");
+    }
+
     @Override
     default void close() {}
 }

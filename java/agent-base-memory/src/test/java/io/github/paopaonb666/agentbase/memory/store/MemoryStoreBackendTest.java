@@ -22,8 +22,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * 记忆存储层后端的全协议往返测试：临时 sqlite 文件库与进程内字典后端跑
  * 同一套断言（六张表核心路径：upsert/get/list 过滤/touch/delete/version/
- * ops/chunks 计数/deleteForThread 保留 memories），对应 Python 侧三个
- * 后端实现的行为契约。
+ * ops/chunks 计数/deleteForThread 保留 memories + deleteMemoriesForThread
+ * 显式清理），对应 Python 侧三个后端实现的行为契约。
  */
 class MemoryStoreBackendTest {
 
@@ -169,6 +169,7 @@ class MemoryStoreBackendTest {
         opsFilterAndCursorRoundTrip(store);
         deleteForThreadKeepsMemories(store);
         deleteMemory(store);
+        deleteMemoriesForThreadPurgesOnlyThatThread(store);
     }
 
     // ── memories：upsert/get 往返 + 写入边界校验 ─────────────────────
@@ -509,5 +510,29 @@ class MemoryStoreBackendTest {
         assertTrue(store.deleteMemory("m1"));
         assertNull(store.getMemory("m1"));
         assertFalse(store.deleteMemory("m1"));
+    }
+
+    // ── 线程级联：#172 deleteMemoriesForThread 只删命中线程 ──────────
+    // sqlite 覆盖 AbstractSqlMemoryStore 共享 DML（MySQL 后端同语句无需
+    // 另测）；InMemory 后端同语义独立断言——两个实现跑同一段。
+
+    private static void deleteMemoriesForThreadPurgesOnlyThatThread(MemoryStore store) {
+        store.upsertMemory(new Models.MemoryRecord(
+                "dz1", USER, "chat", "episodic", "目标线程记忆", List.of(), null, null,
+                0.5, "active", "chat:dz", List.of(), 7000.0, 7000.0, null, 0));
+        store.upsertMemory(new Models.MemoryRecord(
+                "dz2", USER, "chat", "semantic", "别的线程记忆", List.of(), null, null,
+                0.5, "active", "chat:other", List.of(), 7001.0, 7001.0, null, 0));
+
+        assertEquals(1, store.deleteMemoriesForThread("chat:dz"));
+
+        // 目标线程的记忆连出处一起消失。
+        assertNull(store.getMemory("dz1"));
+        // 别的线程、以及无线程出处（source_thread_id=''）的跨会话记忆不受影响。
+        assertNotEquals(null, store.getMemory("dz2"));
+        assertNotEquals(null, store.getMemory("m2"));
+
+        // 重复清理幂等（0 行）。
+        assertEquals(0, store.deleteMemoriesForThread("chat:dz"));
     }
 }

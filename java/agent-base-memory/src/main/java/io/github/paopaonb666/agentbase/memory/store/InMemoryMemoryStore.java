@@ -276,6 +276,23 @@ public final class InMemoryMemoryStore implements MemoryStore {
         }
     }
 
+    /** #172：显式按线程清理跨会话记忆（与 SQL 后端同语义）。 */
+    @Override
+    public int deleteMemoriesForThread(String threadId) {
+        synchronized (lock) {
+            int[] removed = {0};
+            memories.values().removeIf(record -> {
+                boolean hit = record.sourceThreadId() != null
+                        && record.sourceThreadId().equals(threadId);
+                if (hit) {
+                    removed[0]++;
+                }
+                return hit;
+            });
+            return removed[0];
+        }
+    }
+
     @Override
     public void recordOp(Models.MemoryOp op) {
         synchronized (lock) {

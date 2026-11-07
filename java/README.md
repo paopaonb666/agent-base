@@ -81,6 +81,7 @@ tool_call/plan/sources/done/error`）、端点路径与状态码语义与 Python
 
 | 差异 | 说明 |
 | --- | --- |
+| 删线程的 `purge_memories` 参数 | **隐私语义（#172）**：`DELETE /v1/agents/{module}/threads/{thread_id}` 默认只清滚动摘要、知识库分块与注入快照——**删线程不删长期记忆**，memories 行独立于线程存活、出处字段 `source_thread_id` 原样保留（与 Python 版同语义同保留）。Java 单边扩展：可选 `?purge_memories=true|1` 才连跨会话记忆一起清（GDPR 式彻底删除）；Python 端点暂未跟进（行为分歧登记 #315），默认行为两侧一致、无 breaking |
 | 对话状态存储 | Java 用自有 `ab_thread_states` JSON 快照表（checkpointer SPI 三后端：memory/sqlite/mysql），不读写 LangGraph 的 msgpack superstep 表。HTTP 行为等价；业务表 DDL 逐条一致，可与 Python 版共用同一 MySQL 库（checkpointer 表除外） |
 | 运行时 | 自建迷你图运行时复刻本项目实际用到的 LangGraph 语义子集（节点/条件边/三通道流式/按线程状态快照/recursion limit）；supervisor 以 handoff 工具模式自实现（决策记录：`docs/adr/004-java-mini-graph-engine.md`） |
 | 未迁移项 | MCP（启用即报错）/ python_repl（专用「未迁移」错误）/ DuckDuckGo 引擎（构建期报错）——启用即承诺契约保留，默认配置不受影响 |
