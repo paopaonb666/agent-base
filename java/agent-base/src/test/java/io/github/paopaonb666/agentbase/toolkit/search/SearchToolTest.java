@@ -119,10 +119,63 @@ class SearchToolTest {
         server.createContext("/fail", exchange -> exchange.sendResponseHeaders(500, -1));
         TavilyHttpClient failing = new TavilyHttpClient("test-key", 15.0, HttpClient.newHttpClient(),
                 URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/fail"));
-        // 非 2xx → IOException（对应 raise_for_status），由管理器降级吞掉。
+        // 非 2xx → IOException（对应 raise_for_status），由管理器降级。
         assertThrows(IOException.class, () -> failing.search("q", 3));
         FallbackSearchManager manager = new FallbackSearchManager(List.of(failing));
         assertTrue(manager.search("q", 3).isEmpty());
+    }
+
+    // ── 瞬时失败重试与代理解析（#243） ──────────────────────────────
+
+    @Test
+    void tavilyRetriesOnceOnTransient5xxThenSucceeds() throws Exception {
+        java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();
+        server.createContext("/flaky", exchange -> {
+            int attempt = calls.incrementAndGet();
+            if (attempt == 1) {
+                exchange.sendResponseHeaders(503, -1);
+                exchange.close();
+                return;
+            }
+            byte[] body = SEARCH_RESPONSE_JSON.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        TavilyHttpClient flaky = new TavilyHttpClient("test-key", 15.0, HttpClient.newHttpClient(),
+                URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/flaky"));
+        assertEquals(3, flaky.search("q", 5).size());
+        assertEquals(2, calls.get(), "5xx 后应恰好重试一次");
+    }
+
+    @Test
+    void tavilyDoesNotRetryOnAuthError() throws Exception {
+        java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();
+        server.createContext("/unauthorized", exchange -> {
+            calls.incrementAndGet();
+            exchange.sendResponseHeaders(401, -1);
+            exchange.close();
+        });
+        TavilyHttpClient unauthorized = new TavilyHttpClient("bad", 15.0,
+                HttpClient.newHttpClient(),
+                URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/unauthorized"));
+        assertThrows(IOException.class, () -> unauthorized.search("q", 3));
+        assertEquals(1, calls.get(), "4xx 语义错误不重试");
+    }
+
+    @Test
+    void proxyParserAcceptsUrlAndHostPortForms() {
+        var withScheme = TavilyHttpClient.parseProxy("http://127.0.0.1:8080");
+        assertEquals("127.0.0.1", withScheme.getAddress().getHostAddress());
+        assertEquals(8080, withScheme.getPort());
+        var bare = TavilyHttpClient.parseProxy("proxy.internal:9090");
+        assertEquals(9090, bare.getPort());
+        // 非法形态 → null（直连），绝不让代理配置炸掉引擎构造
+        assertEquals(null, TavilyHttpClient.parseProxy(null));
+        assertEquals(null, TavilyHttpClient.parseProxy("  "));
+        assertEquals(null, TavilyHttpClient.parseProxy("no-port"));
+        assertEquals(null, TavilyHttpClient.parseProxy("http://host:notaport"));
     }
 
     // ── 降级管理器 ───────────────────────────────────────────────────

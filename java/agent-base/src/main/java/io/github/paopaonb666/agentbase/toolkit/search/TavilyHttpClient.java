@@ -41,10 +41,61 @@ public final class TavilyHttpClient implements SearchEngine {
     private final HttpClient http;
     private final URI endpoint;
 
-    /** 生产路径：默认端点 + 默认 HttpClient。 */
+    /** 瞬时失败的退避重试间隔（#243：查询幂等，1 次重试安全）。 */
+    static final long RETRY_BACKOFF_MS = 500;
+
+    /** 生产路径：默认端点 + 默认 HttpClient（HTTP(S)_PROXY 生效，#243）。 */
     public TavilyHttpClient(String apiKey, double timeoutSeconds) {
-        this(apiKey, timeoutSeconds, HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(10)).build(), URI.create(ENDPOINT));
+        this(apiKey, timeoutSeconds, defaultHttpClient(), URI.create(ENDPOINT));
+    }
+
+    /**
+     * 默认 HttpClient：连接超时 10s；企业内网经 {@code HTTPS_PROXY} /
+     * {@code HTTP_PROXY}（小写同认）走代理——tavily 端点是 https，
+     * HTTPS_PROXY 优先。解析失败静默忽略（直连）。
+     */
+    static HttpClient defaultHttpClient() {
+        HttpClient.Builder builder = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(10));
+        String proxy = firstNonBlank(System.getenv("HTTPS_PROXY"), System.getenv("https_proxy"),
+                System.getenv("HTTP_PROXY"), System.getenv("http_proxy"));
+        java.net.InetSocketAddress address = parseProxy(proxy);
+        if (address != null) {
+            builder.proxy(java.net.ProxySelector.of(address));
+        }
+        return builder.build();
+    }
+
+    static String firstNonBlank(String... values) {
+        for (String value : values) {
+            if (value != null && !value.isBlank()) {
+                return value.strip();
+            }
+        }
+        return null;
+    }
+
+    /** 解析 {@code http://host:port} / {@code host:port}；非法返回 null（直连）。 */
+    static java.net.InetSocketAddress parseProxy(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        String text = value.strip();
+        if (text.startsWith("http://") || text.startsWith("https://")) {
+            text = text.substring(text.indexOf("://") + 3);
+        }
+        int colon = text.lastIndexOf(':');
+        if (colon <= 0 || colon == text.length() - 1) {
+            return null;
+        }
+        try {
+            // InetSocketAddress(host, port) 不做即时 DNS 解析（未知主机生成
+            // unresolved 地址），离线环境下构造也不炸
+            return new java.net.InetSocketAddress(text.substring(0, colon),
+                    Integer.parseInt(text.substring(colon + 1)));
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /** 测试路径：注入 HttpClient 与端点（对应 Python 的 MockTransport）。 */
@@ -76,6 +127,50 @@ public final class TavilyHttpClient implements SearchEngine {
 
     private List<SearchResult> searchWith(String query, int maxResults, Duration effective)
             throws Exception {
+        // #243：瞬时失败（网络异常 / 5xx / 429）1 次退避重试——查询幂等；
+        // 4xx（鉴权/配额语义错误）不重试。重试沿用同一有效超时，整体仍受
+        // 管线 deadline（#242）与共享池挂钟预算双重约束。
+        int attempt = 0;
+        while (true) {
+            attempt++;
+            try {
+                return searchOnce(query, maxResults, effective);
+            } catch (java.net.http.HttpTimeoutException | java.net.ConnectException e) {
+                if (attempt >= 2) {
+                    throw e;
+                }
+                backoff();
+            } catch (HttpStatusException e) {
+                boolean transientStatus = e.status >= 500 || e.status == 429;
+                if (attempt >= 2 || !transientStatus) {
+                    throw e;
+                }
+                backoff();
+            }
+        }
+    }
+
+    private static void backoff() throws IOException {
+        try {
+            Thread.sleep(RETRY_BACKOFF_MS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Tavily 重试等待被中断");
+        }
+    }
+
+    /** 带 HTTP 状态码的失败（区分可重试的 5xx/429 与终态 4xx）。 */
+    private static final class HttpStatusException extends IOException {
+        final int status;
+
+        HttpStatusException(int status, String bodyAbbreviated) {
+            super("Tavily HTTP " + status + ": " + bodyAbbreviated);
+            this.status = status;
+        }
+    }
+
+    private List<SearchResult> searchOnce(String query, int maxResults, Duration effective)
+            throws Exception {
         ObjectNode body = MAPPER.createObjectNode();
         body.put("query", query);
         body.put("search_depth", "basic");
@@ -92,8 +187,7 @@ public final class TavilyHttpClient implements SearchEngine {
         HttpResponse<String> resp = http.send(request, HttpResponse.BodyHandlers.ofString());
         if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
             // 对应 Python 的 resp.raise_for_status()：交由管理器降级。
-            throw new IOException("Tavily HTTP " + resp.statusCode() + ": "
-                    + abbreviate(resp.body()));
+            throw new HttpStatusException(resp.statusCode(), abbreviate(resp.body()));
         }
         JsonNode data = MAPPER.readTree(resp.body());
         List<SearchResult> results = new ArrayList<>();
