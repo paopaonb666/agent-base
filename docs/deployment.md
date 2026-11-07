@@ -215,6 +215,34 @@ production 且 `MEMORY_ENABLED=true` 时未配 `MEMORY_AUTH_SECRET` 会**拒绝�
 网关层实现真实身份体系，并通过 `create_app(auth_backend=...)` 注入，
 无需修改路由。
 
+### 数据库最小权限（MySQL）
+
+工具审计与成本账本是**只追加**表：两侧实现（Python 与 Java 重构版）对它们
+只发 `INSERT` 与 `SELECT`，从不 `UPDATE`/`DELETE`——表名与 DDL 逐条一致
+（`tool_call_records`，见 `src/agent_base/extensions/toollog.py` 与
+`java/.../extensions/toollog/ToolCallLoggers.java` 的 MySQL DDL；
+`cost_usage`，见 `extensions/costmeter.py` 与
+`java/.../extensions/costmeter/CostLedgers.java`）。这类"事后不可篡改"的
+语义适合下沉到 DB 层强制：给应用账号收紧这两张表的写权限，即使应用被攻破
+或出现 bug，审计与账本记录也无法被改写或抹除。
+
+```sql
+-- <库>/<账号> 按实际部署替换（docker-compose 默认 agent_base/agent）。
+-- 只收这两张 append-only 表：checkpointer、记忆等表需要正常 UPDATE/DELETE，
+-- 不要对整个库执行。
+REVOKE UPDATE, DELETE ON agent_base.tool_call_records FROM 'agent'@'%';
+REVOKE UPDATE, DELETE ON agent_base.cost_usage          FROM 'agent'@'%';
+```
+
+应用账号保留 `INSERT`/`SELECT`：审计查询端点（`GET …/tool-calls`）与预算
+熔断的 `SUM()` 读路径不受影响；`BufferedCostLedger` 的失败重放也是纯
+`INSERT`。迁移/建表（alembic 两条链）需要 DDL 权限，应由部署方账号执行，
+与日常运行的应用账号分离。
+
+> 曾考虑的 hash-chain 式审计链（旧 #86）被裁决拒绝：其威胁模型在单机/内网
+> 自用部署下不成立，而 DB 层 `REVOKE` 以低得多的复杂度给出更强的保证
+>（防改写靠数据库权限，不靠应用代码自觉）。
+
 ### 其它边界
 
 - 上传文件按 magic bytes 校验图片、文档解析有输入/输出上限；

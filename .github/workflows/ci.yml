@@ -186,6 +186,36 @@ jobs:
       - name: Maven verify
         run: mvn -B --file java/pom.xml verify
 
+  java-dependency-check:
+    # Java 侧依赖审计门（对齐 Python audit job 的 pip-audit）：经 -Powasp
+    # 触发 OWASP dependency-check，CVSS>=9 fail（阈值与豁免规则见
+    # java/pom.xml 的 owasp profile）。首次冷跑需全量下载 NVD feed，
+    # actions/cache 缓存数据目录加速。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Cache NVD data
+        uses: actions/cache@v4
+        with:
+          path: ~/.dependency-check
+          key: dependency-check-nvd-${{ runner.os }}
+      - name: OWASP dependency-check
+        env:
+          # 可选 secret：未配置时为空串，下方按需省略 -DnvdApiKey
+          #（匿名访问 NVD 限流更严、跑得慢，但不失败）。
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        run: |
+          OPTS=""
+          if [ -n "$NVD_API_KEY" ]; then
+            OPTS="-DnvdApiKey=$NVD_API_KEY"
+          fi
+          mvn -B --file java/pom.xml -Powasp org.owasp:dependency-check-maven:check $OPTS
+
   docker:
     # Verify the container image still builds on every push/PR.
     runs-on: ubuntu-latest
