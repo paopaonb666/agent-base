@@ -307,7 +307,7 @@ public final class Embeddings {
             LOG.info("memory: 语义检索已禁用（MEMORY_EMBEDDING_ENABLED=false）");
             return new NullEmbedding();
         }
-        String apiKey = settings.memory.embeddingApiKey.strip();
+        String apiKey = settings.memory.embeddingApiKey.value().strip();
         if (apiKey.isEmpty()) {
             LOG.info("memory: 未配置 MEMORY_EMBEDDING_API_KEY，检索走关键词降级");
             return new NullEmbedding();

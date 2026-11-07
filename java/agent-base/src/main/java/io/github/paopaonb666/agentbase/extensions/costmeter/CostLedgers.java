@@ -284,7 +284,7 @@ public final class CostLedgers {
             var s = settings.checkpointer;
             return DriverManager.getConnection(
                     "jdbc:mysql://%s:%d/%s".formatted(s.mysqlHost, s.mysqlPort, s.mysqlDatabase),
-                    s.mysqlUser, s.mysqlPassword);
+                    s.mysqlUser, s.mysqlPassword.value());
         }
 
         /** 幂等建表（每连接首次操作时执行一次；对应 Python _ensure_table）。 */

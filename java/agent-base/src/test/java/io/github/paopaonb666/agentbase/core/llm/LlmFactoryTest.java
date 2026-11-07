@@ -1,5 +1,6 @@
 package io.github.paopaonb666.agentbase.core.llm;
 
+import io.github.paopaonb666.agentbase.core.config.Secret;
 import io.github.paopaonb666.agentbase.core.config.Settings;
 import org.junit.jupiter.api.Test;
 
@@ -21,7 +22,7 @@ class LlmFactoryTest {
 
     private static Settings settingsWithFast() {
         Settings settings = new Settings();
-        settings.llm.apiKey = "sk-test";
+        settings.llm.apiKey = Secret.of("sk-test");
         settings.llm.model = "deepseek-chat";
         settings.llmFast.baseUrl = "https://api.siliconflow.cn/v1";
         settings.llmFast.model = "THUDM/glm-4-9b-chat";
@@ -43,7 +44,7 @@ class LlmFactoryTest {
     @Test
     void fastUnconfiguredReturnsNull() {
         Settings settings = new Settings(); // LLM_FAST_* 全空 = 未配置
-        settings.llm.apiKey = "sk-test";
+        settings.llm.apiKey = Secret.of("sk-test");
         assertNull(LlmFactory.buildLlm(settings, "fast", null),
                 "快档是优化不是依赖：未配置时调用方回落主力，不报错");
     }
@@ -51,7 +52,7 @@ class LlmFactoryTest {
     @Test
     void fastPartiallyConfiguredReturnsNull() {
         Settings settings = new Settings(); // 只有 base_url，缺 model = 未配置
-        settings.llm.apiKey = "sk-test";
+        settings.llm.apiKey = Secret.of("sk-test");
         settings.llmFast.baseUrl = "https://api.siliconflow.cn/v1";
         assertNull(LlmFactory.buildLlm(settings, "fast", null));
     }

@@ -545,7 +545,7 @@ public final class UploadedFileStores {
             var s = settings.checkpointer;
             return DriverManager.getConnection(
                     "jdbc:mysql://%s:%d/%s".formatted(s.mysqlHost, s.mysqlPort, s.mysqlDatabase),
-                    s.mysqlUser, s.mysqlPassword);
+                    s.mysqlUser, s.mysqlPassword.value());
         }
 
         @Override

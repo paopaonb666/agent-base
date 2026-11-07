@@ -52,7 +52,7 @@ public final class MysqlCheckpointer implements Checkpointer {
                 + "&allowPublicKeyRetrieval=true&useSSL=false")
                 .formatted(s.mysqlHost, s.mysqlPort, s.mysqlDatabase);
         this.user = s.mysqlUser;
-        this.password = s.mysqlPassword;
+        this.password = s.mysqlPassword.value();
     }
 
     /**

@@ -83,7 +83,7 @@ public final class WebSearchTool implements AgentTool {
         return new WebSearchTool(
                 new FallbackSearchManager(Engines.buildEngines(
                         Engines.parsePriority(settings.search.enginePriority),
-                        settings.search.tavilyApiKey,
+                        settings.search.tavilyApiKey.value(),
                         settings.search.timeoutSeconds)),
                 new SearchCache(settings.search.cacheTtlSeconds),
                 settings.search.timeoutSeconds);
@@ -96,7 +96,7 @@ public final class WebSearchTool implements AgentTool {
      */
     public static boolean available(Settings settings) {
         return !Engines.usableEngines(Engines.parsePriority(settings.search.enginePriority),
-                settings.search.tavilyApiKey).isEmpty();
+                settings.search.tavilyApiKey.value()).isEmpty();
     }
 
     /** 测试路径：注入替身引擎（对应 Python 的 engine_factory 注入点）。 */

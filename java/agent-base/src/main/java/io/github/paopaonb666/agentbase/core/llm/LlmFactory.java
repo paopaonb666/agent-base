@@ -67,14 +67,14 @@ public final class LlmFactory {
             model = fast.model;
             baseUrl = fast.baseUrl;
             // 快档未单独配 key 时共用主力 key（同一 provider 双档的常见形态）。
-            String fastKey = fast.apiKey == null ? "" : fast.apiKey.strip();
-            String mainKey = settings.llm.apiKey == null ? "" : settings.llm.apiKey.strip();
+            String fastKey = fast.apiKey.value().strip();
+            String mainKey = settings.llm.apiKey.value().strip();
             apiKey = !fastKey.isEmpty() ? fastKey : mainKey;
             toolSafeStreaming = true;
         } else {
             model = settings.llm.model;
             baseUrl = settings.llm.baseUrl;
-            apiKey = settings.llm.apiKey == null ? "" : settings.llm.apiKey.strip();
+            apiKey = settings.llm.apiKey.value().strip();
             toolSafeStreaming = false;
         }
         if (apiKey.isEmpty()) {

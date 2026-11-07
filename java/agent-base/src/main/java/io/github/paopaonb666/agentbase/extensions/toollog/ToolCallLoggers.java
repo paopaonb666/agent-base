@@ -226,7 +226,7 @@ public final class ToolCallLoggers {
             // 记忆 store 同批合并）。
             return io.github.paopaonb666.agentbase.core.storage.MySqlPools.pool(
                     "jdbc:mysql://%s:%d/%s".formatted(s.mysqlHost, s.mysqlPort, s.mysqlDatabase),
-                    s.mysqlUser, s.mysqlPassword).getConnection();
+                    s.mysqlUser, s.mysqlPassword.value()).getConnection();
         }
 
         @Override

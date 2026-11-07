@@ -45,7 +45,7 @@ public final class MysqlCoreStore extends AbstractSqlCoreStore {
                 + "&allowPublicKeyRetrieval=true&useSSL=false")
                 .formatted(s.mysqlHost, s.mysqlPort, s.mysqlDatabase);
         this.user = s.mysqlUser;
-        this.password = s.mysqlPassword;
+        this.password = s.mysqlPassword.value();
         // 不在构造期建连：惰性建表挂在 execute/fetchAll 的 ensureTables 上
         // （Python 语义——首个操作自愈，装配永远成功）。
     }

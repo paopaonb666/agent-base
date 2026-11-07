@@ -24,6 +24,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import io.github.paopaonb666.agentbase.core.config.Secret;
 import io.github.paopaonb666.agentbase.core.config.Settings;
 import io.github.paopaonb666.agentbase.core.tools.AgentTool;
 
@@ -501,12 +502,12 @@ class SearchToolTest {
         assertFalse(WebSearchTool.available(settings));
         assertTrue(Engines.buildEngines(
                 Engines.parsePriority(settings.search.enginePriority),
-                settings.search.tavilyApiKey, settings.search.timeoutSeconds).isEmpty());
-        settings.search.tavilyApiKey = "tvly-test";
+                settings.search.tavilyApiKey.value(), settings.search.timeoutSeconds).isEmpty());
+        settings.search.tavilyApiKey = Secret.of("tvly-test");
         assertTrue(WebSearchTool.available(settings));
         assertEquals(1, Engines.buildEngines(
                 Engines.parsePriority(settings.search.enginePriority),
-                settings.search.tavilyApiKey, settings.search.timeoutSeconds).size());
+                settings.search.tavilyApiKey.value(), settings.search.timeoutSeconds).size());
     }
 
     @Test

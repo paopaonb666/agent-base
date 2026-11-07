@@ -1,5 +1,6 @@
 package io.github.paopaonb666.agentbase.entrypoints.server;
 
+import io.github.paopaonb666.agentbase.core.config.Secret;
 import io.github.paopaonb666.agentbase.core.config.Settings;
 import org.junit.jupiter.api.Test;
 
@@ -19,7 +20,7 @@ class AuthBoundaryTest {
 
     private static Settings settings(int window) {
         Settings s = new Settings();
-        s.memory.authSecret = SECRET;
+        s.memory.authSecret = Secret.of(SECRET);
         s.memory.authReplayWindowSeconds = window;
         return s;
     }

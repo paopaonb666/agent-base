@@ -60,7 +60,7 @@ public final class AuthBackends {
      * 横幅提示（组合根调用，这里只给判定，方便测试锁定条件）。
      */
     public static boolean unauthenticatedDeployment(Settings settings) {
-        return settings.memory.enabled && settings.memory.authSecret.strip().isEmpty();
+        return settings.memory.enabled && settings.memory.authSecret.isBlank();
     }
 
     /** 无鉴权部署的启动横幅文案（醒目、可执行）。 */
@@ -110,7 +110,7 @@ public final class AuthBackends {
             } else {
                 userId = userIdHeader;
             }
-            String secret = settings.memory.authSecret.strip();
+            String secret = settings.memory.authSecret.value().strip();
             if (!secret.isEmpty()) {
                 long window = settings.memory.authReplayWindowSeconds;
                 String timestamp = "";

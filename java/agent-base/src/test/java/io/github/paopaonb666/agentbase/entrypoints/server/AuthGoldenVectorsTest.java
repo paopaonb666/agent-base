@@ -1,5 +1,7 @@
 package io.github.paopaonb666.agentbase.entrypoints.server;
 
+import io.github.paopaonb666.agentbase.core.config.Secret;
+
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -32,7 +34,7 @@ class AuthGoldenVectorsTest {
         AuthBackends.HmacHeaderAuth auth = new AuthBackends.HmacHeaderAuth();
         io.github.paopaonb666.agentbase.core.config.Settings settings =
                 new io.github.paopaonb666.agentbase.core.config.Settings();
-        settings.memory.authSecret = SECRET;
+        settings.memory.authSecret = Secret.of(SECRET);
         settings.memory.authReplayWindowSeconds = 0; // 旧方案：message = user_id
         String sig = AuthBackends.HmacHeaderAuth.hmacSha256Hex(SECRET, "alice");
         assertEquals("alice", auth.authenticate("alice", sig, null, null, settings));
@@ -52,7 +54,7 @@ class AuthGoldenVectorsTest {
         assertTrue(AuthBackends.unauthenticatedDeployment(bare),
                 "默认配置（memory.enabled=true、secret 空）即无鉴权部署");
         assertEquals(true, AuthBackends.unauthenticatedBanner().contains("default"));
-        bare.memory.authSecret = "s";
+        bare.memory.authSecret = Secret.of("s");
         assertFalse(AuthBackends.unauthenticatedDeployment(bare));
         io.github.paopaonb666.agentbase.core.config.Settings memoryOff =
                 new io.github.paopaonb666.agentbase.core.config.Settings();

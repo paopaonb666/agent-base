@@ -10,6 +10,7 @@ import java.util.Set;
 
 import org.junit.jupiter.api.Test;
 
+import io.github.paopaonb666.agentbase.core.config.Secret;
 import io.github.paopaonb666.agentbase.core.config.Settings;
 import io.github.paopaonb666.agentbase.core.tools.AgentTool;
 
@@ -81,7 +82,7 @@ class ToolkitRegistryTest {
         // priority 指到 tavily 且配置了 key → 注册成功（引擎构建不打网络）。
         Settings s = settingsWith(List.of("web_search"));
         s.search.enginePriority = "tavily";
-        s.search.tavilyApiKey = fakeKey();
+        s.search.tavilyApiKey = Secret.of(fakeKey());
         List<AgentTool> tools = Toolkits.buildToolkitTools(s);
         assertEquals(List.of("web_search"), tools.stream().map(AgentTool::name).toList());
     }
@@ -99,7 +100,7 @@ class ToolkitRegistryTest {
     void timeoutsCollectedOnlyForEnabled() {
         Settings s = settingsWith(List.of("current_time", "web_search"));
         s.search.enginePriority = "tavily";
-        s.search.tavilyApiKey = fakeKey();
+        s.search.tavilyApiKey = Secret.of(fakeKey());
         Map<String, Double> timeouts = Toolkits.toolkitTimeouts(s);
         assertEquals(Map.of("web_search", 25.0), timeouts);
     }

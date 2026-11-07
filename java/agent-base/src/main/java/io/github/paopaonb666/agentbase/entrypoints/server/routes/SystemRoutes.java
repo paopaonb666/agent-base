@@ -86,7 +86,7 @@ public class SystemRoutes {
         String url = baseUrl.replaceAll("/+$", "") + "/models";
         String status;
         try {
-            java.net.http.HttpResponse<String> response = fetcher.fetch(url, settings.llm.apiKey);
+            java.net.http.HttpResponse<String> response = fetcher.fetch(url, settings.llm.apiKey.value());
             if (response.statusCode() < 200 || response.statusCode() >= 300) {
                 status = "error:http:" + response.statusCode();
             } else if (!modelsShapeValid(response.body())) {
@@ -148,7 +148,7 @@ public class SystemRoutes {
             components.put("checkpointer", runtime.checkpointer().healthy() ? "ok" : "error");
         }
         Settings settings = runtime.settings();
-        String key = settings.llm.apiKey.strip();
+        String key = settings.llm.apiKey.value().strip();
         if (key.isEmpty()) {
             components.put("model", "unconfigured");
         } else if (!settings.llm.baseUrl.startsWith("http://")

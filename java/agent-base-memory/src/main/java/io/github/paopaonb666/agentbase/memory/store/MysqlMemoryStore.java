@@ -47,7 +47,7 @@ public final class MysqlMemoryStore extends AbstractSqlMemoryStore {
                 + "&allowPublicKeyRetrieval=true&useSSL=false")
                 .formatted(s.mysqlHost, s.mysqlPort, s.mysqlDatabase);
         this.user = s.mysqlUser;
-        this.password = s.mysqlPassword;
+        this.password = s.mysqlPassword.value();
     }
 
     private Connection open() throws SQLException {

@@ -100,8 +100,8 @@ public final class Settings {
     /** LLM（openai 兼容）配置节：env 前缀 {@code LLM_}。 */
     public static final class LlmSettings {
         public String provider = "deepseek";
-        /** API key（SecretStr 语义：禁止写入日志）。 */
-        public String apiKey = "";
+        /** API key（Secret 掩码类型：真值只经 value() 取，禁止写入日志）。 */
+        public Secret apiKey = Secret.of("");
         public String baseUrl = "https://api.deepseek.com/v1";
         public String model = "deepseek-chat";
         /**
@@ -120,7 +120,7 @@ public final class Settings {
      * 未配置时使用 fast 档的调用方应回落主力模型。
      */
     public static final class LlmFastSettings {
-        public String apiKey = "";
+        public Secret apiKey = Secret.of("");
         public String baseUrl = "";
         public String model = "";
         /** 免费档普遍按并发数限速：包装层用它做信号量限流。 */
@@ -138,7 +138,7 @@ public final class Settings {
         public String mysqlHost = "127.0.0.1";
         public int mysqlPort = 3306;
         public String mysqlUser = "root";
-        public String mysqlPassword = "";
+        public Secret mysqlPassword = Secret.of("");
         public String mysqlDatabase = "agent_base";
     }
 
@@ -160,7 +160,7 @@ public final class Settings {
          * 引擎，照文档启用 web_search 必在启动时失败）。
          */
         public String enginePriority = "tavily";
-        public String tavilyApiKey = "";
+        public Secret tavilyApiKey = Secret.of("");
         public double timeoutSeconds = 15.0;
         public double cacheTtlSeconds = 300.0;
     }
@@ -178,7 +178,7 @@ public final class Settings {
         public boolean enabled = true;
         public boolean embeddingEnabled = true;
         public String embeddingBaseUrl = "https://api.siliconflow.cn/v1";
-        public String embeddingApiKey = "";
+        public Secret embeddingApiKey = Secret.of("");
         public String embeddingModel = "BAAI/bge-m3";
         public int embeddingDims = 1024;
         public int embeddingBatchSize = 16;
@@ -216,7 +216,7 @@ public final class Settings {
         public int docChunkOverlap = 100;
         public int mysqlPoolSize = 5;
         /** 记忆身份鉴权（P0）：配置后所有用户作用域请求需附带 HMAC 签名。 */
-        public String authSecret = "";
+        public Secret authSecret = Secret.of("");
         public int authReplayWindowSeconds = 300;
     }
 
@@ -545,7 +545,7 @@ public final class Settings {
             }
             t.provider = value;
         }
-        if (v.containsKey("api_key")) t.apiKey = v.get("api_key");
+        if (v.containsKey("api_key")) t.apiKey = Secret.of(v.get("api_key"));
         if (v.containsKey("base_url")) t.baseUrl = v.get("base_url");
         if (v.containsKey("model")) t.model = v.get("model");
         if (v.containsKey("main_timeout")) {
@@ -573,7 +573,7 @@ public final class Settings {
 
     private static void applyLlmFast(Settings s, Map<String, String> v) {
         LlmFastSettings t = s.llmFast;
-        if (v.containsKey("api_key")) t.apiKey = v.get("api_key");
+        if (v.containsKey("api_key")) t.apiKey = Secret.of(v.get("api_key"));
         if (v.containsKey("base_url")) t.baseUrl = v.get("base_url");
         if (v.containsKey("model")) t.model = v.get("model");
         if (v.containsKey("concurrency")) {
@@ -599,7 +599,7 @@ public final class Settings {
         if (v.containsKey("mysql_host")) t.mysqlHost = v.get("mysql_host");
         if (v.containsKey("mysql_port")) t.mysqlPort = requireInt("mysql_port", v.get("mysql_port"));
         if (v.containsKey("mysql_user")) t.mysqlUser = v.get("mysql_user");
-        if (v.containsKey("mysql_password")) t.mysqlPassword = v.get("mysql_password");
+        if (v.containsKey("mysql_password")) t.mysqlPassword = Secret.of(v.get("mysql_password"));
         if (v.containsKey("mysql_database")) t.mysqlDatabase = v.get("mysql_database");
     }
 
@@ -639,7 +639,7 @@ public final class Settings {
             }
             t.enginePriority = value;
         }
-        if (v.containsKey("tavily_api_key")) t.tavilyApiKey = v.get("tavily_api_key");
+        if (v.containsKey("tavily_api_key")) t.tavilyApiKey = Secret.of(v.get("tavily_api_key"));
         if (v.containsKey("timeout_seconds")) {
             double value = requireFloat("timeout_seconds", v.get("timeout_seconds"));
             if (!(value > 0)) {
@@ -687,7 +687,7 @@ public final class Settings {
         if (v.containsKey("enabled")) t.enabled = requireBool("enabled", v.get("enabled"));
         if (v.containsKey("embedding_enabled")) t.embeddingEnabled = requireBool("embedding_enabled", v.get("embedding_enabled"));
         if (v.containsKey("embedding_base_url")) t.embeddingBaseUrl = v.get("embedding_base_url");
-        if (v.containsKey("embedding_api_key")) t.embeddingApiKey = v.get("embedding_api_key");
+        if (v.containsKey("embedding_api_key")) t.embeddingApiKey = Secret.of(v.get("embedding_api_key"));
         if (v.containsKey("embedding_model")) t.embeddingModel = v.get("embedding_model");
         if (v.containsKey("embedding_dims")) {
             int value = requireInt("embedding_dims", v.get("embedding_dims"));
@@ -827,7 +827,7 @@ public final class Settings {
             if (value <= 0) throw new SettingsError("mysql_pool_size must be > 0, got %d".formatted(value));
             t.mysqlPoolSize = value;
         }
-        if (v.containsKey("auth_secret")) t.authSecret = v.get("auth_secret");
+        if (v.containsKey("auth_secret")) t.authSecret = Secret.of(v.get("auth_secret"));
         if (v.containsKey("auth_replay_window_seconds")) {
             int value = requireInt("auth_replay_window_seconds", v.get("auth_replay_window_seconds"));
             if (value < 0) {
@@ -993,12 +993,12 @@ public final class Settings {
         if (!"production".equals(env)) {
             return;
         }
-        if (llm.apiKey.strip().isEmpty()) {
+        if (llm.apiKey.isBlank()) {
             throw new SettingsError(
                     "LLM_API_KEY is required in production (ENV=production); "
                             + "refusing to start with an empty key");
         }
-        if (memory.enabled && memory.authSecret.strip().isEmpty()) {
+        if (memory.enabled && memory.authSecret.isBlank()) {
             throw new SettingsError(
                     "MEMORY_AUTH_SECRET is required in production when MEMORY_ENABLED=true: "
                             + "memory isolation is enforced via signed X-User-Id "
@@ -1009,7 +1009,7 @@ public final class Settings {
             List<String> missing = new ArrayList<>();
             if (checkpointer.mysqlUser.strip().isEmpty()) missing.add("CHECKPOINTER_MYSQL_USER");
             if (checkpointer.mysqlDatabase.strip().isEmpty()) missing.add("CHECKPOINTER_MYSQL_DATABASE");
-            if (checkpointer.mysqlPassword.strip().isEmpty()) missing.add("CHECKPOINTER_MYSQL_PASSWORD");
+            if (checkpointer.mysqlPassword.isBlank()) missing.add("CHECKPOINTER_MYSQL_PASSWORD");
             if (!missing.isEmpty()) {
                 throw new SettingsError("%s required in production with CHECKPOINTER_BACKEND=mysql"
                         .formatted(String.join(", ", missing)));
