@@ -216,6 +216,28 @@ class SearchToolTest {
     }
 
     @Test
+    void chineseQueryRanksByTermOverlapInsteadOfEngineOrder() {
+        // #244：中文查询切 CJK 二元组——标题含词项的结果胜出，不再退化为
+        // 引擎原始序（此前 matches 恒 0）。
+        SearchResult offTopic = new SearchResult("天气预报", "https://w/1", "明天有雨", 1, "fake");
+        SearchResult onTopic = new SearchResult("拉康的镜像阶段", "https://w/2", "精神分析理论介绍", 2, "fake");
+        List<SearchResult> ranked = SearchPipeline.filterAndRank(
+                List.of(offTopic, onTopic), "镜像阶段 精神分析", 5);
+        assertEquals("拉康的镜像阶段", ranked.get(0).title());
+        assertEquals(1, ranked.get(0).position());
+    }
+
+    @Test
+    void asciiQueryScoringUnchanged() {
+        // 英文行为回归：与旧空白切分口径一致
+        SearchResult a = new SearchResult("alpha prototype", "https://a/1", "nothing", 1, "fake");
+        SearchResult b = new SearchResult("unrelated", "https://a/2", "alpha prototype here", 2, "fake");
+        // 标题命中权重 2x：a 应排前
+        List<SearchResult> ranked = SearchPipeline.filterAndRank(List.of(b, a), "alpha prototype", 5);
+        assertEquals("alpha prototype", ranked.get(0).title());
+    }
+
+    @Test
     void formatWebContextRendersExactly() {
         List<SearchResult> results = List.of(
                 new SearchResult("Alpha", "https://example.com/a", "alpha content", 1, "tavily"),

@@ -5,15 +5,13 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.github.paopaonb666.agentbase.core.config.Settings;
+import io.github.paopaonb666.agentbase.core.text.QueryTerms;
 import io.github.paopaonb666.agentbase.memory.embeddings.EmbeddingClient;
 import io.github.paopaonb666.agentbase.memory.store.MemoryStore;
 import io.github.paopaonb666.agentbase.memory.store.Models;
@@ -63,9 +61,6 @@ public final class Retrieval {
 
     /** 一天的秒数（时间衰减/TTL 换算）。 */
     private static final double DAY_SECONDS = 86400.0;
-
-    private static final Pattern ASCII_WORD_RE = Pattern.compile("[a-zA-Z0-9_]+");
-    private static final Pattern CJK_RUN_RE = Pattern.compile("[\\x{4E00}-\\x{9FFF}]+");
 
     private Retrieval() {}
 
@@ -146,29 +141,11 @@ public final class Retrieval {
     // ── 分词 ─────────────────────────────────────────────────────────
 
     /**
-     * 检索分词：ASCII 词（小写）+ 中文二元组。
-     *
-     * <p>中文无空格分词，二元组是无词典检索的实用折中——"用户偏好"产出
-     * {@code 用户}/{@code 户偏}/{@code 偏好}，足以命中改写查询。
+     * 检索分词：ASCII 词（小写）+ 中文二元组——#244 起委托基座公共件
+     * {@link QueryTerms}（与搜索相关性评分同口径），行为逐值不变。
      */
     public static List<String> tokenize(String text) {
-        List<String> tokens = new ArrayList<>();
-        Matcher ascii = ASCII_WORD_RE.matcher(text);
-        while (ascii.find()) {
-            tokens.add(ascii.group().toLowerCase(Locale.ROOT));
-        }
-        Matcher cjk = CJK_RUN_RE.matcher(text);
-        while (cjk.find()) {
-            int[] run = cjk.group().codePoints().toArray();
-            if (run.length == 1) {
-                tokens.add(new String(run, 0, 1));
-                continue;
-            }
-            for (int i = 0; i + 2 <= run.length; i++) {
-                tokens.add(new String(run, i, 2));
-            }
-        }
-        return List.copyOf(tokens);
+        return QueryTerms.tokenize(text);
     }
 
     // ── 基础因子 ─────────────────────────────────────────────────────

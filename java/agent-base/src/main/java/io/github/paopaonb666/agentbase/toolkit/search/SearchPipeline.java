@@ -43,9 +43,11 @@ public final class SearchPipeline {
 
     /** query 词项在 title/snippet 中的匹配度；标题匹配权重更高。 */
     public static double scoreRelevance(SearchResult result, String query) {
+        // #244：分词改用基座公共件（ASCII 词 + CJK 二元组）——中文查询此前
+        // 被空白切分切成不出词项，排序退化为引擎原始序。
         List<String> terms = new ArrayList<>();
-        // 对应 Python 的 query.lower().split()：按任意空白切分并丢弃空段。
-        for (String t : query.toLowerCase().trim().split("\\s+")) {
+        for (String t : io.github.paopaonb666.agentbase.core.text.QueryTerms.tokenize(
+                query.toLowerCase())) {
             if (t.length() > 1) {
                 terms.add(t);
             }
