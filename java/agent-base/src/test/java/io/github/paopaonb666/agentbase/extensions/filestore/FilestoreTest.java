@@ -9,6 +9,8 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Map;
 
@@ -236,6 +238,43 @@ class FilestoreTest {
                     ids(store.getMany(List.of("fresh-orphan", "stale-orphan", "stale-bound"))));
             // 重复清理：无更多孤儿，计数归零。
             assertEquals(0, store.purgeOrphans());
+        }
+    }
+
+    // #268 后新增用例的时间源（镜像主类的 SECONDS_FORMAT——它私有）。
+    private static final DateTimeFormatter TEST_SECONDS_FORMAT =
+            DateTimeFormatter.ofPattern("uuuu-MM-dd HH:mm:ss");
+
+    @Test
+    void purgeOrphansSkipsMalformedCreatedAtRows() throws SQLException {
+        Path db = tempDir.resolve("purge-broken.db");
+        try (UploadedFileStores.SqliteUploadedFileStore store = sqliteStore("purge-broken.db")) {
+            // 手工制造一行畸形 created_at（直插与 UPDATE 同效）：
+            // #268 后判定走读侧解析，畸形行单行 WARN 跳过——purge 不抛、
+            // 不误删该行；同批的合法旧行照常清理。
+            rawInsert(db, "stale-orphan", "", "2020-01-01 00:00:00");
+            rawInsert(db, "broken-orphan", "", "不是时间串");
+
+            assertEquals(1, store.purgeOrphans());
+            assertEquals(List.of("broken-orphan"),
+                    ids(store.getMany(List.of("stale-orphan", "broken-orphan"))));
+        }
+    }
+
+    @Test
+    void purgeOrphansZeroMaxAgeKeepsFutureRows() throws SQLException {
+        Path db = tempDir.resolve("purge-zero.db");
+        try (UploadedFileStores.SqliteUploadedFileStore store = sqliteStore("purge-zero.db")) {
+            // maxAge=0 边界照旧：严格早于 now 的未绑定行全清。用未来时间戳
+            // 的保留行确定性地避开「同一秒写入/比较」的分辨率竞态。
+            rawInsert(db, "past-orphan", "",
+                    LocalDateTime.now().minusHours(2).format(TEST_SECONDS_FORMAT));
+            rawInsert(db, "future-orphan", "",
+                    LocalDateTime.now().plusHours(1).format(TEST_SECONDS_FORMAT));
+
+            assertEquals(1, store.purgeOrphans(0));
+            assertEquals(List.of("future-orphan"),
+                    ids(store.getMany(List.of("past-orphan", "future-orphan"))));
         }
     }
 

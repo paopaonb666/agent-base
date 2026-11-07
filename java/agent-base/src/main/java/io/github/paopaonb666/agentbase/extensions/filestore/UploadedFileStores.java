@@ -13,6 +13,7 @@ import java.sql.Timestamp;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -443,15 +444,44 @@ public final class UploadedFileStores {
 
         @Override
         public synchronized int purgeOrphans(int maxAgeHours) {
-            // 与 Python 一致：本地时间字符串比较（该格式字典序即时间序）。
-            String cutoff = LocalDateTime.now().minusHours(maxAgeHours).format(SECONDS_FORMAT);
+            // #268：孤儿判定从「created_at 文本序比较」改为「解析后
+            // LocalDateTime 对象比较」——读侧解析化，写侧格式
+            // （secondsText 本地时间文本）与存量数据不动、无迁移。对象比较
+            // 不再依赖文本序，且解析失败的单行 WARN 跳过（宁漏删不误删）；
+            // 逐 id DELETE 是无迁移方案的代价（孤儿候选通常极少）。
+            // Python 侧（filestore.py）仍是文本序比较，差异登记在案（#307 域）。
+            LocalDateTime cutoff = LocalDateTime.now().minusHours(maxAgeHours);
+            List<String> stale = new ArrayList<>();
             try (PreparedStatement ps = conn.prepareStatement(
-                    "DELETE FROM uploaded_files WHERE thread_id = '' AND created_at < ?")) {
-                ps.setString(1, cutoff);
-                return Math.max(0, ps.executeUpdate());
+                    "SELECT file_id, created_at FROM uploaded_files WHERE thread_id = ''")) {
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        String fileId = rs.getString(1);
+                        String createdAt = rs.getString(2);
+                        try {
+                            if (LocalDateTime.parse(createdAt, SECONDS_FORMAT).isBefore(cutoff)) {
+                                stale.add(fileId);
+                            }
+                        } catch (DateTimeParseException malformed) {
+                            LOG.warn("filestore: sqlite purge_orphans 跳过畸形 created_at 行"
+                                    + "（不判死不误删）: file_id={}, created_at={}", fileId, createdAt);
+                        }
+                    }
+                }
             } catch (SQLException e) {
                 throw new IllegalStateException("filestore: sqlite purge_orphans failed: " + e.getMessage(), e);
             }
+            int deleted = 0;
+            for (String fileId : stale) {
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "DELETE FROM uploaded_files WHERE file_id = ?")) {
+                    ps.setString(1, fileId);
+                    deleted += Math.max(0, ps.executeUpdate());
+                } catch (SQLException e) {
+                    throw new IllegalStateException("filestore: sqlite purge_orphans failed: " + e.getMessage(), e);
+                }
+            }
+            return deleted;
         }
 
         @Override
@@ -619,14 +649,41 @@ public final class UploadedFileStores {
 
         @Override
         public int purgeOrphans(int maxAgeHours) {
-            try (Connection conn = connect();
-                 PreparedStatement ps = conn.prepareStatement(
-                         "DELETE FROM uploaded_files WHERE thread_id = '' AND created_at < ?")) {
-                ps.setTimestamp(1, Timestamp.valueOf(LocalDateTime.now().minusHours(maxAgeHours)));
-                return Math.max(0, ps.executeUpdate());
+            // #268：与 sqlite 侧同批——判定从「单条 DELETE 的 WHERE 比较」改为
+            // 「读侧解析后对象比较，命中逐 id 删」。created_at 走 rs.getTimestamp
+            // （与 toInfo 的转换口径一致，逆操作即原 Timestamp.valueOf 写法），
+            // 行级异常 WARN 跳过不误删。Python 侧仍是文本序比较，差异登记在案。
+            LocalDateTime cutoff = LocalDateTime.now().minusHours(maxAgeHours);
+            List<String> stale = new ArrayList<>();
+            int deleted = 0;
+            try (Connection conn = connect()) {
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "SELECT file_id, created_at FROM uploaded_files WHERE thread_id = ''");
+                     ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        String fileId = rs.getString(1);
+                        try {
+                            Timestamp created = rs.getTimestamp(2);
+                            if (created != null && created.toLocalDateTime().isBefore(cutoff)) {
+                                stale.add(fileId);
+                            }
+                        } catch (SQLException rowFailure) {
+                            LOG.warn("filestore: mysql purge_orphans 跳过畸形 created_at 行"
+                                    + "（不判死不误删）: file_id={}", fileId, rowFailure);
+                        }
+                    }
+                }
+                for (String fileId : stale) {
+                    try (PreparedStatement ps = conn.prepareStatement(
+                            "DELETE FROM uploaded_files WHERE file_id = ?")) {
+                        ps.setString(1, fileId);
+                        deleted += Math.max(0, ps.executeUpdate());
+                    }
+                }
             } catch (SQLException e) {
                 throw new IllegalStateException("filestore: mysql purge_orphans failed: " + e.getMessage(), e);
             }
+            return deleted;
         }
 
         @Override
