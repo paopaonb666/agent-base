@@ -285,12 +285,45 @@ public final class InMemoryMemoryStore implements MemoryStore {
 
     @Override
     public List<Models.MemoryOp> listOps(String userId, int limit) {
+        return listOps(userId, null, null, null, limit);
+    }
+
+    /**
+     * #160/#176：过滤 + 游标与 SQL 后端同语义——游标严格早于边界行，
+     * 同秒并列按插入序号前移（边界行的序号由其 op_id 反查；未带 op_id
+     * 时退化为纯时间戳截断）。
+     */
+    @Override
+    public List<Models.MemoryOp> listOps(String userId, String threadId,
+                                         Double sinceEpochSeconds, MemoryStore.OpsCursor before,
+                                         int limit) {
         synchronized (lock) {
+            // 边界行的插入序号：op_id 只在写入时登记，反查需要全量扫描一次。
+            Integer cursorSeq = null;
+            if (before != null && before.beforeOpId() != null) {
+                for (OpEntry entry : ops) {
+                    if (entry.op().opId().equals(before.beforeOpId())) {
+                        cursorSeq = entry.seq();
+                        break;
+                    }
+                }
+            }
             List<OpEntry> pairs = new ArrayList<>();
             for (OpEntry entry : ops) {
-                if (userId == null || entry.op().userId().equals(userId)) {
-                    pairs.add(entry);
+                Models.MemoryOp op = entry.op();
+                if (userId != null && !op.userId().equals(userId)) {
+                    continue;
                 }
+                if (threadId != null && !op.threadId().equals(threadId)) {
+                    continue;
+                }
+                if (sinceEpochSeconds != null && op.createdAt() < sinceEpochSeconds) {
+                    continue;
+                }
+                if (before != null && !strictlyAfterCursor(op, entry.seq(), before, cursorSeq)) {
+                    continue;
+                }
+                pairs.add(entry);
             }
             pairs.sort(OP_ORDER);
             List<Models.MemoryOp> out = new ArrayList<>();
@@ -300,6 +333,16 @@ public final class InMemoryMemoryStore implements MemoryStore {
             }
             return out;
         }
+    }
+
+    /** 游标判定：严格晚于边界行（排序序）——同刻并列时按插入序号前移。 */
+    private static boolean strictlyAfterCursor(Models.MemoryOp op, int seq,
+                                               MemoryStore.OpsCursor before, Integer cursorSeq) {
+        if (op.createdAt() < before.beforeEpochSeconds()) {
+            return true;
+        }
+        return op.createdAt() == before.beforeEpochSeconds()
+                && cursorSeq != null && seq < cursorSeq;
     }
 
     @Override

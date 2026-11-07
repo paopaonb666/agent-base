@@ -68,6 +68,9 @@ public final class MysqlMemoryStore extends AbstractSqlMemoryStore {
         }
         ensureIndex(conn, "memories", "idx_mem_user_updated",
                 MemoryDdl.MYSQL_INDEX_MEM_USER_UPDATED);
+        // #160：存量 memory_ops 表补审计索引（守卫语义同上）。
+        ensureIndex(conn, "memory_ops", "idx_ops_user_created",
+                MemoryDdl.MYSQL_INDEX_OPS_USER_CREATED);
         tableReady = true;
     }
 
@@ -89,7 +92,7 @@ public final class MysqlMemoryStore extends AbstractSqlMemoryStore {
             }
             try (Statement st = conn.createStatement()) {
                 st.execute(alter);
-                LOG.info("mysql memory store: 索引 {}.{} 已补齐（#159）", table, indexName);
+                LOG.info("mysql memory store: 索引 {}.{} 已补齐", table, indexName);
             }
         } catch (SQLException e) {
             LOG.warn("mysql memory store: 补建索引 {}.{} 失败（不影响存储可用）：{}",

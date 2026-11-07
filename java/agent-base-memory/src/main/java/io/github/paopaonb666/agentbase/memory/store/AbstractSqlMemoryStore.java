@@ -92,6 +92,15 @@ abstract class AbstractSqlMemoryStore implements MemoryStore {
      */
     protected abstract String opsTiebreak();
 
+    /**
+     * {@link #opsTiebreak()} 的裸列名（两实现均为 {@code "<col> DESC"}）：
+     * 游标的同秒并列下推要在 WHERE 里比较该列（#160）。
+     */
+    protected final String opsTiebreakColumn() {
+        String tiebreak = opsTiebreak();
+        return tiebreak.substring(0, tiebreak.indexOf(' '));
+    }
+
     /** memory_versions 的同秒并列排序（同 {@link #opsTiebreak()}）。 */
     protected abstract String versionsTiebreak();
 
@@ -736,12 +745,55 @@ abstract class AbstractSqlMemoryStore implements MemoryStore {
 
     @Override
     public List<Models.MemoryOp> listOps(String userId, int limit) {
+        return listOps(userId, null, null, null, limit);
+    }
+
+    /**
+     * #160/#176：thread/since/游标全部在 SQL 层下推。游标 {@code before}
+     * 的语义是严格早于边界行——{@code created_at < 边界} 或（同刻并列时）
+     * 按 opsTiebreak 前移；边界行的 rowid/seq 由其 op_id 反查（op_id 是
+     * 主键，子查询恒单值；游标未带 op_id 时退化为纯时间戳截断，同刻并列
+     * 行的余量不返回——API 侧 next_before 只有秒值的既有约束）。
+     */
+    @Override
+    public List<Models.MemoryOp> listOps(String userId, String threadId,
+                                         Double sinceEpochSeconds, MemoryStore.OpsCursor before,
+                                         int limit) {
         StringBuilder sql = new StringBuilder("SELECT ").append(OP_COLUMNS)
                 .append(" FROM memory_ops");
         List<Object> params = new ArrayList<>();
         if (userId != null) {
             sql.append(" WHERE user_id = ?");
             params.add(userId);
+        }
+        if (threadId != null) {
+            sql.append(" AND thread_id = ?");
+            params.add(threadId);
+        }
+        if (sinceEpochSeconds != null) {
+            // 时间口径与列写入一致（toSqlTs，#301 时间戳矩阵）。
+            sql.append(" AND created_at >= ?");
+            params.add(toSqlTs(sinceEpochSeconds));
+        }
+        if (before != null) {
+            Object boundary = toSqlTs(before.beforeEpochSeconds());
+            if (before.beforeOpId() != null && !before.beforeOpId().isEmpty()) {
+                // 带边界行 op_id：同刻并列按 tiebreak 前移（子查询恒单值，
+                // op_id 不存在时子查询为 NULL、整支不匹配——退化为纯截断）。
+                String column = opsTiebreakColumn();
+                sql.append(" AND (created_at < ? OR (created_at = ?");
+                params.add(boundary);
+                params.add(boundary);
+                sql.append(" AND ").append(column).append(" < (SELECT ").append(column)
+                        .append(" FROM memory_ops WHERE op_id = ?)");
+                params.add(before.beforeOpId());
+                sql.append("))");
+            } else {
+                // 只带秒值（API 契约）：严格早于该时刻，同刻并列行的余量
+                // 不再返回（见 MemoryStore.OpsCursor 的说明）。
+                sql.append(" AND created_at < ?");
+                params.add(boundary);
+            }
         }
         sql.append(" ORDER BY created_at DESC, ").append(opsTiebreak()).append(" LIMIT ?");
         params.add(Math.max(1, limit));

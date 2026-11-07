@@ -11,6 +11,7 @@ import io.github.paopaonb666.agentbase.core.config.Settings;
 import io.github.paopaonb666.agentbase.entrypoints.server.AuthBackends;
 import io.github.paopaonb666.agentbase.entrypoints.server.HttpError;
 import io.github.paopaonb666.agentbase.memory.service.MemoryService;
+import io.github.paopaonb666.agentbase.memory.store.MemoryStore;
 import io.github.paopaonb666.agentbase.memory.store.Models.MemoryBlock;
 import io.github.paopaonb666.agentbase.memory.store.Models.MemoryRecord;
 
@@ -323,18 +324,39 @@ public class MemoryApiController {
 
     // ── GET /v1/memory/audit：记忆操作审计 ──────────────────────────────
 
+    /**
+     * #160/#176：可选 {@code thread}（thread_id 精确匹配）、{@code since}
+     * （epoch 秒，含边界）与 {@code before}（翻页游标，epoch 秒——取上一页
+     * 响应的 next_before，语义是严格早于该时刻）。取满 limit 时响应追加
+     * {@code next_before}（末行的 created_at 秒值）；不足 limit 不带。
+     */
     @GetMapping("/audit")
     public Map<String, Object> audit(@RequestParam(value = "limit", defaultValue = "50") int limit,
+                                     @RequestParam(value = "thread", required = false) String thread,
+                                     @RequestParam(value = "since", required = false) Double since,
+                                     @RequestParam(value = "before", required = false) Double before,
                                      @RequestHeader(value = "X-User-Id", required = false) String userIdHeader,
                                      @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
                                      @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,
                                      @RequestHeader(value = "X-User-Nonce", required = false) String nonceHeader) {
         MemoryService memory = service();
         String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
-        List<Map<String, Object>> ops = memory.listOps(userId, Math.min(Math.max(limit, 1), 200))
-                .stream().map(io.github.paopaonb666.agentbase.memory.store.Models.MemoryOp::toDict)
+        int effectiveLimit = Math.min(Math.max(limit, 1), 200);
+        // 游标只有秒值（API 契约），同刻并列的余量由 store 层的时间戳截断
+        // 兜底（见 MemoryStore.OpsCursor）。
+        MemoryStore.OpsCursor cursor = before == null ? null
+                : new MemoryStore.OpsCursor(before, null);
+        List<io.github.paopaonb666.agentbase.memory.store.Models.MemoryOp> ops =
+                memory.listOps(userId, thread, since, cursor, effectiveLimit);
+        List<Map<String, Object>> items = ops.stream()
+                .map(io.github.paopaonb666.agentbase.memory.store.Models.MemoryOp::toDict)
                 .toList();
-        return Map.of("ops", ops);
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("ops", items);
+        if (ops.size() >= effectiveLimit) {
+            out.put("next_before", ops.get(ops.size() - 1).createdAt());
+        }
+        return out;
     }
 
     // ── 向量回填（#164：换 embedding 模型后的迁移入口） ─────────────────

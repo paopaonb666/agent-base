@@ -657,6 +657,12 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
         return store.listOps(userId, limit);
     }
 
+    /** #160/#176：审计列表过滤 + 游标变体（参数语义见 MemoryStore#listOps）。 */
+    public List<MemoryOp> listOps(String userId, String threadId, Double sinceEpochSeconds,
+                                  MemoryStore.OpsCursor before, int limit) {
+        return store.listOps(userId, threadId, sinceEpochSeconds, before, limit);
+    }
+
     // ── 形成管线编排（M6c） ─────────────────────────────────────────────
 
     @Override

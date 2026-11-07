@@ -56,6 +56,20 @@ class MemoryStoreBackendTest {
         }
     }
 
+    @Test
+    void sqliteCreatesOpsAuditIndexOnMemoryOps() throws Exception {
+        // #160：审计主路径 WHERE user_id=? ORDER BY created_at DESC 需要
+        // (user_id, created_at) 索引——索引清单与 002 迁移双路径幂等收敛，
+        // 重开不重复建。
+        Path db = tempDir.resolve("idx-ops-" + System.nanoTime() + ".db");
+        try (SqliteMemoryStore store = new SqliteMemoryStore(db.toString())) {
+            assertTrue(indexExists(db, "idx_ops_user_created"));
+        }
+        try (SqliteMemoryStore store = new SqliteMemoryStore(db.toString())) {
+            assertTrue(indexExists(db, "idx_ops_user_created"));
+        }
+    }
+
     private static boolean indexExists(Path db, String name) throws Exception {
         try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + db);
              Statement st = conn.createStatement();
@@ -152,6 +166,7 @@ class MemoryStoreBackendTest {
         summariesRoundTrip(store);
         chunksRoundTrip(store);
         opsAndVersionsRoundTrip(store);
+        opsFilterAndCursorRoundTrip(store);
         deleteForThreadKeepsMemories(store);
         deleteMemory(store);
     }
@@ -401,6 +416,77 @@ class MemoryStoreBackendTest {
         assertNull(store.getVersion("ghost"));
         assertEquals(List.of("v2"), store.listVersions("m1", 1).stream()
                 .map(Models.MemoryVersion::versionId).toList());
+    }
+
+    // ── memory_ops：#160/#176 thread/since 过滤 + 游标翻页 ────────────
+
+    private static void opsFilterAndCursorRoundTrip(MemoryStore store) {
+        // 独立用户 u3 隔离前面段落的种子（o1/o2 是 USER=u1）。p3/p4 同刻
+        // 并列（8002.0），验证 tiebreak 在过滤与游标下的稳定性。
+        store.recordOp(new Models.MemoryOp("p1", "extract", "u3", "chat", "chat:t9",
+                Map.of(), "ok", "", 1, 8000.0));
+        store.recordOp(new Models.MemoryOp("p2", "consolidate", "u3", "chat", "chat:t8",
+                Map.of(), "ok", "", 1, 8001.0));
+        store.recordOp(new Models.MemoryOp("p3", "manual", "u3", "chat", "chat:t9",
+                Map.of(), "ok", "", 1, 8002.0));
+        store.recordOp(new Models.MemoryOp("p4", "manual", "u3", "chat", "chat:t9",
+                Map.of(), "ok", "", 1, 8002.0));
+        store.recordOp(new Models.MemoryOp("p5", "summary", "u3", "chat", "",
+                Map.of(), "ok", "", 1, 8003.0));
+
+        // thread 过滤：同刻并列 p4 在前（tiebreak DESC）。
+        assertEquals(List.of("p4", "p3", "p1"),
+                store.listOps("u3", "chat:t9", null, null, 100)
+                        .stream().map(Models.MemoryOp::opId).toList());
+
+        // since 过滤：含边界（>= 8001.0，p2 落在边界上）。
+        assertEquals(List.of("p5", "p4", "p3", "p2"),
+                store.listOps("u3", null, 8001.0, null, 100)
+                        .stream().map(Models.MemoryOp::opId).toList());
+
+        // thread + since 组合：8000.0 的 p1 被 since 排除。
+        assertEquals(List.of("p4", "p3"),
+                store.listOps("u3", "chat:t9", 8001.5, null, 100)
+                        .stream().map(Models.MemoryOp::opId).toList());
+
+        // 游标翻页（limit=2）：边界行含 op_id 时同刻并列稳定前移——无重无漏。
+        List<Models.MemoryOp> page1 = store.listOps("u3", null, null, null, 2);
+        assertEquals(List.of("p5", "p4"), ids(page1));
+        MemoryStore.OpsCursor cursor = cursorOf(page1);
+        List<Models.MemoryOp> page2 = store.listOps("u3", null, null, cursor, 2);
+        assertEquals(List.of("p3", "p2"), ids(page2));
+        cursor = cursorOf(page2);
+        List<Models.MemoryOp> page3 = store.listOps("u3", null, null, cursor, 2);
+        assertEquals(List.of("p1"), ids(page3));
+        cursor = cursorOf(page3);
+        assertEquals(List.of(), ids(store.listOps("u3", null, null, cursor, 2)));
+
+        // since + 游标组合：游标只在 since 窗口内翻页。
+        List<Models.MemoryOp> scopedPage = store.listOps("u3", null, 8001.0, null, 2);
+        assertEquals(List.of("p5", "p4"), ids(scopedPage));
+        assertEquals(List.of("p3", "p2"), ids(store.listOps(
+                "u3", null, 8001.0, cursorOf(scopedPage), 2)));
+
+        // 游标只带秒值（API 契约，无 op_id）：退化为严格早于该时刻——
+        // 同刻并列的 p3 不再返回（其余量语义见 MemoryStore.OpsCursor）。
+        assertEquals(List.of("p2", "p1"),
+                store.listOps("u3", null, null, new MemoryStore.OpsCursor(8002.0, null), 100)
+                        .stream().map(Models.MemoryOp::opId).toList());
+
+        // limit 边界：0 视为 1（与旧签名同一钳制约定）。
+        assertEquals(List.of("p5"),
+                store.listOps("u3", null, null, null, 0)
+                        .stream().map(Models.MemoryOp::opId).toList());
+    }
+
+    private static List<String> ids(List<Models.MemoryOp> ops) {
+        return ops.stream().map(Models.MemoryOp::opId).toList();
+    }
+
+    /** 以上一页末行构造续页游标（created_at + op_id，同刻并列可稳定前移）。 */
+    private static MemoryStore.OpsCursor cursorOf(List<Models.MemoryOp> page) {
+        Models.MemoryOp last = page.get(page.size() - 1);
+        return new MemoryStore.OpsCursor(last.createdAt(), last.opId());
     }
 
     // ── 线程级联：memories 刻意保留 ─────────────────────────────────

@@ -82,7 +82,32 @@ public interface MemoryStore extends AutoCloseable {
 
     void recordOp(Models.MemoryOp op);
 
+    /**
+     * 审计列表游标（#160）：定位上一页的边界行。{@code beforeEpochSeconds}
+     * 是边界行的 created_at（epoch 秒，含小数）；{@code beforeOpId} 是边界
+     * 行的 op_id——同秒并列时 SQL 侧用它反查 rowid/seq 做 tiebreak 前移
+     * 比较（调用方无需感知该内部序号）。null 的 beforeOpId = 游标仅按
+     * 时间戳严格早于截断（同刻并列行的余量不再返回，见 listOps 说明）。
+     */
+    record OpsCursor(double beforeEpochSeconds, String beforeOpId) {}
+
+    /** 审计列表：{@code userId} 为 null 时跨用户；按 created_at 降序取最近 N 条。 */
     List<Models.MemoryOp> listOps(String userId, int limit);
+
+    /**
+     * #160/#176：审计列表的过滤 + 游标下推变体，参数均可选（null = 不过滤）：
+     * {@code threadId} 非空按 thread_id 精确匹配；{@code sinceEpochSeconds}
+     * 为 epoch 秒、含边界（created_at &gt;= since，口径与列写入一致——
+     * toSqlTs）；{@code before} 为上一页边界，语义是严格早于该边界行
+     * （同秒并列按 opsTiebreak 前移，sqlite=rowid / mysql=seq）。排序与
+     * limit 语义同旧签名。默认实现忽略过滤委托旧签名（过滤由调用方内存
+     * 兜底）；SQL 后端与 InMemory 后端覆写以获得下推收益。
+     */
+    default List<Models.MemoryOp> listOps(String userId, String threadId,
+                                          Double sinceEpochSeconds, OpsCursor before,
+                                          int limit) {
+        return listOps(userId, limit);
+    }
 
     // ── VersionRepo：记忆内容版本史（memory_versions 表） ─────────────
 

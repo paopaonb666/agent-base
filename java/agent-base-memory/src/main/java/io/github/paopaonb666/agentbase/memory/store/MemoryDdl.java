@@ -109,14 +109,17 @@ public final class MemoryDdl {
 
     /**
      * sqlite 索引（与 Python _SQLITE_INDEXES 逐条一致，外加 #159 的检索
-     * 索引）：memories 的检索主路径按 {@code WHERE user_id=? … ORDER BY
-     * updated_at DESC} 查询，没有 (user_id, updated_at) 索引万级记忆即
-     * 全表排序劣化。IF NOT EXISTS 幂等——存量库下次打开自动补齐。
+     * 索引与 #160 的审计索引）：memories 的检索主路径按 {@code WHERE
+     * user_id=? … ORDER BY updated_at DESC} 查询，没有 (user_id,
+     * updated_at) 索引万级记忆即全表排序劣化；memory_ops 的审计主路径
+     * 同理（{@code WHERE user_id=? … ORDER BY created_at DESC}，#160）。
+     * IF NOT EXISTS 幂等——存量库下次打开自动补齐。
      */
     public static final List<String> SQLITE_INDEXES = List.of(
             "CREATE INDEX IF NOT EXISTS idx_mem_scope ON memories (user_id, status)",
             "CREATE INDEX IF NOT EXISTS idx_mem_agent ON memories (user_id, agent_id)",
             "CREATE INDEX IF NOT EXISTS idx_mem_user_updated ON memories (user_id, updated_at)",
+            "CREATE INDEX IF NOT EXISTS idx_ops_user_created ON memory_ops (user_id, created_at)",
             "CREATE INDEX IF NOT EXISTS idx_chunks_user ON doc_chunks (user_id)",
             "CREATE INDEX IF NOT EXISTS idx_chunks_file ON doc_chunks (file_id)",
             "CREATE INDEX IF NOT EXISTS idx_chunks_thread ON doc_chunks (thread_id)",
@@ -124,9 +127,10 @@ public final class MemoryDdl {
 
     /**
      * sqlite 声明式迁移（#275）：经 SchemaMigrations 按序应用并记录到
-     * {@code memory_schema_versions}。001 即 #159 的检索索引（语句幂等，
-     * 存量库无论走索引循环还是迁移路径都收敛到同一结果）；后续列新增/
-     * 索引变更/数据回填类演进一律追加到本清单，不再散点硬编码。
+     * {@code memory_schema_versions}。001 即 #159 的检索索引、002 即 #160
+     * 的审计索引（语句幂等，存量库无论走索引循环还是迁移路径都收敛到
+     * 同一结果）；后续列新增/索引变更/数据回填类演进一律追加到本清单，
+     * 不再散点硬编码。
      */
     public static final List<io.github.paopaonb666.agentbase.core.storage.SchemaMigrations.Migration>
             SQLITE_MIGRATIONS = List.of(
@@ -134,7 +138,12 @@ public final class MemoryDdl {
                     "001_idx_mem_user_updated",
                     "memories 检索主路径索引 (#159)",
                     List.of("CREATE INDEX IF NOT EXISTS idx_mem_user_updated "
-                            + "ON memories (user_id, updated_at)")));
+                            + "ON memories (user_id, updated_at)")),
+            new io.github.paopaonb666.agentbase.core.storage.SchemaMigrations.Migration(
+                    "002_idx_ops_user_created",
+                    "memory_ops 审计主路径索引 (#160)",
+                    List.of("CREATE INDEX IF NOT EXISTS idx_ops_user_created "
+                            + "ON memory_ops (user_id, created_at)")));
 
     /**
      * MySQL 侧为存量表补 #159 索引的守卫 ALTER（内联 KEY 只对新建表
@@ -146,10 +155,17 @@ public final class MemoryDdl {
             "ALTER TABLE memories ADD KEY idx_mem_user_updated (user_id, updated_at)";
 
     /**
-     * MySQL 建表语句（与 Python _MYSQL_DDLS 逐条一致 + #159 检索索引）：
-     * LONGTEXT、内联 KEY、显式 ENGINE/CHARSET；memory_ops /
-     * memory_versions 的 seq 为 AUTO_INCREMENT（同秒并列时用 seq 而非
-     * rowid 做稳定次序）。
+     * MySQL 侧为存量 memory_ops 表补 #160 审计索引的守卫 ALTER（列定义与
+     * 建表内联 KEY 一致；接线与 #159 同一 {@code information_schema} 守卫）。
+     */
+    public static final String MYSQL_INDEX_OPS_USER_CREATED =
+            "ALTER TABLE memory_ops ADD KEY idx_ops_user_created (user_id, created_at)";
+
+    /**
+     * MySQL 建表语句（与 Python _MYSQL_DDLS 逐条一致 + #159 检索索引 +
+     * #160 审计索引）：LONGTEXT、内联 KEY、显式 ENGINE/CHARSET；
+     * memory_ops / memory_versions 的 seq 为 AUTO_INCREMENT（同秒并列时
+     * 用 seq 而非 rowid 做稳定次序）。
      */
     public static final List<String> MYSQL_DDLS = List.of(
             """
@@ -230,7 +246,9 @@ public final class MemoryDdl {
               duration_ms INT NOT NULL DEFAULT 0,
               created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
               PRIMARY KEY (op_id),
-              KEY idx_ops_seq (seq)
+              KEY idx_ops_seq (seq),
+              -- #160：审计主路径 WHERE user_id=? … ORDER BY created_at DESC。
+              KEY idx_ops_user_created (user_id, created_at)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """,
             """
