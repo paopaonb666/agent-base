@@ -224,6 +224,13 @@ public final class Settings {
         public int maxReplans = 2;
         /** 空输出门的最小摘要长度门槛；0 = 只拦空白输出。 */
         public int minSummaryChars = 0;
+        /**
+         * 语义判分（#63）：空=关（默认，只跑字数门）；"llm" = check 节点
+         * 对通过字数门的输出做一次 LLM 判分（done/failed/partial 三态；
+         * partial 定向补做一轮）。判分调用走模块主档模型（ModuleContext
+         * 无快档通道，登记差异）。
+         */
+        public String verdict = "";
     }
 
     /** 可观测性配置节：env {@code LOG_JSON} / {@code HEALTH_PROBE_MODEL}。 */
@@ -838,6 +845,14 @@ public final class Settings {
             int value = requireInt("min_summary_chars", v.get("min_summary_chars"));
             if (value < 0) throw new SettingsError("PLANNER_MIN_SUMMARY_CHARS must be >= 0, got %d".formatted(value));
             t.minSummaryChars = value;
+        }
+        if (v.containsKey("verdict")) {
+            String value = v.get("verdict").strip().toLowerCase(java.util.Locale.ROOT);
+            if (!value.isEmpty() && !"off".equals(value) && !"llm".equals(value)) {
+                throw new SettingsError(
+                        "PLANNER_VERDICT must be one of '', 'off', 'llm', got '%s'".formatted(value));
+            }
+            t.verdict = "llm".equals(value) ? "llm" : "";
         }
     }
 

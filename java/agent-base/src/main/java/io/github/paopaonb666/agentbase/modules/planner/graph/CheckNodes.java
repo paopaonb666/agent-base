@@ -38,12 +38,19 @@ public final class CheckNodes {
     private static final int REPLAN_SUMMARY_MAX_CHARS = 150;
     /** synthesize 计划清单里每个子任务摘要的截断长度（summary[:300]）。 */
     private static final int SYNTH_SUMMARY_MAX_CHARS = 300;
+    /** 判分文本进 LLM 前的截断（判分只需要结论级信息）。 */
+    private static final int VERDICT_SUMMARY_MAX_CHARS = 800;
+    /** partial 定向补做的轮数上限（防判分器抖动导致无限重跑）。 */
+    private static final int VERDICT_MAX_RETRIES = 1;
+    /** 任务 map 里判分补做计数的键（非契约字段，随快照序列化无害）。 */
+    private static final String VERDICT_RETRIES = "verdict_retries";
 
     private CheckNodes() {}
 
-    /** check 节点：空输出门 + cursor 推进。 */
+    /** check 节点：空输出门 + （可选 #63）语义判分 + cursor 推进。 */
     public static GraphBuilder.Node makeCheck(AgentModule.ModuleContext ctx) {
         int minChars = ctx.settings().planner.minSummaryChars;
+        boolean verdictEnabled = "llm".equals(ctx.settings().planner.verdict);
         return (GraphState state, NodeContext nodeCtx) -> {
             List<Map<String, Object>> tasks = PlannerState.tasks(state);
             int cur = PlannerState.cursor(state);
@@ -62,6 +69,8 @@ public final class CheckNodes {
                     failed.put(PlannerState.STATUS, PlannerState.FAILED);
                     failed.put(PlannerState.SUMMARY, "输出不足 " + minChars + " 字");
                     tasks.set(cur, failed);
+                } else if (verdictEnabled && PlannerState.DONE.equals(t.get(PlannerState.STATUS))) {
+                    applyVerdict(ctx, tasks, cur, t);
                 }
             }
             int nextIdx = nextPending(tasks);
@@ -69,6 +78,71 @@ public final class CheckNodes {
             return Map.of(
                     PlannerState.TASKS, tasks,
                     PlannerState.CURSOR, nextIdx);
+        };
+    }
+
+    /**
+     * 语义判分（#63）：对照 goal 判 output 的 done/failed/partial 三态。
+     * <ul>
+     *   <li>failed → 转 FAILED（由现有路由进 replan 定向补做）；</li>
+     *   <li>partial → 补做计数 &lt; 上限时重置 PENDING（goal 附补做指引，
+     *       executor 原样重跑该子任务），已补做过则接受为 done 并标注；</li>
+     *   <li>判分调用失败/输出不可解析 → best-effort 保持 done（判分绝不
+     *       打断计划循环）。</li>
+     * </ul>
+     */
+    private static void applyVerdict(AgentModule.ModuleContext ctx,
+                                     List<Map<String, Object>> tasks, int cur,
+                                     Map<String, Object> task) {
+        String goal = PlannerState.str(task, PlannerState.GOAL);
+        String summary = PlannerState.str(task, PlannerState.SUMMARY);
+        String verdict;
+        try {
+            verdict = parseVerdict(invokeText(ctx, PlannerPrompts.verdict(goal,
+                    summary, VERDICT_SUMMARY_MAX_CHARS)));
+        } catch (Exception e) {
+            org.slf4j.LoggerFactory.getLogger(CheckNodes.class)
+                    .warn("verdict 判分失败（保持 done）：{}", e.toString());
+            return;
+        }
+        if ("failed".equals(verdict)) {
+            Map<String, Object> failed = PlannerState.copyTask(task);
+            failed.put(PlannerState.STATUS, PlannerState.FAILED);
+            failed.put(PlannerState.SUMMARY, "判分 failed：" + summary);
+            tasks.set(cur, failed);
+            return;
+        }
+        if ("partial".equals(verdict)) {
+            int retries = PlannerState.intOf(task, VERDICT_RETRIES);
+            if (retries < VERDICT_MAX_RETRIES) {
+                Map<String, Object> retry = PlannerState.copyTask(task);
+                retry.put(PlannerState.STATUS, PlannerState.PENDING);
+                retry.put(PlannerState.GOAL, goal + "\n（上一轮输出被判 partial，请补全未完成部分）");
+                retry.put(VERDICT_RETRIES, retries + 1);
+                tasks.set(cur, retry);
+            } else {
+                // 已补做过：接受，避免判分器抖动把预算烧在同一个子任务上
+                Map<String, Object> accepted = PlannerState.copyTask(task);
+                accepted.put(PlannerState.SUMMARY, summary + "（判分 partial，已补做一轮后接受）");
+                tasks.set(cur, accepted);
+            }
+        }
+        // done 或不可解析：保持原状
+    }
+
+    /** 从判分回复解析三态；取首个词并剥掉 markdown 修饰，不可解析返回空串。 */
+    public static String parseVerdict(String raw) {
+        String firstLine = raw == null ? "" : raw.strip().lines().findFirst().orElse("").strip();
+        if (firstLine.isEmpty()) {
+            return "";
+        }
+        // 首个词：按空白/中文冒号/西文冒号切，再剥非字母（**partial** → partial）
+        String token = firstLine.toLowerCase(java.util.Locale.ROOT)
+                .split("[\\s：:]", 2)[0]
+                .replaceAll("[^a-z]", "");
+        return switch (token) {
+            case "done", "failed", "partial" -> token;
+            default -> "";
         };
     }
 

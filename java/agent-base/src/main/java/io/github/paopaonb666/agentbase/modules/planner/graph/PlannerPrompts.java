@@ -57,4 +57,17 @@ public final class PlannerPrompts {
                 子任务清单：
                 %s""".formatted(plan);
     }
+
+    /** 语义判分（#63，PLANNER_VERDICT=llm）：对照目标判定输出达成度。 */
+    public static String verdict(String goal, String summary, int maxChars) {
+        String clipped = summary.substring(0, Math.min(summary.length(), maxChars));
+        return """
+                你是子任务完成度的裁判。对照目标判断输出是否达成了目标。
+                目标：%s
+                输出：%s
+                只回答一行，格式固定为：done 或 failed 或 partial，加一个空格，再加一句话理由。
+                - done：目标已达成；
+                - partial：部分达成（缺了一部分但方向正确）；
+                - failed：跑题/未达成/明显错误。""".formatted(goal, clipped);
+    }
 }
