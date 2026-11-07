@@ -99,7 +99,9 @@ public final class SearchPipeline {
             return "";
         }
         // 与 Python 侧逐行同构：首行带 \n、每条结果后跟一个空行、\n join。
-        List<String> lines = new ArrayList<>(results.size() * 4 + 1);
+        // 尾行引用约定为 Java 侧扩展（#254/#338）：[n] 序号与来源事件解析
+        // （Citations）配套，Python 侧差异登记在案。
+        List<String> lines = new ArrayList<>(results.size() * 4 + 2);
         lines.add("以下是从互联网搜索到的相关信息：\n");
         for (SearchResult r : results) {
             lines.add("[" + r.position() + "] " + r.title());
@@ -107,6 +109,7 @@ public final class SearchPipeline {
             lines.add("    摘要: " + r.snippet() + " (来源: " + r.engine() + ")");
             lines.add("");
         }
+        lines.add("（回答引用以上来源时，请用 [n] 标注对应序号）");
         return String.join("\n", lines);
     }
 }

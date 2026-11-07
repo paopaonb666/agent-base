@@ -168,10 +168,12 @@ class SearchToolTest {
         List<SearchResult> results = List.of(
                 new SearchResult("Alpha", "https://example.com/a", "alpha content", 1, "tavily"),
                 new SearchResult("Beta", "https://example.com/b", "beta content", 2, "tavily"));
-        // 逐字对齐 Python format_web_context 的拼接结果。
+        // 逐字对齐 Python format_web_context 的拼接结果；尾行引用约定为
+        // Java 侧扩展（#254/#338，Python 差异登记在案）。
         String expected = "以下是从互联网搜索到的相关信息：\n"
                 + "\n[1] Alpha\n    URL: https://example.com/a\n    摘要: alpha content (来源: tavily)"
-                + "\n\n[2] Beta\n    URL: https://example.com/b\n    摘要: beta content (来源: tavily)\n";
+                + "\n\n[2] Beta\n    URL: https://example.com/b\n    摘要: beta content (来源: tavily)\n"
+                + "\n（回答引用以上来源时，请用 [n] 标注对应序号）";
         assertEquals(expected, SearchPipeline.formatWebContext(results));
         assertEquals("", SearchPipeline.formatWebContext(List.of()));
     }

@@ -332,12 +332,31 @@ public final class MemoryTools {
                         if (scored.isEmpty()) {
                             return "（知识库中没有相关内容）";
                         }
-                        StringBuilder sb = new StringBuilder("知识库检索结果：");
+                        // #254/#338：[n] 引用锚 + 来源事件——回复引用约定的一半。
+                        // 序号与 emit 的 sources 事件同序对齐，模型在最终回复里
+                        // 用 [n] 标注后由服务侧解析回 cited sources。
+                        StringBuilder sb = new StringBuilder(
+                                "知识库检索结果（回答引用以上内容时请用 [n] 标注来源序号）：");
+                        List<io.github.paopaonb666.agentbase.extensions.events.Events.Source>
+                                sources = new java.util.ArrayList<>();
+                        int index = 0;
                         for (Map<String, Object> item : scored) {
                             String text = String.valueOf(item.get("text"));
-                            sb.append("\n-（相关度 ")
-                                    .append(String.format(java.util.Locale.ROOT, "%.2f", ((Number) item.get("score")).doubleValue()))
-                                    .append("）").append(CharMetrics.head(text, KNOWLEDGE_SNIPPET_CHARS));
+                            String fileId = String.valueOf(item.get("file_id"));
+                            int ordinal = item.get("ordinal") instanceof Number n ? n.intValue() : 0;
+                            index++;
+                            sb.append("\n[").append(index).append("]（相关度 ")
+                                    .append(String.format(java.util.Locale.ROOT, "%.2f",
+                                            ((Number) item.get("score")).doubleValue()))
+                                    .append(" · 文件 ").append(fileId)
+                                    .append(" 第 ").append(ordinal + 1).append(" 段）")
+                                    .append(CharMetrics.head(text, KNOWLEDGE_SNIPPET_CHARS));
+                            sources.add(new io.github.paopaonb666.agentbase.extensions.events.Events.Source(
+                                    "文件 " + fileId + " 第 " + (ordinal + 1) + " 段", null));
+                        }
+                        if (ctx != null) {
+                            ctx.emit(new io.github.paopaonb666.agentbase.extensions.events.Events.SourcesEvent(
+                                    sources));
                         }
                         return sb.toString();
                     }

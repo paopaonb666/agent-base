@@ -5,6 +5,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
@@ -109,6 +110,10 @@ public final class SseStreams {
         // user/thread（工具线程经 MDC 转发继承）。
         MemoryScope.set(config.userId(), config.threadId());
         Set<String> running = new HashSet<>();
+        // #338：本轮来源登记簿——各工具的 sources 事件按发射序收集，最终
+        // 回复的 [n] 引用据此解析（容错：解析不出就不发）。
+        java.util.List<io.github.paopaonb666.agentbase.extensions.events.Events.Source>
+                sourceRegistry = new java.util.ArrayList<>();
         try {
             EventSink sink = new EventSink() {
                 @Override
@@ -121,6 +126,9 @@ public final class SseStreams {
                             return; // 首见去重（对应 Python running 集合）
                         }
                     }
+                    if (event instanceof Events.SourcesEvent sources) {
+                        sourceRegistry.addAll(sources.sources());
+                    }
                     putUninterruptibly(queue, event, cancelled);
                 }
 
@@ -132,8 +140,16 @@ public final class SseStreams {
             // 输入 extras（附件元数据等）随首轮输入进入状态通道：extras 按
             // 键合并（apply 语义），缺席的键保留历史值——对应 Python 输入
             // dict 只提供 messages 时其余通道保持原值。
-            graph.stream(new GraphState(messagesInput,
-                    extra == null ? java.util.Map.of() : extra), config, sink);
+            io.github.paopaonb666.agentbase.core.graph.GraphState finalState = graph.stream(
+                    new GraphState(messagesInput,
+                            extra == null ? java.util.Map.of() : extra), config, sink);
+            // #338：最终回复 [n] 引用解析 → cited sources 事件（在 done 前）。
+            // 与工具执行期的全量 sources 事件互补：这里只发回复真正引用的子集。
+            List<Events.Source> cited = Citations.resolve(
+                    lastReplyText(finalState), Citations.dedup(sourceRegistry));
+            if (!cited.isEmpty()) {
+                putUninterruptibly(queue, new Events.SourcesEvent(cited), cancelled);
+            }
             putUninterruptibly(queue, new Events.DoneEvent(userThreadId), cancelled);
             if (onComplete != null) {
                 // 独立任务：随后的哨兵与 finally 取消都不影响它跑完。
@@ -191,6 +207,24 @@ public final class SseStreams {
     }
 
     /** 消费者：发首帧 ping，循环消费队列直到哨兵（对应 _event_stream 主体）。 */
+    /** 最终回复文本：状态里最后一条带文本的 AiMessage；没有则 null（不解析不 emit）。 */
+    private static String lastReplyText(io.github.paopaonb666.agentbase.core.graph.GraphState state) {
+        if (state == null) {
+            return null;
+        }
+        var messages = state.messages();
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            if (messages.get(i) instanceof dev.langchain4j.data.message.AiMessage ai) {
+                String text = io.github.paopaonb666.agentbase.core.context.ContextEngine
+                        .contentText(ai);
+                if (text != null && !text.isBlank()) {
+                    return text;
+                }
+            }
+        }
+        return null;
+    }
+
     private static void consume(SseEmitter emitter, BlockingQueue<Object> queue,
                                 AtomicBoolean cancelled, Runnable shutdown) {
         try {
