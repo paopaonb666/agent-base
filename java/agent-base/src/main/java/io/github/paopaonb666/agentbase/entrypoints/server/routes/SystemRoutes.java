@@ -187,7 +187,8 @@ public class SystemRoutes {
         String body = Metrics.http().render()
                 + Metrics.tool().renderToolMetrics()
                 + Metrics.memory().renderMemoryMetrics()
-                + Metrics.cost().renderCostMetrics();
+                + Metrics.cost().renderCostMetrics()
+                + Metrics.events().renderEventDropMetrics();
         return ResponseEntity.ok().contentType(MediaType.parseMediaType(
                 "text/plain; version=0.0.4; charset=utf-8")).body(body);
     }

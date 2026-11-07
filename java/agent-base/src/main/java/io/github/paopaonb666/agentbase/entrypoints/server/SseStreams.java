@@ -209,7 +209,10 @@ public final class SseStreams {
                 return;
             }
             // ping 是可丢弃的保活信号：offer 不等待（满即丢），不与关键事件争抢。
-            queue.offer(new Events.PingEvent());
+            if (!queue.offer(new Events.PingEvent())) {
+                // 丢弃可观测（#210）：慢客户端背压下 ping 被丢的次数进 /metrics。
+                io.github.paopaonb666.agentbase.extensions.Metrics.events().observeDrop("ping_full");
+            }
         }
     }
 

@@ -157,6 +157,10 @@ public final class CompiledGraph {
             public void emit(Object event) {
                 if (sink != null && !sink.cancelled()) {
                     sink.accept(event);
+                } else if (sink != null) {
+                    // 断连后的发射是面板缺口（#210）：计入丢弃，可诊断。
+                    io.github.paopaonb666.agentbase.extensions.Metrics.events()
+                            .observeDrop("cancelled");
                 }
             }
 

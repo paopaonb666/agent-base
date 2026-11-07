@@ -43,6 +43,38 @@ public final class Metrics {
     /** 记忆系统操作的封闭枚举（M6）。 */
     public static final List<String> MEMORY_OUTCOMES = List.of("ok", "error", "degraded");
 
+    /** 事件丢弃原因的封闭枚举（#210：面板缺条目可诊断）。 */
+    public static final List<String> EVENT_DROP_REASONS = List.of("cancelled", "ping_full");
+
+    /** 事件丢弃计数器（#210）：只计"面板看不到"的丢失，按原因分桶。 */
+    public static final class EventDropMetrics {
+        private final Map<String, Long> drops = new ConcurrentHashMap<>();
+
+        /** 记录一次事件丢弃；reason 必须属于 EVENT_DROP_REASONS。 */
+        public void observeDrop(String reason) {
+            if (!EVENT_DROP_REASONS.contains(reason)) {
+                throw new IllegalArgumentException(
+                        "unknown event drop reason '%s'; expected %s".formatted(reason, EVENT_DROP_REASONS));
+            }
+            drops.merge(reason, 1L, Long::sum);
+        }
+
+        public long dropped(String reason) {
+            return drops.getOrDefault(reason, 0L);
+        }
+
+        public String renderEventDropMetrics() {
+            List<String> lines = new ArrayList<>();
+            for (Map.Entry<String, Long> e : drops.entrySet().stream()
+                    .sorted(Map.Entry.comparingByKey())
+                    .collect(java.util.stream.Collectors.toList())) {
+                lines.add("agent_events_dropped_total{reason=\"%s\"} %d"
+                        .formatted(e.getKey(), e.getValue()));
+            }
+            return String.join("\n", lines) + (lines.isEmpty() ? "" : "\n");
+        }
+    }
+
     /** 计数器 + 滑动窗口延迟直方图的公共基类。 */
     abstract static class LabeledHistogram {
         private final Map<List<String>, Long> counts = new ConcurrentHashMap<>();
@@ -219,6 +251,7 @@ public final class Metrics {
     private static final ToolMetrics TOOL = new ToolMetrics();
     private static final MemoryMetricsImpl MEMORY = new MemoryMetricsImpl();
     private static final CostMetrics COST = new CostMetrics();
+    private static final EventDropMetrics EVENTS = new EventDropMetrics();
 
     public static HttpMetrics http() { return HTTP; }
 
@@ -227,4 +260,6 @@ public final class Metrics {
     public static MemoryMetricsImpl memory() { return MEMORY; }
 
     public static CostMetrics cost() { return COST; }
+
+    public static EventDropMetrics events() { return EVENTS; }
 }
