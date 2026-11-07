@@ -61,4 +61,30 @@ class AuthGoldenVectorsTest {
         memoryOff.memory.enabled = false;
         assertFalse(AuthBackends.unauthenticatedDeployment(memoryOff));
     }
+
+    @Test
+    void weakReplayModeIsFlaggedForTheStartupBanner() {
+        // #112：配了 secret 但窗口=0 = 防重放退化（仅签 user_id）——
+        // 组合根以横幅提示；默认窗口(300)/关 memory/无 secret 都不是弱模式。
+        io.github.paopaonb666.agentbase.core.config.Settings windowless =
+                new io.github.paopaonb666.agentbase.core.config.Settings();
+        windowless.memory.authSecret = Secret.of("s");
+        windowless.memory.authReplayWindowSeconds = 0;
+        assertTrue(AuthBackends.weakReplayMode(windowless));
+        assertTrue(AuthBackends.weakReplayBanner().contains("MEMORY_AUTH_REPLAY_WINDOW_SECONDS"));
+        // 默认窗口（300）→ 完整防护。
+        io.github.paopaonb666.agentbase.core.config.Settings windowed =
+                new io.github.paopaonb666.agentbase.core.config.Settings();
+        windowed.memory.authSecret = Secret.of("s");
+        assertFalse(AuthBackends.weakReplayMode(windowed));
+        // 无 secret → 无鉴权部署域（#196），不是弱重放模式。
+        assertFalse(AuthBackends.weakReplayMode(new io.github.paopaonb666.agentbase.core.config.Settings()));
+        // memory 关闭 → 整层跳过。
+        io.github.paopaonb666.agentbase.core.config.Settings memoryOff =
+                new io.github.paopaonb666.agentbase.core.config.Settings();
+        memoryOff.memory.enabled = false;
+        memoryOff.memory.authSecret = Secret.of("s");
+        memoryOff.memory.authReplayWindowSeconds = 0;
+        assertFalse(AuthBackends.weakReplayMode(memoryOff));
+    }
 }

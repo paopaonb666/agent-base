@@ -63,6 +63,26 @@ public final class AuthBackends {
         return settings.memory.enabled && settings.memory.authSecret.isBlank();
     }
 
+    /**
+     * 重放防护弱模式判定（#112）：配了 secret 但窗口为 0 时，防重放退化
+     * 为仅签 user_id（时间戳/nonce 记账全跳过，签名可无限重放）。合法配置
+     * 不拒启——只要求组合根启动时醒目提示（与 #196 横幅同款先例）。
+     */
+    public static boolean weakReplayMode(Settings settings) {
+        return settings.memory.enabled && !settings.memory.authSecret.isBlank()
+                && settings.memory.authReplayWindowSeconds == 0;
+    }
+
+    /** 重放防护弱模式的启动横幅文案（给修复指引）。 */
+    public static String weakReplayBanner() {
+        return """
+                ----------------------------------------------------------------------
+                ⚠ 重放防护弱模式（MEMORY_AUTH_REPLAY_WINDOW_SECONDS=0）：HMAC 仍生效，
+                  但时间戳+nonce 防重放被关闭——同一签名可无限重放。如需完整防护，
+                  设置一个大于 0 的窗口（如 300 秒）。
+                ----------------------------------------------------------------------""";
+    }
+
     /** 无鉴权部署的启动横幅文案（醒目、可执行）。 */
     public static String unauthenticatedBanner() {
         return """

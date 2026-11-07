@@ -245,6 +245,13 @@ public final class AgentRuntime {
             LOG.warn("\n{}", io.github.paopaonb666.agentbase.entrypoints.server.AuthBackends
                     .unauthenticatedBanner());
         }
+        // 重放防护弱模式横幅（#112）：配了 secret 但窗口为 0——防重放退化
+        // 为仅签 user_id。合法配置不拒启，但必须醒目提示而不是静默弱化。
+        if (io.github.paopaonb666.agentbase.entrypoints.server.AuthBackends
+                .weakReplayMode(resolved)) {
+            LOG.warn("\n{}", io.github.paopaonb666.agentbase.entrypoints.server.AuthBackends
+                    .weakReplayBanner());
+        }
         // MCP 工具源（#331/#333）：启用即承诺——配置非法或 server 连不上
         // 启动即失败；未启用零解析、零连接。工具与 per-server 超时并入
         // 共享池，与模块/工具库/记忆工具同规。
