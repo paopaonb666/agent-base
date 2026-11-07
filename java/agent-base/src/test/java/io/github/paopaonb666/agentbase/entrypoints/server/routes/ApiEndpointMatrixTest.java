@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -511,5 +512,59 @@ class ApiEndpointMatrixTest {
                 .revokeFile("chat", "f1", "alice", null, null, null));
         assertEquals(7, cascaded.get("chunks_removed"));
         verify(memory).revokeDocument("f1", "alice");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void attachmentMetadataRoundTripsThroughHistory() throws Exception {
+        // #291：附件元数据 上传→invoke→历史 全链一致。SSE 生产者在测试
+        // servlet 里跑不完落盘（#121 同款约束），拆两层锁定：
+        // ①路由装配层——invoke 附件分支按 getMany 保序取到属主文件并放行
+        //   （元数据组装进图状态 extras 是同步代码，异常即失败）；
+        // ②状态→历史层——同一形状的 extras 经图执行落快照、历史端点读回，
+        //   human 消息携带逐字段一致的 attachments（file_id/filename/
+        //   format/pages/truncated/text_len，无 warning 键时缺席）。
+        var index = Mockito.mock(io.github.paopaonb666.agentbase.core.storage.CoreStore.class);
+        when(index.getThreadIndex("chat:rt")).thenReturn(
+                ThreadIndexRecord.create("chat:rt", "alice", "chat", "t"));
+        when(index.getThreadIndex("chat:rt2")).thenReturn(
+                ThreadIndexRecord.create("chat:rt2", "alice", "chat", "t"));
+        var fileStore = Mockito.mock(io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStore.class);
+        UploadedFileInfo info = new UploadedFileInfo("f-rt", "chat:rt", "chat", "alice",
+                "报告.pdf", "pdf", 3, 12, false, 4200, "", "提取文本…", new byte[0]);
+        when(fileStore.getMany(List.of("f-rt"))).thenReturn(List.of(info));
+        AgentRuntime runtime = runtime(Map.of("chat", graphStub("chat")),
+                new InMemoryCheckpointer(), index, fileStore, null, null, null);
+        AgentsRoutes routes = new AgentsRoutes(runtime, PASS_THROUGH_AUTH, providerOf(null));
+
+        // ① 路由层：附件存在且属主匹配 → 走完装配（bindThread 同步可验）。
+        AgentsRoutes.InvokeRequest body = new AgentsRoutes.InvokeRequest(
+                "总结附件", "rt", List.of("f-rt"), null, null);
+        org.springframework.mock.web.MockHttpServletResponse response =
+                new org.springframework.mock.web.MockHttpServletResponse();
+        assertNotNull(routes.invoke("chat", body, response, "alice", null, null, null));
+        verify(fileStore).bindThread(List.of("f-rt"), "chat:rt");
+
+        // ② 状态→历史层：invoke 装配的 extras 形状（消息下标 → 元数据表）
+        //    同步驱动进图，历史端点读回逐字段一致。用独立线程 id rt2——
+        //    ① 的异步 producer 何时落盘不可控，避免快照覆写竞态。
+        List<Map<String, Object>> meta = List.of(Map.of(
+                "file_id", "f-rt", "filename", "报告.pdf", "format", "pdf",
+                "pages", 3, "truncated", false, "text_len", 4200));
+        var graph = runtime.graph("chat");
+        var state = new io.github.paopaonb666.agentbase.core.graph.GraphState(
+                List.of(dev.langchain4j.data.message.UserMessage.from("总结附件")),
+                Map.of("attachments", Map.of("0", meta)));
+        graph.invoke(state, new io.github.paopaonb666.agentbase.core.graph.RunConfig("chat:rt2", "alice", 25));
+
+        Map<String, Object> history = mapOf(routes.threadHistory("chat", "rt2", "alice", null, null, null));
+        List<Map<String, Object>> messages = (List<Map<String, Object>>) history.get("messages");
+        assertEquals(1, messages.size(), "系统注入块不上屏，只回 human 消息");
+        Map<String, Object> human = messages.get(0);
+        assertEquals("human", human.get("role"));
+        assertEquals(List.of(Map.of(
+                "file_id", "f-rt", "filename", "报告.pdf", "format", "pdf",
+                "pages", 3, "truncated", false, "text_len", 4200)),
+                human.get("attachments"), "附件元数据应逐字段一致地随历史读回");
     }
 }
