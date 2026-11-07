@@ -108,7 +108,9 @@ public class ServerConfiguration {
             public void addCorsMappings(CorsRegistry registry) {
                 registry.addMapping("/**")
                         .allowedOrigins(settings.corsOrigins.toArray(String[]::new))
-                        .allowedMethods("*")
+                        // 全部路由只用 GET/POST/DELETE；HEAD/OPTIONS 供预检与探测。
+                        // 收窄自 "*"（Python 侧仍为 *，差异登记 #315）。
+                        .allowedMethods("GET", "POST", "DELETE", "HEAD", "OPTIONS")
                         .exposedHeaders("X-Request-ID")
                         .allowCredentials(false);
             }
