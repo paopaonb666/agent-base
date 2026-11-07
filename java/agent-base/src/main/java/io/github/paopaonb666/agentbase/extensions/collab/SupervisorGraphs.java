@@ -20,6 +20,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 多 Agent 协作：supervisor 模板（阶段 4）——对应 Python 侧
@@ -131,8 +132,10 @@ public final class SupervisorGraphs {
                 .entry("init")
                 .addEdge("init", "supervisor")
                 // 最后一条 AiMessage 带 tool_calls → handoffs；否则 END。
+                // #202：封闭目标集显式声明，compile 校验笔误。
                 .addConditionalEdges("supervisor",
-                        state -> lastAiHasToolCalls(state) ? "handoffs" : GraphBuilder.END)
+                        state -> lastAiHasToolCalls(state) ? "handoffs" : GraphBuilder.END,
+                        Set.of("handoffs", GraphBuilder.END))
                 .addNode("handoffs", (GraphState state, NodeContext nodeCtx) -> {
                     AiMessage last = lastAi(state);
                     if (last == null || !last.hasToolExecutionRequests()) {

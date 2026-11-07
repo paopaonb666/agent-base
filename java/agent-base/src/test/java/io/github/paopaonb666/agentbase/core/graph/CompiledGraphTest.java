@@ -10,6 +10,7 @@ import org.junit.jupiter.api.Test;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -172,8 +173,9 @@ class CompiledGraphTest {
     }
 
     @Test
-    void routerReturningUnknownNodeFailsOnNextIteration() {
-        // #202 基线：条件边返回未注册节点名，编译期不拦，首次命中该分支才炸。
+    void routerReturningUnknownNodeStillFailsAtRuntimeWithoutTargets() {
+        // #202 翻转：旧两参重载未声明目标集——编译期不拦，首次命中该分支
+        // 仍在运行期炸（兜底语义保留）；错误带节点名 + 可用节点列表。
         CompiledGraph graph = GraphBuilder.begin()
                 .addNode("router", (state, ctx) -> Map.of())
                 .entry("router")
@@ -183,6 +185,25 @@ class CompiledGraphTest {
         IllegalStateException error = assertThrows(IllegalStateException.class,
                 () -> graph.invoke(new GraphState(), RunConfig.of("chat:t1", "u1")));
         assertTrue(error.getMessage().contains("missing_node"), error.getMessage());
+        assertTrue(error.getMessage().contains("router"), error.getMessage());
+    }
+
+    @Test
+    void compileRejectsConditionalEdgeWithUnknownDeclaredTarget() {
+        // #202 翻转：条件边声明目标集后，router 返回值笔误在编译期炸——
+        // 不再等运行期首次命中分支才暴露。
+        GraphBuilder builder = GraphBuilder.begin()
+                .addNode("router", (state, ctx) -> Map.of())
+                .entry("router")
+                .addConditionalEdges("router", state -> "missing_node",
+                        Set.of("missing_node", GraphBuilder.END));
+        IllegalStateException error = assertThrows(IllegalStateException.class,
+                () -> builder.compile(null, "chat"));
+        assertTrue(error.getMessage().contains("missing_node"), error.getMessage());
+        // 文案带图名 + 出边节点 + 可用列表。
+        assertTrue(error.getMessage().contains("chat"), error.getMessage());
+        assertTrue(error.getMessage().contains("router"), error.getMessage());
+        assertTrue(error.getMessage().contains("可用"), error.getMessage());
     }
 
     @Test
@@ -431,6 +452,13 @@ class CompiledGraphTest {
                 .entry("a")
                 .addEdge("a", "ghost");
         assertThrows(IllegalStateException.class, () -> unknownTarget.compile(null, "x"));
+
+        // #202：条件边声明目标集后，未注册目标同样在编译期拦截。
+        GraphBuilder unknownConditionalTarget = GraphBuilder.begin()
+                .addNode("a", (s, c) -> Map.of())
+                .entry("a")
+                .addConditionalEdges("a", s -> "ghost", Set.of("ghost", GraphBuilder.END));
+        assertThrows(IllegalStateException.class, () -> unknownConditionalTarget.compile(null, "x"));
 
         GraphBuilder noOutEdge = GraphBuilder.begin()
                 .addNode("a", (s, c) -> Map.of())

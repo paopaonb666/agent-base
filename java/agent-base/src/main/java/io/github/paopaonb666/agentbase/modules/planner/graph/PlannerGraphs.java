@@ -5,6 +5,8 @@ import io.github.paopaonb666.agentbase.core.graph.CompiledGraph;
 import io.github.paopaonb666.agentbase.core.graph.GraphBuilder;
 import io.github.paopaonb666.agentbase.modules.planner.PlannerModule;
 
+import java.util.Set;
+
 /**
  * planner 模块的图构建（M9）：plan → execute → check →(replan)* →
  * synthesize——对应 Python 侧 {@code modules/planner/graph.py}。
@@ -31,8 +33,9 @@ public final class PlannerGraphs {
                 .addEdge("plan", "execute")
                 .addEdge("execute", "check")
                 // 路由：有 failed 且预算未耗尽 → replan；有 pending → execute；
-                // 否则 → synthesize。
-                .addConditionalEdges("check", CheckNodes.routeAfterCheck(ctx))
+                // 否则 → synthesize。#202：封闭目标集显式声明，compile 校验笔误。
+                .addConditionalEdges("check", CheckNodes.routeAfterCheck(ctx),
+                        Set.of("replan", "execute", "synthesize"))
                 .addEdge("replan", "execute")
                 .addEdge("synthesize", GraphBuilder.END)
                 .compile(ctx.checkpointer(), PlannerModule.MODULE_NAME);

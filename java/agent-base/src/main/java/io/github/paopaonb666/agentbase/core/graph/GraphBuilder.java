@@ -2,6 +2,7 @@ package io.github.paopaonb666.agentbase.core.graph;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Function;
 
 /**
@@ -39,7 +40,12 @@ public final class GraphBuilder {
         String apply(GraphState state);
     }
 
-    record Edge(String target, Router router) {}
+    record Edge(String target, Router router, Set<String> possibleTargets) {
+        /** 旧两参形态（possibleTargets=null = 未声明目标集，不做编译期校验）。 */
+        Edge(String target, Router router) {
+            this(target, router, null);
+        }
+    }
 
     final Map<String, Node> nodes = new LinkedHashMap<>();
     final Map<String, Edge> edges = new LinkedHashMap<>();
@@ -68,6 +74,16 @@ public final class GraphBuilder {
     /** 注册条件边（对应 add_conditional_edges）。 */
     public GraphBuilder addConditionalEdges(String from, Router router) {
         return addEdge(from, new Edge(null, router));
+    }
+
+    /**
+     * 注册条件边并声明路由的全部可能目标（#202）：router 返回值应为封闭
+     * 集合时用它——compile 校验目标 ⊆ 已注册节点 + {@link #END}，笔误在
+     * 编译期暴露而不是首次命中分支才炸。不声明目标集的旧重载保留运行期
+     * 兜底语义。
+     */
+    public GraphBuilder addConditionalEdges(String from, Router router, Set<String> possibleTargets) {
+        return addEdge(from, new Edge(null, router, Set.copyOf(possibleTargets)));
     }
 
     private GraphBuilder addEdge(String from, Edge edge) {
@@ -106,6 +122,15 @@ public final class GraphBuilder {
             if (edge.target() != null && !END.equals(edge.target()) && !nodes.containsKey(edge.target())) {
                 throw new IllegalStateException("边 '%s' 的后继 '%s' 未注册".formatted(e.getKey(), edge.target()));
             }
+            // #202：条件边声明了目标集时编译期校验（⊆ 节点 + END）。
+            if (edge.possibleTargets() != null) {
+                for (String target : edge.possibleTargets()) {
+                    if (!END.equals(target) && !nodes.containsKey(target)) {
+                        throw new IllegalStateException("图 '%s' 条件边 '%s' 声明的目标 '%s' 未注册（可用：%s）"
+                                .formatted(name, e.getKey(), target, declaredTargetsHelp()));
+                    }
+                }
+            }
         }
         // 所有节点都必须有出边（终点由显式路由到 END 表达）。
         for (String node : nodes.keySet()) {
@@ -114,6 +139,11 @@ public final class GraphBuilder {
             }
         }
         return new CompiledGraph(name, Map.copyOf(nodes), Map.copyOf(edges), entry, checkpointer, toolPool);
+    }
+
+    /** 可用目标提示（#202 错误文案）：已注册节点 + END。 */
+    private String declaredTargetsHelp() {
+        return String.join(", ", nodes.keySet()) + ", " + END;
     }
 
     /** 便捷重载：单节点直线图（START → node → END）。 */

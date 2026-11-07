@@ -122,7 +122,10 @@ public final class CompiledGraph {
             }
             GraphBuilder.Node node = nodes.get(current);
             if (node == null) {
-                throw new IllegalStateException("未知节点 '%s'".formatted(current));
+                // #202：运行期兜底（未声明目标集的条件边仍可能到这里）——
+                // 错误带节点名 + 可用节点列表，可直接定位路由笔误。
+                throw new IllegalStateException("未知节点 '%s'（可用：%s）"
+                        .formatted(current, String.join(", ", nodes.keySet())));
             }
             if (sink != null) {
                 sink.accept(io.github.paopaonb666.agentbase.extensions.events.Events.StepEvent.running(current));

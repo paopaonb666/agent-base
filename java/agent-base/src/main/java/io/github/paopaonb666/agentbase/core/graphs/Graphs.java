@@ -17,6 +17,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 共享图工厂（P1-4 / H3）：单 LLM 节点 + 可选工具循环的公共装配。
@@ -115,7 +116,10 @@ public final class Graphs {
             });
             builder.entry("agent");
             // tools_condition：最后的 AIMessage 带 tool_calls → 进工具节点。
-            builder.addConditionalEdges("agent", state -> hasPendingToolCalls(state) ? "tools" : GraphBuilder.END);
+            // #202：封闭目标集显式声明，compile 校验笔误。
+            builder.addConditionalEdges("agent",
+                    state -> hasPendingToolCalls(state) ? "tools" : GraphBuilder.END,
+                    Set.of("tools", GraphBuilder.END));
             builder.addEdge("tools", "agent");
         }
 
