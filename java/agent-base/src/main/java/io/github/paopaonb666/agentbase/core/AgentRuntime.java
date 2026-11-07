@@ -32,9 +32,10 @@ import java.util.Map;
  * <p>保留的模块名 {@code supervisor} 会构建一个 supervisor 图
  * （extensions/collab），把每个已注册的模块编排为 sub-agent。
  *
- * <p>对应 Python 侧 {@code core/bootstrap.py}。MCP 工具来源按第一期
- * 裁剪决策：{@code MCP_ENABLED=true} 时启动即报错（启用即承诺的契约
- * 语义保留——承诺的工具来源无法兑现时拒绝静默启动）。
+ * <p>对应 Python 侧 {@code core/bootstrap.py}。MCP 工具来源（#331/#333）
+ * 在 bootstrap 阶段装配：{@code MCP_ENABLED=true} 时 stdio server 的工具
+ * 经 {@code McpTool} 适配并入共享池（启用即承诺——配置非法或连不上启动
+ * 即失败，绝不静默缺席）。
  */
 public final class AgentRuntime {
 
@@ -205,9 +206,15 @@ public final class AgentRuntime {
         return supervisor;
     }
 
-    /** 释放运行时持有的资源（checkpointer 连接、审计写线程等）。 */
+    /** 释放运行时持有的资源（checkpointer 连接、审计写线程、MCP 子进程等）。 */
     public void close() {
         if (tools != null) {
+            // MCP server 子进程随池的工具收敛关闭（McpTool.close 幂等）。
+            for (AgentTool tool : tools.registeredTools()) {
+                if (tool instanceof io.github.paopaonb666.agentbase.toolkit.mcp.McpTool mcpTool) {
+                    mcpTool.close();
+                }
+            }
             tools.close();
         }
         if (checkpointer != null) {
@@ -239,12 +246,11 @@ public final class AgentRuntime {
             LOG.warn("\n{}", io.github.paopaonb666.agentbase.entrypoints.server.AuthBackends
                     .unauthenticatedBanner());
         }
-        // MCP（第一期未迁移）：启用即承诺——配置打开而能力未迁移时拒绝启动。
-        if (resolved.mcp.enabled) {
-            throw new IllegalStateException(
-                    "MCP_ENABLED=true 但 MCP 工具源第一期未迁移（Java 版）：关闭 MCP_ENABLED 或等待后续版本。"
-                            + "启用即承诺：拒绝静默忽略该配置。");
-        }
+        // MCP 工具源（#331/#333）：启用即承诺——配置非法或 server 连不上
+        // 启动即失败；未启用零解析、零连接。工具与 per-server 超时并入
+        // 共享池，与模块/工具库/记忆工具同规。
+        io.github.paopaonb666.agentbase.toolkit.mcp.McpSources.McpAssembly mcp =
+                io.github.paopaonb666.agentbase.toolkit.mcp.McpSources.load(resolved);
         // usage 采集（T4.1）：cost.enabled 时挂成本计量 sink，未启用时完全不
         // 挂（对应 Python build_llm 的条件挂载——否则 pending 队列没有
         // flusher 消费、metrics 也会泄漏 Python 不会输出的指标）。
@@ -315,10 +321,14 @@ public final class AgentRuntime {
             // 超时包装与审计收口。
             extraTools.addAll(plugin.tools());
         }
+        extraTools.addAll(mcp.tools());
+        // MCP per-server 超时并入池的超时表（键 = 前缀化工具名）。
+        java.util.Map<String, Double> timeouts =
+                new java.util.LinkedHashMap<>(
+                        io.github.paopaonb666.agentbase.toolkit.Toolkits.toolkitTimeouts(resolved));
+        timeouts.putAll(mcp.timeouts());
         ToolPool pool = ToolPool.build(moduleTools(modules), extraTools,
-                resolved.toolkit.timeoutSeconds,
-                io.github.paopaonb666.agentbase.toolkit.Toolkits.toolkitTimeouts(resolved),
-                recorder);
+                resolved.toolkit.timeoutSeconds, timeouts, recorder);
         return new AgentRuntime(resolved, llm, modules, pool, checkpointer, recorder,
                 fileStore, memoryService, coreStore,
                 coreStore == null ? null : new io.github.paopaonb666.agentbase.core.storage.PlanStoreAdapter(coreStore));

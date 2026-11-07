@@ -245,7 +245,7 @@ public final class Settings {
         public Map<String, Map<String, Double>> parsedPrices = Map.of();
     }
 
-    /** MCP 工具来源配置节：env 前缀 {@code MCP_}（第一期未迁移：启用即报错）。 */
+    /** MCP 工具来源配置节：env 前缀 {@code MCP_}（stdio 先行，见 toolkit/mcp）。 */
     public static final class McpSettings {
         public boolean enabled = false;
         public String serversJson = "";

@@ -29,9 +29,8 @@ import io.github.paopaonb666.agentbase.toolkit.search.WebSearchTool;
  *       全局预算）经 {@link #toolkitTimeouts} 下发到共享池。</li>
  * </ul>
  *
- * <p>TODO(mcp)：Python 侧 {@code tools/mcp.py} 的 MCP 工具来源不随工具库
- * 迁移——它由基座 bootstrap 阶段接入（Java 侧 {@code Settings.McpSettings}
- * 已声明"第一期未迁移：启用即报错"的契约），此处只留占位，不建文件。
+ * <p>MCP 工具来源不随工具库迁移——它由基座 bootstrap 阶段接入
+ * （toolkit/mcp 包，#331/#333），此处不再留位。
  * TODO(repl)：{@code python_repl} 第一期未迁移（见 buildToolkitTools 的
  * 分支文案）。
  */
