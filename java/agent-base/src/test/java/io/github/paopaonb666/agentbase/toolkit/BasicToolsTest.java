@@ -44,9 +44,17 @@ class BasicToolsTest {
     }
 
     @Test
-    void currentTimeUtc() {
+    void currentTimeUtc() throws Exception {
         String rendered = call(new CurrentTimeTool(), "{\"tz\": \"UTC\"}");
         assertTrue(rendered.endsWith("(UTC)"));
+        // #249：真转 UTC——偏移必须是 +00:00，且挂钟贴近真实 UTC 时刻
+        // （旧实现是本地挂钟误标 UTC，时区非 UTC 的机器上会偏差数小时）。
+        assertTrue(rendered.contains("+00:00"), "应带零偏移：" + rendered);
+        java.time.OffsetDateTime parsed = java.time.OffsetDateTime.parse(
+                rendered.substring(0, rendered.lastIndexOf(" (")));
+        long skewSeconds = Math.abs(java.time.Duration.between(
+                parsed.toInstant(), java.time.Instant.now()).getSeconds());
+        assertTrue(skewSeconds < 60, "utc 分支应返回真实 UTC 时刻，偏差 " + skewSeconds + "s");
     }
 
     @Test

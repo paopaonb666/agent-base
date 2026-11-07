@@ -24,11 +24,10 @@ import io.github.paopaonb666.agentbase.core.tools.AgentTool;
  * 时区数据来自 JDK 自带的 tzdata（对应 Python 的 {@code tzdata}/
  * {@code zoneinfo}，均为 IANA 库）。
  *
- * <p><b>逐字对齐说明（含已知的宽松语义）</b>：Python 的 {@code utc}
- * 分支用的是不带时区的 {@code datetime.now()}——即服务器本地挂钟
- * 时间——只是把后缀标成 {@code (UTC)}。本机非 UTC 时该输出会被误标；
- * 为了行为一致这里原样移植（{@link LocalDateTime#now()}），若要修正
- * 应 Python/Java 两侧同步修正。
+ * <p><b>utc 分支（#249 已修正，breaking）</b>：Python/Java 双侧原实现都
+ * 是本地挂钟时间——只是把后缀标成 {@code (UTC)}——本机非 UTC 时对用户
+ * 是错的时间。两侧已同步改为真转 UTC（带 {@code +00:00} 偏移渲染）；
+ * 依赖旧行为的下游注意此变更是刻意的。
  *
  * <p>已声明的平台差异：时区短名（{@code tzname()}）在 Python 下来自
  * 操作系统（Windows 上是 "China Standard Time" 一类注册表名，Linux 上
@@ -87,8 +86,10 @@ public final class CurrentTimeTool implements AgentTool {
             return isoformat(now) + " (" + shortName(now.getZone()) + ")";
         }
         if (norm.equals("utc")) {
-            // 逐字对齐 Python：本地挂钟时间 + "(UTC)" 后缀（见类注释）。
-            return isoformat(LocalDateTime.now()) + " (UTC)";
+            // #249（breaking，Python/Java 双侧同步修正）：真转 UTC——旧实现
+            // 是本地挂钟时间 + "(UTC)" 后缀，本机非 UTC 时对用户是错的时间。
+            // isoformat 的零偏移渲染 "+00:00"，与 Python aware datetime 一致。
+            return isoformat(ZonedDateTime.now(java.time.ZoneOffset.UTC)) + " (UTC)";
         }
         // Python ZoneInfo 只接受 tz 数据库里的精确键名（区分大小写）：
         // "+08:00"/"GMT+8"/"Z" 这类偏移形式抛 ZoneInfoNotFoundError → 由

@@ -12,7 +12,7 @@ import ast
 import json
 import operator
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -53,7 +53,9 @@ def current_time(tz: str = "local") -> str:
         now = datetime.now().astimezone()
         return f"{now.isoformat()} ({now.tzname()})"
     if tz.strip().lower() == "utc":
-        return f"{datetime.now().isoformat()} (UTC)"
+        # #249（breaking，与 Java 侧同步修正）：真转 UTC——旧实现是本地
+        # 挂钟时间 + "(UTC)" 后缀，本机非 UTC 时对用户是错的时间。
+        return f"{datetime.now(timezone.utc).isoformat()} (UTC)"
     try:
         zone = ZoneInfo(tz.strip())
     except ZoneInfoNotFoundError as exc:
