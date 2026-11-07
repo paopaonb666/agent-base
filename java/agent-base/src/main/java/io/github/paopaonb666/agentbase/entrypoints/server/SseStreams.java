@@ -72,7 +72,14 @@ public final class SseStreams {
      */
     public static SseEmitter open(CompiledGraph graph, java.util.List<dev.langchain4j.data.message.ChatMessage> messagesInput,
                                   java.util.Map<String, Object> extra, RunConfig config, String userThreadId, Runnable onComplete) {
-        SseEmitter emitter = new SseEmitter(0L); // 不超时（Python 无超时语义）
+        return open(graph, messagesInput, extra, config, userThreadId, onComplete,
+                new SseEmitter(0L)); // 不超时（Python 无超时语义）
+    }
+
+    /** 可注入 emitter 的内部重载（测试替身用；生产方用上面的默认形态）。 */
+    static SseEmitter open(CompiledGraph graph, java.util.List<dev.langchain4j.data.message.ChatMessage> messagesInput,
+                           java.util.Map<String, Object> extra, RunConfig config, String userThreadId,
+                           Runnable onComplete, SseEmitter emitter) {
         BlockingQueue<Object> queue = new ArrayBlockingQueue<>(SSE_QUEUE_MAXSIZE);
         AtomicBoolean cancelled = new AtomicBoolean(false);
         Thread producer = new Thread(() -> produce(queue, graph, messagesInput, extra, config,
