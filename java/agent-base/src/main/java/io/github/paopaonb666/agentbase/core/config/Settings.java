@@ -1052,17 +1052,27 @@ public final class Settings {
                 continue;
             }
             String key = line.substring(0, eq).strip();
-            String value = unquote(line.substring(eq + 1).strip());
-            // 行内注释：未加引号的值以 " #" 分隔时截断（dotenv 常见语义）。
-            if (!value.startsWith("\"") && !value.startsWith("'")) {
-                int hash = value.indexOf(" #");
-                if (hash >= 0) {
-                    value = value.substring(0, hash).strip();
-                }
-            }
-            out.put(key, value);
+            out.put(key, parseEnvValue(line.substring(eq + 1).strip()));
         }
         return out;
+    }
+
+    /**
+     * 单个 .env 值的解析（解引号 + 行内注释，#114）：
+     * 引号内的 " #" 保留（对齐 python-dotenv）；未加引号的值以 " #"
+     * 分隔时截断行内注释（dotenv 常见语义）。引号判定必须在解引号
+     * 之前做——先 unquote 再判会作用在已剥引号的值上，守卫失效。
+     */
+    static String parseEnvValue(String raw) {
+        boolean quoted = raw.startsWith("\"") || raw.startsWith("'");
+        String value = unquote(raw);
+        if (!quoted) {
+            int hash = value.indexOf(" #");
+            if (hash >= 0) {
+                value = value.substring(0, hash).strip();
+            }
+        }
+        return value;
     }
 
     private static String unquote(String value) {
