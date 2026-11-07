@@ -7,6 +7,7 @@ import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Pattern;
 
 /**
@@ -102,6 +103,9 @@ public final class AuthBackends {
         // 进程一致）；LRU 上限防止长期运行下的无界增长。
         private final Map<String, Double> seenNonces = new LinkedHashMap<>();
         private final Object lock = new Object();
+        // LRU 淘汰计数（#207）：容量不足被挤出的指纹数——持续增长意味着
+        // 容量偏小（容量×窗口乘积风险的终解——外置存储——属旧 #83，不在本条）。
+        private final AtomicLong evictionCount = new AtomicLong();
 
         public HmacHeaderAuth() {
             this(4096);
@@ -199,8 +203,14 @@ public final class AuthBackends {
                 while (seenNonces.size() > replayCacheLimit) {
                     String eldest = seenNonces.keySet().iterator().next();
                     seenNonces.remove(eldest);
+                    evictionCount.incrementAndGet();
                 }
             }
+        }
+
+        /** LRU 淘汰累计次数（#207）：观测缓存容量是否偏小的进程内指标。 */
+        public long nonceEvictionCount() {
+            return evictionCount.get();
         }
 
         /** HMAC-SHA256 hex 小写（与 Python hmac.new(...).hexdigest() 一致）。 */

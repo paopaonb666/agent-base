@@ -161,6 +161,8 @@ class AuthBoundaryTest {
                 sig("alice\n1000000\nn3"), "1000000", "n3", s, 1000000)));
         assertEquals(401, statusOf(() -> auth.authenticate("alice",
                 sig("alice\n1000000\nn4"), "1000000", "n4", s, 1000000)));
+        // #207：每次挤出都计数（2 个 nonce 被淘汰）。
+        assertEquals(2, auth.nonceEvictionCount());
         // n1 已被 LRU 淘汰：重放成为可能（缓存上限的固有取舍，文档已注明）。
         assertEquals("alice", auth.authenticate("alice",
                 sig("alice\n1000000\nn1"), "1000000", "n1", s, 1000000));
@@ -169,6 +171,30 @@ class AuthBoundaryTest {
                 sig("alice\n1000000\nn3"), "1000000", "n3", s, 1000000));
         assertEquals(401, statusOf(() -> auth.authenticate("alice",
                 sig("alice\n1000000\nn1"), "1000000", "n1", s, 1000000)));
+        // n3 重登记又挤出 n4：计数累计到 4。
+        assertEquals(4, auth.nonceEvictionCount());
+    }
+
+    /** #207：MEMORY_AUTH_REPLAY_CACHE_LIMIT 经 authBackend bean 生效（直调装配方法）。 */
+    @Test
+    void replayCacheLimitFlowsFromSettingsThroughTheBean() {
+        Settings s = settings(3600);
+        s.memory.authReplayCacheLimit = 2;
+        AuthBackends.HmacHeaderAuth auth =
+                (AuthBackends.HmacHeaderAuth) new ServerConfiguration().authBackend(s);
+        for (String nonce : new String[]{"n1", "n2", "n3", "n4"}) {
+            assertEquals("alice", auth.authenticate("alice",
+                    sig("alice\n1000000\n" + nonce), "1000000", nonce, s, 1000000));
+        }
+        // 容量确实来自 Settings（默认 4096 时 4 个 nonce 记满也不会有淘汰）。
+        assertEquals(2, auth.nonceEvictionCount());
+        // n1 已被挤出 → 重放成为可能；随后 n1 重登记挤出 n3 → n3 同样可重放。
+        assertEquals("alice", auth.authenticate("alice",
+                sig("alice\n1000000\nn1"), "1000000", "n1", s, 1000000));
+        assertEquals(3, auth.nonceEvictionCount());
+        assertEquals("alice", auth.authenticate("alice",
+                sig("alice\n1000000\nn3"), "1000000", "n3", s, 1000000));
+        assertEquals(4, auth.nonceEvictionCount());
     }
 
     @Test

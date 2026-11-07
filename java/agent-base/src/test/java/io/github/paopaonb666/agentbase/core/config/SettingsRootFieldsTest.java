@@ -140,4 +140,24 @@ class SettingsRootFieldsTest {
         // 未配置时保持空串（fast 未配置语义不变）。
         assertEquals("", Settings.load(Map.of("ENV", "development"), null).llmFast.baseUrl);
     }
+
+    @Test
+    void authReplayCacheLimitParsesFromMemorySection() {
+        // #207：nonce 重放缓存容量可配（MEMORY_AUTH_REPLAY_CACHE_LIMIT，
+        // 默认 4096 与构造器默认一致）。
+        assertEquals(4096,
+                Settings.load(Map.of("ENV", "development"), null).memory.authReplayCacheLimit);
+        Settings s = Settings.load(Map.of(
+                "ENV", "development",
+                "MEMORY_AUTH_REPLAY_CACHE_LIMIT", "2048"), null);
+        assertEquals(2048, s.memory.authReplayCacheLimit);
+        // 非正数 fail-fast：0 会让 LRU 淘汰分支恒真（刚记账就被挤出，
+        // 缓存永远为空、防重放失效）。
+        Settings.SettingsError error = assertThrows(Settings.SettingsError.class,
+                () -> Settings.load(Map.of(
+                        "ENV", "development",
+                        "MEMORY_AUTH_REPLAY_CACHE_LIMIT", "0"), null));
+        assertTrue(error.getMessage().contains("auth_replay_cache_limit"),
+                "拒绝文案要点名出错字段：" + error.getMessage());
+    }
 }

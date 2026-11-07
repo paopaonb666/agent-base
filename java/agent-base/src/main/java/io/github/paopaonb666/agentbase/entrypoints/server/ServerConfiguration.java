@@ -56,8 +56,9 @@ public class ServerConfiguration {
     }
 
     @Bean
-    public AuthBackends.AuthBackend authBackend() {
-        return new AuthBackends.HmacHeaderAuth();
+    public AuthBackends.AuthBackend authBackend(Settings settings) {
+        // nonce 重放缓存容量来自 MEMORY_AUTH_REPLAY_CACHE_LIMIT（#207）。
+        return new AuthBackends.HmacHeaderAuth(settings.memory.authReplayCacheLimit);
     }
 
     @Bean

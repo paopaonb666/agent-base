@@ -229,6 +229,8 @@ public final class Settings {
         /** 记忆身份鉴权（P0）：配置后所有用户作用域请求需附带 HMAC 签名。 */
         public Secret authSecret = Secret.of("");
         public int authReplayWindowSeconds = 300;
+        /** nonce 重放缓存的 LRU 容量（#207）：超出即淘汰最旧指纹并计数。 */
+        public int authReplayCacheLimit = 4096;
     }
 
     /** planner 模块的预算与防护（M9）：env 前缀 {@code PLANNER_}。 */
@@ -871,6 +873,13 @@ public final class Settings {
                 throw new SettingsError("memory_auth_replay_window_seconds must be >= 0, got %d".formatted(value));
             }
             t.authReplayWindowSeconds = value;
+        }
+        if (v.containsKey("auth_replay_cache_limit")) {
+            int value = requireInt("auth_replay_cache_limit", v.get("auth_replay_cache_limit"));
+            if (value < 1) {
+                throw new SettingsError("memory_auth_replay_cache_limit must be >= 1, got %d".formatted(value));
+            }
+            t.authReplayCacheLimit = value;
         }
     }
 
