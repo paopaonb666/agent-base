@@ -21,6 +21,16 @@ public interface AgentTool {
     ToolSpecification specification();
 
     /**
+     * 是否只读（#336）：只读工具在批量执行（{@link ToolPool#callAll}）里
+     * 允许并发，有副作用的保持串行。默认 true——基座内置与记忆工具都是
+     * 读取/追加语义；有外部副作用面的工具（web_search 网络请求、MCP
+     * server 工具行为不可知）必须显式声明 false。
+     */
+    default boolean readOnly() {
+        return true;
+    }
+
+    /**
      * 执行工具；返回给模型的结果文本。抛出的任何异常都会被池的包装层
      * 归一成模型可读文本（坏掉的工具绝不打断对话）。
      *

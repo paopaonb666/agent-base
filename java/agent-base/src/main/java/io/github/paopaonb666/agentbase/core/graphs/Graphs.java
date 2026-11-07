@@ -97,10 +97,19 @@ public final class Graphs {
                     return Map.of();
                 }
                 List<ChatMessage> results = new ArrayList<>();
-                for (ToolExecutionRequest request : last.toolExecutionRequests()) {
-                    String result = nodeCtx.callTool(request.name(), request.arguments());
+                List<ToolExecutionRequest> requests = last.toolExecutionRequests();
+                // #337：只读并发、有副作用串行；池未接（测试直构）退化为串行。
+                List<String> outputs = nodeCtx.tools() == null
+                        ? requests.stream().map(r -> nodeCtx.callTool(r.name(), r.arguments())).toList()
+                        : nodeCtx.tools().callAll(requests, nodeCtx.config(), nodeCtx,
+                                request -> nodeCtx.callTool(request.name(), request.arguments()));
+                int index = 0;
+                for (ToolExecutionRequest request : requests) {
                     results.add(ToolExecutionResultMessage.from(
-                            request.id() == null ? "" : request.id(), request.name(), result));
+                            request.id() == null ? "" : request.id(),
+                            request.name() == null ? "" : request.name(),
+                            outputs.get(index)));
+                    index++;
                 }
                 return Map.<String, Object>of(GraphState.MESSAGES, results);
             });

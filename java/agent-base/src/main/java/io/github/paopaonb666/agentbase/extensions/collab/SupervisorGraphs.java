@@ -121,12 +121,23 @@ public final class SupervisorGraphs {
                         return Map.of();
                     }
                     List<ChatMessage> results = new ArrayList<>();
+                    // #337：handoff 工具不在池内 → 按非只读串行（语义同原
+                    // for 循环：异常原样传播，子图事件经转发 sink 透传）。
+                    List<String> outputs = nodeCtx.tools() == null
+                            ? last.toolExecutionRequests().stream()
+                                    .map(request -> runHandoff(request, state.messages(),
+                                            subgraphs, nodeCtx)).toList()
+                            : nodeCtx.tools().callAll(last.toolExecutionRequests(),
+                                    nodeCtx.config(), nodeCtx,
+                                    request -> runHandoff(request, state.messages(),
+                                            subgraphs, nodeCtx));
+                    int index = 0;
                     for (ToolExecutionRequest request : last.toolExecutionRequests()) {
-                        String result = runHandoff(request, state.messages(), subgraphs, nodeCtx);
                         results.add(ToolExecutionResultMessage.from(
                                 request.id() == null ? "" : request.id(),
                                 request.name() == null ? "" : request.name(),
-                                result));
+                                outputs.get(index)));
+                        index++;
                     }
                     return Map.<String, Object>of(GraphState.MESSAGES, results);
                 })

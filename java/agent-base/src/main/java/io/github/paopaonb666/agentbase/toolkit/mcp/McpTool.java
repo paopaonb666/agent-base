@@ -59,6 +59,12 @@ public final class McpTool implements AgentTool, AutoCloseable {
         return spec;
     }
 
+    /** #336：server 工具行为不可知（可能是抓取也可能是写入），保守非只读。 */
+    @Override
+    public boolean readOnly() {
+        return false;
+    }
+
     @Override
     public String call(String argsJson, ToolContext ctx) throws Exception {
         JsonNode args;

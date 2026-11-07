@@ -109,6 +109,12 @@ public final class WebSearchTool implements AgentTool {
         return NAME;
     }
 
+    /** #336：对外发网络请求（查询词出网），显式声明非只读——批量执行保持串行。 */
+    @Override
+    public boolean readOnly() {
+        return false;
+    }
+
     @Override
     public String description() {
         return DESCRIPTION;

@@ -110,11 +110,21 @@ public final class ExecuteNode {
     private static List<ChatMessage> executeToolCalls(List<ToolExecutionRequest> toolCalls,
                                                       NodeContext nodeCtx) {
         List<ChatMessage> results = new ArrayList<>(toolCalls.size());
+        // #337：只读工具并发、有副作用串行，结果按请求序（池内通道保归一）；
+        // 池未接（测试直构）退化为串行 callTool。
+        List<String> outputs = nodeCtx.tools() == null
+                ? toolCalls.stream().map(c -> nodeCtx.callTool(
+                        c.name() == null ? "" : c.name(),
+                        c.arguments() == null ? "{}" : c.arguments())).toList()
+                : nodeCtx.tools().callAll(toolCalls, nodeCtx.config(), nodeCtx,
+                        call -> nodeCtx.callTool(call.name() == null ? "" : call.name(),
+                                call.arguments() == null ? "{}" : call.arguments()));
+        int index = 0;
         for (ToolExecutionRequest call : toolCalls) {
             String name = call.name() == null ? "" : call.name();
-            String content = nodeCtx.callTool(name, call.arguments() == null ? "{}" : call.arguments());
             results.add(ToolExecutionResultMessage.from(
-                    call.id() == null ? "" : call.id(), name, content));
+                    call.id() == null ? "" : call.id(), name, outputs.get(index)));
+            index++;
         }
         return results;
     }

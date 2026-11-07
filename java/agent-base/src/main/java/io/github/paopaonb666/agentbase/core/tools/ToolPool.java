@@ -204,6 +204,44 @@ public final class ToolPool {
                 .validate(spec.parameters(), parsed);
     }
 
+    /**
+     * 批量执行一轮 tool_calls（#337）：池内只读工具（{@link AgentTool#readOnly()}）
+     * 并发跑（tool_call 事件按 call_id 自配对，乱序完成安全），有副作用的
+     * 串行；结果严格按请求顺序返回。
+     *
+     * <p>{@code runner} 是单请求执行通道：普通图节点传 {@code (req) ->
+     * this.call(req.name(), req.arguments(), config, ctx)}；supervisor 的
+     * handoff 传 {@code runHandoff}（handoff 工具不在池内 → 按非只读串行，
+     * 语义与原实现一致）。串行槽的异常原样传播（handoff 依赖这一语义）；
+     * 并发槽由池通道保证不抛（pool.call 全归一）。
+     */
+    public List<String> callAll(List<dev.langchain4j.agent.tool.ToolExecutionRequest> requests,
+                                RunConfig config, NodeContext ctx,
+                                java.util.function.Function<dev.langchain4j.agent.tool.ToolExecutionRequest, String> runner) {
+        int size = requests.size();
+        if (size <= 1) {
+            return requests.stream().map(runner).toList();
+        }
+        // 槽位：String = 已完成的串行结果（异常在提交时原样抛出）；
+        // CompletableFuture<String> = 并发中的只读任务。
+        List<Object> slots = new java.util.ArrayList<>(size);
+        for (dev.langchain4j.agent.tool.ToolExecutionRequest request : requests) {
+            Entry entry = tools.get(request.name() == null ? "" : request.name());
+            if (entry != null && entry.inner().readOnly()) {
+                slots.add(java.util.concurrent.CompletableFuture.supplyAsync(
+                        () -> runner.apply(request), executor));
+            } else {
+                slots.add(runner.apply(request)); // 异常原样传播（语义同旧 for 循环）
+            }
+        }
+        List<String> out = new java.util.ArrayList<>(size);
+        for (Object slot : slots) {
+            out.add(slot instanceof String text
+                    ? text : ((java.util.concurrent.CompletableFuture<String>) slot).join());
+        }
+        return out;
+    }
+
     private static Exception asException(Throwable t) {
         return t instanceof Exception e ? e : new IllegalStateException(t.getMessage(), t);
     }
