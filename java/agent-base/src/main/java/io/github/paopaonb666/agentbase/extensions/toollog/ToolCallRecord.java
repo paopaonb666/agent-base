@@ -77,17 +77,20 @@ public final class ToolCallRecord {
 
     /** HTTP 端点的序列化视图（args 解析为对象；error 空串转 null）。 */
     public Map<String, Object> asDict() {
-        return new java.util.LinkedHashMap<>(java.util.Map.ofEntries(
-                java.util.Map.entry("call_id", callId),
-                java.util.Map.entry("tool", tool),
-                java.util.Map.entry("status", status),
-                java.util.Map.entry("args", loadsOrRaw(argsJson)),
-                java.util.Map.entry("result", resultText),
-                java.util.Map.entry("error", errorText.isEmpty() ? null : errorText),
-                java.util.Map.entry("duration_ms", durationMs),
-                java.util.Map.entry("thread_id", threadId),
-                java.util.Map.entry("module", module),
-                java.util.Map.entry("request_id", requestId)));
+        // LinkedHashMap 而非 Map.entry：error 为 null（成功调用的常态）时
+        // Map.entry 会 NPE——成功调用曾因此整条序列化失败（#298 实测）。
+        Map<String, Object> out = new java.util.LinkedHashMap<>();
+        out.put("call_id", callId);
+        out.put("tool", tool);
+        out.put("status", status);
+        out.put("args", loadsOrRaw(argsJson));
+        out.put("result", resultText);
+        out.put("error", errorText.isEmpty() ? null : errorText);
+        out.put("duration_ms", durationMs);
+        out.put("thread_id", threadId);
+        out.put("module", module);
+        out.put("request_id", requestId);
+        return out;
     }
 
     /** args JSON → 对象（解析失败回退原文；空串 → {}）。 */
