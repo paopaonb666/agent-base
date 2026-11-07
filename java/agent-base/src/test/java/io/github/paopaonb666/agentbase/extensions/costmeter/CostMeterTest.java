@@ -124,6 +124,33 @@ class CostMeterTest {
     }
 
     @Test
+    void pendingQueueIsBoundedAndDropsOldestOnOverflow() {
+        // #263：灌满上限后再 observe → 丢最老并计数；队头是最老未丢的；
+        // takePending 正常取走；后续 observe 恢复正常追加。
+        for (int i = 0; i <= CostMeter.MAX_PENDING; i++) { // 上限 + 1 次
+            meter.recordUsage("m", i, 0); // prompt=i 作行的身份标记
+        }
+        assertEquals(1, meter.droppedRecordCount(), "溢出恰好丢 1 行（最老的 prompt=0）");
+
+        List<UsageRecord> rows = meter.takePending();
+        assertEquals(CostMeter.MAX_PENDING, rows.size());
+        assertEquals(1, rows.get(0).promptTokens(), "队头应是最老未丢的行");
+        assertEquals(CostMeter.MAX_PENDING, rows.get(rows.size() - 1).promptTokens(),
+                "队尾应是最新追加的行");
+        assertTrue(meter.takePending().isEmpty(), "取走后队列为空");
+
+        // 计数是累计口径：不随 takePending 回零。
+        assertEquals(1, meter.droppedRecordCount());
+
+        // 后续 observe 恢复正常（容量已腾出）。
+        meter.recordUsage("m", 42, 0);
+        List<UsageRecord> again = meter.takePending();
+        assertEquals(1, again.size());
+        assertEquals(42, again.get(0).promptTokens());
+        assertEquals(1, meter.droppedRecordCount(), "未再溢出，计数保持");
+    }
+
+    @Test
     void restoreDayAccumulatesIntoDayAndMonth() {
         meter.recordUsage("m", 1_000_000, 0); // 2 元
         String today = LocalDate.now().toString();

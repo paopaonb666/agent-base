@@ -14,6 +14,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 
 import io.github.paopaonb666.agentbase.extensions.Metrics;
 import io.github.paopaonb666.agentbase.extensions.Observability;
@@ -35,6 +36,12 @@ import io.github.paopaonb666.agentbase.extensions.Observability;
  *   <li><b>重启恢复</b>：进程重启后由装配方从账本回放
  *       {@link #restoreDay}；明细落库由调用方（server lifespan 的周期
  *       flush 任务）通过 {@link #takePending} 驱动，本类不直接碰存储。</li>
+ *   <li><b>pending 有界（#263）</b>：待落库明细队列上限 {@link #MAX_PENDING}
+ *       （与账本侧重放缓冲上限同数量级），{@link #observe} 新增侧溢出丢最老
+ *       并计入 {@link #droppedRecordCount()}——丢账方向是<b>少记 → 可能
+ *       少熔断</b>（当日/当月累计照记，丢的只是落库明细），绝不误熔断。
+ *       与 #262 账本侧 flush 失败还回队头的语义不对称：还回的是已产生的
+ *       真账，还回路径不做丢弃（允许瞬时超容量），只有新增侧丢最老。</li>
  * </ul>
  *
  * <p>已知局限：单进程口径（与 /metrics 同款）；价目手工维护。
@@ -44,11 +51,17 @@ public final class CostMeter {
 
     private static final Logger LOG = LoggerFactory.getLogger(CostMeter.class);
 
+    /** pending 队列上限（#263 有界化）：与账本侧重放缓冲上限（CostLedgers 10_000）同数量级。 */
+    public static final int MAX_PENDING = 10_000;
+
     /** 价目表：model → {input_miss, input_hit, output}（元/百万 tokens）。 */
     private Map<String, Map<String, Double>> prices = Map.of();
 
-    /** 待落库行队列（账本 flush 时由 {@link #takePending} 取走）。 */
+    /** 待落库行队列（账本 flush 时由 {@link #takePending} 取走；#263 起新增侧有界）。 */
     private final Deque<UsageRecord> pending = new ArrayDeque<>();
+
+    /** observe() 新增侧因队列满被丢弃的最老行累计数（#263；累计口径，不随 takePending 回零）。 */
+    private final AtomicLong droppedCount = new AtomicLong();
 
     /** day-iso → 当日累计（元）。 */
     private final Map<String, Double> dayTotals = new HashMap<>();
@@ -105,6 +118,14 @@ public final class CostMeter {
             String month = day.substring(0, 7);
             dayTotals.merge(day, cost, Double::sum);
             monthTotals.merge(month, cost, Double::sum);
+            // #263：新增侧有界——溢出丢最老（队头）再追加。丢账方向是
+            // 少记 → 可能少熔断。与 #262 的还回队头语义不对称：还回的是
+            // 已产生的真账，还回路径不做丢弃（允许瞬时超容量），只有
+            // 这里对新增行执行丢最老。
+            if (pending.size() >= MAX_PENDING) {
+                pending.poll();
+                droppedCount.incrementAndGet();
+            }
             pending.add(new UsageRecord(
                     now, Observability.requestId(), model, profile,
                     prompt, completion, cacheRead, cost));
@@ -139,6 +160,11 @@ public final class CostMeter {
             pending.clear();
             return rows;
         }
+    }
+
+    /** 累计因 pending 队列满被丢弃的最老行数（#263 丢账方向：少记 → 可能少熔断）。 */
+    public long droppedRecordCount() {
+        return droppedCount.get();
     }
 
     /** 当日累计（元）。 */
