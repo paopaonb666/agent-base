@@ -2,12 +2,17 @@ package io.github.paopaonb666.agentbase.extensions;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * 带路由模板 label 的请求指标。
@@ -175,17 +180,52 @@ public final class Metrics {
 
     /** 进程内的工具执行计数器 + 延迟直方图。 */
     public static final class ToolMetrics extends LabeledHistogram {
+
+        private static final Logger LOG = LoggerFactory.getLogger(ToolMetrics.class);
+
+        /** 装配期注入的工具名闭集（#33）：tool label 基数的主防线。 */
+        private final Set<String> registeredNames = ConcurrentHashMap.newKeySet();
+
+        /** 已告警过的未注册工具名：每名一次 WARN，防日志刷屏。 */
+        private final Set<String> warnedUnknownNames = ConcurrentHashMap.newKeySet();
+
         @Override
         String totalName() { return "tool_executions_total"; }
 
         @Override
         String bucketPrefix() { return "tool_duration_seconds"; }
 
-        /** 记录一次已完成的工具执行；outcome 必须属于 TOOL_OUTCOMES。 */
+        /**
+         * 注入装配期工具名闭集（#33 基数显式化）：幂等合并，可在不同装配
+         * 批次重复调用。基数防漂移设计——工具名集合本就是装配期闭集
+         * （ToolPool.build 对重名 fail-fast），该闭集是 tool label 基数的
+         * <b>主防线</b>；本方法把闭集显式交给指标层，让绕过装配路径的
+         * 观测可被探测。注册是可选的后置步骤：未注入注册集（直构/测试
+         * 路径）时 {@link #observeTool} 行为与从前完全一致。
+         */
+        public void registerNames(Collection<String> names) {
+            registeredNames.addAll(names);
+        }
+
+        /**
+         * 记录一次已完成的工具执行；outcome 必须属于 TOOL_OUTCOMES。
+         *
+         * <p>未注册名<b>照常按原名计数，不抛错</b>（抛错会把指标层变成
+         * 故障点），仅对每个未注册名 WARN 一次（漂移探测）：真实新工具
+         * 漏注册或绕过装配路径的观测由此可诊断；计数按原名保留，不做
+         * other 兜底——兜底会掩盖漏注册本身。未注入注册集时不告警
+         * （没有闭集就无从谈起「未注册」）。
+         */
         public void observeTool(String name, String outcome, double duration) {
             if (!TOOL_OUTCOMES.contains(outcome)) {
                 throw new IllegalArgumentException(
                         "unknown tool outcome '%s'; expected %s".formatted(outcome, TOOL_OUTCOMES));
+            }
+            if (!registeredNames.isEmpty() && !registeredNames.contains(name)
+                    && warnedUnknownNames.add(name)) {
+                LOG.warn("tool '{}': observed but not in the registered name set "
+                        + "(assembly-time closed set, #33); if this is a new tool it must be "
+                        + "added at assembly or metric label cardinality will drift", name);
             }
             record(List.of(name, outcome), name, duration);
         }

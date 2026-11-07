@@ -1,10 +1,16 @@
 package io.github.paopaonb666.agentbase.extensions;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import io.github.paopaonb666.agentbase.entrypoints.server.routes.SystemRoutes;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.http.ResponseEntity;
 
+import java.util.List;
 import java.util.regex.Pattern;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -130,6 +136,73 @@ class MetricsRenderTest {
         assertTrue(body.contains("tool_executions_total{tool=\"" + tool + "\",outcome=\"ok\"} 1"));
         assertTrue(body.contains("tool_executions_total{tool=\"" + tool + "\",outcome=\"invalid\"} 1"));
         assertTrue(body.contains("tool_duration_seconds_count{tool=\"" + tool + "\"} 2"));
+    }
+
+    @Test
+    void registerNamesEnablesUnknownToolDriftWarning() {
+        // #33：装配期闭集（registerNames，幂等合并）是工具指标基数的主
+        // 防线；未注册名照常按原名计数、不抛错（指标层不能成为故障点），
+        // 每名仅 WARN 一次（漂移探测，WARN 断言模式抄 CostMeterTest）。
+        String known = uniq("known");
+        String unknown = uniq("unknown");
+        Metrics.ToolMetrics toolMetrics = new Metrics.ToolMetrics();
+        toolMetrics.registerNames(List.of(known, "spare-" + System.nanoTime()));
+        toolMetrics.registerNames(List.of(known)); // 幂等合并：重复注入无副作用
+
+        Logger metricsLogger = (Logger) LoggerFactory.getLogger(Metrics.ToolMetrics.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        metricsLogger.addAppender(appender);
+        try {
+            toolMetrics.observeTool(known, "ok", 0.1);      // 注册名：不告警
+            toolMetrics.observeTool(unknown, "ok", 0.2);    // 未注册：WARN 一次
+            toolMetrics.observeTool(unknown, "error", 0.3); // 同名再观测：不再 WARN
+        } finally {
+            metricsLogger.detachAppender(appender);
+            appender.stop();
+        }
+
+        assertEquals(1, warnCount(appender, unknown));
+        String body = toolMetrics.renderToolMetrics();
+        assertTrue(body.contains(
+                "tool_executions_total{tool=\"" + known + "\",outcome=\"ok\"} 1"));
+        assertTrue(body.contains(
+                "tool_executions_total{tool=\"" + unknown + "\",outcome=\"ok\"} 1"));
+        assertTrue(body.contains(
+                "tool_executions_total{tool=\"" + unknown + "\",outcome=\"error\"} 1"));
+        assertTrue(body.contains("tool_duration_seconds_count{tool=\"" + unknown + "\"} 2"));
+    }
+
+    @Test
+    void noRegistryProvidedCountsNormallyWithoutWarning() {
+        // #33：registerNames 后置可选——直构路径（如 ToolPoolTest 直建池、
+        // 本类既有用例的裸实例）没有注册调用：未注册名照常计数、不抛错、
+        // 不告警（没有闭集就无从谈起「未注册」，行为与从前完全一致）。
+        String tool = uniq("direct");
+        Metrics.ToolMetrics toolMetrics = new Metrics.ToolMetrics();
+
+        Logger metricsLogger = (Logger) LoggerFactory.getLogger(Metrics.ToolMetrics.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        metricsLogger.addAppender(appender);
+        try {
+            toolMetrics.observeTool(tool, "ok", 0.1);
+        } finally {
+            metricsLogger.detachAppender(appender);
+            appender.stop();
+        }
+
+        assertEquals(0, warnCount(appender, tool));
+        assertTrue(toolMetrics.renderToolMetrics().contains(
+                "tool_executions_total{tool=\"" + tool + "\",outcome=\"ok\"} 1"));
+    }
+
+    /** WARN 计数（CostMeterTest 模式）：按级别与消息片段过滤。 */
+    private static long warnCount(ListAppender<ILoggingEvent> appender, String contains) {
+        return appender.list.stream()
+                .filter(e -> e.getLevel() == Level.WARN)
+                .filter(e -> e.getFormattedMessage().contains(contains))
+                .count();
     }
 
     @Test

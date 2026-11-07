@@ -102,6 +102,8 @@ public final class ToolPool {
         for (AgentTool tool : extraTools) {
             put(pool, tool, "toolkit", defaultTimeout, timeouts);
         }
+        // #33：装配期把工具名闭集显式交给指标层（基数防漂移；未注册名照常计数并 WARN 一次）。
+        Metrics.tool().registerNames(pool.keySet());
         return new ToolPool(Map.copyOf(pool), recorder);
     }
 
