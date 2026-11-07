@@ -94,6 +94,13 @@ public final class AuthBackends {
         @Override
         public String authenticate(String userIdHeader, String sigHeader, String timestampHeader,
                                    String nonceHeader, Settings settings) {
+            return authenticate(userIdHeader, sigHeader, timestampHeader, nonceHeader, settings,
+                    System.currentTimeMillis() / 1000.0);
+        }
+
+        /** 同上，时钟可注入（窗口/过期边界测试用；生产路径语义不变）。 */
+        String authenticate(String userIdHeader, String sigHeader, String timestampHeader,
+                            String nonceHeader, Settings settings, double nowSeconds) {
             String userId;
             if (userIdHeader == null || userIdHeader.isEmpty()) {
                 userId = "default";
@@ -120,7 +127,7 @@ public final class AuthBackends {
                     } catch (NumberFormatException e) {
                         throw new HttpError(401, "X-User-Timestamp 必须是 unix 秒（整数）");
                     }
-                    if (Math.abs(System.currentTimeMillis() / 1000.0 - ts) > window) {
+                    if (Math.abs(nowSeconds - ts) > window) {
                         throw new HttpError(401,
                                 "X-User-Timestamp 超出容忍窗口：请求已过期或时钟漂移过大");
                     }
@@ -136,7 +143,7 @@ public final class AuthBackends {
                     verifySignature(sigHeader, secret, message);
                     if (!nonce.isEmpty()) {
                         // 通过了签名校验才记账/查账：错签名的 nonce 不占用缓存。
-                        rejectReplay(nonce, ts + 2.0 * window);
+                        rejectReplay(nonce, ts + 2.0 * window, nowSeconds);
                     }
                 } else {
                     verifySignature(sigHeader, secret, userId);
@@ -157,9 +164,14 @@ public final class AuthBackends {
 
         /** 窗口期内的 nonce 只允许出现一次；过期指纹视作新请求。 */
         private void rejectReplay(String nonce, double expiresAt) {
+            rejectReplay(nonce, expiresAt, System.currentTimeMillis() / 1000.0);
+        }
+
+        /** 同上，时钟可注入（过期/LRU 淘汰边界测试用）。 */
+        private void rejectReplay(String nonce, double expiresAt, double nowSeconds) {
             synchronized (lock) {
                 Double seenUntil = seenNonces.get(nonce);
-                if (seenUntil != null && seenUntil > System.currentTimeMillis() / 1000.0) {
+                if (seenUntil != null && seenUntil > nowSeconds) {
                     throw new HttpError(401, "X-User-Nonce 已使用：重放被拒绝");
                 }
                 seenNonces.remove(nonce);
