@@ -81,6 +81,23 @@ public class FilesRoutes {
         return info;
     }
 
+    /**
+     * 上传响应组装（#226）：{@code meta()} 键集与 Python 逐键对齐（不动
+     * {@link UploadedFileInfo#meta()} 本身），仅在 Java 响应组装层附加
+     * {@code knowledge_status}——同步响应拿不到 chunks_created 实数（摄取
+     * 是后台任务），只给三态：memory 缺席 = disabled；空提取（扫描件/
+     * 纯图片）= skipped_empty_text；正常 spawn 摄取 = queued。
+     */
+    private Map<String, Object> uploadMeta(UploadedFileInfo info) {
+        Map<String, Object> out = new LinkedHashMap<>(info.meta());
+        var memory = runtime.memory();
+        String status = memory == null ? "disabled"
+                : info.extractedText().strip().isEmpty() ? "skipped_empty_text"
+                : "queued";
+        out.put("knowledge_status", status);
+        return out;
+    }
+
     // ── POST /v1/agents/{module}/files：上传附件 ─────────────────────────
 
     @PostMapping("/agents/{module}/files")
@@ -141,7 +158,7 @@ public class FilesRoutes {
                     mime.split("/", 2)[1], null, null, false, 0, "", "", data);
             fileStore.save(info);
             Background.spawn(fileStore::purgeOrphans, "purge-orphans");
-            return info.meta();
+            return uploadMeta(info);
         }
         ParseResult doc;
         try {
@@ -166,7 +183,7 @@ public class FilesRoutes {
         }
         // 机会式清理 24h 未绑定的孤儿附件（fire-and-forget）。
         Background.spawn(fileStore::purgeOrphans, "purge-orphans");
-        return info.meta();
+        return uploadMeta(info);
     }
 
     // ── DELETE /v1/agents/{module}/files/{file_id}：撤销 ─────────────────

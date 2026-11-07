@@ -4,7 +4,10 @@ import io.github.paopaonb666.agentbase.core.AgentModule;
 import io.github.paopaonb666.agentbase.core.AgentRuntime;
 import io.github.paopaonb666.agentbase.core.config.Settings;
 import io.github.paopaonb666.agentbase.entrypoints.server.AuthBackends;
+import io.github.paopaonb666.agentbase.entrypoints.server.Background;
 import io.github.paopaonb666.agentbase.entrypoints.server.HttpError;
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.PDPage;
 import org.junit.jupiter.api.Test;
 import org.springframework.mock.web.MockMultipartFile;
 
@@ -20,9 +23,10 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * FilesRoutes 上传端点测试（roadmap #144）：413 检查点在流式读取中
- * 边读边判——声明 size 与实际不符（multipart 声明值不可信）时超限内容
- * 不再整读进内存；空上传 400；正常路径元信息完整。
+ * FilesRoutes 上传端点测试（roadmap #144/#226/#290）：413 检查点在流式
+ * 读取中边读边判——声明 size 与实际不符（multipart 声明值不可信）时超限
+ * 内容不再整读进内存；空上传 400；正常路径元信息完整；上传响应携带
+ * knowledge_status 三态（disabled / skipped_empty_text / queued）。
  */
 class FilesRoutesTest {
 
@@ -32,6 +36,12 @@ class FilesRoutesTest {
 
     /** 反射构造 AgentRuntime（包私有构造器，与 AgentsRoutesTest 同法）。 */
     private static AgentRuntime buildRuntime(Settings settings, Object fileStore) throws Exception {
+        return buildRuntime(settings, fileStore, null);
+    }
+
+    /** 同上，另可注入 memory（AgentModule.MemoryServicePort 的桩/代理）。 */
+    private static AgentRuntime buildRuntime(Settings settings, Object fileStore,
+                                             Object memory) throws Exception {
         Map<String, AgentModule> modules = Map.of("chat", moduleStub());
         Constructor<AgentRuntime> ctor = AgentRuntime.class.getDeclaredConstructor(
                 Settings.class, io.github.paopaonb666.agentbase.core.llm.ModelRuntime.class,
@@ -44,7 +54,7 @@ class FilesRoutesTest {
                 AgentModule.PlanStorePort.class);
         ctor.setAccessible(true);
         return ctor.newInstance(settings, null, modules, null, null, null,
-                fileStore, null, null, null);
+                fileStore, memory, null, null);
     }
 
     /** 最小模块桩（FilesRoutes 只查 modules.containsKey）。 */
@@ -82,6 +92,46 @@ class FilesRoutesTest {
                     }
                     return null;
                 });
+    }
+
+    /** 记录调用名的 memory 桩（AgentModule.MemoryServicePort 代理，#226）。 */
+    private static Object recordingMemoryPort(List<String> calls) {
+        return Proxy.newProxyInstance(
+                AgentModule.MemoryServicePort.class.getClassLoader(),
+                new Class<?>[]{AgentModule.MemoryServicePort.class},
+                (proxy, method, args) -> {
+                    calls.add(method.getName());
+                    // 基本型回默认值防拆箱 NPE（ingestDocument/revokeDocument 返 int）。
+                    if (method.getReturnType() == int.class) {
+                        return 0;
+                    }
+                    if (method.getReturnType() == long.class) {
+                        return 0L;
+                    }
+                    if (method.getReturnType() == boolean.class) {
+                        return false;
+                    }
+                    return null;
+                });
+    }
+
+    /** 等待后台任务排空（BackgroundTest 同款轮询），给摄取断言确定性时点。 */
+    private static void awaitBackgroundDrain() throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (Background.pending() > 0 && System.currentTimeMillis() < deadline) {
+            Thread.sleep(20);
+        }
+        assertEquals(0, Background.pending(), "后台任务应在 5s 内排空");
+    }
+
+    /** 单页无内容流的 PDF（扫描件形态）：解析成功但提取文本为空。 */
+    private static byte[] emptyTextPdf() throws java.io.IOException {
+        try (PDDocument document = new PDDocument()) {
+            document.addPage(new PDPage());
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            document.save(out);
+            return out.toByteArray();
+        }
     }
 
     private static HttpError httpErrorOf(java.util.concurrent.Callable<?> body) {
@@ -205,5 +255,67 @@ class FilesRoutesTest {
         // 正常路径流式读取后落库（save）；purgeOrphans 在后台线程触发，
         // 不参与时序断言。
         assertTrue(calls.contains("save"), calls.toString());
+    }
+
+    @Test
+    void uploadResponseCarriesKnowledgeStatusThreeStates() throws Exception {
+        // #226：摄取是后台任务，同步响应拿不到 chunks_created 实数，但
+        // 必须明确告知前端知识库摄取的三态（disabled / skipped_empty_text
+        // / queued）——meta() 键集保持 Python 对齐，状态只在响应组装层附加。
+        Settings settings = Settings.load(Map.of("ENV", "development"));
+
+        // 1) memory 缺席 → disabled（入库照常，只是知识库摄取关闭）。
+        List<String> storeCalls = new java.util.concurrent.CopyOnWriteArrayList<>();
+        AgentRuntime noMemory = buildRuntime(settings, recordingFileStore(storeCalls));
+        Map<String, Object> disabled = new FilesRoutes(noMemory, PASS_THROUGH_AUTH)
+                .uploadFile("chat",
+                        new MockMultipartFile("file", "notes.txt", "text/plain",
+                                "正文".getBytes(java.nio.charset.StandardCharsets.UTF_8)),
+                        "u1", null, null, null);
+        assertEquals("disabled", disabled.get("knowledge_status"));
+
+        // 2) 非空文本 + memory 在 → queued；后台排空后 ingestDocument
+        //    确被调用（状态不是空头支票）。
+        List<String> memCalls = new java.util.concurrent.CopyOnWriteArrayList<>();
+        AgentRuntime withMemory = buildRuntime(settings, recordingFileStore(new ArrayList<>()),
+                recordingMemoryPort(memCalls));
+        Map<String, Object> queued = new FilesRoutes(withMemory, PASS_THROUGH_AUTH)
+                .uploadFile("chat",
+                        new MockMultipartFile("file", "notes.txt", "text/plain",
+                                "正文".getBytes(java.nio.charset.StandardCharsets.UTF_8)),
+                        "u1", null, null, null);
+        assertEquals("queued", queued.get("knowledge_status"));
+        awaitBackgroundDrain();
+        assertTrue(memCalls.contains("ingestDocument"), memCalls.toString());
+
+        // 3) 空提取（单页无内容流的 PDF，扫描件形态）→ skipped_empty_text
+        //    + warning 文案；后台排空后 memory 侧零摄取调用（「不摄取」
+        //    半边与「明确状态」半边一起锁定）。
+        List<String> emptyMemCalls = new java.util.concurrent.CopyOnWriteArrayList<>();
+        AgentRuntime scanned = buildRuntime(settings, recordingFileStore(new ArrayList<>()),
+                recordingMemoryPort(emptyMemCalls));
+        Map<String, Object> skipped = new FilesRoutes(scanned, PASS_THROUGH_AUTH)
+                .uploadFile("chat",
+                        new MockMultipartFile("file", "scan.pdf", "application/pdf",
+                                emptyTextPdf()),
+                        "u1", null, null, null);
+        assertEquals("skipped_empty_text", skipped.get("knowledge_status"));
+        assertEquals("未能从文件中提取到文本：可能是扫描件或纯图片 PDF",
+                skipped.get("warning"));
+        awaitBackgroundDrain();
+        assertTrue(!emptyMemCalls.contains("ingestDocument"), emptyMemCalls.toString());
+
+        // 4) 图片路径同口径：无提取文本，memory 在 → skipped_empty_text。
+        List<String> imgMemCalls = new java.util.concurrent.CopyOnWriteArrayList<>();
+        AgentRuntime images = buildRuntime(settings, recordingFileStore(new ArrayList<>()),
+                recordingMemoryPort(imgMemCalls));
+        Map<String, Object> image = new FilesRoutes(images, PASS_THROUGH_AUTH)
+                .uploadFile("chat",
+                        new MockMultipartFile("file", "pixel.png", "image/png",
+                                new byte[]{(byte) 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}),
+                        "u1", null, null, null);
+        assertEquals("skipped_empty_text", image.get("knowledge_status"));
+        awaitBackgroundDrain();
+        assertTrue(!imgMemCalls.contains("ingestDocument"), imgMemCalls.toString());
     }
 }
