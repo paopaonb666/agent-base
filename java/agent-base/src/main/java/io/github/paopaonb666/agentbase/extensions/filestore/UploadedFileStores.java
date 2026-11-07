@@ -78,10 +78,21 @@ public final class UploadedFileStores {
             """;
 
     /**
-     * MySQL 建表 DDL：alembic 0003 + 0006 的合并形态（user_id 列位于
-     * module 之后，与 0006 的 {@code AFTER `module`} 一致）。幂等可重复
-     * 执行，未跑迁移的库首写时自举。
+     * sqlite 声明式迁移（#275）：001 是基线标记——user_id 列（#144 后置）
+     * 由构造期的 PRAGMA 补列分支处理（sqlite 无 ADD COLUMN IF NOT EXISTS，
+     * 裸 ALTER 会让新装库失败），记入版本表使演进审计有单一事实源；
+     * 后续真正的新列/索引演进追加到本清单。
      */
+    private static final java.util.List<io.github.paopaonb666.agentbase.core.storage.SchemaMigrations.Migration>
+            SQLITE_MIGRATIONS = java.util.List.of(
+            new io.github.paopaonb666.agentbase.core.storage.SchemaMigrations.Migration(
+                    "001_uploaded_files_user_id",
+                    "uploaded_files 属主列基线（实际补列走构造期 PRAGMA 分支）",
+                    List.of("SELECT 1")));
+
+    /** MySQL 建表 DDL：alembic 0003 + 0006 的合并形态（user_id 列位于
+     * module 之后，与 0006 的 {@code AFTER `module`} 一致）。幂等可重复
+     * 执行，未跑迁移的库首写时自举。 */
     private static final String MYSQL_DDL = """
             CREATE TABLE IF NOT EXISTS uploaded_files (
               file_id VARCHAR(32) PRIMARY KEY,
@@ -277,8 +288,48 @@ public final class UploadedFileStores {
 
         private final Connection conn;
 
-        public SqliteUploadedFileStore(String path) {
-            Connection opened = null;
+        /** sqlite 方言的迁移执行通道（连接为本 store 私有，构造期单线程）。 */
+        private final class SqliteMigrationExecutor
+                implements io.github.paopaonb666.agentbase.core.storage.SchemaMigrations.Executor {
+
+            @Override
+            public void ensureVersionsTable(String table) throws SQLException {
+                try (Statement st = conn.createStatement()) {
+                    st.execute("CREATE TABLE IF NOT EXISTS " + table
+                            + " (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)");
+                }
+            }
+
+            @Override
+            public void recordVersion(String table, String id) throws SQLException {
+                try (Statement st = conn.createStatement()) {
+                    st.execute("INSERT INTO " + table + " (id, applied_at) VALUES ('"
+                            + id.replace("'", "''") + "', '"
+                            + java.time.LocalDateTime.now() + "')");
+                }
+            }
+
+            @Override
+            public java.util.List<String> appliedVersions(String table) throws SQLException {
+                java.util.List<String> ids = new java.util.ArrayList<>();
+                try (Statement st = conn.createStatement();
+                     ResultSet rs = st.executeQuery("SELECT id FROM " + table)) {
+                    while (rs.next()) {
+                        ids.add(rs.getString(1));
+                    }
+                }
+                return ids;
+            }
+
+            @Override
+            public void execute(String sql) throws SQLException {
+                try (Statement st = conn.createStatement()) {
+                    st.execute(sql);
+                }
+            }
+        }
+
+        public SqliteUploadedFileStore(String path) {            Connection opened = null;
             try {
                 opened = DriverManager.getConnection("jdbc:sqlite:" + path);
                 try (Statement st = opened.createStatement()) {
@@ -301,6 +352,11 @@ public final class UploadedFileStores {
                             + " ON uploaded_files (thread_id)");
                 }
                 this.conn = opened;
+                // #275：声明式 schema 迁移（版本表 + 按序应用，fail-fast）。
+                // 001 把「旧库补 user_id」收编为迁移项——新装库表里已有该列
+                // （SQLITE_DDL），语句带存在性检查天然幂等。
+                io.github.paopaonb666.agentbase.core.storage.SchemaMigrations.apply(
+                        "core_files", new SqliteMigrationExecutor(), SQLITE_MIGRATIONS, LOG);
             } catch (SQLException e) {
                 if (opened != null) {
                     try {

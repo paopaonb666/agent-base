@@ -123,6 +123,20 @@ public final class MemoryDdl {
             "CREATE INDEX IF NOT EXISTS idx_versions_memory ON memory_versions (memory_id, created_at)");
 
     /**
+     * sqlite 声明式迁移（#275）：经 SchemaMigrations 按序应用并记录到
+     * {@code memory_schema_versions}。001 即 #159 的检索索引（语句幂等，
+     * 存量库无论走索引循环还是迁移路径都收敛到同一结果）；后续列新增/
+     * 索引变更/数据回填类演进一律追加到本清单，不再散点硬编码。
+     */
+    public static final List<io.github.paopaonb666.agentbase.core.storage.SchemaMigrations.Migration>
+            SQLITE_MIGRATIONS = List.of(
+            new io.github.paopaonb666.agentbase.core.storage.SchemaMigrations.Migration(
+                    "001_idx_mem_user_updated",
+                    "memories 检索主路径索引 (#159)",
+                    List.of("CREATE INDEX IF NOT EXISTS idx_mem_user_updated "
+                            + "ON memories (user_id, updated_at)")));
+
+    /**
      * MySQL 侧为存量表补 #159 索引的守卫 ALTER（内联 KEY 只对新建表
      * 生效——CREATE TABLE IF NOT EXISTS 不会给已存在的表补索引；MySQL
      * 8.0 又没有 CREATE INDEX IF NOT EXISTS）。列定义与 memories 的

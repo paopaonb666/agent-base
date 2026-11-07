@@ -55,9 +55,52 @@ public final class SqliteMemoryStore extends AbstractSqlMemoryStore {
                     st.execute(index);
                 }
             }
+            // #275：声明式 schema 迁移（版本表 + 按序应用，fail-fast）。
+            io.github.paopaonb666.agentbase.core.storage.SchemaMigrations.apply(
+                    "memory", new SqliteMigrationExecutor(), MemoryDdl.SQLITE_MIGRATIONS, LOG);
         } catch (SQLException e) {
             closeQuietly();
             throw new IllegalStateException("sqlite memory store: 建表失败", e);
+        }
+    }
+
+    /** sqlite 方言的迁移执行通道（连接为本 store 私有，构造期单线程）。 */
+    private final class SqliteMigrationExecutor
+            implements io.github.paopaonb666.agentbase.core.storage.SchemaMigrations.Executor {
+
+        @Override
+        public void ensureVersionsTable(String table) throws SQLException {
+            try (Statement st = conn.createStatement()) {
+                st.execute("CREATE TABLE IF NOT EXISTS " + table
+                        + " (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)");
+            }
+        }
+
+        @Override
+        public void recordVersion(String table, String id) throws SQLException {
+            try (Statement st = conn.createStatement()) {
+                st.execute("INSERT INTO " + table + " (id, applied_at) VALUES ('"
+                        + id.replace("'", "''") + "', '" + LocalDateTime.now() + "')");
+            }
+        }
+
+        @Override
+        public List<String> appliedVersions(String table) throws SQLException {
+            List<String> ids = new ArrayList<>();
+            try (Statement st = conn.createStatement();
+                 ResultSet rs = st.executeQuery("SELECT id FROM " + table)) {
+                while (rs.next()) {
+                    ids.add(rs.getString(1));
+                }
+            }
+            return ids;
+        }
+
+        @Override
+        public void execute(String sql) throws SQLException {
+            try (Statement st = conn.createStatement()) {
+                st.execute(sql);
+            }
         }
     }
 
