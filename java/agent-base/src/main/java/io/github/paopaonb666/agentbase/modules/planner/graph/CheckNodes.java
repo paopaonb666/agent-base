@@ -179,8 +179,19 @@ public final class CheckNodes {
             List<Map<String, Object>> merged = new ArrayList<>(done.size() + newTasks.size());
             merged.addAll(done);
             merged.addAll(newTasks);
+            // #259：截断是静默丢弃——截断前先算丢弃数，emitPlan detail 标注 +
+            // WARN 日志（截断行为本身不动：max_subtasks 约束语义与 Python
+            // merged = [*done, *new_tasks][:max] 一致）。
+            int dropped = done.size() + newTasks.size() - maxSubtasks;
             merged = new ArrayList<>(merged.subList(0, Math.min(merged.size(), maxSubtasks)));
-            PlanStreaming.emitPlan(nodeCtx, merged, "replanned", "重规划为 " + merged.size() + " 个子任务");
+            String detail = "重规划为 " + merged.size() + " 个子任务";
+            if (dropped > 0) {
+                detail = detail + "（dropped_tasks=" + dropped + "）";
+                org.slf4j.LoggerFactory.getLogger(CheckNodes.class)
+                        .warn("replan: {} 个子任务被截断丢弃（done {} + 重拆 {} 超出 max_subtasks {}）",
+                                dropped, done.size(), newTasks.size(), maxSubtasks);
+            }
+            PlanStreaming.emitPlan(nodeCtx, merged, "replanned", detail);
             PlanPersist.persistPlan(ctx, nodeCtx, merged, done.size(), PlannerState.replans(state) + 1);
             return Map.of(
                     PlannerState.TASKS, merged,

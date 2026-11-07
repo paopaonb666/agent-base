@@ -290,6 +290,37 @@ class PlannerGraphTest {
         assertEquals("输出不足 10 字", firstCheck.tasks().get(0).get(PlannerState.SUMMARY));
     }
 
+    /** #259：done 占位后重拆产出超限 → replanned detail 标注 dropped_tasks，截断行为不动。 */
+    @Test
+    void replanTruncationAnnotatesDroppedTasks() {
+        ScriptedModel model = new ScriptedModel(
+                AiMessage.from("[{\"id\": 1, \"goal\": \"A\"}, {\"id\": 2, \"goal\": \"B\"}]"),
+                AiMessage.from("A 的结果"),
+                AiMessage.from(""), // execute B：空输出 → 门改判 failed
+                AiMessage.from("[{\"id\": 1, \"goal\": \"重做 A\"}, {\"id\": 2, \"goal\": \"重做 B\"}]"),
+                AiMessage.from("重做的结果"),
+                AiMessage.from("最终答复"));
+        Settings settings = new Settings();
+        settings.planner.maxSubtasks = 2;
+        RecordingPlanStore planStore = new RecordingPlanStore();
+        CompiledGraph graph = PlannerGraphs.buildPlannerGraph(new AgentModule.ModuleContext(
+                settings, model, new InMemoryCheckpointer(), List.of(), null, planStore));
+        List<Object> events = new ArrayList<>();
+        GraphState result = graph.stream(
+                new GraphState(List.of(UserMessage.from("做 A 和 B")), Map.of()),
+                new RunConfig("planner:t1", "u1", 25),
+                events::add);
+
+        assertEquals(1, result.getOrDefault(PlannerState.REPLANS, -1));
+        // done(1) + 重拆(2) = 3 > max_subtasks=2：清单截到 2，丢弃 1。
+        List<Map<String, Object>> tasks = result.getOrDefault(PlannerState.TASKS, List.of());
+        assertEquals(2, tasks.size());
+        Events.PlanEvent replanned = planEvents(events).stream()
+                .filter(p -> "replanned".equals(p.status())).findFirst().orElseThrow();
+        assertEquals(2, replanned.plan().size());
+        assertTrue(replanned.detail().contains("dropped_tasks=1"));
+    }
+
     /** 解析兜底：模型输出非 JSON → 以目标兜底单任务，规划不失败。 */
     @Test
     void unparseablePlanFallsBackToSingleTask() {
