@@ -195,9 +195,11 @@ public final class WebSearchTool implements AgentTool {
         if (cached != null) {
             return cached;
         }
-        // Python 用 asyncio.wait_for 给整条管线设总预算；第一期只有 HTTP
-        // 引擎，请求超时（timeoutSeconds）等价覆盖该预算。
-        List<SearchResult> raw = manager.search(query, maxResults * 2);
+        // 管线总预算（#242，对应 Python asyncio.wait_for）：SEARCH_TIMEOUT_
+        // SECONDS 是整条 fallback 管线的 deadline，逐引擎传剩余部分——多引擎
+        // 时最坏等待不再无界放大（引擎线程被池掐断后继续跑完的泄漏，从源头
+        // 收口）。
+        List<SearchResult> raw = manager.search(query, maxResults * 2, timeoutSeconds);
         List<SearchResult> ranked = SearchPipeline.filterAndRank(raw, query, maxResults);
         if (!ranked.isEmpty()) {
             cache.put(query, ranked);

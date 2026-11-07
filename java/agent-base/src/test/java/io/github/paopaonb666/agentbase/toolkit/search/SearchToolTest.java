@@ -133,8 +133,7 @@ class SearchToolTest {
             @Override public String name() { return "failing"; }
             @Override public List<SearchResult> search(String query, int maxResults) {
                 throw new RuntimeException("boom");
-            }
-        };
+            }        };
         FallbackSearchManager manager = new FallbackSearchManager(List.of(failing, engine()));
         List<SearchResult> results = manager.search("拉康", 5);
         assertEquals(3, results.size());
@@ -176,6 +175,89 @@ class SearchToolTest {
                 + "\n（回答引用以上来源时，请用 [n] 标注对应序号）";
         assertEquals(expected, SearchPipeline.formatWebContext(results));
         assertEquals("", SearchPipeline.formatWebContext(List.of()));
+    }
+
+    // ── 管线 deadline（#242） ────────────────────────────────────────
+
+    @Test
+    void pipelineBudgetPropagatesRemainingToEachEngine() throws Exception {
+        List<Double> budgetsSeen = new java.util.concurrent.CopyOnWriteArrayList<>();
+        SearchEngine recorder = new SearchEngine() {
+            @Override public String name() { return "recorder"; }
+            @Override public List<SearchResult> search(String query, int maxResults) {
+                return List.of();
+            }
+            @Override public List<SearchResult> search(String query, int maxResults,
+                                                       double timeoutSeconds) {
+                budgetsSeen.add(timeoutSeconds);
+                try {
+                    Thread.sleep(120); // 消耗一部分预算
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                return List.of(); // 空结果 → 管理器继续下一个引擎
+            }
+        };
+        new FallbackSearchManager(List.of(recorder)).search("q", 3, 0.5);
+        assertEquals(1, budgetsSeen.size());
+        assertTrue(budgetsSeen.get(0) <= 0.5 && budgetsSeen.get(0) > 0.3,
+                "首引擎应拿到完整预算 0.5s，实得 " + budgetsSeen.get(0));
+    }
+
+    @Test
+    void pipelineBudgetStopsBeforeLaterEnginesWhenExhausted() {
+        List<Double> budgetsSeen = new java.util.concurrent.CopyOnWriteArrayList<>();
+        SearchEngine slow = new SearchEngine() {
+            @Override public String name() { return "slow"; }
+            @Override public List<SearchResult> search(String query, int maxResults) {
+                return List.of();
+            }
+            @Override public List<SearchResult> search(String query, int maxResults,
+                                                       double timeoutSeconds) {
+                try {
+                    Thread.sleep(150); // 超过整个预算
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                return List.of();
+            }
+        };
+        SearchEngine next = new SearchEngine() {
+            @Override public String name() { return "next"; }
+            @Override public List<SearchResult> search(String query, int maxResults) {
+                budgetsSeen.add(0.0);
+                return List.of();
+            }
+            @Override public List<SearchResult> search(String query, int maxResults,
+                                                       double timeoutSeconds) {
+                budgetsSeen.add(timeoutSeconds);
+                return List.of();
+            }
+        };
+        new FallbackSearchManager(List.of(slow, next)).search("q", 3, 0.1);
+        assertTrue(budgetsSeen.isEmpty(), "预算耗尽后不得点燃后续引擎");
+    }
+
+    @Test
+    void tavilyHonorsPipelineBudgetBelowConfiguredTimeout() throws Exception {
+        // 引擎请求超时压到预算（0.2s < 配置 15s）：慢端点下请求应在预算级
+        // 时间尺度失败，而不是等满配置超时
+        server.createContext("/slow", exchange -> {
+            try {
+                Thread.sleep(2000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            exchange.sendResponseHeaders(200, 2);
+            exchange.getResponseBody().write("{}".getBytes(StandardCharsets.UTF_8));
+            exchange.close();
+        });
+        TavilyHttpClient slowEngine = new TavilyHttpClient("k", 15.0, HttpClient.newHttpClient(),
+                URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/slow"));
+        long started = System.nanoTime();
+        assertThrows(Exception.class, () -> slowEngine.search("q", 3, 0.2));
+        long elapsedMs = (System.nanoTime() - started) / 1_000_000;
+        assertTrue(elapsedMs < 1500, "请求应在预算级时间失败，实耗 " + elapsedMs + "ms");
     }
 
     // ── web_search 工具 ──────────────────────────────────────────────

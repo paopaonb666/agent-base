@@ -61,7 +61,21 @@ public final class TavilyHttpClient implements SearchEngine {
     }
 
     @Override
+    public List<SearchResult> search(String query, int maxResults,
+                                     double budgetSeconds) throws Exception {
+        // #242：剩余预算小于自身配置超时时按预算收口（管线 deadline 贯穿）。
+        Duration budget = Duration.ofMillis((long) (budgetSeconds * 1000));
+        return searchWith(query, maxResults,
+                budgetSeconds > 0 && budget.compareTo(timeout) < 0 ? budget : timeout);
+    }
+
+    @Override
     public List<SearchResult> search(String query, int maxResults) throws Exception {
+        return searchWith(query, maxResults, timeout);
+    }
+
+    private List<SearchResult> searchWith(String query, int maxResults, Duration effective)
+            throws Exception {
         ObjectNode body = MAPPER.createObjectNode();
         body.put("query", query);
         body.put("search_depth", "basic");
@@ -69,7 +83,7 @@ public final class TavilyHttpClient implements SearchEngine {
         body.put("include_answer", false);
 
         HttpRequest request = HttpRequest.newBuilder(endpoint)
-                .timeout(timeout)
+                .timeout(effective)
                 .header("Content-Type", "application/json")
                 .header("Authorization", "Bearer " + apiKey)
                 .POST(HttpRequest.BodyPublishers.ofString(MAPPER.writeValueAsString(body)))
