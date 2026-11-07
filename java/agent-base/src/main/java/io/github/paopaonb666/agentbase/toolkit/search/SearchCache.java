@@ -38,14 +38,25 @@ public final class SearchCache {
         this.ttlNanos = (long) (ttlSeconds * 1_000_000_000L);
     }
 
+    /**
+     * 缓存键规范化（#241）：trim + 小写折叠 + 空白序列折叠——「缓了但没
+     * 命中」的三个常见变体（前后空格、大小写、多空格）归一为同一键。
+     * 原始语义查询（模型重试只改了空格）直接命中缓存，不再各占条目。
+     */
+    static String normalizeKey(String query) {
+        return query == null ? "" : query.strip().toLowerCase(java.util.Locale.ROOT)
+                .replaceAll("\\s+", " ");
+    }
+
     /** 命中返回缓存结果；过期条目被顺手清除。 */
     public synchronized List<SearchResult> get(String query) {
-        Entry entry = entries.get(query);
+        String key = normalizeKey(query);
+        Entry entry = entries.get(key);
         if (entry == null) {
             return null;
         }
         if (System.nanoTime() - entry.atNanos >= ttlNanos) {
-            entries.remove(query);
+            entries.remove(key);
             return null;
         }
         return entry.results;
@@ -53,7 +64,7 @@ public final class SearchCache {
 
     /** 写入并按容量淘汰最旧（最久未访问）条目。 */
     public synchronized void put(String query, List<SearchResult> results) {
-        entries.put(query, new Entry(System.nanoTime(), List.copyOf(results)));
+        entries.put(normalizeKey(query), new Entry(System.nanoTime(), List.copyOf(results)));
         while (entries.size() > CACHE_MAX_ENTRIES) {
             Iterator<String> it = entries.keySet().iterator();
             it.next();

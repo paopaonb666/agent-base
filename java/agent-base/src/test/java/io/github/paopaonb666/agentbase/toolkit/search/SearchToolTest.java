@@ -268,9 +268,18 @@ class SearchToolTest {
         callTool(t, "{\"query\": \"拉康 精神分析\"}");
         callTool(t, "{\"query\": \"拉康 精神分析\"}");
         assertEquals(1, requestCount.get(), "相同 query 第二次应命中缓存");
-        // 不同 query 不命中缓存（缓存键是原始 query）。
+        // 不同 query 不命中缓存（键规范化后仍不同，#241）。
         callTool(t, "{\"query\": \"镜像阶段\"}");
         assertEquals(2, requestCount.get());
+    }
+
+    @Test
+    void webSearchCacheKeyNormalizesWhitespaceAndCase() {
+        WebSearchTool t = tool();
+        callTool(t, "{\"query\": \"  Lacan   Mirror  \"}");
+        // trim + 空白折叠 + 小写折叠后与原查询同键（#241：省真实搜索）
+        callTool(t, "{\"query\": \"lacan mirror\"}");
+        assertEquals(1, requestCount.get(), "规范化变体应命中同一缓存条目");
     }
 
     @Test
