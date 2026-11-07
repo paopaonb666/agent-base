@@ -357,7 +357,7 @@ class AgentsRoutesTest {
                 null, index, null, null, null, null);
         AgentsRoutes routes = route(runtime);
 
-        Map<String, Object> out = routes.listThreads("chat", "u1", null, null, null);
+        Map<String, Object> out = routes.listThreads("chat", 50, 0, "u1", null, null, null);
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> threads = (List<Map<String, Object>>) out.get("threads");
         assertEquals(2, threads.size());
@@ -371,7 +371,7 @@ class AgentsRoutesTest {
         AgentRuntime runtime = buildRuntime(Map.of("chat", stubModule("chat")),
                 null, null, null, null, null, null);
         AgentsRoutes routes = route(runtime);
-        HttpError error = httpErrorOf(() -> routes.listThreads("ghost", "u1", null, null, null));
+        HttpError error = httpErrorOf(() -> routes.listThreads("ghost", 50, 0, "u1", null, null, null));
         assertEquals(404, error.status());
     }
 
@@ -389,7 +389,7 @@ class AgentsRoutesTest {
         AgentsRoutes routes = route(runtime);
 
         long before = System.currentTimeMillis();
-        Map<String, Object> out = routes.listThreads("chat", "u1", null, null, null);
+        Map<String, Object> out = routes.listThreads("chat", 50, 0, "u1", null, null, null);
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> threads = (List<Map<String, Object>>) out.get("threads");
         assertEquals(1, threads.size());
@@ -575,7 +575,7 @@ class AgentsRoutesTest {
         assertEquals(503, history.status());
         assertTrue(history.getMessage().contains("fail-safe"), history.getMessage());
         HttpError list = httpErrorOf(() ->
-                prodRoutes.listThreads("chat", "u1", null, null, null));
+                prodRoutes.listThreads("chat", 50, 0, "u1", null, null, null));
         assertEquals(503, list.status());
         HttpError delete = httpErrorOf(() ->
                 prodRoutes.deleteThread("chat", "t1", "u1", null, null, null));
@@ -588,7 +588,7 @@ class AgentsRoutesTest {
                 new io.github.paopaonb666.agentbase.core.graph.GraphState(
                         List.of(dev.langchain4j.data.message.UserMessage.from("本地")), Map.of()));
         Map<String, Object> out = new AgentsRoutes(devRuntime, PASS_THROUGH_AUTH,
-                providerOf(null)).listThreads("chat", "u1", null, null, null);
+                providerOf(null)).listThreads("chat", 50, 0, "u1", null, null, null);
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> threads = (List<Map<String, Object>>) out.get("threads");
         assertEquals(1, threads.size());
