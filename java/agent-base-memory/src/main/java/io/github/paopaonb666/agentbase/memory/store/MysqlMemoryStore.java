@@ -145,7 +145,9 @@ public final class MysqlMemoryStore extends AbstractSqlMemoryStore {
             return toEpochSeconds(dateTime);
         }
         if (value instanceof java.sql.Timestamp timestamp) {
-            return timestamp.getTime() / 1000.0;
+            // getTime() 只有毫秒精度（nanos 被 getTime 丢掉）——经共享转换
+            // 器走微秒口径，与 sqlite 读取对齐（#301）。
+            return toEpochSeconds(timestamp.toLocalDateTime());
         }
         try {
             return toEpochSeconds(LocalDateTime.parse(String.valueOf(value), FLEX_TS));

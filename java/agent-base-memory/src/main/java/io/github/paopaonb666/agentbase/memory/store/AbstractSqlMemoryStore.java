@@ -121,9 +121,12 @@ abstract class AbstractSqlMemoryStore implements MemoryStore {
         return LocalDateTime.ofInstant(Instant.ofEpochSecond(whole, nanos), ZoneId.systemDefault());
     }
 
-    /** LocalDateTime → epoch 秒（对应 Python datetime.timestamp()）。 */
+    /** LocalDateTime → epoch 秒（对应 Python datetime.timestamp()，微秒精度）。 */
     static double toEpochSeconds(LocalDateTime dateTime) {
-        return dateTime.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli() / 1000.0;
+        // 写入是微秒精度（TS_WRITE），读取也必须回到微秒——toEpochMilli()
+        // 会把亚毫秒位抹掉，updated_at 往返一次丢精度（#301 实测）。
+        java.time.Instant instant = dateTime.atZone(ZoneId.systemDefault()).toInstant();
+        return instant.getEpochSecond() + instant.getNano() / 1_000_000_000.0;
     }
 
     /** 当前时刻的 epoch 秒（对应 Python time.time()）。 */
