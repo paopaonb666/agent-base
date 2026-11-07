@@ -36,9 +36,8 @@ import io.github.paopaonb666.agentbase.toolkit.search.WebSearchTool;
  */
 public final class Toolkits {
 
-    /** 注册表全部工具名（与 Python 注册表的键集一致，含未迁移条目）。 */
-    public static final List<String> KNOWN_TOOLKIT_NAMES =
-            List.of("calculator", "current_time", "json_query", "python_repl", "web_search");
+    /** 注册表全部工具名——名单单源在 Settings（#103），此处保留别名兼容既有引用。 */
+    public static final List<String> KNOWN_TOOLKIT_NAMES = Settings.KNOWN_TOOLKIT_NAMES;
 
     private Toolkits() {
     }

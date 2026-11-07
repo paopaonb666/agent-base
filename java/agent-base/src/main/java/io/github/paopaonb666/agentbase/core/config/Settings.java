@@ -47,6 +47,13 @@ public final class Settings {
     /** 基座识别的 checkpointer 后端。 */
     public static final Set<String> KNOWN_CHECKPOINTER_BACKENDS = Set.of("memory", "sqlite", "mysql");
     /**
+     * 注册表全部工具名（与 Python 注册表的键集一致，含未迁移条目）。
+     * #103：名单单源下放到 Settings——TOOLKIT_ENABLED 在配置期即校验，
+     * 装配期（Toolkits）只引用同一份名单。
+     */
+    public static final List<String> KNOWN_TOOLKIT_NAMES =
+            List.of("calculator", "current_time", "json_query", "python_repl", "web_search");
+    /**
      * 工具库搜索引擎实现清单（SEARCH_ENGINE_PRIORITY 的合法取值，#276 终局）：
      * Java 侧只实现了 tavily；duckduckgo 是 Python 侧的 ddgs 可选依赖引擎
      * （{@code pip install 'agent-base[search]'}），Java 配它会在启动时
@@ -976,6 +983,13 @@ public final class Settings {
         }
         if (!KNOWN_ENVIRONMENTS.contains(env)) {
             throw new SettingsError("unknown ENV '%s'; expected one of %s".formatted(env, sorted(KNOWN_ENVIRONMENTS)));
+        }
+        // #103：TOOLKIT_ENABLED 名单校验前移到配置期（此前在装配期才报）。
+        for (String name : toolkit.enabled) {
+            if (!KNOWN_TOOLKIT_NAMES.contains(name)) {
+                throw new SettingsError("unknown TOOLKIT_ENABLED entry '" + name + "'; known toolkit tools: "
+                        + KNOWN_TOOLKIT_NAMES);
+            }
         }
     }
 

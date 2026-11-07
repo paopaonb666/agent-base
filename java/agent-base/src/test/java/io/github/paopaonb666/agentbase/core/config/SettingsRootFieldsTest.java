@@ -108,4 +108,23 @@ class SettingsRootFieldsTest {
                 "SEARCH_ENGINE_PRIORITY", "tavily"), null);
         assertEquals("tavily", withGhost.search.enginePriority);
     }
+
+    @Test
+    void toolkitEnabledUnknownEntryFailsAtConfigTime() {
+        // #103：名单校验前移到配置期（此前装配期才报，文案与 Toolkits 一致）。
+        Settings.SettingsError error = assertThrows(Settings.SettingsError.class,
+                () -> Settings.load(Map.of(
+                        "ENV", "development",
+                        "TOOLKIT_ENABLED", "calculator,nope"), null));
+        assertTrue(error.getMessage().contains("unknown TOOLKIT_ENABLED entry 'nope'"),
+                error.getMessage());
+        // 未迁移条目 python_repl 仍在名单内（合法；装配期另有显式报错）。
+        Settings s = Settings.load(Map.of(
+                "ENV", "development",
+                "TOOLKIT_ENABLED", "python_repl"), null);
+        assertEquals(List.of("python_repl"), s.toolkit.enabled);
+        // 默认 enabled 通过。
+        assertEquals(List.of("current_time", "calculator", "json_query"),
+                Settings.load(Map.of("ENV", "development"), null).toolkit.enabled);
+    }
 }
