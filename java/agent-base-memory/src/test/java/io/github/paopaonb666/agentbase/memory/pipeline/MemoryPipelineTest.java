@@ -524,4 +524,78 @@ class MemoryPipelineTest {
                         || fast.prompts.get(0).contains("抽取"),
                 "extraction prompt should hit the fast lane");
     }
+
+    // ── 敏感内容红线（#48，Java 先行） ───────────────────────────────────
+
+    @Test
+    void consolidateRejectsSensitiveContentWithRejectedAudit() {
+        // 默认开启（sensitiveContentFilter=true）：直接 consolidate 命中
+        // 即拒——REJECTED、rejected 审计（detail 带规则名）、不消耗 LLM。
+        ScriptedMain main = new ScriptedMain();
+        RecordingOps ops = new RecordingOps();
+        MemoryPipeline pipeline = new MemoryPipeline(main, new ScriptedFast(),
+                Settings.load(Map.of(), null), ops);
+
+        assertEquals("REJECTED", pipeline.consolidate(
+                new MemoryPipeline.Candidate("密钥是 sk-abcdefghijklmnop123456",
+                        "semantic", 0.5, List.of()),
+                "u1", "chat", "t"));
+        assertTrue(ops.calls.contains("op:consolidate|rejected"), ops.calls.toString());
+        assertEquals(Map.of("rules", "api_key", "op", "REJECTED"),
+                ops.opDetails.get("consolidate|rejected"));
+        assertTrue(main.prompts.isEmpty(), "命中红线不应消耗 LLM 调用");
+        // 不落库：无任何 addMemory/updateMemory 调用。
+        assertFalse(ops.calls.stream().anyMatch(c ->
+                c.startsWith("addMemory") || c.startsWith("updateMemory")));
+    }
+
+    @Test
+    void consolidateHonorsSensitiveFilterToggle() {
+        // 开关关闭：命中内容照常走整合（LLM 消耗一个决策），无 rejected 审计。
+        ScriptedMain main = new ScriptedMain();
+        main.responses.add("{\"op\": \"NONE\"}");
+        RecordingOps ops = new RecordingOps();
+        MemoryPipeline off = new MemoryPipeline(main, new ScriptedFast(),
+                Settings.load(Map.of("MEMORY_SENSITIVE_CONTENT_FILTER", "false"), null), ops);
+
+        assertEquals("NONE", off.consolidate(
+                new MemoryPipeline.Candidate("密钥是 sk-abcdefghijklmnop123456",
+                        "semantic", 0.5, List.of()),
+                "u1", "chat", "t"));
+        assertFalse(ops.calls.contains("op:consolidate|rejected"));
+        assertEquals(1, main.prompts.size());
+    }
+
+    @Test
+    void captureTurnRejectsSensitiveCandidateButKeepsCleanOnes() {
+        ScriptedFast fast = new ScriptedFast();
+        // 两条候选：一条含 sk- 密钥（应被红线拦下），一条干净（照常整合）。
+        fast.responses.add("""
+                [
+                  {"content": "用户的 API key 是 sk-abcdefghijklmnop123456", "kind": "semantic", "salience": 0.8},
+                  {"content": "用户在杭州", "kind": "semantic", "salience": 0.8}
+                ]
+                """);
+        ScriptedMain main = new ScriptedMain();
+        main.responses.add("{\"op\": \"ADD\", \"content\": \"用户在杭州\"}");
+        RecordingOps ops = new RecordingOps();
+        MemoryPipeline pipeline = new MemoryPipeline(main, fast, Settings.load(Map.of(), null), ops);
+
+        // humanCount=1 不触发摘要；关掉画像避免无关 fast 响应消耗。
+        Map<String, Object> detail = pipeline.captureTurn("u1", "chat", "chat:t",
+                "用户：我把 key 发你\n用户：我在杭州", 1, false);
+
+        // 脏候选被拒（REJECTED 不入 ops 落库），干净候选照常 ADD。
+        @SuppressWarnings("unchecked")
+        Map<String, Object> opsMap = (Map<String, Object>) detail.get("ops");
+        assertEquals("REJECTED", opsMap.get("用户的 API key 是 sk-abcdefghijklmnop123456"));
+        assertEquals("ADD", opsMap.get("用户在杭州"));
+        assertTrue(ops.calls.contains("op:consolidate|rejected"), ops.calls.toString());
+        assertEquals("api_key", ((Map<?, ?>) ops.opDetails.get("consolidate|rejected")).get("rules"));
+        // 脏内容绝不落库，也绝不进整合 LLM prompt（不把密钥回喂给模型）。
+        assertFalse(ops.calls.stream().anyMatch(c -> c.startsWith("addMemory:用户的 API key")));
+        assertEquals(1, main.prompts.size());
+        assertFalse(main.prompts.get(0).contains("sk-"), "密钥不应出现在整合 prompt 里");
+        assertTrue(main.prompts.get(0).contains("用户在杭州"));
+    }
 }

@@ -231,6 +231,12 @@ public final class Settings {
         public int authReplayWindowSeconds = 300;
         /** nonce 重放缓存的 LRU 容量（#207）：超出即淘汰最旧指纹并计数。 */
         public int authReplayCacheLimit = 4096;
+        /**
+         * 敏感内容红线（#48）：记忆入库前对密钥/手机号/证件号做正则检查，
+         * 命中即拒绝（抽取路径跳过 + rejected 审计；手工路径回提示文案）。
+         * Java 先行单边增强（Python 侧无此层）。
+         */
+        public boolean sensitiveContentFilter = true;
     }
 
     /** planner 模块的预算与防护（M9）：env 前缀 {@code PLANNER_}。 */
@@ -880,6 +886,9 @@ public final class Settings {
                 throw new SettingsError("memory_auth_replay_cache_limit must be >= 1, got %d".formatted(value));
             }
             t.authReplayCacheLimit = value;
+        }
+        if (v.containsKey("sensitive_content_filter")) {
+            t.sensitiveContentFilter = requireBool("sensitive_content_filter", v.get("sensitive_content_filter"));
         }
     }
 

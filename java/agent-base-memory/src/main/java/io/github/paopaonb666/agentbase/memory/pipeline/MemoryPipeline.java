@@ -309,8 +309,30 @@ public final class MemoryPipeline {
 
     // ── 整合 ─────────────────────────────────────────────────────────────
 
-    /** 对一条候选拿到整合决策并落库；返回实际执行的 op。 */
+    /**
+     * 对一条候选拿到整合决策并落库；返回实际执行的 op。
+     *
+     * <p>敏感内容红线（#48）：候选内容命中
+     * {@link io.github.paopaonb666.agentbase.memory.textkit.SensitiveContentPolicy}
+     * 规则即拒绝——不入检索、不入库，只记一条 {@code status=rejected}
+     * 审计（detail 带规则名，不写原文，避免把密钥落进审计表）并返回
+     * {@code REJECTED}。可经 {@code MEMORY_SENSITIVE_CONTENT_FILTER=false}
+     * 关闭。Java 先行单边增强（Python 侧无此层）。
+     */
     public String consolidate(Candidate candidate, String userId, String agentId, String threadId) {
+        if (settings.memory.sensitiveContentFilter) {
+            long started = System.nanoTime();
+            List<String> rules = io.github.paopaonb666.agentbase.memory.textkit.SensitiveContentPolicy
+                    .INSTANCE.violations(candidate.content());
+            if (!rules.isEmpty()) {
+                long durationMs = (System.nanoTime() - started) / 1_000_000;
+                ops.recordOp("consolidate", userId, agentId, threadId,
+                        Map.of("rules", String.join(",", rules), "op", "REJECTED"),
+                        "rejected", "", durationMs);
+                LOG.info("memory: 候选记忆命中敏感内容红线（{}），已拒绝入库", String.join(",", rules));
+                return "REJECTED";
+            }
+        }
         List<io.github.paopaonb666.agentbase.memory.retrieval.Retrieval.ScoredMemory> similar =
                 ops.search(userId, agentId, candidate.content(), 3);
         StringBuilder existing = new StringBuilder();
