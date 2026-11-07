@@ -12,11 +12,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.UUID;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 import io.github.paopaonb666.agentbase.core.ThreadId;
 import io.github.paopaonb666.agentbase.core.graph.NodeContext;
@@ -37,7 +40,16 @@ import io.github.paopaonb666.agentbase.extensions.toollog.ToolCallRecorder;
  *
  * <p>每个工具都用挂钟超时（TOOL_TIMEOUT_SECONDS）包装：截止时间在调用
  * 方一侧得到遵守，超时后调用方立即收到超时文本；失控工具留在后台线程
- * 跑完直至自然结束（有界泄漏，已记录在案的权衡）。包装层同时是
+ * 跑完直至自然结束（有界泄漏，已记录在案的权衡）——超时即
+ * {@code cancel(true)}，被取消任务的工具体结束时计入
+ * {@link #leakedTaskCount()}（累计口径，不回零）。执行线程池有界
+ * （#25，此前是全仓唯一的 {@code newCachedThreadPool} 无界池）：
+ * 常驻 8 / 峰值 64 / 队列 200 / AbortPolicy，容量远超现实负载
+ * （AGENT_MAIN_CONCURRENCY 默认 8），只防 OOM 级失控；池满被拒的提交
+ * 归一成模型可读文本（"tool execution failed: pool saturated"，
+ * LOG.warn，metrics 走 outcome=error 既有通道），池水位见
+ * {@link #activeThreadCount()} / {@link #queuedCount()}（暂不接
+ * /metrics，由指标收口任务统一接线）。包装层同时是
  * <b>工具调用可观测的唯一收口</b>（M5）：执行前后发 {@code tool_call}
  * 流事件，完结时把记录交给 recorder 落库——成功、超时、异常、参数校验
  * 失败（outcome=invalid，#334/#335：不执行、回喂契约文本）四种结局
@@ -70,12 +82,27 @@ public final class ToolPool {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    /** 工具执行用的守护线程池（对应 Python 的 daemon 线程语义）。 */
-    private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
-        Thread t = new Thread(r, "agent-tool-worker");
-        t.setDaemon(true);
-        return t;
-    });
+    // #25 有界池参数：容量远超现实负载（AGENT_MAIN_CONCURRENCY 默认 8，
+    // callAll 并发槽复用同一池），只防 OOM 级失控——队列满且线程到峰值
+    // 后才拒绝（AbortPolicy），拒绝由 call/callAll 捕获并归一。
+    private static final int POOL_CORE_SIZE = 8;
+    private static final int POOL_MAX_SIZE = 64;
+    private static final long POOL_KEEP_ALIVE_SECONDS = 60L;
+    private static final int POOL_QUEUE_CAPACITY = 200;
+
+    /** 工具执行用的有界守护线程池（对应 Python 的 daemon 线程语义；#25 前为 newCachedThreadPool）。 */
+    private final ThreadPoolExecutor executor = new ThreadPoolExecutor(
+            POOL_CORE_SIZE, POOL_MAX_SIZE, POOL_KEEP_ALIVE_SECONDS, TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(POOL_QUEUE_CAPACITY),
+            r -> {
+                Thread t = new Thread(r, "agent-tool-worker");
+                t.setDaemon(true);
+                return t;
+            },
+            new ThreadPoolExecutor.AbortPolicy());
+
+    /** 超时被 cancel(true) 的任务在其工具体结束时的累计计数（#25 泄漏口径，不回零）。 */
+    private final AtomicLong leakedTasks = new AtomicLong();
 
     private final Map<String, Entry> tools;
     private final ToolCallRecorder recorder;
@@ -164,11 +191,34 @@ public final class ToolPool {
             // #162：MDC（request id + MemoryScope 的 user/thread）随任务
             // 进工具线程——工具体内的日志与作用域读取和调用方一致（此前
             // 工具线程 MDC 全空，记忆工具经池调用会落到 default 用户作用域）。
-            Future<String> future = executor.submit(Observability.wrapCallable(
-                    () -> entry.inner().call(argsJson, new AgentTool.ToolContext(config, ctx))));
+            // #25 泄漏计数：超时路径先置 per-call 标志再 cancel(true)；
+            // 被取消任务的工具体结束时（finally）发现标志 → 计一次泄漏。
+            AtomicBoolean cancelledByTimeout = new AtomicBoolean(false);
+            Future<String> future;
+            try {
+                future = executor.submit(Observability.wrapCallable(() -> {
+                    try {
+                        return entry.inner().call(argsJson, new AgentTool.ToolContext(config, ctx));
+                    } finally {
+                        if (cancelledByTimeout.get()) {
+                            leakedTasks.incrementAndGet();
+                        }
+                    }
+                }));
+            } catch (RejectedExecutionException e) {
+                // #25：有界池饱和。照 unknown tool/timeout 的归一风格回喂
+                // 模型可读文本；metrics 经 finally track() 走 outcome=error
+                // 既有通道。绝不抛错打断对话。
+                LOG.warn("tool {}: 线程池饱和，任务提交被拒（有界池队列 {}）",
+                        name, POOL_QUEUE_CAPACITY, e);
+                outcome = "error";
+                errorText = handleToolError(new RejectedExecutionException("pool saturated"));
+                return errorText;
+            }
             try {
                 resultText = future.get((long) (entry.timeout() * 1000), TimeUnit.MILLISECONDS);
             } catch (TimeoutException e) {
+                cancelledByTimeout.set(true); // 先登记泄漏标志，再取消
                 future.cancel(true);
                 outcome = "timeout";
                 errorText = "tool '%s' exceeded %ss timeout".formatted(name, entry.timeout());
@@ -233,8 +283,15 @@ public final class ToolPool {
             Entry entry = tools.get(request.name() == null ? "" : request.name());
             if (entry != null && entry.inner().readOnly()) {
                 // #162：并发槽同样转发 MDC（wrapSupplier 在调用方线程捕获快照）。
-                slots.add(java.util.concurrent.CompletableFuture.supplyAsync(
-                        Observability.wrapSupplier(() -> runner.apply(request)), executor));
+                try {
+                    slots.add(java.util.concurrent.CompletableFuture.supplyAsync(
+                            Observability.wrapSupplier(() -> runner.apply(request)), executor));
+                } catch (RejectedExecutionException e) {
+                    // #25：并发槽提交被拒——归一文本占位该槽结果（并发槽
+                    // 契约：由池通道保证不抛；pool.call 侧同款归一）。
+                    LOG.warn("tool {}: 线程池饱和，并发槽提交被拒", request.name(), e);
+                    slots.add(handleToolError(new RejectedExecutionException("pool saturated")));
+                }
             } else {
                 slots.add(runner.apply(request)); // 异常原样传播（语义同旧 for 循环）
             }
@@ -249,6 +306,21 @@ public final class ToolPool {
 
     private static Exception asException(Throwable t) {
         return t instanceof Exception e ? e : new IllegalStateException(t.getMessage(), t);
+    }
+
+    /** 超时被 cancel(true) 的任务在工具体结束时的累计泄漏计数（#25；不回零）。 */
+    public long leakedTaskCount() {
+        return leakedTasks.get();
+    }
+
+    /** 池水位：正在执行工具的线程数（#25；暂不接 /metrics，由指标收口任务统一接线）。 */
+    public int activeThreadCount() {
+        return executor.getActiveCount();
+    }
+
+    /** 池水位：排队等待执行的任务数（#25；暂不接 /metrics）。 */
+    public int queuedCount() {
+        return executor.getQueue().size();
     }
 
     /** 完结一支调用：发流事件 + 交审计记录（两者都绝不抛错打断对话）。 */

@@ -276,6 +276,63 @@ class ToolPoolTest {
     }
 
     @Test
+    void timeoutLeakCountedWhenCancelledWorkerEndsNaturally() throws Exception {
+        // #25：超时路径 cancel(true) 前先置 per-call 标志；被取消任务的
+        // 工具体结束时（finally）计一次泄漏。慢工具忙等 400ms（不可中断，
+        // 同上一测试）：调用方超时返回时计数仍为 0（工具体尚未结束），
+        // 后台自然结束后计数升到 1 并保持——累计口径，不回零。
+        AtomicBoolean finished = new AtomicBoolean(false);
+        AgentTool slow = new AgentTool() {
+            @Override
+            public String name() {
+                return "slow";
+            }
+
+            @Override
+            public String description() {
+                return "slow fixture";
+            }
+
+            @Override
+            public ToolSpecification specification() {
+                return ToolSpecification.builder().name("slow").build();
+            }
+
+            @Override
+            public String call(String argsJson, ToolContext ctx) throws Exception {
+                // 忙等：Thread.interrupt 只置位不打断——对齐不可中断 IO。
+                long end = System.currentTimeMillis() + 400;
+                while (System.currentTimeMillis() < end) {
+                    Thread.onSpinWait();
+                }
+                finished.set(true);
+                return "late";
+            }
+        };
+        ToolPool pool = ToolPool.build(List.of(slow), List.of(), 0.05, Map.of(), null);
+        RecordingContext ctx = new RecordingContext();
+
+        assertEquals(0, pool.leakedTaskCount());
+        assertEquals("tool execution failed: tool 'slow' exceeded 0.05s timeout",
+                pool.call("slow", "{}", ctx.config(), ctx));
+        assertEquals(0, pool.leakedTaskCount(), "工具体结束前不计泄漏");
+
+        // 等被取消的后台工具自然结束并核销泄漏计数。
+        long deadline = System.nanoTime() + 2_000_000_000L;
+        while (pool.leakedTaskCount() == 0 && System.nanoTime() < deadline) {
+            Thread.sleep(10);
+        }
+        assertTrue(finished.get(), "background worker should finish naturally");
+        assertTrue(pool.leakedTaskCount() >= 1, "被取消任务结束后泄漏计数>0");
+        // 再等一拍：计数是累计的——不回零也不重复计数。
+        Thread.sleep(50);
+        assertEquals(1, pool.leakedTaskCount());
+        // 池水位 getter 冒烟：队列必空（active 短窗内可能含收尾线程，不苛求 0）。
+        assertEquals(0, pool.queuedCount());
+        assertTrue(pool.activeThreadCount() >= 0);
+    }
+
+    @Test
     void toolExceptionIsNormalizedNotPropagated() {
         // 坏掉的工具绝不打断对话：异常 → 模型可读文本。
         AgentTool broken = new AgentTool() {
