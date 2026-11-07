@@ -1,6 +1,7 @@
 package io.github.paopaonb666.agentbase.core.config;
 
 import java.io.IOException;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -65,6 +66,9 @@ public final class Settings {
     public static final Set<String> KNOWN_PIPELINE_PROFILES = Set.of("split", "all_main", "all_fast");
     /** 预算超限行为（COST_ACTION 的合法取值）。 */
     public static final Set<String> KNOWN_COST_ACTIONS = Set.of("warn", "block");
+    /** 常见 OpenAI 兼容 provider 的 host（#110：base_url 缺 /v1 的启动期提示用）。 */
+    private static final Set<String> KNOWN_OPENAI_HOSTS =
+            Set.of("api.deepseek.com", "open.bigmodel.cn", "api.openai.com");
 
     /** 当配置校验失败时抛出（快速失败）。 */
     public static final class SettingsError extends IllegalArgumentException {
@@ -553,7 +557,7 @@ public final class Settings {
             t.provider = value;
         }
         if (v.containsKey("api_key")) t.apiKey = Secret.of(v.get("api_key"));
-        if (v.containsKey("base_url")) t.baseUrl = v.get("base_url");
+        if (v.containsKey("base_url")) t.baseUrl = normalizeBaseUrl(v.get("base_url"), "LLM_BASE_URL");
         if (v.containsKey("model")) t.model = v.get("model");
         if (v.containsKey("main_timeout")) {
             double value = requireFloat("main_timeout", v.get("main_timeout"));
@@ -581,7 +585,7 @@ public final class Settings {
     private static void applyLlmFast(Settings s, Map<String, String> v) {
         LlmFastSettings t = s.llmFast;
         if (v.containsKey("api_key")) t.apiKey = Secret.of(v.get("api_key"));
-        if (v.containsKey("base_url")) t.baseUrl = v.get("base_url");
+        if (v.containsKey("base_url")) t.baseUrl = normalizeBaseUrl(v.get("base_url"), "LLM_FAST_BASE_URL");
         if (v.containsKey("model")) t.model = v.get("model");
         if (v.containsKey("concurrency")) {
             int value = requireInt("concurrency", v.get("concurrency"));
@@ -590,6 +594,32 @@ public final class Settings {
             }
             t.concurrency = value;
         }
+    }
+
+    /**
+     * base_url 规范化（#110）：trim + 去尾斜杠；已知 provider 的 host 缺
+     * {@code /v1} 时告警——langchain4j 的 OpenAI 兼容客户端按 baseUrl 原样
+     * 拼路径，缺 /v1 的笔误常见表现为运行期 404，启动期提示一次排障减负。
+     * 只提示不改值（自定义网关的路径形态不可枚举，不自动补 /v1）。
+     */
+    private static String normalizeBaseUrl(String raw, String field) {
+        if (raw == null || raw.isBlank()) {
+            return raw;
+        }
+        String v = raw.strip();
+        while (v.endsWith("/")) {
+            v = v.substring(0, v.length() - 1);
+        }
+        try {
+            String host = URI.create(v).getHost();
+            if (host != null && KNOWN_OPENAI_HOSTS.contains(host) && !v.endsWith("/v1")) {
+                LOG.warn("{} 缺 /v1（{}）：OpenAI 兼容客户端按 baseUrl 原样拼接，"
+                        + "缺 /v1 常见表现为运行期 404", field, v);
+            }
+        } catch (IllegalArgumentException ignored) {
+            // 非法 URL 不在这里做第二套校验——由探活/首次调用报错。
+        }
+        return v;
     }
 
     private static void applyCheckpointer(Settings s, Map<String, String> v) {

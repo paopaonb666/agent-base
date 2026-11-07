@@ -127,4 +127,17 @@ class SettingsRootFieldsTest {
         assertEquals(List.of("current_time", "calculator", "json_query"),
                 Settings.load(Map.of("ENV", "development"), null).toolkit.enabled);
     }
+
+    @Test
+    void baseUrlIsTrimmedAndTrailingSlashStripped() {
+        // #110：base_url 规范化（trim+去尾斜杠）；自定义路径原样保留。
+        Settings s = Settings.load(Map.of(
+                "ENV", "development",
+                "LLM_BASE_URL", "https://api.deepseek.com/v1/",
+                "LLM_FAST_BASE_URL", "  https://gw.example.com/v1/openai//  "), null);
+        assertEquals("https://api.deepseek.com/v1", s.llm.baseUrl);
+        assertEquals("https://gw.example.com/v1/openai", s.llmFast.baseUrl);
+        // 未配置时保持空串（fast 未配置语义不变）。
+        assertEquals("", Settings.load(Map.of("ENV", "development"), null).llmFast.baseUrl);
+    }
 }
