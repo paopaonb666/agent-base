@@ -7,6 +7,14 @@
 # schema, then the memory package's own chain in alembic_version_memory), then
 # starts uvicorn. Secrets stay in .env (ignored by git) and are never baked
 # into the image.
+#
+# The Java rewrite ships its own image behind the "java" profile — it is not
+# started by a plain `docker compose up`:
+#
+#   docker compose --profile java up --build     # Python app + app-java
+#
+# app-java shares the same MySQL and .env but runs no migration command: the
+# Java side bootstraps its schema at startup (SchemaMigrations), no alembic.
 
 services:
   mysql:
@@ -57,6 +65,35 @@ services:
       - python -m alembic upgrade head && python -m alembic -c memory-alembic/alembic.ini upgrade head && exec python -m uvicorn agent_base.entrypoints.server:app --host 0.0.0.0 --port 8000
     restart: unless-stopped
 
+  app-java:
+    # Java 重构版（feat/java-rewrite，java/Dockerfile）：与 app 共用同一
+    # MySQL 与 .env，environment 覆写与 app 服务逐项一致。与 app 的两点
+    # 差异：无迁移命令（Java 侧 SchemaMigrations 启动自举建表，没有
+    # alembic）；默认 8100 主机端口，避免与 app 的 8000 冲突。
+    profiles: ["java"]
+    build:
+      context: ./java
+    image: agent-base-java:local
+    env_file:
+      - .env
+    environment:
+      # Container-to-container MySQL coordinates override anything in .env.
+      CHECKPOINTER_BACKEND: mysql
+      CHECKPOINTER_MYSQL_HOST: mysql
+      CHECKPOINTER_MYSQL_PORT: "3306"
+      CHECKPOINTER_MYSQL_DATABASE: ${MYSQL_DATABASE:-agent_base}
+      CHECKPOINTER_MYSQL_USER: ${MYSQL_USER:-agent}
+      CHECKPOINTER_MYSQL_PASSWORD: ${MYSQL_PASSWORD:-agent}
+    ports:
+      - "${APP_JAVA_PORT:-8100}:8000"
+    volumes:
+      - app_java_data:/app/data
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   mysql_data:
   app_data:
+  app_java_data:

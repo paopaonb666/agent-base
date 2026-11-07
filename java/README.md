@@ -49,6 +49,11 @@ mvn -s mvn-settings.xml install   # 构建 fat jar（-exec 分类器）并刷新
 - `agent-base/target/agent-base-0.3.0-exec.jar` —— 基座（不含记忆包；装它时 `/v1/memory` 是 404，对应 Python「只装基座」语义）
 - `agent-base-memory/target/agent-base-memory-0.3.0-exec.jar` —— **基座 + 记忆包的完整部署形态**（对应 Python 镜像内置记忆包的形态，日常用这个）
 
+容器部署：`java/Dockerfile` 多阶段构建同一产物（非 root、HEALTHCHECK `/health`，
+入口为完整形态 jar）。可单独 `docker build -t agent-base-java ./java`，或用
+仓库根 compose 的 `app-java` 服务：`docker compose --profile java up --build`
+（共享 MySQL 与 `.env`；Java 侧无 alembic，表结构由 SchemaMigrations 启动自举）。
+
 ## 运行
 
 读取与 Python 版相同的 `.env`（工作目录下），配置契约逐项一致：
