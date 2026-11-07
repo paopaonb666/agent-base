@@ -28,7 +28,8 @@ public final class MemoryPluginProviderImpl implements MemoryPlugins.MemoryPlugi
             throw new IllegalStateException(
                     "memory: 记忆服务装配失败（存储后端不可用）——启用即承诺，拒绝静默降级");
         }
-        return new MemoryPlugins.MemoryPlugin(service, MemoryTools.build(service));
+        return new MemoryPlugins.MemoryPlugin(service,
+                MemoryTools.build(service, settings.memory.sensitiveContentFilter));
     }
 
     @Override

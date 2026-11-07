@@ -14,6 +14,11 @@ import io.github.paopaonb666.agentbase.core.tools.AgentTool;
  * <p>实现 {@link AutoCloseable}：{@code close()} 关掉所属 server 的
  * 客户端（同 server 的多个工具共享一个 {@link McpClient}，重复关闭幂等）；
  * 运行时 close 经池扫描收敛，server 子进程随运行时退出。
+ *
+ * <p><b>description 透传（#24 豁免）</b>：描述原样转发 server 侧声明
+ * （{@link AgentTool#description()} 返回 McpToolDef 的 description），
+ * 内容不受基座三段式规范约束——server 侧不可控，基座只在包装层补
+ * 名称前缀与超时语义。
  */
 public final class McpTool implements AgentTool, AutoCloseable {
 

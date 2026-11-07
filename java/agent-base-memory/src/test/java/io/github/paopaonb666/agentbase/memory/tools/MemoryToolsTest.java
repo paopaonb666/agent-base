@@ -15,6 +15,7 @@ import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -126,11 +127,11 @@ class MemoryToolsTest {
         MemoryScope.set("alice", "chat:t1");
         assertEquals("content 必须是 1..2000 字符",
                 errorOf(() -> call(tool("memory_save"), "{\"content\": \"\"}", null)).getMessage());
-        assertEquals("tags 最多 10 个", errorOf(() -> call(tool("memory_save"), 
+        assertEquals("tags 最多 10 个", errorOf(() -> call(tool("memory_save"),
                 "{\"content\": \"x\", \"tags\": [\"a\",\"b\",\"c\",\"d\",\"e\",\"f\",\"g\",\"h\",\"i\",\"j\",\"k\"]}",
                 null)).getMessage());
 
-        String out = call(tool("memory_save"), 
+        String out = call(tool("memory_save"),
                 "{\"content\": \"用户的部署环境是 Ubuntu 22.04\", \"kind\": \"semantic\", "
                         + "\"tags\": [\"env\"]}", null);
         assertTrue(out.matches("(?s)^已记住（memory_id=[0-9a-f]{12}…，kind=semantic）$"), out);
@@ -145,6 +146,72 @@ class MemoryToolsTest {
         call(tool("memory_save"), "{\"content\": \"全局偏好：简洁回复\"}", null);
         assertEquals(1, memory.store()
                 .listMemories("alice", "*", false, null, null, 10, false).size());
+    }
+
+    @Test
+    void memorySaveRejectsSensitiveContentWithDesensitizedNotice() {
+        // #48（Java 先行）：命中密钥形态 → 回脱敏提示文案（不抛异常、
+        // 不打断对话），内容绝不落库。
+        MemoryScope.set("alice", "chat:t1");
+        String out = call(tool("memory_save"),
+                "{\"content\": \"用户的密钥是 sk-abcdefghijklmnop123456\"}", null);
+        assertEquals("记忆保存被拒绝：内容命中敏感信息规则（api_key），请移除后重试", out);
+        assertTrue(memory.store().listMemories("alice", "chat", false, null, null, 10, false).isEmpty());
+
+        // 多规则命中：规则名全部列出。
+        String multi = call(tool("memory_save"),
+                "{\"content\": \"key 是 sk-abcdefghijklmnop123456，手机 13812345678\"}", null);
+        assertEquals("记忆保存被拒绝：内容命中敏感信息规则（api_key、phone_number），请移除后重试",
+                multi);
+
+        // 关闭开关（build 重载）：同一内容照常落库。
+        MemoryService unfiltered = new MemoryService(store, neverEmbedder(),
+                Settings.load(Map.of(), null), null, null);
+        AgentTool save = MemoryTools.build(unfiltered, false).stream()
+                .filter(t -> t.name().equals("memory_save")).findFirst().orElseThrow();
+        String saved = call(save, "{\"content\": \"用户的密钥是 sk-abcdefghijklmnop123456\"}", null);
+        assertTrue(saved.startsWith("已记住（memory_id="), saved);
+    }
+
+    @Test
+    void sensitivePolicyRuleMatrixAndFalsePositives() {
+        var policy = io.github.paopaonb666.agentbase.memory.textkit.SensitiveContentPolicy.INSTANCE;
+        // 命中矩阵：每条规则一个高置信样例。
+        assertTrue(policy.violations("密钥 sk-abcdefghijklmnop123456").contains("api_key"));
+        assertTrue(policy.violations("AWS key AKIAIOSFODNN7EXAMPLE").contains("aws_access_key"));
+        assertTrue(policy.violations("token ghp_0123456789abcdefghij").contains("github_token"));
+        assertTrue(policy.violations("slack xoxb-1234567890-abcd").contains("slack_token"));
+        assertTrue(policy.violations("Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9")
+                .contains("bearer_token"));
+        assertTrue(policy.violations("手机号 13812345678").contains("phone_number"));
+        assertTrue(policy.violations("身份证 11010119900307751X").contains("id_card"));
+        // 多规则：按声明顺序返回。
+        assertEquals(List.of("api_key", "phone_number"),
+                policy.violations("sk-abcdefghijklmnop123456 和 13812345678"));
+
+        // 误报边界（短数字串/词内子串不报）：
+        assertTrue(policy.violations("任务编号 task-1234567890123456").isEmpty(),
+                "risk-/task- 等词内 sk- 子串不应命中");
+        assertTrue(policy.violations("sk-abc").isEmpty(), "密钥体过短不命中");
+        assertTrue(policy.violations("工单号 1381234567").isEmpty(), "10 位数字不是手机号");
+        assertTrue(policy.violations("订单 1381234567890").isEmpty(), "两侧贴数字的长数字串不命中");
+        assertTrue(policy.violations("1234567890123456789").isEmpty(), "19 位数字不是 18 位证件号");
+        assertTrue(policy.violations("Bearer short").isEmpty(), "Bearer 后短 token 不命中");
+        // null/空白视为干净。
+        assertTrue(policy.violations(null).isEmpty());
+        assertTrue(policy.violations("   ").isEmpty());
+    }
+
+    @Test
+    void sensitiveContentFilterSettingParses() {
+        // Settings 解析（#48）：默认开；env 布尔形式走 requireBool 全集。
+        assertTrue(Settings.load(Map.of(), null).memory.sensitiveContentFilter);
+        assertFalse(Settings.load(Map.of("MEMORY_SENSITIVE_CONTENT_FILTER", "false"), null)
+                .memory.sensitiveContentFilter);
+        assertFalse(Settings.load(Map.of("MEMORY_SENSITIVE_CONTENT_FILTER", "0"), null)
+                .memory.sensitiveContentFilter);
+        assertTrue(Settings.load(Map.of("MEMORY_SENSITIVE_CONTENT_FILTER", "on"), null)
+                .memory.sensitiveContentFilter);
     }
 
     // ── memory_update_block ───────────────────────────────────────────────
@@ -198,15 +265,33 @@ class MemoryToolsTest {
                         "{\"label\": \"persona\", \"content\": \"x\", \"operation\": \"upsert\"}", null));
 
         // 超限保尾：note 前缀 + 最近内容保留在 charLimit 内。
-        call(tool("memory_update_block"), 
+        call(tool("memory_update_block"),
                 "{\"label\": \"persona\", \"content\": \"" + "旧".repeat(1990) + "\", \"operation\": \"replace\"}",
                 null);
-        call(tool("memory_update_block"), 
+        call(tool("memory_update_block"),
                 "{\"label\": \"persona\", \"content\": \"" + "新".repeat(100) + "\"}", null);
         var capped = memory.store().getBlock("alice", "chat", "persona");
         assertTrue(capped.content().startsWith("……（较早内容已截断）"), capped.content());
         assertTrue(capped.content().endsWith("新".repeat(100)), "保尾：最近写入保留");
         assertTrue(io.github.paopaonb666.agentbase.core.text.CharMetrics.len(capped.content()) <= 2000);
+    }
+
+    @Test
+    void memoryUpdateBlockAcceptsContentAtToolLimit() {
+        // #178 三路径上限收口：工具入参上限 BlockLimits.CONTENT_MAX_TOOL
+        // 边界值成功——块声明容量预置 CHAR_LIMIT_MAX，保尾截断不触发。
+        MemoryScope.set("alice", "chat:t1");
+        store.upsertBlock(new io.github.paopaonb666.agentbase.memory.store.Models.MemoryBlock(
+                "alice", "chat", "persona", "seed", BlockLimits.CHAR_LIMIT_MAX, 1,
+                io.github.paopaonb666.agentbase.memory.store.Models.now()));
+        String out = call(tool("memory_update_block"),
+                "{\"label\": \"persona\", \"content\": \""
+                        + "字".repeat(BlockLimits.CONTENT_MAX_TOOL)
+                        + "\", \"operation\": \"replace\"}", null);
+        assertTrue(out.matches("(?s)^记忆块 'persona' 已更新（v2，"
+                + BlockLimits.CONTENT_MAX_TOOL + "/" + BlockLimits.CHAR_LIMIT_MAX + " 字符）$"), out);
+        assertEquals(BlockLimits.CONTENT_MAX_TOOL,
+                memory.store().getBlock("alice", "chat", "persona").content().length());
     }
 
     // ── memory_delete ─────────────────────────────────────────────────────

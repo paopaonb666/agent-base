@@ -41,12 +41,16 @@ public final class JsonQueryTool implements AgentTool {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    /** 给模型看的说明书（在 Python 版 docstring 基础上补 #246 语法扩展）。 */
+    /** 给模型看的说明书（在 Python 版 docstring 基础上补 #246 语法扩展
+     * 与三段式「何时不用」——#24 起与 Python 不再逐字对齐，差异登记项）。 */
     private static final String DESCRIPTION = """
             查询 JSON 文本中的值。path 为空时返回结构概要（顶层键或元素数）；
             否则按 ``a.b[0].c`` 形式的点/下标路径提取子值。支持：负下标取尾
             元素（``items[-1]`` = 最后一个）；含点号/特殊字符的键用引号
             （``a["b.c"]`` 或 ``a["b.c"][0]``）。不支持通配符。
+
+            何时不用：文本不是合法 JSON、或需要改写/过滤整个结构时不要用
+            ——本工具只读取值，无变换能力。
 
             Args:
                 json_text: 要查询的 JSON 文本（对象或数组）。

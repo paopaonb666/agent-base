@@ -14,6 +14,7 @@ import io.github.paopaonb666.agentbase.memory.service.MemoryService;
 import io.github.paopaonb666.agentbase.memory.store.MemoryStore;
 import io.github.paopaonb666.agentbase.memory.store.Models.MemoryBlock;
 import io.github.paopaonb666.agentbase.memory.store.Models.MemoryRecord;
+import io.github.paopaonb666.agentbase.memory.tools.BlockLimits;
 
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -283,12 +284,15 @@ public class MemoryApiController {
                                         @RequestHeader(value = "X-User-Nonce", required = false) String nonceHeader) {
         MemoryService memory = service();
         String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
-        if (body.content() == null || body.content().isEmpty() || body.content().length() > 8000) {
-            throw new HttpError(422, "content 必须是 1..8000 字符");
+        // #178：三路径上限收口于 BlockLimits（工具侧 4000 更保守，见该类 javadoc 矩阵）。
+        if (body.content() == null || body.content().isEmpty()
+                || body.content().length() > BlockLimits.CONTENT_MAX_API) {
+            throw new HttpError(422, "content 必须是 1.." + BlockLimits.CONTENT_MAX_API + " 字符");
         }
-        int charLimit = body.charLimit() == null ? 2000 : body.charLimit();
-        if (charLimit < 50 || charLimit > 8000) {
-            throw new HttpError(422, "char_limit 必须在 50..8000 之间");
+        int charLimit = body.charLimit() == null ? BlockLimits.CHAR_LIMIT_DEFAULT : body.charLimit();
+        if (charLimit < BlockLimits.CHAR_LIMIT_MIN || charLimit > BlockLimits.CHAR_LIMIT_MAX) {
+            throw new HttpError(422, "char_limit 必须在 " + BlockLimits.CHAR_LIMIT_MIN + ".."
+                    + BlockLimits.CHAR_LIMIT_MAX + " 之间");
         }
         String agentId = body.module() == null || body.module().isEmpty() ? "*" : body.module();
         return memory.putBlock(userId, agentId, label, body.content(), charLimit).toDict();

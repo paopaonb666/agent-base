@@ -31,13 +31,21 @@ import io.github.paopaonb666.agentbase.memory.store.Models.MemoryRecord;
  * （跨模块可见，user 隔离是唯一边界）；memory_save / 常驻块写入继续带
  * 模块归属（agent_id），供管理端按模块溯源与过滤。
  *
- * <p>对应 Python 侧 {@code agent_base_memory/tools.py}；输出文案逐字节对齐。
+ * <p>对应 Python 侧 {@code agent_base_memory/tools.py}；工具结果文案
+ * 逐字节对齐。<b>两处已声明的 Java 先行差异</b>（Python 侧无对应物）：
+ * <ul>
+ *   <li>#48 敏感内容红线——memory_save 命中密钥/手机号/证件号形态时
+ *       拒绝入库并回提示文案（开关 {@code MEMORY_SENSITIVE_CONTENT_FILTER}，
+ *       默认开）；</li>
+ *   <li>#24 工具描述三段式——各工具 description 补齐「何时不用」要素，
+ *       与 Python docstring 不再逐字对齐（差异登记项）。</li>
+ * </ul>
  */
 public final class MemoryTools {
 
     private MemoryTools() {}
 
-    public static final int DEFAULT_BLOCK_CHAR_LIMIT = 2000;
+    // #178：块三路径上限（content/char_limit）收口于同包 BlockLimits。
     /** knowledge_search 单条结果回给模型的文本截断（防止单块撑爆上下文）。 */
     public static final int KNOWLEDGE_SNIPPET_CHARS = 400;
 
@@ -79,8 +87,19 @@ public final class MemoryTools {
         }
     }
 
-    /** 构建绑定到 MemoryService 的五个记忆工具。 */
+    /** 构建绑定到 MemoryService 的五个记忆工具（敏感红线默认开启）。 */
     public static List<AgentTool> build(MemoryService memory) {
+        return build(memory, true);
+    }
+
+    /**
+     * 同上，但可显式关掉敏感内容红线（#48）——值取
+     * {@code Settings.MemorySettings.sensitiveContentFilter}
+     * （env {@code MEMORY_SENSITIVE_CONTENT_FILTER}，默认 true）。工具
+     * 侧拿不到 Settings 实例，由持有方传值进来；单参重载与 Settings
+     * 默认值一致。
+     */
+    public static List<AgentTool> build(MemoryService memory, boolean sensitiveContentFilter) {
         return List.of(
                 new AgentTool() {
                     @Override public String name() { return "memory_search"; }
@@ -88,7 +107,9 @@ public final class MemoryTools {
                     @Override
                     public String description() {
                         return "检索关于当前用户的长期记忆（偏好、背景、过往约定等）。"
-                                + "当需要回忆用户提过的事情或偏好时调用。";
+                                + "当需要回忆用户提过的事情或偏好时调用。"
+                                + "何时不用：答案就在当前对话里或属于通用常识时不要检索"
+                                + "——本工具只覆盖跨会话的长期记忆，查不到当下上下文。";
                     }
 
                     @Override
@@ -140,7 +161,9 @@ public final class MemoryTools {
                     @Override
                     public String description() {
                         return "把值得跨会话记住的信息写入长期记忆。用户说'记住……'、"
-                                + "或对话中出现持久的偏好/约束/事实时调用。宁缺毋滥。";
+                                + "或对话中出现持久的偏好/约束/事实时调用。宁缺毋滥。"
+                                + "何时不用：一次性的临时请求、闲聊或只在本轮有效的信息不要保存；"
+                                + "含密钥、手机号、身份证号等敏感信息的内容会被拒绝入库，请先脱敏。";
                     }
 
                     @Override
@@ -173,6 +196,18 @@ public final class MemoryTools {
                         if (tags.size() > 10) {
                             throw new IllegalArgumentException("tags 最多 10 个");
                         }
+                        // 敏感内容红线（#48，Java 先行单边增强）：命中密钥/
+                        // 手机号/证件号形态即拒绝入库——回提示文案而不是抛
+                        // 异常，不打断对话；模型可移除敏感信息后重试。
+                        if (sensitiveContentFilter) {
+                            List<String> rules =
+                                    io.github.paopaonb666.agentbase.memory.textkit
+                                            .SensitiveContentPolicy.INSTANCE.violations(content);
+                            if (!rules.isEmpty()) {
+                                return "记忆保存被拒绝：内容命中敏感信息规则（"
+                                        + String.join("、", rules) + "），请移除后重试";
+                            }
+                        }
                         Scope scope = Scope.current();
                         MemoryRecord record = memory.addMemory(scope.userId(), scope.agentId(),
                                 content, str(a, "kind", "semantic"), tags, 0.5,
@@ -189,7 +224,9 @@ public final class MemoryTools {
                     public String description() {
                         return "更新你自己的常驻记忆块：persona（你的人设与工作方式）、"
                                 + "human（对当前用户的画像摘要）或自定义标签。这些块每轮"
-                                + "对话都会出现在你的上下文里。";
+                                + "对话都会出现在你的上下文里。"
+                                + "何时不用：一次性的事实请走 memory_save，不要塞进常驻块"
+                                + "——块内容每轮都占用上下文，只放长期有效的信息。";
                     }
 
                     @Override
@@ -210,7 +247,8 @@ public final class MemoryTools {
                         Map<String, Object> a = args(argsJson);
                         // 约束对应 Python _MemoryBlockArgs：label 1..64 且
                         // ^[\w.-]+$（(?U) 使 \w 支持unicode——Python re 的 \w
-                        // 默认 unicode 语义），content 1..4000。
+                        // 默认 unicode 语义），content 1..CONTENT_MAX_TOOL（4000，
+                        // #178 三路径上限见 BlockLimits）。
                         String label = str(a, "label", "");
                         if (label.isEmpty() || CharMetrics.len(label) > 64
                                 || !label.matches("(?U)^[\\w.-]+$")) {
@@ -218,8 +256,9 @@ public final class MemoryTools {
                                     "label 必须是 1..64 字符且匹配 [\\w.-]+");
                         }
                         String content = str(a, "content", "");
-                        if (content.isEmpty() || CharMetrics.len(content) > 4000) {
-                            throw new IllegalArgumentException("content 必须是 1..4000 字符");
+                        if (content.isEmpty() || CharMetrics.len(content) > BlockLimits.CONTENT_MAX_TOOL) {
+                            throw new IllegalArgumentException(
+                                    "content 必须是 1.." + BlockLimits.CONTENT_MAX_TOOL + " 字符");
                         }
                         String operation = str(a, "operation", "append");
                         Scope scope = Scope.current();
@@ -228,7 +267,7 @@ public final class MemoryTools {
                             return "未知 operation '" + operation + "'（只支持 append / replace）";
                         }
                         MemoryBlock existing = memory.store().getBlock(scope.userId(), agent, label);
-                        int charLimit = existing != null ? existing.charLimit() : DEFAULT_BLOCK_CHAR_LIMIT;
+                        int charLimit = existing != null ? existing.charLimit() : BlockLimits.CHAR_LIMIT_DEFAULT;
                         String merged;
                         if ("append".equals(operation) && existing != null) {
                             merged = (existing.content().replaceAll("\\s+$", "") + "\n" + content).strip();
@@ -257,7 +296,9 @@ public final class MemoryTools {
                     public String description() {
                         return "删除一条已过时或错误的长期记忆（先用 memory_search 找到"
                                 + " id）。当用户更正了此前的事实（如换了项目代号、搬了城市）"
-                                + "时，配合 memory_save 使用：删旧、存新。";
+                                + "时，配合 memory_save 使用：删旧、存新。"
+                                + "何时不用：只删长期记忆条目，不动知识库文档与常驻块；"
+                                + "不确定 id 时先 memory_search，不要凭猜测调用。";
                     }
 
                     @Override
@@ -300,7 +341,9 @@ public final class MemoryTools {
                     @Override
                     public String description() {
                         return "在用户上传过的文档构建的知识库里检索（PDF/DOCX/TXT 等）。"
-                                + "当用户的问题可能在他们上传的文档中有答案时调用。";
+                                + "当用户的问题可能在他们上传的文档中有答案时调用。"
+                                + "何时不用：本轮对话已注入/引用过的附件内容不必再检索；"
+                                + "与上传文档无关的通用问题不要调用（知识库为空只会浪费一轮）。";
                     }
 
                     @Override

@@ -40,10 +40,14 @@ public final class CurrentTimeTool implements AgentTool {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    /** 给模型看的说明书（逐字复制 Python 版 docstring，docstring 即提示词）。 */
+    /** 给模型看的说明书（Python docstring 基础上补三段式「何时不用」，
+     * #24 起与 Python 不再逐字对齐——差异登记项）。 */
     private static final String DESCRIPTION = """
             获取当前日期时间。返回 ISO 8601 格式（含时区偏移），例如
             2026-09-12T14:30:00+08:00。
+
+            何时不用：不要凭记忆估计当前日期——模型自推不可靠；涉及
+            "三天后""下周三"等相对时间时，先用本工具拿 now 再自行推算。
 
             Args:
                 tz: 时区。"local"（服务器本地时区，默认）、"UTC" 或 IANA 名称

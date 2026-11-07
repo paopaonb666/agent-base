@@ -45,10 +45,14 @@ public final class CalculatorTool implements AgentTool {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    /** 给模型看的说明书（逐字复制 Python 版 docstring）。 */
+    /** 给模型看的说明书（Python docstring 基础上补三段式「何时不用」，
+     * #24 起与 Python 不再逐字对齐——差异登记项）。 */
     private static final String DESCRIPTION = """
             计算算术表达式的值。仅支持四则运算（+ - * / // %）、幂运算（**）
             与括号，例如 "(1 + 2) * 3 ** 2"。不支持变量、函数调用与单位换算。
+
+            何时不用：上千位的巨大整数或对精度敏感的财务计算不要用本工具
+            （浮点除法有舍入），请改用专用计算库。
 
             Args:
                 expression: 算术表达式，如 "144 / 12" 或 "2 ** 10"。
