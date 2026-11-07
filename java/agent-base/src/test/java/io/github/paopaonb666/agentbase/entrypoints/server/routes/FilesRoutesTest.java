@@ -134,6 +134,62 @@ class FilesRoutesTest {
     }
 
     @Test
+    void imageUploadsOutsideWhitelistGetExplicit400() throws Exception {
+        // #216/#247：图片白名单契约的 400 矩阵——每个失败分支都有可读
+        // 原因（而不是静默降级或解析器兜底）。
+        Settings settings = Settings.load(Map.of("ENV", "development"));
+        AgentRuntime runtime = buildRuntime(settings, recordingFileStore(new ArrayList<>()));
+        FilesRoutes routes = new FilesRoutes(runtime, PASS_THROUGH_AUTH);
+
+        // 1) 图片扩展名 + 内容不是该类型（magic 校验失败）→ 400。
+        HttpError mismatch = httpErrorOf(() -> routes.uploadFile("chat",
+                new MockMultipartFile("file", "fake.png", "image/png",
+                        new byte[]{1, 2, 3, 4}),
+                "u1", null, null, null));
+        assertEquals(400, mismatch.status());
+        assertTrue(mismatch.getMessage().contains("magic 校验失败"), mismatch.getMessage());
+
+        // 2) 图片形态扩展名但不在扩展白名单（bmp）→ 解析器 400（不是
+        //    文本兜底吞掉二进制垃圾）。
+        HttpError unsupported = httpErrorOf(() -> routes.uploadFile("chat",
+                new MockMultipartFile("file", "pic.bmp", "image/bmp",
+                        java.nio.ByteBuffer.allocate(52).put((byte) 'B').put((byte) 'M')
+                                .array()),
+                "u1", null, null, null));
+        assertEquals(400, unsupported.status());
+        assertTrue(unsupported.getMessage().contains("无法识别的文档扩展名 'bmp'"),
+                unsupported.getMessage());
+
+        // 3) 无扩展名 → 推断失败 400。
+        HttpError noExt = httpErrorOf(() -> routes.uploadFile("chat",
+                new MockMultipartFile("file", "image", "application/octet-stream",
+                        "GIF89a".getBytes(java.nio.charset.StandardCharsets.US_ASCII)),
+                "u1", null, null, null));
+        assertEquals(400, noExt.status());
+        assertTrue(noExt.getMessage().contains("无法识别的文档扩展名 ''"), noExt.getMessage());
+
+        // 4) 白名单内且 magic 相符（jpg 扩展名）→ 入库 format 归一为
+        //    嗅探 mime（jpeg），png 魔数扩展名说谎同样按真实类型入库。
+        java.util.List<String> calls = new java.util.concurrent.CopyOnWriteArrayList<>();
+        AgentRuntime saving = buildRuntime(settings, recordingFileStore(calls));
+        Map<String, Object> meta = (Map<String, Object>) new FilesRoutes(saving, PASS_THROUGH_AUTH)
+                .uploadFile("chat",
+                        new MockMultipartFile("file", "photo.jpg", "image/jpeg",
+                                new byte[]{(byte) 0xFF, (byte) 0xD8, (byte) 0xFF, 0x00}),
+                        "u1", null, null, null);
+        assertEquals("jpeg", meta.get("format"), "扩展名 jpg 归一为嗅探 mime jpeg");
+        assertTrue(calls.contains("save"));
+
+        // 5) PNG 魔数 + .png 扩展名 → format png。
+        Map<String, Object> pngMeta = (Map<String, Object>) new FilesRoutes(saving, PASS_THROUGH_AUTH)
+                .uploadFile("chat",
+                        new MockMultipartFile("file", "pixel.png", "image/png",
+                                new byte[]{(byte) 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}),
+                        "u1", null, null, null);
+        assertEquals("png", pngMeta.get("format"));
+    }
+
+    @Test
     void honestUploadUnderLimitReturnsMeta() throws Exception {
         Settings settings = Settings.load(Map.of("ENV", "development"));
         List<String> calls = new java.util.concurrent.CopyOnWriteArrayList<>();
