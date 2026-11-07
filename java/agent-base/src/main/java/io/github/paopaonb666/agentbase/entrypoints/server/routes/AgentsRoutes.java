@@ -28,6 +28,7 @@ import io.github.paopaonb666.agentbase.core.context.ContextEngine;
 import io.github.paopaonb666.agentbase.core.graph.CompiledGraph;
 import io.github.paopaonb666.agentbase.core.graph.GraphState;
 import io.github.paopaonb666.agentbase.core.graph.RunConfig;
+import io.github.paopaonb666.agentbase.core.storage.ThreadIndexRecord;
 import io.github.paopaonb666.agentbase.entrypoints.server.Attachments;
 import io.github.paopaonb666.agentbase.entrypoints.server.AuthBackends;
 import io.github.paopaonb666.agentbase.entrypoints.server.Background;
@@ -60,7 +61,9 @@ public class AgentsRoutes {
     // 线程列表端点的扫描/数量上限（旧版回退路径仍用）。
     private static final int THREAD_LIST_SCAN_LIMIT = 2000;
     private static final int THREAD_LIST_TOTAL_LIMIT = 20_000;
-    private static final int THREAD_LIST_LIMIT = 50;
+    private static final int THREAD_LIST_PAGE_MAX = 200;
+    /** 单次取数上限：offset+limit 的扫描预算（#204）。 */
+    private static final int THREAD_LIST_FETCH_MAX = 1000;
 
     private final AgentRuntime runtime;
     private final AuthBackends.AuthBackend auth;
@@ -413,6 +416,8 @@ public class AgentsRoutes {
 
     @GetMapping("/{module}/threads")
     public Map<String, Object> listThreads(@PathVariable("module") String module,
+                                           @RequestParam(value = "limit", defaultValue = "50") int limit,
+                                           @RequestParam(value = "offset", defaultValue = "0") int offset,
                                            @RequestHeader(value = "X-User-Id", required = false) String userIdHeader,
                                            @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
                                            @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,
@@ -422,10 +427,20 @@ public class AgentsRoutes {
         if (!knownModule(module)) {
             throw new HttpError(404, "unknown module '" + module + "'");
         }
+        // 分页（#204，Java 侧 wire 扩展）：limit/offset 可选，缺省 = Python
+        // 同构（50 条、零偏移）。limit 钳 1..200，offset 非负，取数上限
+        // 1000 行（防止 offset 放大扫描——要更深的页面前端应该收窄模块）。
+        int pageLimit = Math.max(1, Math.min(limit, THREAD_LIST_PAGE_MAX));
+        int pageOffset = Math.max(0, offset);
+        // +1 探针行：满页时还能区分"恰好满页"与"后面还有"（无 COUNT 查询）。
+        int fetch = Math.min(pageOffset + pageLimit + 1, THREAD_LIST_FETCH_MAX);
         var index = runtime.threadIndex();
         if (index != null) {
+            List<ThreadIndexRecord> entries = index.listThreadIndexes(userId, module, fetch);
+            boolean hasMore = entries.size() > pageOffset + pageLimit;
             List<Map<String, Object>> threads = new ArrayList<>();
-            for (var entry : index.listThreadIndexes(userId, module, THREAD_LIST_LIMIT)) {
+            for (int i = pageOffset; i < entries.size() && threads.size() < pageLimit; i++) {
+                var entry = entries.get(i);
                 // 索引行总是命名空间形态；异常行整串回退。
                 ThreadId parsed = ThreadId.tryParse(entry.threadId());
                 String shortId = parsed != null ? parsed.raw() : entry.threadId();
@@ -435,8 +450,16 @@ public class AgentsRoutes {
                 view.put("title", entry.title().isEmpty() ? entry.threadId() : entry.title());
                 view.put("updated_at", (long) (entry.updatedAt() * 1000));
                 threads.add(view);
+                if (threads.size() >= pageLimit) {
+                    break;
+                }
             }
-            return Map.of("threads", threads);
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("threads", threads);
+            if (hasMore) {
+                out.put("next_offset", pageOffset + pageLimit);
+            }
+            return out;
         }
         // 降级：checkpointer 扫描（#82：production 拒绝，development 豁免）。
         requireIndexForDegradedPath("线程列表");
@@ -482,13 +505,20 @@ public class AgentsRoutes {
             // 解析不了才退 0（对齐 Python checkpoint.ts 的降级口径）。
             view.put("updated_at", runtime.checkpointer().updatedAt(fullId));
             threads.put(shortId, view);
-            if (threads.size() >= THREAD_LIST_LIMIT) {
+            if (threads.size() >= fetch) {
                 break;
             }
         }
         List<Map<String, Object>> ordered = new ArrayList<>(threads.values());
         ordered.sort((a, b) -> Long.compare((long) b.get("updated_at"), (long) a.get("updated_at")));
-        return Map.of("threads", ordered);
+        List<Map<String, Object>> page = ordered.subList(Math.min(pageOffset, ordered.size()),
+                Math.min(pageOffset + pageLimit, ordered.size()));
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("threads", page);
+        if (ordered.size() > pageOffset + pageLimit) {
+            out.put("next_offset", pageOffset + pageLimit);
+        }
+        return out;
     }
 
     // ── GET /{module}/threads/{thread_id}：持久化消息历史 ────────────────

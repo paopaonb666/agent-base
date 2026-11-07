@@ -114,7 +114,7 @@ class ApiEndpointMatrixTest {
                 null, null, null, null);
         AgentsRoutes routes = new AgentsRoutes(runtime, PASS_THROUGH_AUTH, providerOf(null));
 
-        Map<String, Object> out = mapOf(routes.listThreads("chat", "alice", null, null, null));
+        Map<String, Object> out = mapOf(routes.listThreads("chat", 50, 0, "alice", null, null, null));
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> threads = (List<Map<String, Object>>) out.get("threads");
         assertEquals(2, threads.size());
@@ -129,7 +129,71 @@ class ApiEndpointMatrixTest {
         assertEquals("legacy-raw", threads.get(1).get("title"));
 
         // 未知模块 404（鉴权先行，但模块守卫在鉴权之后）。
-        assertEquals(404, statusOf(() -> routes.listThreads("nope", "alice", null, null, null)));
+        assertEquals(404, statusOf(() -> routes.listThreads("nope", 50, 0, "alice", null, null, null)));
+    }
+
+    @Test
+    void threadListPaginatesWithLimitOffsetOnBothPaths() throws Exception {
+        // 索引路径：5 个线程（updated_at 降序 t5..t1），页大小 2。
+        var index = Mockito.mock(io.github.paopaonb666.agentbase.core.storage.CoreStore.class);
+        List<ThreadIndexRecord> seeded = new ArrayList<>();
+        for (int i = 1; i <= 5; i++) {
+            seeded.add(new ThreadIndexRecord("chat:t" + i, "alice", "chat", "标题" + i,
+                    1000.0 + i, 2000.0 + i));
+        }
+        when(index.listThreadIndexes(eq("alice"), eq("chat"), anyInt()))
+                .thenAnswer(inv -> {
+                    // 后端契约：updated_at 降序后取前 fetch 条。
+                    List<ThreadIndexRecord> sorted = new ArrayList<>(seeded);
+                    sorted.sort(java.util.Comparator.comparingDouble(
+                            ThreadIndexRecord::updatedAt).reversed());
+                    int fetch = Math.min(sorted.size(), Math.max(1, (int) inv.getArgument(2)));
+                    return new ArrayList<>(sorted.subList(0, fetch));
+                });
+        AgentRuntime runtime = runtime(Map.of("chat", graphStub("chat")), null, index,
+                null, null, null, null);
+        AgentsRoutes routes = new AgentsRoutes(runtime, PASS_THROUGH_AUTH, providerOf(null));
+
+        // 第一页：2 条 + next_offset=2。
+        Map<String, Object> page1 = mapOf(routes.listThreads("chat", 2, 0, "alice", null, null, null));
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> t1 = (List<Map<String, Object>>) page1.get("threads");
+        assertEquals(List.of("t5", "t4"), t1.stream().map(m -> m.get("thread_id")).toList());
+        assertEquals(2, page1.get("next_offset"));
+
+        // 第二页。
+        Map<String, Object> page2 = mapOf(routes.listThreads("chat", 2, 2, "alice", null, null, null));
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> t2 = (List<Map<String, Object>>) page2.get("threads");
+        assertEquals(List.of("t3", "t2"), t2.stream().map(m -> m.get("thread_id")).toList());
+        assertEquals(4, page2.get("next_offset"));
+
+        // 末页：不满页 → 无 next_offset。
+        Map<String, Object> page3 = mapOf(routes.listThreads("chat", 2, 4, "alice", null, null, null));
+        assertEquals(1, ((List<?>) page3.get("threads")).size());
+        org.junit.jupiter.api.Assertions.assertFalse(page3.containsKey("next_offset"));
+
+        // 钳制：limit=0 → 1 条；offset 越界 → 空页。
+        assertEquals(1, ((List<?>) mapOf(routes.listThreads("chat", 0, 0, "alice", null, null, null))
+                .get("threads")).size());
+        assertTrue(((List<?>) mapOf(routes.listThreads("chat", 2, 99, "alice", null, null, null))
+                .get("threads")).isEmpty());
+
+        // 降级路径（索引缺席）：同样支持 limit/offset。
+        var checkpointer = Mockito.mock(io.github.paopaonb666.agentbase.core.graph.Checkpointer.class);
+        when(checkpointer.listThreadIds()).thenReturn(
+                List.of("chat:t1", "chat:t2", "chat:t3", "chat:t4", "chat:t5"));
+        when(checkpointer.updatedAt(anyString())).thenAnswer(inv ->
+                (long) ((2000.0 + Integer.parseInt(
+                        ((String) inv.getArgument(0)).substring("chat:t".length()))) * 1000));
+        AgentRuntime degraded = runtime(Map.of("chat", graphStub("chat")), checkpointer, null,
+                null, null, null, null);
+        AgentsRoutes degradedRoutes = new AgentsRoutes(degraded, PASS_THROUGH_AUTH, providerOf(null));
+        Map<String, Object> dPage = mapOf(degradedRoutes.listThreads("chat", 2, 2, "alice", null, null, null));
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> dt = (List<Map<String, Object>>) dPage.get("threads");
+        assertEquals(List.of("t3", "t2"), dt.stream().map(m -> m.get("thread_id")).toList());
+        assertEquals(4, dPage.get("next_offset"));
     }
 
     @Test
