@@ -4,6 +4,8 @@ import org.slf4j.MDC;
 
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.Callable;
+import java.util.function.Supplier;
 
 /**
  * 可观测性基础：请求 ID（request_id）传播 + 结构化日志。
@@ -69,6 +71,59 @@ public final class Observability {
             }
             try {
                 body.run();
+            } finally {
+                if (previous != null) {
+                    MDC.setContextMap(previous);
+                } else {
+                    MDC.clear();
+                }
+            }
+        };
+    }
+
+    /**
+     * 捕获当前 MDC 上下文的 Callable 包装（#162）：对应 {@link #wrap} 的
+     * 有返回值版，供 ToolPool.call 把 request id 与 MemoryScope 的
+     * user/thread（同为 MDC 键）随任务带进工具线程。恢复语义与 wrap 一致：
+     * 进线程前套用捕获快照（无快照则清空），finally 恢复线程原有 MDC。
+     */
+    public static Callable<String> wrapCallable(Callable<String> body) {
+        Map<String, String> context = MDC.getCopyOfContextMap();
+        return () -> {
+            Map<String, String> previous = MDC.getCopyOfContextMap();
+            if (context != null) {
+                MDC.setContextMap(context);
+            } else {
+                MDC.clear();
+            }
+            try {
+                return body.call();
+            } finally {
+                if (previous != null) {
+                    MDC.setContextMap(previous);
+                } else {
+                    MDC.clear();
+                }
+            }
+        };
+    }
+
+    /**
+     * 捕获当前 MDC 上下文的 Supplier 包装（#162）：{@link #wrapCallable}
+     * 的无受检异常版，供 ToolPool.callAll 的 supplyAsync 并发槽使用。
+     * Supplier 不能声明受检异常，无法由 Callable 适配——单独成法。
+     */
+    public static Supplier<String> wrapSupplier(Supplier<String> body) {
+        Map<String, String> context = MDC.getCopyOfContextMap();
+        return () -> {
+            Map<String, String> previous = MDC.getCopyOfContextMap();
+            if (context != null) {
+                MDC.setContextMap(context);
+            } else {
+                MDC.clear();
+            }
+            try {
+                return body.get();
             } finally {
                 if (previous != null) {
                     MDC.setContextMap(previous);

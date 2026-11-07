@@ -159,9 +159,11 @@ public final class ToolPool {
                         .contractText(validationErrors);
                 return errorText;
             }
-            Future<String> future = executor.submit(
-                    (java.util.concurrent.Callable<String>) () ->
-                            entry.inner().call(argsJson, new AgentTool.ToolContext(config, ctx)));
+            // #162：MDC（request id + MemoryScope 的 user/thread）随任务
+            // 进工具线程——工具体内的日志与作用域读取和调用方一致（此前
+            // 工具线程 MDC 全空，记忆工具经池调用会落到 default 用户作用域）。
+            Future<String> future = executor.submit(Observability.wrapCallable(
+                    () -> entry.inner().call(argsJson, new AgentTool.ToolContext(config, ctx))));
             try {
                 resultText = future.get((long) (entry.timeout() * 1000), TimeUnit.MILLISECONDS);
             } catch (TimeoutException e) {
@@ -228,8 +230,9 @@ public final class ToolPool {
         for (dev.langchain4j.agent.tool.ToolExecutionRequest request : requests) {
             Entry entry = tools.get(request.name() == null ? "" : request.name());
             if (entry != null && entry.inner().readOnly()) {
+                // #162：并发槽同样转发 MDC（wrapSupplier 在调用方线程捕获快照）。
                 slots.add(java.util.concurrent.CompletableFuture.supplyAsync(
-                        () -> runner.apply(request), executor));
+                        Observability.wrapSupplier(() -> runner.apply(request)), executor));
             } else {
                 slots.add(runner.apply(request)); // 异常原样传播（语义同旧 for 循环）
             }

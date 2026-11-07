@@ -6,8 +6,9 @@ import org.slf4j.MDC;
  * 记忆作用域（M6e）：图节点与记忆工具据此拿到当前请求的 user/thread。
  *
  * <p>实现为 MDC 键（对应 Python 侧 ContextVar）：server 在把图执行提交
- * 到工作线程前写入；工具池转发 MDC 到工具线程（Observability.wrap），
- * 记忆工具读取。Python 侧曾有基座与记忆包两个同名 ContextVar 的历史
+ * 到工作线程前写入；工具池经 Observability wrap 把 MDC（含 request id
+ * 与本作用域的 user/thread）随任务转发到工具线程（#162 起），记忆工具
+ * 读取。Python 侧曾有基座与记忆包两个同名 ContextVar 的历史
  * 包袱——Java 侧统一为单一请求作用域（重构计划决策）。
  */
 public final class MemoryScope {

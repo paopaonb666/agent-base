@@ -23,8 +23,9 @@ import io.github.paopaonb666.agentbase.memory.store.Models.MemoryRecord;
  * memory_save / memory_update_block / memory_delete / knowledge_search。
  *
  * <p><b>作用域传递</b>：user_id / thread_id 经 core/MemoryScope（MDC，
- * server 在拉起图执行前设置，工具线程继承）——CLI 等未设置的场景优雅
- * 回退到 default / 全局作用域。
+ * server 在拉起图执行前设置；工具池经 Observability wrap 随任务转发 MDC
+ * 到工具线程，#162 起）——CLI 等未设置的场景优雅回退到 default /
+ * 全局作用域。
  *
  * <p><b>检索作用域</b>：memory_search / knowledge_search 是<b>用户级</b>
  * （跨模块可见，user 隔离是唯一边界）；memory_save / 常驻块写入继续带

@@ -1,8 +1,11 @@
 package io.github.paopaonb666.agentbase.core.tools;
 
+import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.agent.tool.ToolSpecification;
+import io.github.paopaonb666.agentbase.core.MemoryScope;
 import io.github.paopaonb666.agentbase.core.graph.NodeContext;
 import io.github.paopaonb666.agentbase.core.graph.RunConfig;
+import io.github.paopaonb666.agentbase.extensions.Observability;
 import io.github.paopaonb666.agentbase.extensions.events.Events;
 import io.github.paopaonb666.agentbase.extensions.toollog.ToolCallRecord;
 import io.github.paopaonb666.agentbase.extensions.toollog.ToolCallRecorder;
@@ -12,6 +15,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -24,7 +28,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <p>池是全部模块的工具执行唯一收口：超时、错误归一、审计截断、事件
  * 配对与重名 fail-fast 在这里一次锁定。事件与审计里参数键序为字母序
  * （TreeMap）、`_raw` 为原始 JSON 串（#126/#127 的裁决语义，改动时先改
- * 这里再改 Python 侧）。
+ * 这里再改 Python 侧）。MDC（request id + MemoryScope 的 user/thread）
+ * 随任务进工具线程（#162）也在这里锁定。
  */
 class ToolPoolTest {
 
@@ -99,6 +104,11 @@ class ToolPoolTest {
         }
     }
 
+    /** 工具执行请求替身（callAll 用）。 */
+    private static ToolExecutionRequest req(String name) {
+        return ToolExecutionRequest.builder().name(name).arguments("{}").build();
+    }
+
     @Test
     void callRoutesToToolAndReturnsResult() {
         ToolPool pool = ToolPool.build(
@@ -106,6 +116,101 @@ class ToolPoolTest {
         RecordingContext ctx = new RecordingContext();
 
         assertEquals("pong", pool.call("echo", "{\"k\":1}", ctx.config(), ctx));
+    }
+
+    @Test
+    void callPropagatesMdcIntoToolThread() {
+        // #162：request id 与 MemoryScope user/thread（同为 MDC 键）随任务
+        // 进工具线程——此前工具线程 MDC 全空，记忆工具经池调用会落到
+        // default 用户作用域。工具体内读取必须与提交线程一致。
+        AtomicReference<String> observed = new AtomicReference<>();
+        AgentTool probe = new AgentTool() {
+            @Override
+            public String name() {
+                return "scope_probe";
+            }
+
+            @Override
+            public String description() {
+                return "scope probe fixture";
+            }
+
+            @Override
+            public ToolSpecification specification() {
+                return ToolSpecification.builder().name("scope_probe").build();
+            }
+
+            @Override
+            public String call(String argsJson, ToolContext ctx) {
+                observed.set(Observability.requestId() + "|" + MemoryScope.currentUserId()
+                        + "|" + MemoryScope.currentThreadId());
+                return "ok";
+            }
+        };
+        ToolPool pool = ToolPool.build(List.of(probe), List.of(), 30.0, Map.of(), null);
+        RecordingContext ctx = new RecordingContext();
+
+        try {
+            Observability.withRequestId("req-162", () -> {
+                MemoryScope.set("alice", "chat:t1");
+                assertEquals("ok", pool.call("scope_probe", "{}", ctx.config(), ctx));
+            });
+        } finally {
+            MemoryScope.clear(); // 不给同线程的后续测试留 MDC 残留
+        }
+
+        assertEquals("req-162|alice|chat:t1", observed.get());
+    }
+
+    @Test
+    void callAllPropagatesMdcIntoReadOnlyConcurrentRuns() {
+        // #162：callAll 的只读并发槽（supplyAsync）同样裸提交断链——
+        // wrapSupplier 后并发槽内的工具体读取与提交线程一致。两个只读
+        // 请求保证走并发槽（单请求会走串行快速路径，测不到）。
+        List<String> observed =
+                java.util.Collections.synchronizedList(new ArrayList<>());
+        AgentTool probe = new AgentTool() {
+            @Override
+            public String name() {
+                return "scope_probe2";
+            }
+
+            @Override
+            public String description() {
+                return "scope probe fixture";
+            }
+
+            @Override
+            public ToolSpecification specification() {
+                return ToolSpecification.builder().name("scope_probe2").build();
+            }
+
+            @Override
+            public String call(String argsJson, ToolContext ctx) {
+                observed.add(Observability.requestId() + "|" + MemoryScope.currentUserId()
+                        + "|" + MemoryScope.currentThreadId());
+                return "ok";
+            }
+        };
+        ToolPool pool = ToolPool.build(List.of(probe), List.of(), 30.0, Map.of(), null);
+        RunConfig config = RunConfig.of("chat:pool-mdc", "u");
+
+        try {
+            Observability.withRequestId("req-162b", () -> {
+                MemoryScope.set("bob", "chat:t2");
+                // 两个只读请求都打 probe（只有 probe 记录观测），保证走并发槽。
+                List<String> outputs = pool.callAll(
+                        List.of(req("scope_probe2"), req("scope_probe2")),
+                        config, null, r -> pool.call(r.name(), r.arguments(), config, null));
+                assertEquals(List.of("ok", "ok"), outputs);
+            });
+        } finally {
+            MemoryScope.clear();
+        }
+
+        assertEquals(2, observed.size());
+        assertTrue(observed.stream().allMatch(s -> s.equals("req-162b|bob|chat:t2")),
+                "并发槽内的 MDC 应与提交线程一致: " + observed);
     }
 
     @Test
