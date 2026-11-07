@@ -86,6 +86,15 @@ public final class GraphBuilder {
 
     /** 编译：校验拓扑完整性。checkpointer 可为 null（测试手动构造）。 */
     public CompiledGraph compile(Checkpointer checkpointer, String name) {
+        return compile(checkpointer, name, null);
+    }
+
+    /**
+     * 编译并绑定工具池（#238：池是编译参数，不是编译后覆写）；
+     * {@code pool} 为 null = 本图未接工具。
+     */
+    public CompiledGraph compile(Checkpointer checkpointer, String name,
+                                 io.github.paopaonb666.agentbase.core.tools.ToolPool toolPool) {
         if (entry == null || START.equals(entry) || END.equals(entry)) {
             throw new IllegalStateException("必须设置入口节点（builder.entry(...)）");
         }
@@ -104,7 +113,7 @@ public final class GraphBuilder {
                 throw new IllegalStateException("节点 '%s' 缺少出边".formatted(node));
             }
         }
-        return new CompiledGraph(name, Map.copyOf(nodes), Map.copyOf(edges), entry, checkpointer);
+        return new CompiledGraph(name, Map.copyOf(nodes), Map.copyOf(edges), entry, checkpointer, toolPool);
     }
 
     /** 便捷重载：单节点直线图（START → node → END）。 */

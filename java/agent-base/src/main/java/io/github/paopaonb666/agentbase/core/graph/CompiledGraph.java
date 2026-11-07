@@ -48,12 +48,14 @@ public final class CompiledGraph {
     private final Checkpointer checkpointer;
 
     CompiledGraph(String name, Map<String, GraphBuilder.Node> nodes,
-                  Map<String, GraphBuilder.Edge> edges, String entry, Checkpointer checkpointer) {
+                  Map<String, GraphBuilder.Edge> edges, String entry, Checkpointer checkpointer,
+                  io.github.paopaonb666.agentbase.core.tools.ToolPool toolPool) {
         this.name = name;
         this.nodes = nodes;
         this.edges = edges;
         this.entry = entry;
         this.checkpointer = checkpointer;
+        this.toolPoolRef = toolPool;
     }
 
     public String name() {
@@ -199,12 +201,9 @@ public final class CompiledGraph {
         }
     }
 
-    private volatile io.github.paopaonb666.agentbase.core.tools.ToolPool toolPoolRef;
-
-    /** 装配方（AgentRuntime）注入工具池；null = 本图未接工具。 */
-    public void setToolPool(io.github.paopaonb666.agentbase.core.tools.ToolPool pool) {
-        this.toolPoolRef = pool;
-    }
+    // 工具池在 compile 期定死（#238：post-compile 的 volatile 覆写是竞态面
+    // 也是装配顺序陷阱）；null = 本图未接工具。
+    private final io.github.paopaonb666.agentbase.core.tools.ToolPool toolPoolRef;
 
     public io.github.paopaonb666.agentbase.core.tools.ToolPool toolPool() {
         return toolPoolRef;

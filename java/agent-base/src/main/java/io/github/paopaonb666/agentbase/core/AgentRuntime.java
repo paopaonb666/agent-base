@@ -149,7 +149,7 @@ public final class AgentRuntime {
     /** 交给每个模块的 {@code buildGraph} 的 {@code ModuleContext}。 */
     public AgentModule.ModuleContext context() {
         return new AgentModule.ModuleContext(settings, llm, checkpointer,
-                tools == null ? java.util.List.of() : moduleToolViews(), memory, planStore);
+                tools == null ? java.util.List.of() : moduleToolViews(), memory, planStore, tools);
     }
 
     /**
@@ -190,9 +190,9 @@ public final class AgentRuntime {
                     "module '%s' is not enabled; available: %s. Add it to AGENT_MODULES."
                             .formatted(moduleName, availableText));
         }
+        // 共享池经 ModuleContext 在 compile 期绑定（#238）：图的工具执行
+        // 统一走共享池（超时 + 审计 + 指标收口），不再编译后覆写。
         CompiledGraph graph = module.buildGraph(context());
-        // 共享池覆写：图的工具执行统一走共享池（超时 + 审计 + 指标收口）。
-        graph.setToolPool(tools);
         graphs.put(moduleName, graph);
         return graph;
     }
@@ -201,7 +201,6 @@ public final class AgentRuntime {
     public CompiledGraph supervisorGraph() {
         if (supervisor == null) {
             supervisor = SupervisorGraphs.buildSupervisorGraph(context(), modules);
-            supervisor.setToolPool(tools);
         }
         return supervisor;
     }

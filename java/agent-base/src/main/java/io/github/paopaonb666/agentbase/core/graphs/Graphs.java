@@ -119,14 +119,16 @@ public final class Graphs {
             builder.addEdge("tools", "agent");
         }
 
-        CompiledGraph graph = builder.compile(ctx.checkpointer(), name);
-        // 本地兜底池仅服务测试直构场景（无超时/审计）；生产装配（AgentRuntime）
-        // 会在 compile 后覆写为共享池（超时包装 + 审计 + 指标收口）。
-        graph.setToolPool(io.github.paopaonb666.agentbase.core.tools.ToolPool.build(
-                pool, List.of(),
-                io.github.paopaonb666.agentbase.core.tools.ToolPool.DEFAULT_TOOL_TIMEOUT_SECONDS,
-                Map.of(), null));
-        return graph;
+        // 工具池（#131/#238）：生产装配经 ModuleContext 带入共享池（超时
+        // 包装 + 审计 + 指标收口）；缺省（测试直构）退回本地兜底池——
+        // 保留默认超时（兜底池不搞无超时执行）。
+        io.github.paopaonb666.agentbase.core.tools.ToolPool toolPool =
+                ctx.toolPool() != null ? ctx.toolPool()
+                        : io.github.paopaonb666.agentbase.core.tools.ToolPool.build(
+                                pool, List.of(),
+                                io.github.paopaonb666.agentbase.core.tools.ToolPool.DEFAULT_TOOL_TIMEOUT_SECONDS,
+                                Map.of(), null);
+        return builder.compile(ctx.checkpointer(), name, toolPool);
     }
 
     private static List<dev.langchain4j.agent.tool.ToolSpecification> specs(List<AgentTool> pool) {

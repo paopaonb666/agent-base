@@ -52,10 +52,19 @@ public interface AgentModule {
             io.github.paopaonb666.agentbase.core.graph.Checkpointer checkpointer,
             List<AgentTool> tools,
             MemoryPort memory,
-            PlanStorePort planStore) {
+            PlanStorePort planStore,
+            io.github.paopaonb666.agentbase.core.tools.ToolPool toolPool) {
 
         public ModuleContext {
             tools = tools == null ? List.of() : List.copyOf(tools);
+        }
+
+        /** 六参便利构造（toolPool=null：测试直构/未接池的模块）。 */
+        public ModuleContext(io.github.paopaonb666.agentbase.core.config.Settings settings,
+                             ModelRuntime llm,
+                             io.github.paopaonb666.agentbase.core.graph.Checkpointer checkpointer,
+                             List<AgentTool> tools, MemoryPort memory, PlanStorePort planStore) {
+            this(settings, llm, checkpointer, tools, memory, planStore, null);
         }
     }
 

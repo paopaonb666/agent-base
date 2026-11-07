@@ -179,7 +179,7 @@ public final class SupervisorGraphs {
                     return update;
                 })
                 .addEdge("handoffs", "supervisor")
-                .compile(ctx.checkpointer(), MODULE_NAME);
+                .compile(ctx.checkpointer(), MODULE_NAME, ctx.toolPool());
     }
 
     /**
