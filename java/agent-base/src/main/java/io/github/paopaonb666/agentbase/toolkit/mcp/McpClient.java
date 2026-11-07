@@ -62,7 +62,10 @@ public final class McpClient implements AutoCloseable {
         params.putObject("capabilities");
         params.putObject("clientInfo").put("name", clientName).put("version", clientVersion);
         try {
-            request("initialize", params, handshakeTimeoutSeconds);
+            ObjectNode result = request("initialize", params, handshakeTimeoutSeconds);
+            // 协商版本回传给传输层（HTTP 系做后续请求的协议版本头）
+            String negotiated = result.path("protocolVersion").asText(PROTOCOL_VERSION);
+            transport.onProtocolVersion(negotiated);
         } catch (McpException e) {
             close();
             throw e;

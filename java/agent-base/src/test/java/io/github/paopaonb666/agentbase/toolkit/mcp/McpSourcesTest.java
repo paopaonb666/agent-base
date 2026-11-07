@@ -8,6 +8,7 @@ import io.github.paopaonb666.agentbase.core.tools.ToolPool;
 import org.junit.jupiter.api.Test;
 
 import java.io.File;
+import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -75,11 +76,11 @@ class McpSourcesTest {
     }
 
     @Test
-    void unimplementedHttpTransportFailsWithGuidance() {
+    void websocketTransportFailsWithGuidance() {
         Settings settings = enabledSettings(
-                "{\"remote\": {\"transport\": \"streamable_http\", \"url\": \"http://localhost:9/mcp\"}}");
+                "{\"remote\": {\"transport\": \"websocket\", \"url\": \"ws://localhost:9/mcp\"}}");
         McpException e = assertThrows(McpException.class, () -> McpSources.load(settings));
-        assertTrue(e.getMessage().contains("本期未实现"));
+        assertTrue(e.getMessage().contains("websocket' 本期未实现"));
     }
 
     @Test
@@ -161,6 +162,91 @@ class McpSourcesTest {
             assertTrue(e.getMessage().contains("duplicate tool name 'a_x_y'"));
         } finally {
             assembly.close();
+        }
+    }
+
+    // ── #332：HTTP 系 transport（JDK HttpServer 夹具端到端） ─────────
+
+    /** 拉起 FakeHttpMcpServer 子进程，返回「配置 JSON + 关闭句柄」。 */
+    private static HttpFixture httpFixture(String mode) throws Exception {
+        int port;
+        try (java.net.ServerSocket socket = new java.net.ServerSocket(0)) {
+            port = socket.getLocalPort();
+        }
+        String javaBin = jsonEscape(javaCommand());
+        String classpath = jsonEscape(System.getProperty("java.class.path"));
+        String[] command = {javaBin, "-cp", System.getProperty("java.class.path"),
+                FakeHttpMcpServer.class.getName(), mode, String.valueOf(port)};
+        Process process = new ProcessBuilder(command).start();
+        // 等端口就绪（最多 10s）
+        long deadline = System.currentTimeMillis() + 10_000;
+        boolean ready = false;
+        while (System.currentTimeMillis() < deadline && process.isAlive()) {
+            try (java.net.Socket probe = new java.net.Socket()) {
+                probe.connect(new java.net.InetSocketAddress("127.0.0.1", port), 200);
+                ready = true;
+                break;
+            } catch (IOException probeFailure) {
+                Thread.sleep(50);
+            }
+        }
+        if (!ready) {
+            process.destroyForcibly();
+            throw new IllegalStateException("FakeHttpMcpServer 未能在预算内就绪");
+        }
+        String url = "http://127.0.0.1:" + port
+                + ("streamable".equals(mode) ? "/mcp" : "/sse");
+        return new HttpFixture("{\"http\": {\"transport\": \"" + ("streamable".equals(mode)
+                ? "streamable_http" : "sse") + "\", \"url\": \"" + url + "\"}}", process);
+    }
+
+    private record HttpFixture(String serversJson, Process process) {
+        void close() {
+            process.destroyForcibly();
+        }
+    }
+
+    @Test
+    void streamableHttpEndToEnd() throws Exception {
+        HttpFixture fixture = httpFixture("streamable");
+        try {
+            McpSources.McpAssembly asm = McpSources.load(enabledSettings(fixture.serversJson()));
+            try {
+                assertEquals(List.of("http_echo"), asm.tools().stream()
+                        .map(AgentTool::name).toList());
+                ToolPool pool = ToolPool.build(List.of(), asm.tools(), 30.0,
+                        asm.timeouts(), null);
+                String result = pool.call("http_echo",
+                        MAPPER.writeValueAsString(Map.of("query", "http 你好")),
+                        RunConfig.of("chat:t1", "u1"), null);
+                assertEquals("echo:http 你好", result);
+            } finally {
+                asm.close();
+            }
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    void sseEndToEnd() throws Exception {
+        HttpFixture fixture = httpFixture("sse");
+        try {
+            McpSources.McpAssembly asm = McpSources.load(enabledSettings(fixture.serversJson()));
+            try {
+                assertEquals(List.of("http_echo"), asm.tools().stream()
+                        .map(AgentTool::name).toList());
+                ToolPool pool = ToolPool.build(List.of(), asm.tools(), 30.0,
+                        asm.timeouts(), null);
+                String result = pool.call("http_echo",
+                        MAPPER.writeValueAsString(Map.of("query", "sse 你好")),
+                        RunConfig.of("chat:t1", "u1"), null);
+                assertEquals("echo:sse 你好", result);
+            } finally {
+                asm.close();
+            }
+        } finally {
+            fixture.close();
         }
     }
 }

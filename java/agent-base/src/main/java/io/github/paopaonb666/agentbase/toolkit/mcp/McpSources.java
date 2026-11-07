@@ -115,17 +115,22 @@ public final class McpSources {
         return client;
     }
 
-    /** transport 分发：本期 stdio 先行（#331），HTTP 系随 #332 落地。 */
+    /** transport 分发：stdio（#331）+ streamable_http/sse（#332）；websocket 延后。 */
     private static McpTransport openTransport(McpServerSpec spec) {
+        double timeout = spec.timeoutSeconds() == null
+                ? HANDSHAKE_TIMEOUT_SECONDS : spec.timeoutSeconds();
         switch (spec.transport()) {
             case "stdio":
                 return new McpStdioTransport(spec.name(), spec.command(), spec.args(),
                         spec.env());
-            case "streamable_http", "sse", "websocket":
+            case "streamable_http":
+                return new McpStreamableHttpTransport(spec.name(), spec.url(), timeout);
+            case "sse":
+                return new McpSseTransport(spec.name(), spec.url(), timeout);
+            case "websocket":
                 throw new McpException(
-                        "MCP server '" + spec.name() + "'：transport '" + spec.transport()
-                                + "' 本期未实现（Java 版先支持 stdio）；"
-                                + "先用 stdio 形态，HTTP 支持在后续版本跟进。");
+                        "MCP server '" + spec.name() + "'：transport 'websocket' 本期未实现"
+                                + "（Java 版支持 stdio / streamable_http / sse）。");
             default:
                 throw new McpException("MCP server '" + spec.name() + "'：未知 transport '"
                         + spec.transport() + "'");
