@@ -72,6 +72,12 @@ public final class Settings {
     public List<String> agentModulePackages = List.of("agent_base.modules");
     /** 单轮 invoke 的图步数上限（含工具往返）。 */
     public int agentRecursionLimit = 25;
+    /**
+     * 单轮 run 的 handoff 次数上限（#68）：超限后 supervisor 收到结构化
+     * 提示强制收敛出最终回答——supervisor↔子模块乒乓循环不再烧满全局
+     * recursionLimit 才被用户看到。0 = 不限。
+     */
+    public int agentHandoffMaxPerRun = 10;
     /** 允许跨域调用本服务的来源（浏览器客户端，如 agent-base-ui）。 */
     public List<String> corsOrigins = List.of("http://localhost:3000");
     /** 运行环境：development | production。 */
@@ -360,7 +366,7 @@ public final class Settings {
         }
         // 根级字段的 env/dotenv 键可能全大写（AGENT_MODULES）：归一小写。
         for (String key : List.of("agent_modules", "agent_module_packages", "cors_origins", "env",
-                "agent_recursion_limit")) {
+                "agent_recursion_limit", "agent_handoff_max_per_run")) {
             String up = key.toUpperCase(Locale.ROOT);
             if (out.containsKey(up) && !out.containsKey(key)) {
                 out.put(key, out.remove(up));
@@ -389,6 +395,13 @@ public final class Settings {
             }
             if (vals.containsKey("agent_recursion_limit")) {
                 s.agentRecursionLimit = requireInt("agent_recursion_limit", vals.get("agent_recursion_limit"));
+            }
+            if (vals.containsKey("agent_handoff_max_per_run")) {
+                int value = requireInt("agent_handoff_max_per_run", vals.get("agent_handoff_max_per_run"));
+                if (value < 0) {
+                    throw new SettingsError("AGENT_HANDOFF_MAX_PER_RUN must be >= 0, got %d".formatted(value));
+                }
+                s.agentHandoffMaxPerRun = value;
             }
             if (vals.containsKey("cors_origins")) {
                 s.corsOrigins = parseCsvOrJsonList(vals.get("cors_origins"), "cors_origins");

@@ -63,6 +63,18 @@ public final class SupervisorGraphs {
     /** handoff 工具名前缀（langgraph-supervisor 默认，未传 prefix 时的形态）。 */
     public static final String HANDOFF_TOOL_PREFIX = "transfer_to_";
 
+    // ── handoff 预算（#68）：run 级计数器（init 节点每轮清零） ──────
+    /** 状态通道：本轮已执行的 handoff 次数。 */
+    static final String HANDOFF_COUNT = "handoff_count";
+    /** 状态通道：最近一次 handoff 的目标模块（乒乓检测留观，登记不强制）。 */
+    static final String LAST_HANDOFF = "last_handoff";
+
+    /** 预算耗尽时回给 supervisor 的结构化收敛提示（超限后不再执行子图）。 */
+    static String handoffBudgetExhaustedText(int count, int limit) {
+        return ("handoff 预算耗尽（本轮已 %d 次，上限 %d）：请基于已有信息直接给出最终回答，"
+                + "不要再调用 transfer_to_* 工具。").formatted(count, limit);
+    }
+
     /**
      * supervisor 的默认系统提示词（Python 侧 DEFAULT_PROMPT 逐字复制）。
      */
@@ -99,6 +111,11 @@ public final class SupervisorGraphs {
         int maxTokens = ctx.settings().memory.contextMaxTokens;
 
         return GraphBuilder.begin()
+                // #68：run 级 handoff 预算的清零点——每轮 invoke 从 entry
+                // 进入，计数器随快照持久化但每轮重置为 0。
+                .addNode("init", (GraphState state, NodeContext nodeCtx) -> Map.<String, Object>of(
+                        HANDOFF_COUNT, 0,
+                        LAST_HANDOFF, ""))
                 .addNode("supervisor", (GraphState state, NodeContext nodeCtx) -> {
                     // prompt 作为 SystemMessage 加在消息列表开头（库的
                     // prompt: str 语义）；上下文工程对所有模块生效。
@@ -111,7 +128,8 @@ public final class SupervisorGraphs {
                     }
                     return Map.<String, Object>of(GraphState.MESSAGES, List.of(message));
                 })
-                .entry("supervisor")
+                .entry("init")
+                .addEdge("init", "supervisor")
                 // 最后一条 AiMessage 带 tool_calls → handoffs；否则 END。
                 .addConditionalEdges("supervisor",
                         state -> lastAiHasToolCalls(state) ? "handoffs" : GraphBuilder.END)
@@ -120,26 +138,45 @@ public final class SupervisorGraphs {
                     if (last == null || !last.hasToolExecutionRequests()) {
                         return Map.of();
                     }
+                    // #68：run 级预算——超限后不再执行子图，回结构化提示
+                    // 让 supervisor 收敛出最终回答（乒乓循环止于预算而非
+                    // recursionLimit 触顶的裸错误）。
+                    int limit = ctx.settings().agentHandoffMaxPerRun;
+                    int count = state.get(HANDOFF_COUNT) instanceof Number n ? n.intValue() : 0;
+                    // String.valueOf(state.get(...)) 会让泛型 T 推断成 char[]
+                    // （valueOf(char[]) 比 valueOf(Object) 更具体）——先收窄到 Object
+                    Object lastRaw = state.get(LAST_HANDOFF);
+                    String lastTarget = lastRaw == null ? "" : String.valueOf(lastRaw);
                     List<ChatMessage> results = new ArrayList<>();
-                    // #337：handoff 工具不在池内 → 按非只读串行（语义同原
-                    // for 循环：异常原样传播，子图事件经转发 sink 透传）。
-                    List<String> outputs = nodeCtx.tools() == null
-                            ? last.toolExecutionRequests().stream()
-                                    .map(request -> runHandoff(request, state.messages(),
-                                            subgraphs, nodeCtx)).toList()
-                            : nodeCtx.tools().callAll(last.toolExecutionRequests(),
-                                    nodeCtx.config(), nodeCtx,
-                                    request -> runHandoff(request, state.messages(),
-                                            subgraphs, nodeCtx));
-                    int index = 0;
+                    // handoff 按非只读语义串行执行（#337：callAll 对池外工具
+                    // 同样串行；预算判定要求按序，直接内联）。
+                    boolean budgetExhausted = false;
+                    int executed = 0;
                     for (ToolExecutionRequest request : last.toolExecutionRequests()) {
+                        String output;
+                        if (budgetExhausted) {
+                            output = handoffBudgetExhaustedText(count, limit);
+                        } else if (limit > 0 && count + executed >= limit) {
+                            budgetExhausted = true;
+                            output = handoffBudgetExhaustedText(count + executed, limit);
+                        } else {
+                            output = runHandoff(request, state.messages(), subgraphs, nodeCtx);
+                            executed++;
+                            lastTarget = request.name() == null ? lastTarget
+                                    : request.name().substring(
+                                            request.name().startsWith(HANDOFF_TOOL_PREFIX)
+                                                    ? HANDOFF_TOOL_PREFIX.length() : 0);
+                        }
                         results.add(ToolExecutionResultMessage.from(
                                 request.id() == null ? "" : request.id(),
                                 request.name() == null ? "" : request.name(),
-                                outputs.get(index)));
-                        index++;
+                                output));
                     }
-                    return Map.<String, Object>of(GraphState.MESSAGES, results);
+                    Map<String, Object> update = new java.util.LinkedHashMap<>();
+                    update.put(GraphState.MESSAGES, results);
+                    update.put(HANDOFF_COUNT, count + executed);
+                    update.put(LAST_HANDOFF, lastTarget);
+                    return update;
                 })
                 .addEdge("handoffs", "supervisor")
                 .compile(ctx.checkpointer(), MODULE_NAME);
