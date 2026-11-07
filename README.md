@@ -369,8 +369,12 @@ SSE 事件新增 `plan`（全量任务清单，前端整表替换）：
   各变更点 upsert，`GET …/plan` 端点读表——chat 轮穿插不再重置计划。
   新的 plan 轮仍会按当轮目标重新拆解（延续执行旧计划属后续增量）；
 - 前端渲染 PlanEvent 属 agent-base-ui 仓库，本仓库只提供契约与端点；
-- planner 重度使用的最坏图步数约 34，超出默认
-  `AGENT_RECURSION_LIMIT=25`——按需在 .env 调高。
+- planner 重度使用的最坏图步数为
+  `8 + 2*PLANNER_MAX_SUBTASKS*(PLANNER_SUBTASK_TOOL_ROUNDS+1)`，默认配置
+  （5 子任务 × 8 工具轮）= **98**，超出默认 `AGENT_RECURSION_LIMIT=25`——
+  在 .env 把 `AGENT_RECURSION_LIMIT` 调到 ≥ 98，或调低 PLANNER_* 预算。
+  启动期按上述公式自动推导最坏步数、不足时给出建议值的 WARN 目前 Java
+  侧提供（决策记录见 `docs/adr/004-java-mini-graph-engine.md`）。
 
 ## 成本治理（T4）
 

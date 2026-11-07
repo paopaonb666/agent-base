@@ -65,11 +65,12 @@ BM25 索引缓存、SSE 连接都按进程持有，不跨 worker 共享。
 ## H5：planner 递归预算与全局递归上限不完全对齐
 
 **口径**：`PLANNER_MAX_SUBTASKS` / `PLANNER_SUBTASK_TOOL_ROUNDS` /
-`PLANNER_MAX_REPLANS` 共同决定 planner 的最坏步数；在当前默认值下最坏约
-**34 步**，高于 `AGENT_RECURSION_LIMIT=25`。
+`PLANNER_MAX_REPLANS` 共同决定 planner 的最坏步数；按公式
+`8 + 2 * max_subtasks * (subtask_tool_rounds + 1)`，当前默认值
+（5 子任务、8 工具轮）下最坏 **98 步**，高于 `AGENT_RECURSION_LIMIT=25`。
 
 **为什么这样定**：planner 的每次"子任务 + 工具轮次 + 重规划"都是一次
-可观测的决策，压缩全局递归上限会先杀掉正常的长任务；反过来把上限调到 34+
+可观测的决策，压缩全局递归上限会先杀掉正常的长任务；反过来把上限调到 98+
 会让失控循环的代价变高。当前选择是"让预算由 planner 参数表达，全局上限
 只做兜底"。
 
