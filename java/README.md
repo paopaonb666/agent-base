@@ -75,22 +75,28 @@ tool_call/plan/sources/done/error`）、端点路径与状态码语义与 Python
 
 ## 与 Python 版的已知差异
 
-以下差异均为**内部实现口径**，不影响 HTTP 行为与配置契约：
+以下为核心差异摘要（均为**内部实现口径**，不影响 HTTP 行为与配置契约）。
+完整登记簿——**有意差异 / Java 侧扩展 / 待修** 三分类、逐条 file 锚点与
+存活状态——见 [`docs/java-differences.md`](../docs/java-differences.md)：
 
 | 差异 | 说明 |
 | --- | --- |
-| 对话状态存储 | Java 用自有 `ab_thread_states` JSON 快照表（checkpointer SPI 三后端：memory/sqlite/mysql），不读写 LangGraph 的 msgpack superstep 表。HTTP 行为等价：历史回放/恢复/删除/线程列表一致；业务表（tool_call_records / uploaded_files / thread_index / plan_snapshots / cost_usage / 六张记忆表）DDL 逐条一致，可与 Python 版共用同一 MySQL 库（checkpointer 表除外，两版各自管理各自的表） |
-| 运行时 | 自建迷你图运行时复刻本项目实际用到的 LangGraph 语义子集（节点/条件边/三通道流式/按线程状态快照/recursion limit）；supervisor 以 handoff 工具模式自实现（对应 langgraph-supervisor 行为） |
-| MCP | 第一期未迁移：`MCP_ENABLED=true` 启动即报错（启用即承诺的契约语义保留），默认 false 不受影响 |
-| python_repl | 未迁移：`TOOLKIT_ENABLED` 含 `python_repl` 时启动即报专用「未迁移」错误（说明 exec 级隔离语义未承诺，并指引从 TOOLKIT_ENABLED 移除该条目）；不是泛化的「未知工具」报错。合法名：`current_time/calculator/json_query/web_search` |
-| DuckDuckGo 引擎 | 未迁移：`SEARCH_ENGINE_PRIORITY` 含 `duckduckgo` 且被选中时构建期报错；Tavily 完整可用 |
-| 日志 | SLF4J/Logback 实现，`LOG_JSON=true` 输出与 Python 版同字段的 JSON 行（ts/level/logger/request_id/message） |
+| 对话状态存储 | Java 用自有 `ab_thread_states` JSON 快照表（checkpointer SPI 三后端：memory/sqlite/mysql），不读写 LangGraph 的 msgpack superstep 表。HTTP 行为等价；业务表 DDL 逐条一致，可与 Python 版共用同一 MySQL 库（checkpointer 表除外） |
+| 运行时 | 自建迷你图运行时复刻本项目实际用到的 LangGraph 语义子集（节点/条件边/三通道流式/按线程状态快照/recursion limit）；supervisor 以 handoff 工具模式自实现（决策记录：`docs/adr/004-java-mini-graph-engine.md`） |
+| 未迁移项 | MCP（启用即报错）/ python_repl（专用「未迁移」错误）/ DuckDuckGo 引擎（构建期报错）——启用即承诺契约保留，默认配置不受影响 |
 | 多进程口径 | 与 Python 版一致：metrics / 预算 / nonce 防重放缓存均为单进程口径，多实例部署需在采集/网关侧聚合 |
+
+其余差异（日志毫秒分隔符、422 文案语言、`_raw` 降级载荷、score 舍入层级、
+supervisor 派生线程键、web_search/knowledge_search 引用格式扩展等）全部
+登记在差异登记簿，不在此重复。
 
 ## 质量门
 
-Java 侧第一期质量门为 `mvn test`（JUnit 5）：核心行为测试覆盖配置契约、
-HMAC 签名防重放（golden 向量与 Python `scripts/memory_user_sig.py` 交叉
-验证）、SSE 事件帧逐字节、混合检索打分、token 预算修剪、预算熔断、文档
-切块、线程命名空间、图执行（scripted 模型）、服务器路由契约。CI 集成随
-Python 侧工作流后续补齐。
+Java 侧质量门为 `mvn test`（JUnit 5）：核心行为测试覆盖配置契约、HMAC
+签名防重放（golden 向量与 Python `scripts/memory_user_sig.py` 交叉验证）、
+SSE 事件帧逐字节、混合检索打分、token 预算修剪、预算熔断、文档切块、
+线程命名空间、图执行（scripted 模型）、服务器路由契约；JaCoCo 行覆盖门
+生效（`java/pom.xml`）。CI（`.github/workflows/ci.yml`）已接入：`java` job
+跑 `mvn verify` + memory exec jar 产物冒烟（`/health` 200 + `/v1/memory`
+非 404），`java-dependency-check` job 跑 OWASP dependency-check 依赖审计门
+（CVSS≥9 fail，经 `-Powasp` profile 触发）。
