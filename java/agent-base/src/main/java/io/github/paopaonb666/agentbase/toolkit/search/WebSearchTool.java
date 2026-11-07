@@ -12,6 +12,7 @@ import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.model.chat.request.json.JsonObjectSchema;
 
 import io.github.paopaonb666.agentbase.core.config.Settings;
+import io.github.paopaonb666.agentbase.core.text.CharMetrics;
 import io.github.paopaonb666.agentbase.core.tools.AgentTool;
 
 /**
@@ -26,9 +27,10 @@ import io.github.paopaonb666.agentbase.core.tools.AgentTool;
  *       （基座已有的机制，工具层不重复兜底）。</li>
  * </ul>
  *
- * <p>TODO(流式事件)：Python 侧 M3.5 还经 {@code emit_step}/
- * {@code emit_sources} 发 UI 进度事件；本模块 {@code ctx.emit} 通道已具备，
- * 事件契约（step/sources）随服务侧事件批次迁移，这里先不发。
+ * <p>流式事件（#277）：对齐 Python M3.5 的 {@code emit_step}/
+ * {@code emit_sources}——搜索开始/完成各发一条 step（detail 与 Python
+ * 同文案），结果来源发一条 sources（title/url）。经 {@code ctx.emit}
+ * 通道（图外调用为无操作），事件失败不影响搜索本身。
  */
 public final class WebSearchTool implements AgentTool {
 
@@ -152,11 +154,39 @@ public final class WebSearchTool implements AgentTool {
                     "max_results 必须在 (1, " + MAX_RESULTS + ") 内，收到了 " + maxResults);
         }
 
+        emitStep(ctx, "running", "搜索：" + CharMetrics.head(query, 40));
         List<SearchResult> results = runSearch(query, maxResults);
         if (results.isEmpty()) {
+            emitStep(ctx, "completed", "找到 0 条结果");
             return EMPTY_RESULT_GUIDANCE;
         }
+        emitStep(ctx, "completed", "找到 " + results.size() + " 条结果");
+        emitSources(ctx, results);
         return SearchPipeline.formatWebContext(results);
+    }
+
+    /** step 进度事件（文案对齐 Python emit_step 调用点；尽力而为）。 */
+    private static void emitStep(AgentTool.ToolContext ctx, String status, String detail) {
+        if (ctx != null) {
+            ctx.emit(new io.github.paopaonb666.agentbase.extensions.events.Events.StepEvent(
+                    NAME, status, detail));
+        }
+    }
+
+    /** sources 来源事件（title/url 对齐 Python emit_sources；尽力而为）。 */
+    private static void emitSources(AgentTool.ToolContext ctx, List<SearchResult> results) {
+        if (ctx == null) {
+            return;
+        }
+        try {
+            ctx.emit(new io.github.paopaonb666.agentbase.extensions.events.Events.SourcesEvent(
+                    results.stream()
+                            .map(r -> new io.github.paopaonb666.agentbase.extensions.events.Events.Source(
+                                    r.title(), r.url()))
+                            .toList()));
+        } catch (Exception e) {
+            LOG.debug("web_search: emit sources failed", e);
+        }
     }
 
     /** 缓存优先的搜索执行；引擎全失败时返回空列表（管理器已记日志）。 */

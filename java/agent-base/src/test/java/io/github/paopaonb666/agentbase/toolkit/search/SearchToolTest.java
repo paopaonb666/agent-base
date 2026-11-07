@@ -191,6 +191,75 @@ class SearchToolTest {
         assertTrue(out.contains("(来源: tavily)"));
     }
 
+    /** 录制事件的事件通道替身（#277：step/sources 发射断言用）。 */
+    private static final class RecordingNodeContext
+            implements io.github.paopaonb666.agentbase.core.graph.NodeContext {
+        final List<Object> events = new java.util.ArrayList<>();
+        private final io.github.paopaonb666.agentbase.core.graph.RunConfig config =
+                io.github.paopaonb666.agentbase.core.graph.RunConfig.of("chat:search", "u");
+
+        @Override
+        public io.github.paopaonb666.agentbase.core.graph.RunConfig config() {
+            return config;
+        }
+
+        @Override
+        public void emit(Object event) {
+            events.add(event);
+        }
+
+        @Override
+        public String callTool(String name, String argsJson) {
+            return "";
+        }
+
+        @Override
+        public io.github.paopaonb666.agentbase.core.tools.ToolPool tools() {
+            return null;
+        }
+
+        @Override
+        public boolean cancelled() {
+            return false;
+        }
+    }
+
+    @Test
+    void webSearchEmitsStepAndSourcesEvents() {
+        RecordingNodeContext nodeCtx = new RecordingNodeContext();
+        String out = tool().call("{\"query\": \"拉康 精神分析\"}",
+                new AgentTool.ToolContext(nodeCtx.config(), nodeCtx));
+        assertTrue(out.contains("[1] "));
+
+        // 事件序：running → completed → sources（文案对齐 Python emit_*）。
+        assertEquals(3, nodeCtx.events.size());
+        var stepRunning = (io.github.paopaonb666.agentbase.extensions.events.Events.StepEvent)
+                nodeCtx.events.get(0);
+        assertEquals("web_search", stepRunning.name());
+        assertEquals("running", stepRunning.status());
+        assertEquals("搜索：拉康 精神分析", stepRunning.detail());
+
+        var stepCompleted = (io.github.paopaonb666.agentbase.extensions.events.Events.StepEvent)
+                nodeCtx.events.get(1);
+        assertEquals("completed", stepCompleted.status());
+        assertEquals("找到 3 条结果", stepCompleted.detail());
+
+        var sources = (io.github.paopaonb666.agentbase.extensions.events.Events.SourcesEvent)
+                nodeCtx.events.get(2);
+        // Python 语义：全量结果都进 sources（无 url 条目回空串），过滤交给前端
+        assertEquals(3, sources.sources().size());
+        assertEquals(new io.github.paopaonb666.agentbase.extensions.events.Events.Source(
+                "Alpha page", "https://example.com/alpha"), sources.sources().get(0));
+        assertEquals("", sources.sources().get(2).url());
+    }
+
+    @Test
+    void webSearchEmitsNothingWhenOutsideGraph() {
+        // ctx 的 nodeContext 为 null（图外/池内直调）：emit 无操作不抛
+        String out = callTool(tool(), "{\"query\": \"拉康 精神分析\"}");
+        assertTrue(out.contains("[1] "));
+    }
+
     @Test
     void webSearchCacheHitsDoNotHitServerTwice() {
         WebSearchTool t = tool();
