@@ -259,8 +259,30 @@ class AgentsRoutesTest {
     }
 
     @Test
-    void truncatedAttachmentInjectionCarriesGuidance() {
-        // #250：截断的附件全文注入时，块尾带指路提示（模型不再把半份文档
+    void continuePlanWithoutSnapshotGives400() throws Exception {
+        // #66：显式要求延续而快照缺席 → 400（静默重拆反而误导）。
+        AgentRuntime runtime = buildRuntime(Map.of("planner", stubModule("planner")),
+                null, null, null, null, null, null);
+        AgentsRoutes routes = route(runtime);
+        HttpError error = httpErrorOf(() -> invoke(routes, "planner",
+                new AgentsRoutes.InvokeRequest("继续", "t1", null, "plan", null, true), "u1"));
+        assertEquals(400, error.status());
+        assertTrue(error.getMessage().contains("没有可延续的计划快照"));
+    }
+
+    @Test
+    void continuePlanOutsidePlannerGives400() throws Exception {
+        AgentRuntime runtime = buildRuntime(Map.of("chat", stubModule("chat")),
+                null, null, null, null, null, null);
+        AgentsRoutes routes = route(runtime);
+        HttpError error = httpErrorOf(() -> invoke(routes, "chat",
+                new AgentsRoutes.InvokeRequest("继续", "t1", null, "chat", null, true), "u1"));
+        assertEquals(400, error.status());
+        assertTrue(error.getMessage().contains("continue_plan 需要与 planner 一起使用"));
+    }
+
+    @Test
+    void truncatedAttachmentInjectionCarriesGuidance() {        // #250：截断的附件全文注入时，块尾带指路提示（模型不再把半份文档
         // 当全文回答）；未截断的不带。
         List<UploadedFileInfo> infos = List.of(
                 new UploadedFileInfo("f1", "", "", "u1", "a.pdf", "pdf",

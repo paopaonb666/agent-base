@@ -42,6 +42,17 @@ public final class PlanNode {
     public static GraphBuilder.Node make(AgentModule.ModuleContext ctx) {
         int maxSubtasks = ctx.settings().planner.maxSubtasks;
         return (GraphState state, NodeContext nodeCtx) -> {
+            // #66 跨轮延续：快照已注入 tasks（continue_plan=true）→ 跳过
+            // 重拆，从注入的 cursor 续跑；plan 事件 status=progress。
+            List<Map<String, Object>> seeded = PlannerState.tasks(state);
+            if (!seeded.isEmpty()) {
+                PlanStreaming.emitPlan(nodeCtx, seeded, "progress",
+                        "延续既有计划（cursor=" + PlannerState.cursor(state) + "）");
+                return Map.of(
+                        PlannerState.TASKS, seeded,
+                        PlannerState.CURSOR, PlannerState.cursor(state),
+                        PlannerState.REPLANS, PlannerState.replans(state));
+            }
             List<ChatMessage> messages = PlannerState.messages(state);
             String goal = PlannerState.lastHumanText(messages);
             if (goal.isEmpty()) {

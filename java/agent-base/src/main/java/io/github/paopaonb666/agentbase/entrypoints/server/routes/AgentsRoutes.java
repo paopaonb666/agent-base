@@ -122,7 +122,15 @@ public class AgentsRoutes {
     // ── invoke 请求体（校验在 invoke 内手写 → 422，对齐 FastAPI 语义） ────
 
     public record InvokeRequest(String message, String threadId, List<String> attachments,
-                                String mode, String profile) {}
+                                String mode, String profile,
+                                @com.fasterxml.jackson.annotation.JsonProperty("continue_plan")
+                                Boolean continuePlan) {
+        /** 五参便利构造（continue_plan 缺省 false；测试与旧调用方用）。 */
+        public InvokeRequest(String message, String threadId, List<String> attachments,
+                             String mode, String profile) {
+            this(message, threadId, attachments, mode, profile, null);
+        }
+    }
 
     @PostMapping("/{module}/invoke")
     public SseEmitter invoke(@PathVariable("module") String module,
@@ -193,6 +201,9 @@ public class AgentsRoutes {
                     + "），请等待当前轮完成或稍后重试");
         }
         RunConfig config = new RunConfig(fullThreadId, userId, runtime.settings().agentRecursionLimit);
+        // 跨轮 plan 延续（#66）：continue_plan=true 载入快照，planner 从
+        // cursor 直接续跑（plan 节点检测到已注入 tasks 即跳过重拆）。
+        Map<String, Object> planSeed = planContinuationSeed(runtime, body, usePlan, fullThreadId);
         List<ChatMessage> messagesInput = new ArrayList<>();
         // 记忆上下文注入（M6d + T2.1）：冻结段在前，召回段紧随其后；任何
         // 一段失败都静默降级。
@@ -262,13 +273,44 @@ public class AgentsRoutes {
             // 元数据随本轮输入合并进状态（execute 后由 GraphState extras 承载）。
             Map<String, Object> inputExtra = new LinkedHashMap<>();
             inputExtra.put("attachments", Map.of(String.valueOf(messagesInput.size() - 1), attachmentsMeta));
+            inputExtra.putAll(planSeed);
             return startStream(graph, messagesInput, inputExtra, config, userThreadId, userId, module, response);
         }
         messagesInput.add(UserMessage.from(body.message()));
         // 会话索引 upsert（S1）由 startStream 统一执行（#141：非附件分支
         // 不再先行写一次——双写既放大写入量，两次写之间失败还会留下
         // 不一致标题；Python 侧恰一次）。
-        return startStream(graph, messagesInput, Map.of(), config, userThreadId, userId, module, response);
+        return startStream(graph, messagesInput, planSeed, config, userThreadId, userId, module, response);
+    }
+
+    /**
+     * 跨轮 plan 延续的种子（#66）：{@code continue_plan=true} 时从
+     * plan_snapshots 载入 tasks/cursor/replans 作为图状态注入。校验：
+     * 非 planner 执行（mode=chat 或 auto 未分流）→ 400；无快照 → 400
+     * （显式要求延续而快照缺席是用户可理解的错误，静默重拆反而误导）。
+     */
+    private Map<String, Object> planContinuationSeed(AgentRuntime runtime, InvokeRequest body,
+                                                     boolean usePlan, String fullThreadId) {
+        if (body.continuePlan() == null || !body.continuePlan()) {
+            return Map.of();
+        }
+        if (!usePlan) {
+            throw new HttpError(400,
+                    "continue_plan 需要与 planner 一起使用（mode=plan，或 mode=auto 且本轮分流到 planner）");
+        }
+        var planStore = runtime.planStore();
+        Map<String, Object> snapshot = planStore == null ? null : planStore.getPlan(fullThreadId);
+        if (snapshot == null || !(snapshot.get("tasks") instanceof List<?> tasks) || tasks.isEmpty()) {
+            throw new HttpError(400,
+                    "没有可延续的计划快照（该线程首轮或快照已清理）；请正常发起 plan");
+        }
+        Map<String, Object> seed = new LinkedHashMap<>();
+        seed.put(io.github.paopaonb666.agentbase.modules.planner.graph.PlannerState.TASKS, tasks);
+        seed.put(io.github.paopaonb666.agentbase.modules.planner.graph.PlannerState.CURSOR,
+                snapshot.get("cursor"));
+        seed.put(io.github.paopaonb666.agentbase.modules.planner.graph.PlannerState.REPLANS,
+                snapshot.get("replans"));
+        return seed;
     }
 
     /** 打开 SSE 流（挂记忆形成钩子；索引 upsert 的唯一落点，所有分支共用）。 */
@@ -328,6 +370,12 @@ public class AgentsRoutes {
         Map<String, Object> effectiveExtra = new LinkedHashMap<>();
         if (!attachmentsByIndex.isEmpty()) {
             effectiveExtra.put("attachments", attachmentsByIndex);
+        }
+        // 非附件的种子键（#66 的 planner 延续）原样透传进图状态
+        for (Map.Entry<String, Object> e : extra.entrySet()) {
+            if (!"attachments".equals(e.getKey())) {
+                effectiveExtra.putIfAbsent(e.getKey(), e.getValue());
+            }
         }
         return SseStreams.open(graph, messagesInput, effectiveExtra, config, userThreadId, onComplete);
     }
