@@ -185,6 +185,40 @@ jobs:
           cache: maven
       - name: Maven verify
         run: mvn -B --file java/pom.xml verify
+      - name: Smoke memory exec jar
+        # 产物冒烟（对齐 Python memory-package job 的产物断言）：mvn verify
+        # 产出的 memory exec jar（mainClass=AgentBaseApplication）应能
+        # `java -jar` 直接起服务——`--server.port=18080` 由 Spring 作为
+        # 程序参数吸收（换端口防撞默认 8000）；`--server` 旗标属 CliMain，
+        # 这里不需要。断言 /health 200 与 GET /v1/memory 非 404（记忆包
+        # 已装配）；不依赖任何启动日志行。后台进程必须显式收尾。
+        run: |
+          bash -c '
+            java -jar java/agent-base-memory/target/agent-base-memory-0.3.0-exec.jar --server.port=18080 > exec-jar-smoke.log 2>&1 &
+            pid=$!
+            trap "kill $pid 2>/dev/null || true" EXIT
+            ok=""
+            for i in $(seq 1 30); do
+              sleep 2
+              code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:18080/health || true)
+              if [ "$code" = "200" ]; then ok=1; break; fi
+            done
+            if [ -z "$ok" ]; then
+              echo "::error::/health did not return 200 within 60s"
+              cat exec-jar-smoke.log
+              exit 1
+            fi
+            echo "/health OK (200)"
+            mem_code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:18080/v1/memory?limit=1" || true)
+            if [ "$mem_code" = "404" ]; then
+              echo "::error::/v1/memory unexpectedly 404 (memory package not assembled?)"
+              cat exec-jar-smoke.log
+              exit 1
+            fi
+            echo "/v1/memory OK (HTTP $mem_code)"
+            kill $pid 2>/dev/null || true
+            wait $pid 2>/dev/null || true
+          '
 
   java-dependency-check:
     # Java 侧依赖审计门（对齐 Python audit job 的 pip-audit）：经 -Powasp
