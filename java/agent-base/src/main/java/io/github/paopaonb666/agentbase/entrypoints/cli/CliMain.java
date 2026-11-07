@@ -47,14 +47,21 @@ public final class CliMain {
 
     /** 解析参数并运行；返回进程退出码（对应 argparse + main）。 */
     public static int runCli(String[] argv) {
-        String module = "chat";
-        String message = null;
-        String threadId = null;
+        String module;
+        String message;
+        String threadId;
+        try {
+            String[] parsed = parseArgs(argv);
+            module = parsed[0];
+            message = parsed[1];
+            threadId = parsed[2];
+        } catch (IllegalArgumentException e) {
+            // 参数解析错误对应 argparse 的 exit 2（缺值/非法形态），不裸抛。
+            System.err.println("error: " + e.getMessage());
+            return 2;
+        }
         for (int i = 0; i < argv.length; i++) {
             switch (argv[i]) {
-                case "--module" -> module = requireValue(argv, ++i, "--module");
-                case "--message", "-m" -> message = requireValue(argv, ++i, "--message");
-                case "--thread-id" -> threadId = requireValue(argv, ++i, "--thread-id");
                 case "--server" -> {
                     // SSE 服务入口（对应 uvicorn agent_base.entrypoints.server:app）。
                     // 反射加载避免 CLI 编译期依赖 Spring 装配类。
@@ -99,6 +106,22 @@ public final class CliMain {
             System.err.println("error: " + exc.getMessage());
             return 1;
         }
+    }
+
+    /** 解析 --module/--message/--thread-id；返回 [module, message, threadId]。 */
+    private static String[] parseArgs(String[] argv) {
+        String module = "chat";
+        String message = null;
+        String threadId = null;
+        for (int i = 0; i < argv.length; i++) {
+            switch (argv[i]) {
+                case "--module" -> module = requireValue(argv, ++i, "--module");
+                case "--message", "-m" -> message = requireValue(argv, ++i, "--message");
+                case "--thread-id" -> threadId = requireValue(argv, ++i, "--thread-id");
+                default -> { /* 立即返回型参数（--server/--version/--help）在调用方处理 */ }
+            }
+        }
+        return new String[]{module, message, threadId};
     }
 
     private static String requireValue(String[] argv, int index, String flag) {
