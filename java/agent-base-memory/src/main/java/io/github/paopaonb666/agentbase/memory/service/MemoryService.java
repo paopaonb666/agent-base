@@ -582,20 +582,42 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
     // ── 用户画像 ────────────────────────────────────────────────────────
 
     /**
-     * 读取结构化用户画像（JSON dict）；不存在或畸形返回 null。
+     * 读取结构化用户画像（JSON dict）；不存在返回 null。内容畸形（解析
+     * 失败或顶层不是 JSON object）同样返回 null（#177：composeFrozen 与
+     * GET /v1/memory/profile 的契约不变），但不再静默——WARN + 一条
+     * {@code profile_corrupt} 审计让「失忆」可诊断。
      */
     public Map<String, Object> getProfile(String userId) {
-        MemoryRecord record = store.getMemory(Models.profileMemoryId(userId));
+        String memoryId = Models.profileMemoryId(userId);
+        MemoryRecord record = store.getMemory(memoryId);
         if (record == null) {
             return null;
         }
+        Map<String, Object> profile;
         try {
             Object parsed = new com.fasterxml.jackson.databind.ObjectMapper()
                     .readValue(record.content(), Object.class);
-            return parsed instanceof Map<?, ?> map ? asStringMap(map) : null;
+            profile = parsed instanceof Map<?, ?> map ? asStringMap(map) : null;
         } catch (Exception e) {
+            profileCorrupt(userId, memoryId,
+                    e.getClass().getSimpleName() + ": " + e.getMessage());
             return null;
         }
+        if (profile == null) {
+            // 解析成功但顶层不是 dict（如 JSON 数组/字符串）：同样按损坏处理。
+            profileCorrupt(userId, memoryId, "画像内容不是 JSON object");
+            return null;
+        }
+        return profile;
+    }
+
+    /** #177：画像损坏的可诊断旁路（WARN + 审计），不改变返回形态（仍 null）。 */
+    private void profileCorrupt(String userId, String memoryId, String reason) {
+        String summary = reason.length() > 300 ? reason.substring(0, 300) : reason;
+        LOG.warn("memory: 用户画像损坏（user='{}', memory_id='{}'）：{}——按无画像处理",
+                userId, memoryId, summary);
+        recordOp("profile_corrupt", userId, "", "",
+                Map.of("memory_id", memoryId, "reason", summary), "error", summary, 0);
     }
 
     /**
