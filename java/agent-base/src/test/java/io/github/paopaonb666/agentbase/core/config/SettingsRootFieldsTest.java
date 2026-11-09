@@ -207,6 +207,20 @@ class SettingsRootFieldsTest {
     }
 
     @Test
+    void streamIdleSecondsParsesWithZeroMeaningDisabled() {
+        // #74：默认 30s；0 = 禁用（旧行为，唯一兜底是 HTTP 总超时）；负数拒绝。
+        assertEquals(30.0,
+                Settings.load(Map.of("ENV", "development"), null).llm.streamIdleSeconds, 1e-9);
+        assertEquals(60.0, Settings.load(Map.of(
+                "ENV", "development", "LLM_STREAM_IDLE_SECONDS", "60"), null).llm.streamIdleSeconds, 1e-9);
+        assertEquals(0.0, Settings.load(Map.of(
+                "ENV", "development", "LLM_STREAM_IDLE_SECONDS", "0"), null).llm.streamIdleSeconds, 1e-9);
+        assertThrows(Settings.SettingsError.class,
+                () -> Settings.load(Map.of(
+                        "ENV", "development", "LLM_STREAM_IDLE_SECONDS", "-1"), null));
+    }
+
+    @Test
     void llmFallbacksParseAsJsonArrayOfTriples() {
         // #71：JSON 数组三元组；api_key 掩码类型；缺 model/base_url 拒绝；
         // 空串=空链。

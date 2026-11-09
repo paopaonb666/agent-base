@@ -102,6 +102,31 @@ class LangChain4jRuntimeTest {
     }
 
     @Test
+    void stalledStreamFailsFastWithIdleWatchdog() {
+        // #74：provider 半途停止发 delta 且不结束——idle 看门狗让它快速
+        // 失败（StreamStalledException），不再等 600s HTTP 总超时。
+        dev.langchain4j.model.chat.StreamingChatModel stalling =
+                new dev.langchain4j.model.chat.StreamingChatModel() {
+                    @Override
+                    public void chat(dev.langchain4j.model.chat.request.ChatRequest request,
+                                     dev.langchain4j.model.chat.response.StreamingChatResponseHandler handler) {
+                        handler.onPartialResponse("半截");
+                        // 既不 onComplete 也不 onError：模拟静默断流。
+                    }
+                };
+        LangChain4jRuntime runtime = new LangChain4jRuntime(
+                new ScriptedModels.ScriptedChatModel(List.of()), stalling, "scripted-main",
+                false, 0, 200, null);
+        long start = System.nanoTime();
+        LangChain4jRuntime.StreamStalledException error = assertThrows(
+                LangChain4jRuntime.StreamStalledException.class,
+                () -> runtime.stream(MESSAGES, List.of(), delta -> {}));
+        long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+        assertTrue(elapsedMillis < 5_000, "idle 看门狗应快速失败，实测 " + elapsedMillis + "ms");
+        assertTrue(error.getMessage().contains("idle"), error.getMessage());
+    }
+
+    @Test
     void streamAggregatesToolCallsWithAccumulatedText() {
         ScriptedModels.ScriptedResponse scripted = ScriptedModels.ScriptedResponse.withToolCalls(
                 " I will use the tool. ", List.of(echoCall()));

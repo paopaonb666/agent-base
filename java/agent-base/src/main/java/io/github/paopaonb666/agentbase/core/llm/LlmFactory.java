@@ -115,7 +115,8 @@ public final class LlmFactory {
                     ? java.time.Duration.ofMillis((long) (settings.llm.mainTimeoutSeconds * 1000))
                     : java.time.Duration.ofSeconds(600);
             return buildOpenAiRuntime(baseUrl, apiKey, model, timeout,
-                    toolSafeStreaming, contextWindowTokens, usageSink);
+                    toolSafeStreaming, contextWindowTokens,
+                    (long) (settings.llm.streamIdleSeconds * 1000), usageSink);
         } catch (RuntimeException exc) {
             // 客户端构造失败（典型：完全没有任何 API key）转成可操作的
             // SettingsError，而不是泄漏 langchain4j 的原始异常——对应 Python
@@ -130,6 +131,7 @@ public final class LlmFactory {
     private static LangChain4jRuntime buildOpenAiRuntime(String baseUrl, String apiKey, String model,
                                                          java.time.Duration timeout,
                                                          boolean toolSafeStreaming, int contextWindowTokens,
+                                                         long streamIdleMillis,
                                                          BiConsumer<String, TokenUsage> usageSink) {
         OpenAiChatModel chat = OpenAiChatModel.builder()
                 .baseUrl(baseUrl)
@@ -144,7 +146,7 @@ public final class LlmFactory {
                 .timeout(timeout)
                 .build();
         return new LangChain4jRuntime(chat, streaming, model, toolSafeStreaming,
-                contextWindowTokens, usageSink);
+                contextWindowTokens, streamIdleMillis, usageSink);
     }
 
     /**
@@ -172,7 +174,8 @@ public final class LlmFactory {
             try {
                 runtimes.add(buildOpenAiRuntime(spec.baseUrl(), apiKey, spec.model(),
                         java.time.Duration.ofMillis((long) (settings.llm.mainTimeoutSeconds * 1000)),
-                        false, spec.maxContextTokens(), usageSink));
+                        false, spec.maxContextTokens(),
+                        (long) (settings.llm.streamIdleSeconds * 1000), usageSink));
             } catch (RuntimeException exc) {
                 throw new Settings.SettingsError(
                         "LLM_FALLBACKS[%d] client build failed: %s".formatted(i, exc.getMessage()));

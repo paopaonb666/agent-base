@@ -54,6 +54,8 @@ public final class LangChain4jRuntime implements ModelRuntime {
     private final String modelName;
     private final boolean toolSafeStreaming;
     private final int contextWindowTokens;
+    /** #74：流式 idle 超时（毫秒）；0 = 禁用（旧行为，唯一兜底为 HTTP 总超时）。 */
+    private final long streamIdleMillis;
     private final BiConsumer<String, TokenUsage> usageSink;
 
     /**
@@ -68,7 +70,7 @@ public final class LangChain4jRuntime implements ModelRuntime {
                               String modelName,
                               boolean toolSafeStreaming,
                               BiConsumer<String, TokenUsage> usageSink) {
-        this(chatModel, streamingModel, modelName, toolSafeStreaming, 0, usageSink);
+        this(chatModel, streamingModel, modelName, toolSafeStreaming, 0, 0, usageSink);
     }
 
     /** 全参形态（#4）：contextWindowTokens 随运行时走（0 = 未配置）。 */
@@ -78,11 +80,23 @@ public final class LangChain4jRuntime implements ModelRuntime {
                               boolean toolSafeStreaming,
                               int contextWindowTokens,
                               BiConsumer<String, TokenUsage> usageSink) {
+        this(chatModel, streamingModel, modelName, toolSafeStreaming, contextWindowTokens, 0, usageSink);
+    }
+
+    /** 最全形态（#74）：streamIdleMillis = 流式 idle 超时（毫秒，0 = 禁用）。 */
+    public LangChain4jRuntime(ChatModel chatModel,
+                              StreamingChatModel streamingModel,
+                              String modelName,
+                              boolean toolSafeStreaming,
+                              int contextWindowTokens,
+                              long streamIdleMillis,
+                              BiConsumer<String, TokenUsage> usageSink) {
         this.chatModel = Objects.requireNonNull(chatModel, "chatModel is required");
         this.streamingModel = streamingModel;
         this.modelName = Objects.requireNonNull(modelName, "modelName is required");
         this.toolSafeStreaming = toolSafeStreaming;
         this.contextWindowTokens = Math.max(0, contextWindowTokens);
+        this.streamIdleMillis = Math.max(0, streamIdleMillis);
         this.usageSink = usageSink == null ? ModelRuntime.noopUsageSink() : usageSink;
     }
 
@@ -150,9 +164,15 @@ public final class LangChain4jRuntime implements ModelRuntime {
                 .build();
         CompletableFuture<ChatResponse> done = new CompletableFuture<>();
         StringBuilder deltas = new StringBuilder();
+        // #74：流式 idle 看门狗——provider 半途停止发 delta 且不断连接时，
+        // 无限 join 会把图节点线程挂死（唯一兜底是 600s HTTP 总超时）。
+        // 记录最近活动时刻，等待侧轮询；idleMillis<=0 = 禁用（旧行为）。
+        java.util.concurrent.atomic.AtomicLong lastActivity =
+                new java.util.concurrent.atomic.AtomicLong(System.nanoTime());
         streamingModel.chat(request, new StreamingChatResponseHandler() {
             @Override
             public void onPartialResponse(String token) {
+                lastActivity.set(System.nanoTime());
                 deltas.append(token);
                 onDelta.accept(token);
             }
@@ -167,7 +187,7 @@ public final class LangChain4jRuntime implements ModelRuntime {
                 done.completeExceptionally(error);
             }
         });
-        ChatResponse response = awaitResponse(done);
+        ChatResponse response = awaitResponse(done, lastActivity);
         AiMessage aggregated = response.aiMessage();
         List<ToolExecutionRequest> toolRequests = aggregated == null || aggregated.toolExecutionRequests() == null
                 ? List.of()
@@ -227,7 +247,31 @@ public final class LangChain4jRuntime implements ModelRuntime {
     }
 
     /** 等待流式完成；onError 投递的异常转成 RuntimeException 上抛。 */
-    private static ChatResponse awaitResponse(CompletableFuture<ChatResponse> done) {
+    /** #74：流式断流（idle 超时）——ResilientModelRuntime 重试边界照常适用。 */
+    public static final class StreamStalledException extends IllegalStateException {
+        public StreamStalledException(String message) {
+            super(message);
+        }
+    }
+
+    private ChatResponse awaitResponse(CompletableFuture<ChatResponse> done,
+                                       java.util.concurrent.atomic.AtomicLong lastActivity) {
+        // #74：idle 轮询等待（不引入第三种线程族；sleep 可被 interrupt 打断
+        // ——与 SSE 取消语义天然兼容）。超时 = completeExceptionally，异常
+        // 经 join 的 CompletionException 还原为 StreamStalledException。
+        while (!done.isDone()) {
+            if (streamIdleMillis > 0
+                    && System.nanoTime() - lastActivity.get() > streamIdleMillis * 1_000_000L) {
+                done.completeExceptionally(new StreamStalledException(
+                        "llm 流 idle 超时（%dms 无 delta 且未结束）".formatted(streamIdleMillis)));
+            }
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("llm 流等待被中断", interrupted);
+            }
+        }
         try {
             return done.join();
         } catch (CompletionException e) {

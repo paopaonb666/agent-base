@@ -161,6 +161,13 @@ public final class Settings {
          */
         public int circuitFailureThreshold = 5;
         public long circuitCooldownSeconds = 30;
+        /**
+         * 流式 idle 超时（秒，#74）：provider 半途停止发 delta 且不断连接时
+         * 的看门狗——0 = 禁用（旧行为，唯一兜底是 LLM_MAIN_TIMEOUT 的 600s
+         * 总超时）。默认 30s；推理型模型 thinking 阶段可几十秒无 token，
+         * 按模型特性调高。
+         */
+        public double streamIdleSeconds = 30.0;
     }
 
     /** #71 fallback 链的单个备用模型规格。 */
@@ -670,6 +677,13 @@ public final class Settings {
                 throw new SettingsError("LLM_CIRCUIT_COOLDOWN_SECONDS must be >= 0 (0 = no cooldown wait), got %s".formatted(value));
             }
             t.circuitCooldownSeconds = (long) value;
+        }
+        if (v.containsKey("stream_idle_seconds")) {
+            double value = requireFloat("stream_idle_seconds", v.get("stream_idle_seconds"));
+            if (!(value >= 0)) {
+                throw new SettingsError("LLM_STREAM_IDLE_SECONDS must be >= 0 (0 = disabled), got %s".formatted(value));
+            }
+            t.streamIdleSeconds = value;
         }
     }
 
