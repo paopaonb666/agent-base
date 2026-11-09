@@ -205,4 +205,33 @@ class SettingsRootFieldsTest {
         production.rateLimitPerMinute = 60;
         production.ensureProductionReady(); // 不抛
     }
+
+    @Test
+    void llmFallbacksParseAsJsonArrayOfTriples() {
+        // #71：JSON 数组三元组；api_key 掩码类型；缺 model/base_url 拒绝；
+        // 空串=空链。
+        Settings s = Settings.load(Map.of(
+                "ENV", "development",
+                "LLM_FALLBACKS", "[{\"base_url\":\"https://b1.invalid/v1\",\"model\":\"m1\"},"
+                        + "{\"base_url\":\"https://b2.invalid/v1\",\"api_key\":\"sk-fb\","
+                        + "\"model\":\"m2\",\"max_context_tokens\":8192}]"), null);
+        assertEquals(2, s.llm.fallbacks.size());
+        assertEquals("https://b1.invalid/v1", s.llm.fallbacks.get(0).baseUrl());
+        assertEquals("m1", s.llm.fallbacks.get(0).model());
+        assertTrue(s.llm.fallbacks.get(0).apiKey().isBlank(), "省略 api_key → 空 Secret（构建期回落主力 key）");
+        assertEquals("sk-fb", s.llm.fallbacks.get(1).apiKey().value());
+        assertEquals(8192, s.llm.fallbacks.get(1).maxContextTokens());
+        assertEquals(0, s.llm.fallbacks.get(0).maxContextTokens());
+        assertEquals(List.of(), Settings.load(Map.of("ENV", "development",
+                "LLM_FALLBACKS", ""), null).llm.fallbacks);
+        assertThrows(Settings.SettingsError.class,
+                () -> Settings.load(Map.of(
+                        "ENV", "development", "LLM_FALLBACKS", "[{\"model\":\"m1\"}]"), null));
+        assertThrows(Settings.SettingsError.class,
+                () -> Settings.load(Map.of(
+                        "ENV", "development", "LLM_FALLBACKS", "{\"not\":\"array\"}"), null));
+        assertThrows(Settings.SettingsError.class,
+                () -> Settings.load(Map.of(
+                        "ENV", "development", "LLM_FALLBACKS", "not-json"), null));
+    }
 }

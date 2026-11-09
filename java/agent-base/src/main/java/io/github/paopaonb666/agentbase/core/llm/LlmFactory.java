@@ -5,6 +5,7 @@ import dev.langchain4j.model.openai.OpenAiStreamingChatModel;
 import dev.langchain4j.model.output.TokenUsage;
 import io.github.paopaonb666.agentbase.core.config.Settings;
 
+import java.util.List;
 import java.util.function.BiConsumer;
 
 /**
@@ -113,20 +114,8 @@ public final class LlmFactory {
             java.time.Duration timeout = "main".equals(profile)
                     ? java.time.Duration.ofMillis((long) (settings.llm.mainTimeoutSeconds * 1000))
                     : java.time.Duration.ofSeconds(600);
-            OpenAiChatModel chat = OpenAiChatModel.builder()
-                    .baseUrl(baseUrl)
-                    .apiKey(apiKey)
-                    .modelName(model)
-                    .timeout(timeout)
-                    .build();
-            OpenAiStreamingChatModel streaming = OpenAiStreamingChatModel.builder()
-                    .baseUrl(baseUrl)
-                    .apiKey(apiKey)
-                    .modelName(model)
-                    .timeout(timeout)
-                    .build();
-            return new LangChain4jRuntime(chat, streaming, model, toolSafeStreaming,
-                    contextWindowTokens, usageSink);
+            return buildOpenAiRuntime(baseUrl, apiKey, model, timeout,
+                    toolSafeStreaming, contextWindowTokens, usageSink);
         } catch (RuntimeException exc) {
             // 客户端构造失败（典型：完全没有任何 API key）转成可操作的
             // SettingsError，而不是泄漏 langchain4j 的原始异常——对应 Python
@@ -135,5 +124,60 @@ public final class LlmFactory {
                     "LLM_API_KEY is not configured and no ambient OPENAI_API_KEY is set; "
                             + "copy .env.example to .env, set LLM_API_KEY, then retry");
         }
+    }
+
+    /** 单个 openai 兼容客户端装配（主档与 #71 fallback 链共用）。 */
+    private static LangChain4jRuntime buildOpenAiRuntime(String baseUrl, String apiKey, String model,
+                                                         java.time.Duration timeout,
+                                                         boolean toolSafeStreaming, int contextWindowTokens,
+                                                         BiConsumer<String, TokenUsage> usageSink) {
+        OpenAiChatModel chat = OpenAiChatModel.builder()
+                .baseUrl(baseUrl)
+                .apiKey(apiKey)
+                .modelName(model)
+                .timeout(timeout)
+                .build();
+        OpenAiStreamingChatModel streaming = OpenAiStreamingChatModel.builder()
+                .baseUrl(baseUrl)
+                .apiKey(apiKey)
+                .modelName(model)
+                .timeout(timeout)
+                .build();
+        return new LangChain4jRuntime(chat, streaming, model, toolSafeStreaming,
+                contextWindowTokens, usageSink);
+    }
+
+    /**
+     * fallback 链构建（#71，Java 单边增强）：按配置顺序为每个备用模型构建
+     * 独立运行时（各自带 modelName——usage 按实际生效模型记账自动成立）。
+     * api_key 留空共用主力 key（与快档同先例）；主力 key 也为空时该元素
+     * 报 SettingsError（构造期 fail-fast，运行期不再探测配置）。
+     */
+    public static List<ModelRuntime> buildFallbacks(Settings settings, BiConsumer<String, TokenUsage> usageSink) {
+        if (settings.llm.fallbacks.isEmpty()) {
+            return List.of();
+        }
+        List<ModelRuntime> runtimes = new java.util.ArrayList<>();
+        for (int i = 0; i < settings.llm.fallbacks.size(); i++) {
+            Settings.LlmFallbackSpec spec = settings.llm.fallbacks.get(i);
+            String apiKey = spec.apiKey().value().strip();
+            if (apiKey.isEmpty()) {
+                apiKey = settings.llm.apiKey.value().strip();
+            }
+            if (apiKey.isEmpty()) {
+                throw new Settings.SettingsError(
+                        "LLM_FALLBACKS[%d] has no api_key and LLM_API_KEY is empty; "
+                                + "set an api_key on the fallback entry or configure LLM_API_KEY".formatted(i));
+            }
+            try {
+                runtimes.add(buildOpenAiRuntime(spec.baseUrl(), apiKey, spec.model(),
+                        java.time.Duration.ofMillis((long) (settings.llm.mainTimeoutSeconds * 1000)),
+                        false, spec.maxContextTokens(), usageSink));
+            } catch (RuntimeException exc) {
+                throw new Settings.SettingsError(
+                        "LLM_FALLBACKS[%d] client build failed: %s".formatted(i, exc.getMessage()));
+            }
+        }
+        return List.copyOf(runtimes);
     }
 }

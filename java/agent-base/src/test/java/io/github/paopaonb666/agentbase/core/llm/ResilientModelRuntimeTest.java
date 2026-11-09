@@ -217,4 +217,96 @@ class ResilientModelRuntimeTest {
         assertTrue(wrapped.toolSafeStreaming());
         assertEquals(8192, wrapped.contextWindowTokens());
     }
+
+    // ── #71 fallback 链 ──────────────────────────────────────────────
+
+    /** 恒成功/恒败的计数桩（fallback 语义断言用）。 */
+    private static class CountingRuntime implements ModelRuntime {
+        final java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();
+        private final AiMessage reply;
+        private final RuntimeException failure;
+
+        CountingRuntime(AiMessage reply, RuntimeException failure) {
+            this.reply = reply;
+            this.failure = failure;
+        }
+
+        int invocations() { return calls.get(); }
+
+        @Override public ChatModel chat() { throw new UnsupportedOperationException(); }
+        @Override public StreamingChatModel streaming() { return null; }
+        @Override public AiMessage stream(List<ChatMessage> messages,
+                List<dev.langchain4j.agent.tool.ToolSpecification> tools,
+                java.util.function.Consumer<String> onDelta) {
+            calls.incrementAndGet();
+            if (failure != null) {
+                throw failure;
+            }
+            onDelta.accept("ok");
+            return reply;
+        }
+        @Override public AiMessage invoke(List<ChatMessage> messages) {
+            calls.incrementAndGet();
+            if (failure != null) {
+                throw failure;
+            }
+            return reply;
+        }
+    }
+
+    @Test
+    void invokeFallsThroughChainWhenPrimaryExhausts() {
+        CountingRuntime primary = new CountingRuntime(null, new IllegalStateException("primary down"));
+        CountingRuntime backup1 = new CountingRuntime(null, new IllegalStateException("backup1 down"));
+        CountingRuntime backup2 = new CountingRuntime(AiMessage.from("ok"), null);
+        ResilientModelRuntime chain = new ResilientModelRuntime(primary,
+                List.of(backup1, backup2), 1, 4, 0.0, 60, 20);
+        assertEquals("ok", chain.invoke(oneMessage()).text());
+        // 主力打满重试（1+1），两个 fallback 各恰一次真实调用。
+        assertEquals(2, primary.invocations());
+        assertEquals(1, backup1.invocations());
+        assertEquals(1, backup2.invocations());
+    }
+
+    @Test
+    void allChainMembersFailThrowsLastFallbackError() {
+        CountingRuntime primary = new CountingRuntime(null, new IllegalStateException("primary down"));
+        CountingRuntime backup = new CountingRuntime(null, new IllegalStateException("backup down"));
+        ResilientModelRuntime chain = new ResilientModelRuntime(primary,
+                List.of(backup), 0, 4, 0.0, 60, 20);
+        IllegalStateException error = assertThrows(IllegalStateException.class,
+                () -> chain.invoke(oneMessage()));
+        assertEquals("backup down", error.getMessage(), "全链失败抛最后一个 fallback 的错误");
+        assertEquals(1, error.getSuppressed().length, "主力故障以 suppressed 保留对账");
+    }
+
+    @Test
+    void streamSwitchesToFallbackOnlyBeforeFirstDelta() {
+        // delta 已发 → 不切 fallback（重放=重复输出）；未发 delta → 正常切换。
+        CountingRuntime emittingThenFailing = new CountingRuntime(null, null) {
+            @Override public AiMessage stream(List<ChatMessage> messages,
+                    List<dev.langchain4j.agent.tool.ToolSpecification> tools,
+                    java.util.function.Consumer<String> onDelta) {
+                calls.incrementAndGet();
+                onDelta.accept("半截");
+                throw new IllegalStateException("stalled after delta");
+            }
+        };
+        CountingRuntime backup = new CountingRuntime(AiMessage.from("ok"), null);
+        ResilientModelRuntime chain = new ResilientModelRuntime(emittingThenFailing,
+                List.of(backup), 0, 4, 0.0, 60, 20);
+        StringBuilder deltas = new StringBuilder();
+        IllegalStateException error = assertThrows(IllegalStateException.class,
+                () -> chain.stream(oneMessage(), List.of(), deltas::append));
+        assertEquals("stalled after delta", error.getMessage());
+        assertEquals("半截", deltas.toString());
+        assertEquals(0, backup.invocations(), "已发 delta 不得切 fallback");
+
+        // 对照：主力未发 delta 即败 → fallback 正常接手。
+        CountingRuntime silentFailure = new CountingRuntime(null, new IllegalStateException("primary down"));
+        ResilientModelRuntime chain2 = new ResilientModelRuntime(silentFailure,
+                List.of(backup), 0, 4, 0.0, 60, 20);
+        assertEquals("ok", chain2.stream(oneMessage(), List.of(), delta -> {}).text());
+        assertEquals(1, backup.invocations());
+    }
 }

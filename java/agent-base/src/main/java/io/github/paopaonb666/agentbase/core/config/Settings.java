@@ -145,6 +145,18 @@ public final class Settings {
          * 快档独立配置（LLM_FAST_MAX_CONTEXT_TOKENS）——免费档模型窗口普遍更小。
          */
         public int maxContextTokens = 0;
+        /**
+         * fallback 链（#71，Java 单边增强）：主力重试耗尽后按序尝试的备用
+         * 模型（openai 兼容三元组；api_key 留空共用主力 key）。每个元素
+         * 独立构建运行时、usage 按实际生效模型记账。LLM_FALLBACKS 是
+         * JSON 数组：[{"base_url":"…","api_key":"…","model":"…",
+         * "max_context_tokens":0}]（max_context_tokens 可省）。
+         */
+        public List<LlmFallbackSpec> fallbacks = List.of();
+    }
+
+    /** #71 fallback 链的单个备用模型规格。 */
+    public record LlmFallbackSpec(String baseUrl, Secret apiKey, String model, int maxContextTokens) {
     }
 
     /**
@@ -634,6 +646,50 @@ public final class Settings {
             }
             t.maxContextTokens = value;
         }
+        if (v.containsKey("fallbacks")) {
+            t.fallbacks = parseFallbacks(v.get("fallbacks"));
+        }
+    }
+
+    /**
+     * LLM_FALLBACKS 解析（#71）：JSON 数组 [{base_url, api_key, model,
+     * max_context_tokens?}]。model/base_url 必填，max_context_tokens 缺省 0；
+     * api_key 可省（构建期回落主力 key）。非数组/元素缺关键字段 fail-fast。
+     */
+    private static List<LlmFallbackSpec> parseFallbacks(String raw) {
+        String text = raw == null ? "" : raw.strip();
+        if (text.isEmpty()) {
+            return List.of();
+        }
+        com.fasterxml.jackson.databind.JsonNode array;
+        try {
+            array = new com.fasterxml.jackson.databind.ObjectMapper().readTree(text);
+        } catch (Exception e) {
+            throw new SettingsError("LLM_FALLBACKS must be a JSON array of {base_url, model[, api_key, max_context_tokens]}: "
+                    + e.getMessage());
+        }
+        if (!array.isArray()) {
+            throw new SettingsError("LLM_FALLBACKS must be a JSON array, got: " + text);
+        }
+        List<LlmFallbackSpec> specs = new ArrayList<>();
+        for (int i = 0; i < array.size(); i++) {
+            com.fasterxml.jackson.databind.JsonNode item = array.get(i);
+            if (!item.isObject()) {
+                throw new SettingsError("LLM_FALLBACKS[" + i + "] must be an object");
+            }
+            String model = item.path("model").asText("").strip();
+            String baseUrl = item.path("base_url").asText("").strip();
+            if (model.isEmpty() || baseUrl.isEmpty()) {
+                throw new SettingsError("LLM_FALLBACKS[" + i + "] requires non-empty 'model' and 'base_url'");
+            }
+            String apiKey = item.path("api_key").asText("");
+            int window = item.path("max_context_tokens").asInt(0);
+            if (window < 0) {
+                throw new SettingsError("LLM_FALLBACKS[" + i + "].max_context_tokens must be >= 0, got %d".formatted(window));
+            }
+            specs.add(new LlmFallbackSpec(baseUrl, Secret.of(apiKey), model, window));
+        }
+        return List.copyOf(specs);
     }
 
     private static void applyLlmFast(Settings s, Map<String, String> v) {
