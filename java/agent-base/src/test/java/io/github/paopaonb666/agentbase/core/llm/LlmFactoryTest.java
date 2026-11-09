@@ -82,6 +82,23 @@ class LlmFactoryTest {
     }
 
     @Test
+    void contextWindowTravelsWithTheRuntime() {
+        // #4：窗口随运行时走——主档带主窗口；快档配置了带快窗口；
+        // 快档未配置回落主力配置时带主力窗口（#128 同构）。
+        Settings settings = settingsWithFast();
+        settings.llm.maxContextTokens = 32768;
+        settings.llmFast.maxContextTokens = 8192;
+        assertEquals(32768, LlmFactory.buildLlm(settings, "main", null).contextWindowTokens());
+        assertEquals(8192, LlmFactory.buildLlm(settings, "fast", null).contextWindowTokens());
+        Settings noFast = new Settings();
+        noFast.llm.apiKey = Secret.of("sk-test");
+        noFast.llm.maxContextTokens = 32768;
+        assertEquals(32768, LlmFactory.buildLlm(noFast, "fast", null).contextWindowTokens());
+        // 未配置 → 0（预算推导沿用现状）。
+        assertEquals(0, LlmFactory.buildLlm(settingsWithFast(), "main", null).contextWindowTokens());
+    }
+
+    @Test
     void unknownProfileThrows() {
         Settings settings = settingsWithFast();
         IllegalArgumentException exc = assertThrows(IllegalArgumentException.class,

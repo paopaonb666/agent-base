@@ -65,7 +65,8 @@ public final class Graphs {
     public static CompiledGraph buildSingleAgentGraph(
             AgentModule.ModuleContext ctx, String name, String systemPrompt, List<AgentTool> tools) {
         List<AgentTool> pool = tools == null ? ctx.tools() : tools;
-        int maxTokens = ctx.settings().memory.contextMaxTokens;
+        int maxTokens = io.github.paopaonb666.agentbase.core.context.ContextEngine.resolveInputBudget(
+                ctx.settings(), ctx.llm()); // #4：per-model 窗口推导
 
         GraphBuilder builder = GraphBuilder.begin();
         builder.addNode("agent", (GraphState state, NodeContext nodeCtx) -> {

@@ -46,7 +46,8 @@ public final class ExecuteNode {
         List<ToolSpecification> specs = pool.isEmpty()
                 ? List.of()
                 : pool.stream().map(AgentTool::specification).toList();
-        int maxTokens = ctx.settings().memory.contextMaxTokens;
+        int maxTokens = io.github.paopaonb666.agentbase.core.context.ContextEngine.resolveInputBudget(
+                ctx.settings(), ctx.llm()); // #4：per-model 窗口推导
 
         return (GraphState state, NodeContext nodeCtx) -> {
             int subtaskToolRounds = ctx.settings().planner.subtaskToolRounds;

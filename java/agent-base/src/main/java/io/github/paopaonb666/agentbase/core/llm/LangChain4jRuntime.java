@@ -52,6 +52,7 @@ public final class LangChain4jRuntime implements ModelRuntime {
     private final StreamingChatModel streamingModel;
     private final String modelName;
     private final boolean toolSafeStreaming;
+    private final int contextWindowTokens;
     private final BiConsumer<String, TokenUsage> usageSink;
 
     /**
@@ -66,16 +67,32 @@ public final class LangChain4jRuntime implements ModelRuntime {
                               String modelName,
                               boolean toolSafeStreaming,
                               BiConsumer<String, TokenUsage> usageSink) {
+        this(chatModel, streamingModel, modelName, toolSafeStreaming, 0, usageSink);
+    }
+
+    /** 全参形态（#4）：contextWindowTokens 随运行时走（0 = 未配置）。 */
+    public LangChain4jRuntime(ChatModel chatModel,
+                              StreamingChatModel streamingModel,
+                              String modelName,
+                              boolean toolSafeStreaming,
+                              int contextWindowTokens,
+                              BiConsumer<String, TokenUsage> usageSink) {
         this.chatModel = Objects.requireNonNull(chatModel, "chatModel is required");
         this.streamingModel = streamingModel;
         this.modelName = Objects.requireNonNull(modelName, "modelName is required");
         this.toolSafeStreaming = toolSafeStreaming;
+        this.contextWindowTokens = Math.max(0, contextWindowTokens);
         this.usageSink = usageSink == null ? ModelRuntime.noopUsageSink() : usageSink;
     }
 
     @Override
     public boolean toolSafeStreaming() {
         return toolSafeStreaming;
+    }
+
+    @Override
+    public int contextWindowTokens() {
+        return contextWindowTokens;
     }
 
     @Override

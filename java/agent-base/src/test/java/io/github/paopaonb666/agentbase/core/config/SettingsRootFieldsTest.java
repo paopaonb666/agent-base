@@ -160,4 +160,26 @@ class SettingsRootFieldsTest {
         assertTrue(error.getMessage().contains("auth_replay_cache_limit"),
                 "拒绝文案要点名出错字段：" + error.getMessage());
     }
+
+    @Test
+    void perModelContextWindowsParseIndependently() {
+        // #4：主/快档窗口独立解析；0 = 未配置（预算沿用现状）；负数拒绝。
+        Settings s = Settings.load(Map.of(
+                "ENV", "development",
+                "LLM_MAX_CONTEXT_TOKENS", "32768",
+                "LLM_FAST_MAX_CONTEXT_TOKENS", "8192"), null);
+        assertEquals(32768, s.llm.maxContextTokens);
+        assertEquals(8192, s.llmFast.maxContextTokens);
+        Settings defaults = Settings.load(Map.of("ENV", "development"), null);
+        assertEquals(0, defaults.llm.maxContextTokens);
+        assertEquals(0, defaults.llmFast.maxContextTokens);
+        assertThrows(Settings.SettingsError.class,
+                () -> Settings.load(Map.of(
+                        "ENV", "development",
+                        "LLM_MAX_CONTEXT_TOKENS", "-1"), null));
+        assertThrows(Settings.SettingsError.class,
+                () -> Settings.load(Map.of(
+                        "ENV", "development",
+                        "LLM_FAST_MAX_CONTEXT_TOKENS", "-1"), null));
+    }
 }

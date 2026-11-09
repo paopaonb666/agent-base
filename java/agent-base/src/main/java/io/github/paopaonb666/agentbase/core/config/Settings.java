@@ -123,6 +123,13 @@ public final class Settings {
         public double mainTimeoutSeconds = 600.0;
         public int mainRetries = 2;
         public int mainConcurrency = 8;
+        /**
+         * 模型上下文窗口（token，#4）：0 = 未配置，预算推导沿用
+         * memory.contextMaxTokens 现状；配置后输入预算 =
+         * min(contextMaxTokens, 窗口 - 输出预留)（ContextEngine.resolveInputBudget）。
+         * 快档独立配置（LLM_FAST_MAX_CONTEXT_TOKENS）——免费档模型窗口普遍更小。
+         */
+        public int maxContextTokens = 0;
     }
 
     /**
@@ -136,6 +143,8 @@ public final class Settings {
         public String model = "";
         /** 免费档普遍按并发数限速：包装层用它做信号量限流。 */
         public int concurrency = 2;
+        /** 快档模型上下文窗口（token，#4）；0 = 未配置（语义见主档同名字段）。 */
+        public int maxContextTokens = 0;
 
         public boolean isConfigured() {
             return !baseUrl.strip().isEmpty() && !model.strip().isEmpty();
@@ -588,6 +597,13 @@ public final class Settings {
             }
             t.mainConcurrency = value;
         }
+        if (v.containsKey("max_context_tokens")) {
+            int value = requireInt("max_context_tokens", v.get("max_context_tokens"));
+            if (value < 0) {
+                throw new SettingsError("LLM_MAX_CONTEXT_TOKENS must be >= 0 (0 = unset), got %d".formatted(value));
+            }
+            t.maxContextTokens = value;
+        }
     }
 
     private static void applyLlmFast(Settings s, Map<String, String> v) {
@@ -601,6 +617,13 @@ public final class Settings {
                 throw new SettingsError("LLM_FAST_CONCURRENCY must be >= 1, got %d".formatted(value));
             }
             t.concurrency = value;
+        }
+        if (v.containsKey("max_context_tokens")) {
+            int value = requireInt("max_context_tokens", v.get("max_context_tokens"));
+            if (value < 0) {
+                throw new SettingsError("LLM_FAST_MAX_CONTEXT_TOKENS must be >= 0 (0 = unset), got %d".formatted(value));
+            }
+            t.maxContextTokens = value;
         }
     }
 

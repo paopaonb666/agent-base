@@ -166,6 +166,36 @@ class ContextEngineTest {
         assertEquals(huge, input.get(0));
     }
 
+    /** #4 预算推导用的最小运行时桩（只携带窗口；ModelRuntime 非函数接口）。 */
+    private static io.github.paopaonb666.agentbase.core.llm.ModelRuntime stubRuntime(int window) {
+        return new io.github.paopaonb666.agentbase.core.llm.ModelRuntime() {
+            @Override public dev.langchain4j.model.chat.ChatModel chat() { throw new UnsupportedOperationException(); }
+            @Override public dev.langchain4j.model.chat.StreamingChatModel streaming() { return null; }
+            @Override public dev.langchain4j.data.message.AiMessage stream(java.util.List<ChatMessage> messages,
+                    java.util.List<dev.langchain4j.agent.tool.ToolSpecification> tools,
+                    java.util.function.Consumer<String> onDelta) { throw new UnsupportedOperationException(); }
+            @Override public dev.langchain4j.data.message.AiMessage invoke(java.util.List<ChatMessage> messages) { throw new UnsupportedOperationException(); }
+            @Override public int contextWindowTokens() { return window; }
+        };
+    }
+
+    @Test
+    void resolveInputBudgetDerivesFromPerModelWindow() {
+        // #4：未配置窗口 → memory.contextMaxTokens 现状；配置后取
+        // min(memoryBudget, 窗口-输出预留)，窗口极小时有下限兜底。
+        var settings = new io.github.paopaonb666.agentbase.core.config.Settings();
+        int memoryBudget = settings.memory.contextMaxTokens;
+        assertEquals(memoryBudget, ContextEngine.resolveInputBudget(settings, null));
+        assertEquals(memoryBudget, ContextEngine.resolveInputBudget(settings, stubRuntime(0)));
+        assertEquals(Math.min(memoryBudget, 8192 - ContextEngine.OUTPUT_RESERVE_TOKENS),
+                ContextEngine.resolveInputBudget(settings, stubRuntime(8192)));
+        // 窗口 - 预留 < 1024 → 下限兜底后再与 memoryBudget 取小。
+        assertEquals(1024, ContextEngine.resolveInputBudget(settings, stubRuntime(2048)));
+        // memoryBudget 本身更小 → 以其为预算（组装面约束仍在）。
+        settings.memory.contextMaxTokens = 2000;
+        assertEquals(2000, ContextEngine.resolveInputBudget(settings, stubRuntime(8192)));
+    }
+
     @Test
     void imageContentCountsFixedEstimateInBudget() {
         // #130：图片块按固定估价（1500）计入预算——"[image]" 占位只是渲染

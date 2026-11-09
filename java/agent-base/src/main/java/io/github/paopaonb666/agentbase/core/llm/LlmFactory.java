@@ -62,6 +62,7 @@ public final class LlmFactory {
         String baseUrl;
         String apiKey;
         boolean toolSafeStreaming;
+        int contextWindowTokens;
         if ("fast".equals(profile)) {
             if (settings.llmFast.isConfigured()) {
                 Settings.LlmFastSettings fast = settings.llmFast;
@@ -71,12 +72,14 @@ public final class LlmFactory {
                 String fastKey = fast.apiKey.value().strip();
                 String mainKey = settings.llm.apiKey.value().strip();
                 apiKey = !fastKey.isEmpty() ? fastKey : mainKey;
+                contextWindowTokens = fast.maxContextTokens;
             } else {
                 // #128：未配置回落主力配置（对象不同、配置相同——Python 同构），
-                // 不再返回 null 让调用方拿到原生主档运行时。
+                // 不再返回 null 让调用方拿到原生主档运行时。窗口同随主力配置。
                 model = settings.llm.model;
                 baseUrl = settings.llm.baseUrl;
                 apiKey = settings.llm.apiKey.value().strip();
+                contextWindowTokens = settings.llm.maxContextTokens;
             }
             toolSafeStreaming = true;
         } else {
@@ -84,6 +87,7 @@ public final class LlmFactory {
             baseUrl = settings.llm.baseUrl;
             apiKey = settings.llm.apiKey.value().strip();
             toolSafeStreaming = false;
+            contextWindowTokens = settings.llm.maxContextTokens;
         }
         if (apiKey.isEmpty()) {
             // 环境兜底：对应 langchain-openai 的标准回退（LLM_API_KEY 未设置
@@ -121,7 +125,8 @@ public final class LlmFactory {
                     .modelName(model)
                     .timeout(timeout)
                     .build();
-            return new LangChain4jRuntime(chat, streaming, model, toolSafeStreaming, usageSink);
+            return new LangChain4jRuntime(chat, streaming, model, toolSafeStreaming,
+                    contextWindowTokens, usageSink);
         } catch (RuntimeException exc) {
             // 客户端构造失败（典型：完全没有任何 API key）转成可操作的
             // SettingsError，而不是泄漏 langchain4j 的原始异常——对应 Python

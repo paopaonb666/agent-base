@@ -55,6 +55,15 @@ public interface ModelRuntime {
         return false;
     }
 
+    /**
+     * 该运行时对应模型的上下文窗口（token，#4）：0 = 未配置（预算推导
+     * 沿用 memory.contextMaxTokens 现状）。窗口随运行时走——快档/主力
+     * 各自生效，配置面见 Settings.LlmSettings.maxContextTokens。
+     */
+    default int contextWindowTokens() {
+        return 0;
+    }
+
     /** usage 回调：(model, usage)；实现方在每次调用结束时投递一次。 */
     static BiConsumer<String, TokenUsage> noopUsageSink() {
         return (model, usage) -> {};

@@ -115,6 +115,28 @@ public final class ContextEngine {
         return tokenCounter.countTokens(contentText(message));
     }
 
+    /** 输出预留（#4）：输入预算要给模型留出的生成空间（OpenAI 兼容默认输出上限量级）。 */
+    public static final int OUTPUT_RESERVE_TOKENS = 4096;
+    /** 窗口极小时的输入预算下限（防 0/负预算让修剪逻辑退化为只保一条以下）。 */
+    private static final int MIN_INPUT_BUDGET = 1024;
+
+    /**
+     * 图执行输入预算推导（#4 per-model 窗口）：运行时携带了窗口（
+     * {@code llm.contextWindowTokens() > 0}）时取
+     * {@code min(contextMaxTokens, 窗口 - 输出预留)}——上下文窗口是硬顶，
+     * 超窗请求会被 provider 直接拒绝；未配置窗口（0）沿用
+     * {@code memory.contextMaxTokens} 现状，行为逐字节不变。
+     */
+    public static int resolveInputBudget(io.github.paopaonb666.agentbase.core.config.Settings settings,
+                                         io.github.paopaonb666.agentbase.core.llm.ModelRuntime llm) {
+        int memoryBudget = settings.memory.contextMaxTokens;
+        int window = llm == null ? 0 : llm.contextWindowTokens();
+        if (window <= 0) {
+            return memoryBudget;
+        }
+        return Math.min(memoryBudget, Math.max(MIN_INPUT_BUDGET, window - OUTPUT_RESERVE_TOKENS));
+    }
+
     /** 返回消息的注入类型（匹配的标记前缀）；非注入消息返回 null。 */
     public static String injectedKind(ChatMessage message) {
         if (!(message instanceof SystemMessage system)) {

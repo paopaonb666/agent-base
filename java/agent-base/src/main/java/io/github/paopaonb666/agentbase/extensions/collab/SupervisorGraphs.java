@@ -109,7 +109,8 @@ public final class SupervisorGraphs {
             handoffSpecs.add(handoffSpec(module));
         }
         List<ToolSpecification> boundSpecs = List.copyOf(handoffSpecs);
-        int maxTokens = ctx.settings().memory.contextMaxTokens;
+        int maxTokens = io.github.paopaonb666.agentbase.core.context.ContextEngine.resolveInputBudget(
+                ctx.settings(), ctx.llm()); // #4：per-model 窗口推导
 
         return GraphBuilder.begin()
                 // #68：run 级 handoff 预算的清零点——每轮 invoke 从 entry

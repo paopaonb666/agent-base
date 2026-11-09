@@ -202,7 +202,8 @@ public final class CheckNodes {
 
     /** synthesize 节点：无工具的 best-effort 综合，emit PlanEvent(done)。 */
     public static GraphBuilder.Node makeSynthesize(AgentModule.ModuleContext ctx) {
-        int maxTokens = ctx.settings().memory.contextMaxTokens;
+        int maxTokens = io.github.paopaonb666.agentbase.core.context.ContextEngine.resolveInputBudget(
+                ctx.settings(), ctx.llm()); // #4：per-model 窗口推导
         return (GraphState state, NodeContext nodeCtx) -> {
             // 保持无工具（决策 2）：不在 replan 预算之外开第二条执行路径。
             StringBuilder plan = new StringBuilder();
