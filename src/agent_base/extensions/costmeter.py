@@ -38,6 +38,10 @@ if TYPE_CHECKING:  # pragma: no cover - import avoided at runtime
 
 logger = logging.getLogger(__name__)
 
+# 待落库队列封顶（对齐 Java 侧 CostLedgers 的 RETRY_BUFFER_LIMIT）：
+# 账本长时间不可用时丢最老行，避免无界吃内存。
+_PENDING_LIMIT = 10_000
+
 # sqlite 账本 DDL（幂等自举）。MySQL 的同名表由 MysqlCostLedger 自建
 # （5.7 没有 CREATE INDEX IF NOT EXISTS，索引进 CREATE TABLE）。
 _COST_USAGE_DDL = """
@@ -211,15 +215,40 @@ class CostMeter:
                 cost_cny=cost,
             )
         )
+        # 待写队列封顶（对齐 Java 侧 RETRY_BUFFER_LIMIT）：账本长时间不可
+        # 用时丢最老的行而不是无限吃内存——方向安全（只会少记不会误熔断），
+        # 预算门读的是内存聚合值，不受队列影响。
+        while len(self._pending) > _PENDING_LIMIT:
+            self._pending.popleft()
+            COST_METRICS.observe_flush_drop()
         COST_METRICS.observe_tokens(model, profile, "input", prompt)
         COST_METRICS.observe_tokens(model, profile, "output", completion)
         COST_METRICS.observe_cost(cost)
 
     def take_pending(self) -> list[UsageRecord]:
-        """取走待落库行（账本 flush 时调用）。"""
+        """取走待落库行（一次性清空）。
+
+        .. deprecated:: 修复账本漏账后生产路径改用 ``pending_rows`` +
+           ``drop_pending`` 两段式——本方法在写入失败时会丢批，仅供
+           兼容保留。
+        """
         rows = list(self._pending)
         self._pending.clear()
         return rows
+
+    def pending_rows(self) -> list[UsageRecord]:
+        """待落库行快照（不清空）。刷盘流程：``pending_rows`` → 写库 →
+        成功后 ``drop_pending``——写失败时行留在队列里，下轮重试不丢不重。"""
+        return list(self._pending)
+
+    def drop_pending(self, rows: list[UsageRecord]) -> None:
+        """确认移除已成功落库的批次（与最近一次 ``pending_rows`` 对应）。
+
+        单事件循环内无并发写者，批次必然位于队首——按长度出队即可。
+        """
+        count = min(len(rows), len(self._pending))
+        for _ in range(count):
+            self._pending.popleft()
 
     def day_total_cny(self, day: str | None = None) -> float:
         key = day or datetime.fromtimestamp(time.time()).date().isoformat()

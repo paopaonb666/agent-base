@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import sys
 import time
@@ -564,3 +565,70 @@ async def test_mysql_ledger_roundtrip() -> None:
         async with conn.cursor() as cur:
             await cur.execute("DROP DATABASE IF EXISTS `agent_base_cost_test`")
         conn.close()
+
+
+# ───────────────── 两段式刷盘（H1 漏账修复：写失败不丢批） ─────────────────
+
+
+class _FailingLedger:
+    """insert 必然抛异常的账本替身（模拟存储端故障）。"""
+
+    def __init__(self) -> None:
+        self.attempts = 0
+
+    async def insert(self, rows: list[Any]) -> None:
+        self.attempts += 1
+        raise RuntimeError("存储端故障")
+
+
+class _RecordingLedger:
+    """正常记账的账本替身（记录收到的批次）。"""
+
+    def __init__(self) -> None:
+        self.batches: list[list[Any]] = []
+
+    async def insert(self, rows: list[Any]) -> None:
+        self.batches.append(list(rows))
+
+
+def test_flush_once_failure_keeps_rows_for_retry() -> None:
+    """写库失败：批次留在队列、失败计数 +1；恢复后补齐且不重不漏。"""
+    from agent_base.entrypoints.server import _flush_cost_ledger_once
+    from agent_base.extensions.metrics import COST_METRICS
+
+    meter = _fresh_meter('{"m": {"input_miss": 1.0, "output": 2.0}}')
+    handler = CostMeterHandler(model="m", profile="main", meter=meter)
+    handler.on_llm_end(_response({"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}))
+    assert len(meter.pending_rows()) == 1
+
+    failing = _FailingLedger()
+    failures_before = COST_METRICS.flush_failures_total
+    assert asyncio.run(_flush_cost_ledger_once(failing, meter)) is False
+    assert failing.attempts == 1
+    assert COST_METRICS.flush_failures_total == failures_before + 1
+    # 行没有被"取走"——还在队列里等下一轮。
+    assert len(meter.pending_rows()) == 1
+
+    recording = _RecordingLedger()
+    assert asyncio.run(_flush_cost_ledger_once(recording, meter)) is True
+    assert len(recording.batches) == 1 and len(recording.batches[0]) == 1
+    assert recording.batches[0][0].prompt_tokens == 10
+    # 成功后队列清空，再刷一次是空操作（不重）。
+    assert meter.pending_rows() == []
+    assert asyncio.run(_flush_cost_ledger_once(recording, meter)) is True
+    assert len(recording.batches) == 1
+
+
+def test_pending_queue_is_bounded() -> None:
+    """待写队列封顶：账本长时间不可用时丢最老行而不是无界吃内存。"""
+    from agent_base.extensions import costmeter as cm
+    from agent_base.extensions.metrics import COST_METRICS
+
+    meter = _fresh_meter('{"m": {"input_miss": 1.0, "output": 2.0}}')
+    drops_before = COST_METRICS.flush_drops_total
+    for _ in range(cm._PENDING_LIMIT + 50):
+        meter.observe(model="m", profile="main", prompt=1, completion=1, cache_read=0)
+    assert len(meter.pending_rows()) == cm._PENDING_LIMIT
+    assert COST_METRICS.flush_drops_total > drops_before
+    # 预算门不受队列溢出影响：聚合值仍完整。
+    assert meter.day_total_cny() > 0.0

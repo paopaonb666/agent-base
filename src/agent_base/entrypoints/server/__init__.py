@@ -26,7 +26,7 @@ import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -53,7 +53,7 @@ from agent_base.entrypoints.server.sse import (
     _decode_custom_event,
     _event_stream,
 )
-from agent_base.extensions.metrics import Metrics
+from agent_base.extensions.metrics import COST_METRICS, Metrics
 from agent_base.extensions.observability import (
     new_request_id,
     request_id,
@@ -65,6 +65,35 @@ logger = logging.getLogger(__name__)
 # 成本账本的周期落库间隔（秒）：进程被杀最多丢这个窗口的明细行，
 # 预算门读的是内存聚合值，不受影响。
 _COST_FLUSH_INTERVAL_SECONDS = 5.0
+
+
+async def _flush_cost_ledger_once(ledger: Any, meter: Any = None) -> bool:
+    """把一批待写行安全落库（H1 漏账修复的两段式刷盘）。
+
+    流程是 **快照 → 写库 → 确认移除**：写库抛异常时批次留在队列里，下轮
+    周期重试——不再像旧的 ``take_pending``（先清空后写）那样一次故障就
+    永久丢一批。失败计数暴露给 /metrics，持续增长即存储端故障信号。
+
+    返回是否全部落库成功；``meter`` 缺省用全局单例（测试可注入隔离实例）。
+    """
+    from agent_base.extensions.costmeter import COST_METER
+
+    m = meter if meter is not None else COST_METER
+    rows = m.pending_rows()
+    if not rows:
+        return True
+    try:
+        await ledger.insert(rows)
+    except Exception:
+        COST_METRICS.observe_flush_failure()
+        logger.warning(
+            "cost: 账本刷盘失败，%d 行保留待重试（存储恢复后自动补齐）",
+            len(rows),
+            exc_info=True,
+        )
+        return False
+    m.drop_pending(rows)
+    return True
 
 __all__ = [
     "IMAGE_EXTENSIONS",
@@ -145,7 +174,7 @@ def create_app(
             async def _flush_cost_ledger() -> None:
                 while True:
                     await asyncio.sleep(_COST_FLUSH_INTERVAL_SECONDS)
-                    await ledger.insert(COST_METER.take_pending())
+                    await _flush_cost_ledger_once(ledger)
 
             flush_task = asyncio.create_task(_flush_cost_ledger())
         else:
@@ -157,8 +186,15 @@ def create_app(
             # sqlite 连接、toollog 写线程），否则全部泄漏到进程退出。
             if flush_task is not None:
                 flush_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await flush_task
             if ledger is not None:
-                await ledger.insert(COST_METER.take_pending())
+                # 收尾尽力刷一次（H1）：失败不丢队列之外的东西——行保留在
+                # COST_METER._pending 里随日志告警，不拖垮 shutdown。
+                try:
+                    await _flush_cost_ledger_once(ledger)
+                except Exception:  # pragma: no cover - _flush_cost_ledger_once 自捕获
+                    logger.warning("cost: 关闭刷盘异常（待写行保留）", exc_info=True)
                 aclose = getattr(ledger, "aclose", None)
                 if aclose is not None:
                     await aclose()

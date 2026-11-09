@@ -199,6 +199,8 @@ class CostMetrics:
     def __init__(self) -> None:
         self._tokens: dict[tuple[str, str, str], int] = {}
         self.cost_cny_total = 0.0
+        self.flush_failures_total = 0
+        self.flush_drops_total = 0
 
     def observe_tokens(self, model: str, profile: str, kind: str, amount: int) -> None:
         key = (model, profile, kind)
@@ -207,6 +209,14 @@ class CostMetrics:
     def observe_cost(self, cost_cny: float) -> None:
         self.cost_cny_total += cost_cny
 
+    def observe_flush_failure(self) -> None:
+        """账本刷盘失败（批次保留待重试）——持续增长说明存储端故障。"""
+        self.flush_failures_total += 1
+
+    def observe_flush_drop(self) -> None:
+        """待写队列溢出丢最老行（账本长时间不可用的容量保护）。"""
+        self.flush_drops_total += 1
+
     def render_cost_metrics(self) -> str:
         lines: list[str] = []
         for (model, profile, kind), count in sorted(self._tokens.items()):
@@ -214,6 +224,8 @@ class CostMetrics:
                 f'llm_tokens_total{{model="{model}",profile="{profile}",kind="{kind}"}} {count}'
             )
         lines.append(f"llm_cost_cny_total {self.cost_cny_total:.6f}")
+        lines.append(f"llm_cost_flush_failures_total {self.flush_failures_total}")
+        lines.append(f"llm_cost_flush_drops_total {self.flush_drops_total}")
         return ("\n".join(lines) + "\n") if lines else ""
 
 
