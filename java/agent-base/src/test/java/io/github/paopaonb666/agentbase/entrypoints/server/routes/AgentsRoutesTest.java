@@ -182,6 +182,13 @@ class AgentsRoutesTest {
                 userId, null, null, null);
     }
 
+    /** 同上，response 由调用方持有（断言 Retry-After 等响应头用）。 */
+    private static SseEmitter invoke(AgentsRoutes routes, String module,
+                                     AgentsRoutes.InvokeRequest body, String userId,
+                                     MockHttpServletResponse response) {
+        return routes.invoke(module, body, response, userId, null, null, null);
+    }
+
     // ── invoke 校验链（422 矩阵） ─────────────────────────────────────────
 
     @Test
@@ -256,6 +263,28 @@ class AgentsRoutesTest {
         HttpError error = httpErrorOf(() ->
                 invoke(routes, "chat", invokeBody("hi", null, List.of("f1"), null, null), "u1"));
         assertEquals(503, error.status());
+    }
+
+    @Test
+    void perUserRateLimitGives429WithRetryAfter() throws Exception {
+        // #78：RATE_LIMIT_PER_MINUTE=1 → 同一用户第二发 429 + Retry-After；
+        // 限流在认证后、副作用前（不发 SSE、不写索引）。
+        AgentRuntime runtime = buildRuntime(Settings.load(Map.of(
+                "ENV", "development", "RATE_LIMIT_PER_MINUTE", "1")), Map.of("chat", stubModule("chat")),
+                null, null, null, null, null, null);
+        AgentsRoutes routes = route(runtime);
+        var first = new org.springframework.mock.web.MockHttpServletResponse();
+        assertNotNull(invoke(routes, "chat", invokeBody("hi", null, null, null, null), "u1",
+                first));
+        var second = new org.springframework.mock.web.MockHttpServletResponse();
+        HttpError error = httpErrorOf(() ->
+                invoke(routes, "chat", invokeBody("hi", null, null, null, null), "u1", second));
+        assertEquals(429, error.status());
+        assertTrue(error.getMessage().contains("RATE_LIMIT_PER_MINUTE"), error.getMessage());
+        assertEquals("60", second.getHeader("Retry-After"));
+        // 不同用户桶独立：bob 首发不受 alice 限流影响。
+        var third = new org.springframework.mock.web.MockHttpServletResponse();
+        assertNotNull(invoke(routes, "chat", invokeBody("hi", null, null, null, null), "bob", third));
     }
 
     @Test

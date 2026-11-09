@@ -182,4 +182,27 @@ class SettingsRootFieldsTest {
                         "ENV", "development",
                         "LLM_FAST_MAX_CONTEXT_TOKENS", "-1"), null));
     }
+
+    @Test
+    void rateLimitPerMinuteParsesAndProductionRequiresIt() {
+        // #78：0 = 不限（本机开发默认）；负数拒绝；production 必须显式配置
+        // 限流（多用户硬前提——单用户无限并发是成本/资源无保护暴露面）。
+        assertEquals(0, Settings.load(Map.of("ENV", "development"), null).rateLimitPerMinute);
+        assertEquals(30, Settings.load(Map.of(
+                "ENV", "development", "RATE_LIMIT_PER_MINUTE", "30"), null).rateLimitPerMinute);
+        assertThrows(Settings.SettingsError.class,
+                () -> Settings.load(Map.of(
+                        "ENV", "development", "RATE_LIMIT_PER_MINUTE", "-1"), null));
+        // production 守卫：缺限流拒绝启动，指路键名；显式配置后通过。
+        Settings production = Settings.load(Map.of(
+                "ENV", "production",
+                "LLM_API_KEY", "sk-test",
+                "MEMORY_AUTH_SECRET", "sec",
+                "CHECKPOINTER_BACKEND", "memory"), null);
+        Settings.SettingsError error = assertThrows(Settings.SettingsError.class,
+                production::ensureProductionReady);
+        assertTrue(error.getMessage().contains("RATE_LIMIT_PER_MINUTE"), error.getMessage());
+        production.rateLimitPerMinute = 60;
+        production.ensureProductionReady(); // 不抛
+    }
 }

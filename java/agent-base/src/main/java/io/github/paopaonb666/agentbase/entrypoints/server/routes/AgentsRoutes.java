@@ -34,6 +34,7 @@ import io.github.paopaonb666.agentbase.entrypoints.server.AuthBackends;
 import io.github.paopaonb666.agentbase.entrypoints.server.Background;
 import io.github.paopaonb666.agentbase.entrypoints.server.HttpError;
 import io.github.paopaonb666.agentbase.entrypoints.server.MessageSerializers;
+import io.github.paopaonb666.agentbase.entrypoints.server.RateLimiters;
 import io.github.paopaonb666.agentbase.entrypoints.server.SseStreams;
 import io.github.paopaonb666.agentbase.extensions.costmeter.CostBudgetExceededException;
 import io.github.paopaonb666.agentbase.extensions.costmeter.CostGovernor;
@@ -68,6 +69,8 @@ public class AgentsRoutes {
     private final AgentRuntime runtime;
     private final AuthBackends.AuthBackend auth;
     private final CostGovernor governor;
+    /** #78 per-user 令牌桶（invoke 入口 enforcement；0 = 不限）。 */
+    private final RateLimiters.PerUserRateLimiter rateLimiter;
 
     public AgentsRoutes(AgentRuntime runtime, AuthBackends.AuthBackend auth,
                         org.springframework.beans.factory.ObjectProvider<CostGovernor> governorProvider) {
@@ -75,6 +78,9 @@ public class AgentsRoutes {
         this.auth = auth;
         // COST_ENABLED=false 时 governor bean 缺席（null）——可选注入。
         this.governor = governorProvider.getIfAvailable();
+        // #78 per-user 限流：0 = 不限（本机开发），production 由
+        // ensureProductionReady 强制显式配置。
+        this.rateLimiter = new RateLimiters.PerUserRateLimiter(runtime.settings().rateLimitPerMinute);
     }
 
     private String user(String userIdHeader, String sigHeader, String tsHeader, String nonceHeader) {
@@ -195,6 +201,13 @@ public class AgentsRoutes {
                 ? body.threadId()
                 : io.github.paopaonb666.agentbase.extensions.Observability.newRequestId();
         String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
+        // per-user 限流（#78）：认证之后、任何副作用之前——429 优先于半截
+        // SSE（与预算熔断 429 同哲学）。Retry-After 取整窗口秒数。
+        if (!rateLimiter.tryAcquire(userId, System.nanoTime())) {
+            response.setHeader("Retry-After", String.valueOf(60));
+            throw new HttpError(429, "请求过于频繁：每用户上限 " + rateLimiter.perMinute()
+                    + " 次/分钟，请稍后重试（RATE_LIMIT_PER_MINUTE）");
+        }
         String fullThreadId = new ThreadId(module, userThreadId).toString();
         // 属主预检（S1/P0）：已认证 ≠ 有权访问该线程。invoke 的全部副作用
         // （busy 探针、plan 快照读取、记忆注入、附件绑定、checkpoint 写入）

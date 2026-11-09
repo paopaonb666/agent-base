@@ -93,6 +93,13 @@ public final class Settings {
     public List<String> corsOrigins = List.of("http://localhost:3000");
     /** 运行环境：development | production。 */
     public String env = "development";
+    /**
+     * per-user 请求限流（次/分钟，#78 多用户硬前提）：0 = 不限（本机开发）。
+     * 令牌桶按 user 维度在 invoke 入口 enforcement；production 必须显式
+     * 配置（ensureProductionReady）——单用户无限并发是 LLM 成本与线程
+     * 资源的无保护暴露面。
+     */
+    public int rateLimitPerMinute = 0;
 
     public final LlmSettings llm = new LlmSettings();
     public final LlmFastSettings llmFast = new LlmFastSettings();
@@ -394,7 +401,7 @@ public final class Settings {
         }
         // 根级字段的 env/dotenv 键可能全大写（AGENT_MODULES）：归一小写。
         for (String key : List.of("agent_modules", "agent_module_packages", "cors_origins", "env",
-                "agent_recursion_limit", "agent_handoff_max_per_run")) {
+                "agent_recursion_limit", "agent_handoff_max_per_run", "rate_limit_per_minute")) {
             String up = key.toUpperCase(Locale.ROOT);
             if (out.containsKey(up) && !out.containsKey(key)) {
                 out.put(key, out.remove(up));
@@ -433,6 +440,13 @@ public final class Settings {
             }
             if (vals.containsKey("cors_origins")) {
                 s.corsOrigins = parseCsvOrJsonList(vals.get("cors_origins"), "cors_origins");
+            }
+            if (vals.containsKey("rate_limit_per_minute")) {
+                int value = requireInt("rate_limit_per_minute", vals.get("rate_limit_per_minute"));
+                if (value < 0) {
+                    throw new SettingsError("RATE_LIMIT_PER_MINUTE must be >= 0 (0 = unlimited), got %d".formatted(value));
+                }
+                s.rateLimitPerMinute = value;
             }
             switch (section) {
                 case "llm" -> applyLlm(s, vals);
@@ -1089,6 +1103,15 @@ public final class Settings {
                             + "memory isolation is enforced via signed X-User-Id "
                             + "(clients must send X-User-Sig = HMAC-SHA256("
                             + "user_id\\ntimestamp\\nnonce, secret))");
+        }
+        if (rateLimitPerMinute < 1) {
+            // #78：多用户硬前提——无限流时单个用户可无限并发 invoke（LLM
+            // 成本与线程资源无保护）。production 拒绝隐式放开；本机开发
+            // （0 = 不限）不受影响。
+            throw new SettingsError(
+                    "RATE_LIMIT_PER_MINUTE is required in production (>=1, per-user token bucket): "
+                            + "unlimited per-user invoke concurrency exposes LLM cost and thread "
+                            + "resources without protection; local development may set 0 explicitly");
         }
         if ("mysql".equals(checkpointer.backend)) {
             List<String> missing = new ArrayList<>();
