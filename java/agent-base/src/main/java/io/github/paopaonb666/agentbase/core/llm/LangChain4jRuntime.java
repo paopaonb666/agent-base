@@ -74,6 +74,11 @@ public final class LangChain4jRuntime implements ModelRuntime {
     }
 
     @Override
+    public boolean toolSafeStreaming() {
+        return toolSafeStreaming;
+    }
+
+    @Override
     public ChatModel chat() {
         return chatModel;
     }

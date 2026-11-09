@@ -45,17 +45,17 @@ public final class LlmFactory {
      *                 {@link IllegalArgumentException}（对应 Python ValueError）
      * @param usageSink usage 回调 {@code (model, usage)}（对应 Python 在
      *                  cost.enabled 时挂的 CostMeterHandler；null 视为 no-op）
-     * @return ModelRuntime；{@code profile="fast"} 且 {@code LLM_FAST_*}
-     *         未配置（base_url 与 model 任一为空）时返回 {@code null}，
-     *         调用方回落主力运行时——快档是优化不是依赖
+     * @return ModelRuntime（恒非 null）。{@code profile="fast"} 且
+     *         {@code LLM_FAST_*} 未配置（base_url 与 model 任一为空）时
+     *         用主力配置构建——对齐 Python {@code build_llm(profile="fast")
+     *         } 的回落语义；且快档恒走工具安全装配（#128：回落路径复用
+     *         toolSafe 判定，不把流式 tool_calls 协议缺陷重新暴露给回落
+     *         流量）。调用方按 {@code LLM_FAST_*} 是否配置自行决定分流。
      */
     public static ModelRuntime buildLlm(Settings settings, String profile, BiConsumer<String, TokenUsage> usageSink) {
         if (!"main".equals(profile) && !"fast".equals(profile)) {
             throw new IllegalArgumentException(
                     "unknown llm profile '%s'; expected 'main' or 'fast'".formatted(profile));
-        }
-        if ("fast".equals(profile) && !settings.llmFast.isConfigured()) {
-            return null;
         }
 
         String model;
@@ -63,13 +63,21 @@ public final class LlmFactory {
         String apiKey;
         boolean toolSafeStreaming;
         if ("fast".equals(profile)) {
-            Settings.LlmFastSettings fast = settings.llmFast;
-            model = fast.model;
-            baseUrl = fast.baseUrl;
-            // 快档未单独配 key 时共用主力 key（同一 provider 双档的常见形态）。
-            String fastKey = fast.apiKey.value().strip();
-            String mainKey = settings.llm.apiKey.value().strip();
-            apiKey = !fastKey.isEmpty() ? fastKey : mainKey;
+            if (settings.llmFast.isConfigured()) {
+                Settings.LlmFastSettings fast = settings.llmFast;
+                model = fast.model;
+                baseUrl = fast.baseUrl;
+                // 快档未单独配 key 时共用主力 key（同一 provider 双档的常见形态）。
+                String fastKey = fast.apiKey.value().strip();
+                String mainKey = settings.llm.apiKey.value().strip();
+                apiKey = !fastKey.isEmpty() ? fastKey : mainKey;
+            } else {
+                // #128：未配置回落主力配置（对象不同、配置相同——Python 同构），
+                // 不再返回 null 让调用方拿到原生主档运行时。
+                model = settings.llm.model;
+                baseUrl = settings.llm.baseUrl;
+                apiKey = settings.llm.apiKey.value().strip();
+            }
             toolSafeStreaming = true;
         } else {
             model = settings.llm.model;

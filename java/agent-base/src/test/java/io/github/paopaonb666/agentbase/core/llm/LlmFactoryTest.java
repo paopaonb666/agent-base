@@ -7,8 +7,9 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertNull;
+
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * {@link LlmFactory#buildLlm} 的装配语义测试（对应 Python 侧 build_llm
@@ -42,19 +43,29 @@ class LlmFactoryTest {
     }
 
     @Test
-    void fastUnconfiguredReturnsNull() {
+    void fastUnconfiguredFallsBackToToolSafeMainConfig() {
+        // #128：未配置回落主力配置（对象不同、配置相同——Python 同构），
+        // 且回落路径同样走工具安全装配（不把流式 tool_calls 协议缺陷
+        // 重新暴露给回落流量）。修复前返回 null，调用方拿到原生主档。
         Settings settings = new Settings(); // LLM_FAST_* 全空 = 未配置
         settings.llm.apiKey = Secret.of("sk-test");
-        assertNull(LlmFactory.buildLlm(settings, "fast", null),
-                "快档是优化不是依赖：未配置时调用方回落主力，不报错");
+        settings.llm.model = "deepseek-chat";
+        ModelRuntime runtime = LlmFactory.buildLlm(settings, "fast", null);
+        LangChain4jRuntime lcRuntime = assertInstanceOf(LangChain4jRuntime.class, runtime);
+        assertEquals("deepseek-chat", lcRuntime.modelName(), "回落主力配置");
+        assertTrue(runtime.toolSafeStreaming(), "回落路径必须工具安全（#128）");
     }
 
     @Test
-    void fastPartiallyConfiguredReturnsNull() {
+    void fastPartiallyConfiguredAlsoFallsBack() {
         Settings settings = new Settings(); // 只有 base_url，缺 model = 未配置
         settings.llm.apiKey = Secret.of("sk-test");
+        settings.llm.model = "deepseek-chat";
         settings.llmFast.baseUrl = "https://api.siliconflow.cn/v1";
-        assertNull(LlmFactory.buildLlm(settings, "fast", null));
+        LangChain4jRuntime lcRuntime = assertInstanceOf(LangChain4jRuntime.class,
+                LlmFactory.buildLlm(settings, "fast", null));
+        assertEquals("deepseek-chat", lcRuntime.modelName());
+        assertTrue(lcRuntime.toolSafeStreaming());
     }
 
     @Test
@@ -65,8 +76,8 @@ class LlmFactoryTest {
         LangChain4jRuntime lcRuntime = assertInstanceOf(LangChain4jRuntime.class, runtime);
         assertEquals("THUDM/glm-4-9b-chat", lcRuntime.modelName());
         // 快档走工具安全装配（见 LlmFactory docstring：SiliconFlow GLM-4-9B
-        // 流式 tool_calls 协议违规）。toolSafeStreaming 的行为由
-        // LangChain4jRuntimeTest 验证，这里只验证装配面。
+        // 流式 tool_calls 协议违规）。
+        assertTrue(runtime.toolSafeStreaming());
         assertNotNull(runtime.streaming());
     }
 

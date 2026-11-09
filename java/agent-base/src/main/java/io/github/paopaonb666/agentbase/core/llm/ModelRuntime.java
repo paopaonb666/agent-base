@@ -45,6 +45,16 @@ public interface ModelRuntime {
     /** 非流式单次调用（后台管线用）。 */
     AiMessage invoke(List<ChatMessage> messages);
 
+    /**
+     * 工具安全标志（#128 可观测面）：true = 绑定工具时退回非流式
+     * （对应 Python _ToolSafeStreamChatOpenAI 的选择逻辑）。快档恒 true
+     * （含未配置回落主力配置的形态——回落路径同样要规避流式 tool_calls
+     * 协议缺陷），主档 false。
+     */
+    default boolean toolSafeStreaming() {
+        return false;
+    }
+
     /** usage 回调：(model, usage)；实现方在每次调用结束时投递一次。 */
     static BiConsumer<String, TokenUsage> noopUsageSink() {
         return (model, usage) -> {};

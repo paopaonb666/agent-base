@@ -297,12 +297,13 @@ public final class AgentRuntime {
             LOG.warn("core store: 装配失败（线程索引/计划快照降级为不可用）", e);
             coreStore = null;
         }
-        // 快档侧（成本治理）：LLM_FAST_* 已配置且非 all_main 时，为形成管线
-        // 装配限流回退包装（抽取/画像/摘要走它，整合裁决按 profile 决定）。
+        // 快档侧（成本治理）：非 all_main 时为形成管线装配限流回退包装
+        // （抽取/画像/摘要走它，整合裁决按 profile 决定）。LLM_FAST_* 未
+        // 配置时 buildLlm("fast") 回落主力配置的工具安全形态（#128，对齐
+        // Python build_llm 恒返回客户端的语义）——分流能力不缺位。
         ResilientLlm fastLlm = null;
         if (resolved.memory.enabled
-                && !"all_main".equals(resolved.memory.pipelineProfile)
-                && resolved.llmFast.isConfigured()) {
+                && !"all_main".equals(resolved.memory.pipelineProfile)) {
             fastLlm = new ResilientLlm(
                     LlmFactory.buildLlm(resolved, "fast",
                             resolved.cost.enabled
