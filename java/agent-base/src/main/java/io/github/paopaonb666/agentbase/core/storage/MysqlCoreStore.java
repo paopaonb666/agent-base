@@ -40,7 +40,7 @@ public final class MysqlCoreStore extends AbstractSqlCoreStore {
 
     /** 复用 CheckpointerSettings 的 MySQL 参数（与对话状态同一服务器）。 */
     public MysqlCoreStore(Settings.CheckpointerSettings s) {
-        super("REPLACE");
+        super("REPLACE", "INSERT IGNORE");
         this.url = ("jdbc:mysql://%s:%d/%s?useUnicode=true&characterEncoding=utf8"
                 + "&allowPublicKeyRetrieval=true&useSSL=false")
                 .formatted(s.mysqlHost, s.mysqlPort, s.mysqlDatabase);

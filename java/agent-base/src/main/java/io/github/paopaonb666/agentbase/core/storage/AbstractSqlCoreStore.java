@@ -59,12 +59,18 @@ abstract class AbstractSqlCoreStore implements CoreStore {
     /** 整行覆盖式 upsert 的动词：sqlite 与 MySQL 各有拼写。 */
     private final String replaceVerb;
 
+    /** 缺席才插入的动词（claim 原语用）：sqlite 与 MySQL 各有拼写。 */
+    private final String ignoreVerb;
+
     /**
      * @param replaceVerb {@code "INSERT OR REPLACE"}（sqlite）或
      *                    {@code "REPLACE"}（MySQL），SQL 里后接 {@code INTO}
+     * @param ignoreVerb  {@code "INSERT OR IGNORE"}（sqlite）或
+     *                    {@code "INSERT IGNORE"}（MySQL），SQL 里后接 {@code INTO}
      */
-    protected AbstractSqlCoreStore(String replaceVerb) {
+    protected AbstractSqlCoreStore(String replaceVerb, String ignoreVerb) {
         this.replaceVerb = replaceVerb;
+        this.ignoreVerb = ignoreVerb;
     }
 
     // ── 连接原语（子类实现） ────────────────────────────────────────
@@ -91,6 +97,16 @@ abstract class AbstractSqlCoreStore implements CoreStore {
         }
         return "%s INTO %s (%s) VALUES (%s)".formatted(
                 replaceVerb, table, String.join(", ", columns), marks);
+    }
+
+    /** 缺席才插入的 SQL（claim 原语第一步；属主判定交给后面的条件 UPDATE）。 */
+    private String insertIgnoreInto(String table, String... columns) {
+        StringJoiner marks = new StringJoiner(", ");
+        for (int i = 0; i < columns.length; i++) {
+            marks.add("?");
+        }
+        return "%s INTO %s (%s) VALUES (%s)".formatted(
+                ignoreVerb, table, String.join(", ", columns), marks);
     }
 
     /** 绑定参数（全部用 setObject：本仓储的参数只会是字符串/数值/时间）。 */
@@ -196,6 +212,25 @@ abstract class AbstractSqlCoreStore implements CoreStore {
         List<Object[]> rows = fetchAll(
                 "SELECT " + THREAD_COLUMNS + " FROM thread_index WHERE thread_id = ?", threadId);
         return rows.isEmpty() ? null : threadFromRow(rows.get(0));
+    }
+
+    @Override
+    public ThreadIndexRecord claimThreadIndex(ThreadIndexRecord entry) {
+        // 三条单语句各自原子（连接原语每语句独立提交）：并发首发同一
+        // 线程时 INSERT [OR] IGNORE 只有一家生效，输家的 UPDATE 匹配
+        // 0 行、SELECT 读到赢家的行——属主永远不会被翻转。不用
+        // ON DUPLICATE KEY UPDATE ... WHERE：MySQL 5.7 不支持条件写法。
+        execute(insertIgnoreInto("thread_index",
+                        "thread_id", "user_id", "module", "title", "created_at", "updated_at"),
+                entry.threadId(), entry.userId(), entry.module(), entry.title(),
+                toSqlTs(entry.createdAt()), toSqlTs(entry.updatedAt()));
+        execute("UPDATE thread_index SET updated_at = ? WHERE thread_id = ? AND user_id = ?",
+                toSqlTs(entry.updatedAt()), entry.threadId(), entry.userId());
+        List<Object[]> rows = fetchAll(
+                "SELECT " + THREAD_COLUMNS + " FROM thread_index WHERE thread_id = ?",
+                entry.threadId());
+        // INSERT [OR] IGNORE 之后行必在席；防御性回退避免 NPE。
+        return rows.isEmpty() ? entry : threadFromRow(rows.get(0));
     }
 
     @Override

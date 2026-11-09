@@ -37,6 +37,15 @@ public interface CoreStore extends AutoCloseable {
     /** 删除会话索引行。 */
     void deleteThreadIndex(String threadId);
 
+    /**
+     * 原子认领（对应 Python {@code claim_thread_index}）：缺席则按
+     * {@code entry} 插入；在席且属主一致则仅刷新 {@code updatedAt}
+     * （标题保持首条语义）；在席但属主不一致则**不改动**。返回权威行
+     * ——调用方比较 {@code userId} 判定越权（invoke 端点的 P0 属主校验
+     * 与并发首发抢占都收敛在这一个原语里）。
+     */
+    ThreadIndexRecord claimThreadIndex(ThreadIndexRecord entry);
+
     // ── 计划快照（plan_snapshots；M10 跨轮延续的数据面） ────────────
 
     /** upsert 计划快照；{@code tasks} 是任务 dict 清单（实现方自行 JSON 化）。 */

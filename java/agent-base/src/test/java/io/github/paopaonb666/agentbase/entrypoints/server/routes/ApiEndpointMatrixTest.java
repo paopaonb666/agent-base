@@ -529,6 +529,8 @@ class ApiEndpointMatrixTest {
                 ThreadIndexRecord.create("chat:rt", "alice", "chat", "t"));
         when(index.getThreadIndex("chat:rt2")).thenReturn(
                 ThreadIndexRecord.create("chat:rt2", "alice", "chat", "t"));
+        // invoke 链路的索引写入已从 upsert 换成原子认领（P0）：权威行 = 入参行。
+        when(index.claimThreadIndex(Mockito.any())).thenAnswer(inv -> inv.getArgument(0));
         var fileStore = Mockito.mock(io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStore.class);
         UploadedFileInfo info = new UploadedFileInfo("f-rt", "chat:rt", "chat", "alice",
                 "报告.pdf", "pdf", 3, 12, false, 4200, "", "提取文本…", new byte[0]);

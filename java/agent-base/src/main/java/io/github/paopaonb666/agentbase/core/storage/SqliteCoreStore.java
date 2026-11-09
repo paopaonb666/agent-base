@@ -31,7 +31,7 @@ public final class SqliteCoreStore extends AbstractSqlCoreStore {
 
     /** 打开（或创建）sqlite 库并自举建表；失败抛出，由装配方决定降级。 */
     public SqliteCoreStore(String path) {
-        super("INSERT OR REPLACE");
+        super("INSERT OR REPLACE", "INSERT OR IGNORE");
         Connection connection;
         try {
             connection = DriverManager.getConnection("jdbc:sqlite:" + path);

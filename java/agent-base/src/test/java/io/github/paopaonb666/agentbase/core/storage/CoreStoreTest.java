@@ -69,6 +69,52 @@ class CoreStoreTest {
         }
     }
 
+    @Test
+    void memoryThreadClaimLifecycle() {
+        try (MemoryCoreStore store = new MemoryCoreStore()) {
+            threadClaimLifecycle(store);
+        }
+    }
+
+    @Test
+    void sqliteThreadClaimLifecycle() {
+        try (SqliteCoreStore store = new SqliteCoreStore(tempDir.resolve("claim.db").toString())) {
+            threadClaimLifecycle(store);
+        }
+    }
+
+    /** 原子认领语义（对应 Python _check_thread_claim_semantics）：缺席插入 /
+     * 属主刷新 / 他人不改动，属主永不翻转。 */
+    private void threadClaimLifecycle(CoreStore store) {
+        ThreadIndexRecord entry = new ThreadIndexRecord(
+                "chat:t1", "alice", "chat", "first message", 100.0, 100.0);
+        // 缺席 → 按 entry 插入，返回权威行。
+        ThreadIndexRecord claimed = store.claimThreadIndex(entry);
+        assertEquals("alice", claimed.userId());
+        assertEquals("first message", claimed.title());
+        // 属主再认领 → 仅刷新 updated_at，标题保持首条语义。
+        ThreadIndexRecord refreshed = store.claimThreadIndex(new ThreadIndexRecord(
+                "chat:t1", "alice", "chat", "first message", 100.0, 105.0));
+        assertEquals("alice", refreshed.userId());
+        assertEquals("first message", refreshed.title());
+        assertEquals(105.0, store.getThreadIndex("chat:t1").updatedAt());
+        // 他人认领 → 原行不改动，返回现有属主行（调用方据此 404）。
+        ThreadIndexRecord foreign = store.claimThreadIndex(new ThreadIndexRecord(
+                "chat:t1", "bob", "chat", "first message", 100.0, 109.0));
+        assertEquals("alice", foreign.userId());
+        assertEquals("first message", foreign.title());
+        ThreadIndexRecord stored = store.getThreadIndex("chat:t1");
+        assertEquals("alice", stored.userId());
+        assertEquals(105.0, stored.updatedAt());
+        // 重复认领轮换：删除后他人首发成为新属主（旧属主再认领被拒）。
+        store.deleteThreadIndex("chat:t1");
+        assertEquals("bob", store.claimThreadIndex(new ThreadIndexRecord(
+                "chat:t1", "bob", "chat", "bob first", 200.0, 200.0)).userId());
+        assertEquals("bob", store.claimThreadIndex(new ThreadIndexRecord(
+                "chat:t1", "alice", "chat", "alice try", 200.0, 201.0)).userId());
+        assertEquals("bob first", store.getThreadIndex("chat:t1").title());
+    }
+
     private void threadIndexLifecycle(CoreStore store) {
         assertNull(store.getThreadIndex("chat:a"));
 

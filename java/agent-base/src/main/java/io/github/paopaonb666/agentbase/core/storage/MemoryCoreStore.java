@@ -6,6 +6,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * 进程内字典实现的基座存储：memory 后端（重启即丢）与测试用（对应
@@ -44,6 +45,28 @@ public final class MemoryCoreStore implements CoreStore {
     @Override
     public void deleteThreadIndex(String threadId) {
         threads.remove(threadId);
+    }
+
+    @Override
+    public ThreadIndexRecord claimThreadIndex(ThreadIndexRecord entry) {
+        // compute 对同一 key 原子：缺席插入 / 属主刷新 / 他人原样保留。
+        AtomicReference<ThreadIndexRecord> authoritative = new AtomicReference<>();
+        threads.compute(entry.threadId(), (threadId, current) -> {
+            if (current == null) {
+                authoritative.set(entry);
+                return entry;
+            }
+            if (!current.userId().equals(entry.userId())) {
+                authoritative.set(current);
+                return current;
+            }
+            ThreadIndexRecord refreshed = new ThreadIndexRecord(
+                    current.threadId(), current.userId(), current.module(),
+                    current.title(), current.createdAt(), entry.updatedAt());
+            authoritative.set(refreshed);
+            return refreshed;
+        });
+        return authoritative.get();
     }
 
     // ── 计划快照（plan_snapshots；M10 跨轮延续） ────────────────────

@@ -612,15 +612,20 @@ class AgentsRoutesTest {
     }
 
     @Test
-    void invokeUpsertsThreadIndexExactlyOnce() throws Exception {
-        // #141：索引 upsert 收敛到 startStream 单次执行——非附件分支不再
-        // 先行写一次（双写放大写入量，两次写之间失败会留下不一致标题）。
+    void invokeClaimsThreadIndexExactlyOnce() throws Exception {
+        // #141 语义保持 + P0 认领化：索引写入收敛到 startStream 单次
+        // claimThreadIndex——预检的 getThreadIndex 是读不算写，旧 upsert
+        // 路径已移除。
         List<String> calls = new ArrayList<>();
         Object index = Proxy.newProxyInstance(
                 io.github.paopaonb666.agentbase.core.storage.CoreStore.class.getClassLoader(),
                 new Class<?>[]{io.github.paopaonb666.agentbase.core.storage.CoreStore.class},
                 (proxy, method, args) -> {
                     calls.add(method.getName());
+                    if ("claimThreadIndex".equals(method.getName())) {
+                        // 权威行 = 入参行（预检已确保属主一致或缺席）。
+                        return args[0];
+                    }
                     return defaultValue(method.getReturnType());
                 });
         AgentRuntime runtime = buildRuntime(Map.of("chat", stubModule("chat")),
@@ -628,8 +633,53 @@ class AgentsRoutesTest {
         AgentsRoutes routes = route(runtime);
 
         invoke(routes, "chat", invokeBody("第一条消息", "t1", null, null, null), "u1");
-        assertEquals(1, calls.stream().filter("upsertThreadIndex"::equals).count(),
-                "一次 invoke 恰一次 upsert：" + calls);
+        assertEquals(1, calls.stream().filter("claimThreadIndex"::equals).count(),
+                "一次 invoke 恰一次 claim：" + calls);
+        assertFalse(calls.contains("upsertThreadIndex"), "旧 upsert 路径应已移除：" + calls);
+    }
+
+    @Test
+    void invokeMasksForeignThreadsAndSkipsSideEffects() throws Exception {
+        // P0 属主校验：他人拿既有 thread_id invoke → 404 掩蔽，且零副作用
+        // ——不触发 claim（索引写入）、不绑定附件、不进图（对应 Python
+        // test_invoke_rejects_foreign_thread）。缺席行放行（新线程首发）、
+        // 属主放行。
+        List<String> calls = new ArrayList<>();
+        Object index = Proxy.newProxyInstance(
+                io.github.paopaonb666.agentbase.core.storage.CoreStore.class.getClassLoader(),
+                new Class<?>[]{io.github.paopaonb666.agentbase.core.storage.CoreStore.class},
+                (proxy, method, args) -> {
+                    calls.add(method.getName());
+                    if ("getThreadIndex".equals(method.getName())) {
+                        return "chat:t1".equals(args[0])
+                                ? ThreadIndexRecord.create("chat:t1", "owner-a", "chat", "标题")
+                                : null;
+                    }
+                    if ("claimThreadIndex".equals(method.getName())) {
+                        return args[0];
+                    }
+                    return defaultValue(method.getReturnType());
+                });
+        Object fileStore = recordingProxy(
+                io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStore.class,
+                calls, "files");
+        AgentRuntime runtime = buildRuntime(Map.of("chat", stubModule("chat")),
+                new InMemoryCheckpointer(), index, fileStore, null, null, null);
+        AgentsRoutes routes = route(runtime);
+
+        HttpError foreign = httpErrorOf(() ->
+                invoke(routes, "chat",
+                        invokeBody("hi", "t1", List.of("a"), null, null), "u1"));
+        assertEquals(404, foreign.status());
+        assertTrue(foreign.getMessage().contains("线程不存在"), foreign.getMessage());
+        // 零副作用：预检之后没有发生任何索引写入或附件绑定。
+        assertFalse(calls.contains("claimThreadIndex"), String.valueOf(calls));
+        assertFalse(calls.stream().anyMatch(c -> c.startsWith("files:")), String.valueOf(calls));
+
+        // 缺席行放行（新线程首发），缺席行的 getThreadIndex 返回 null。
+        assertNotNull(invoke(routes, "chat", invokeBody("hi", "fresh", null, null, null), "u1"));
+        // 属主本人放行。
+        assertNotNull(invoke(routes, "chat", invokeBody("hi", "t1", null, null, null), "owner-a"));
     }
 
     @Test

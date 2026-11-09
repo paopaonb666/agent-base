@@ -196,6 +196,17 @@ public class AgentsRoutes {
                 : io.github.paopaonb666.agentbase.extensions.Observability.newRequestId();
         String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         String fullThreadId = new ThreadId(module, userThreadId).toString();
+        // 属主预检（S1/P0）：已认证 ≠ 有权访问该线程。invoke 的全部副作用
+        // （busy 探针、plan 快照读取、记忆注入、附件绑定、checkpoint 写入）
+        // 都必须在通过之后。404 文案与 threadOwnerOr404 一致，不泄露存在性
+        // （顺带堵住 409/400 对非属主线程的存在性枚举通道）。
+        var threadIndex = runtime.threadIndex();
+        if (threadIndex != null) {
+            var existing = threadIndex.getThreadIndex(fullThreadId);
+            if (existing != null && !existing.userId().equals(userId)) {
+                throw new HttpError(404, "线程不存在：" + userThreadId);
+            }
+        }
         // 同 thread 并发 invoke → 409（#197）：权威判定在图执行的 tryLock，
         // 探针只把报错时机提前到响应提交前（SSE 开始后只能以 error 事件收口）。
         if (graph.isThreadBusy(fullThreadId)) {
@@ -326,7 +337,10 @@ public class AgentsRoutes {
         // proxy_buffering——缺了它 delta 会被缓冲到流结束才一次性下发。
         response.setHeader("Cache-Control", "no-cache");
         response.setHeader("X-Accel-Buffering", "no");
-        // 会话索引 upsert（S1）：标题取首条 human 消息前 60 字符。
+        // 会话索引原子认领（S1）：标题取首条 human 消息前 60 字符。缺席则
+        // 按本用户插入，在席且属主一致则仅刷新 updated_at，属主不符则不
+        // 改动并以 404 拒绝——invoke 开头的预检与这里的认领之间属主被
+        // 并发改变（删除后被他人首发）由权威行兜底，属主永不翻转。
         if (runtime.threadIndex() != null) {
             String title = messagesInput.stream()
                     .filter(m -> m instanceof UserMessage)
@@ -335,14 +349,12 @@ public class AgentsRoutes {
                     .findFirst()
                     .map(t -> t.substring(0, Math.min(60, t.length())))
                     .orElse(userThreadId);
-            var existing = runtime.threadIndex().getThreadIndex(config.threadId());
-            runtime.threadIndex().upsertThreadIndex(existing == null
-                    ? io.github.paopaonb666.agentbase.core.storage.ThreadIndexRecord.create(
-                            config.threadId(), userId, module, title)
-                    : new io.github.paopaonb666.agentbase.core.storage.ThreadIndexRecord(
-                            existing.threadId(), existing.userId(), existing.module(),
-                            existing.title(), existing.createdAt(),
-                            System.currentTimeMillis() / 1000.0));
+            var claimed = runtime.threadIndex().claimThreadIndex(
+                    io.github.paopaonb666.agentbase.core.storage.ThreadIndexRecord.create(
+                            config.threadId(), userId, module, title));
+            if (!claimed.userId().equals(userId)) {
+                throw new HttpError(404, "线程不存在：" + userThreadId);
+            }
         }
         // 记忆形成（M6c）：轮次正常完成后在后台跑抽取/整合/画像/摘要。
         Runnable onComplete = buildCaptureHook(module, userThreadId, graph, config);
