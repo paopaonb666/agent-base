@@ -298,4 +298,28 @@ class SseStreamsTest {
         assertEquals("RuntimeException: ", SseStreams.safeErrorText(
                 new RuntimeException("")).substring(0, "RuntimeException: ".length()));
     }
+
+    @Test
+    void putUninterruptiblyBailsOutOfFullQueueWhenCancelled() throws Exception {
+        // review R1-F1（P0）回归：取消态 + 满队列 + 消费者死亡（再无新中断）
+        // 时，入队必须有限等待后放弃——否则生产者永久阻塞、终态钩子（#79
+        // 闸门释放）永不执行，32 次慢断连后全站 invoke 永久 429。
+        java.util.concurrent.BlockingQueue<Object> queue =
+                new java.util.concurrent.ArrayBlockingQueue<>(2);
+        queue.put(new Object());
+        queue.put(new Object()); // 满
+        java.util.concurrent.atomic.AtomicBoolean cancelled =
+                new java.util.concurrent.atomic.AtomicBoolean(true);
+        long start = System.nanoTime();
+        org.junit.jupiter.api.Assertions.assertThrows(
+                java.util.concurrent.CancellationException.class,
+                () -> SseStreams.putUninterruptibly(queue, new Object(), cancelled));
+        long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+        org.junit.jupiter.api.Assertions.assertTrue(elapsedMillis < 5_000,
+                "取消态满队列应在有限时间放弃，实测 " + elapsedMillis + "ms");
+        // 对照：队列有空位时取消态事件照常送达（终态标注尽力可达）。
+        queue.take();
+        SseStreams.putUninterruptibly(queue, new Object(), cancelled);
+        assertEquals(2, queue.size());
+    }
 }

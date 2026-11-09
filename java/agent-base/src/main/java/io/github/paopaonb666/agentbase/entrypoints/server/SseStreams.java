@@ -9,6 +9,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import io.github.paopaonb666.agentbase.core.MemoryScope;
@@ -232,8 +233,8 @@ public final class SseStreams {
     }
 
     /** 尽力入队（取消路径专用）：入不进去就放弃——连接已死，标注无从送达。 */
-    private static void putBestEffort(BlockingQueue<Object> queue, Object event,
-                                      AtomicBoolean cancelled) {
+    static void putBestEffort(BlockingQueue<Object> queue, Object event,
+                              AtomicBoolean cancelled) {
         try {
             putUninterruptibly(queue, event, cancelled);
         } catch (java.util.concurrent.CancellationException ignored) {
@@ -241,12 +242,24 @@ public final class SseStreams {
         }
     }
 
-    private static void putUninterruptibly(BlockingQueue<Object> queue, Object event,
-                                           AtomicBoolean cancelled) {
+    static void putUninterruptibly(BlockingQueue<Object> queue, Object event,
+                                   AtomicBoolean cancelled) {
         boolean interrupted = false;
         try {
             while (true) {
                 try {
+                    if (cancelled.get()) {
+                        // 取消态（消费者已死或停摆）：入队改有限等待——#9 清挂起
+                        // 中断后「再无新中断」是常态而非例外，无限 put 会永久卡住
+                        // 生产者线程、graph.stream 不返回、终态钩子（#79 闸门
+                        // 释放）不执行（review R1-F1）。1s 内无空位即中止：满队列
+                        // +无人消费=事件注定无法送达，交由 finally 收尾。
+                        if (!queue.offer(event, 1, TimeUnit.SECONDS)) {
+                            throw new java.util.concurrent.CancellationException(
+                                    "client disconnected");
+                        }
+                        return;
+                    }
                     queue.put(event);
                     return;
                 } catch (InterruptedException e) {
