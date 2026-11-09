@@ -100,6 +100,14 @@ public final class Settings {
      * 资源的无保护暴露面。
      */
     public int rateLimitPerMinute = 0;
+    /**
+     * 全局 run 并发上限（#79）：同时在途的 SSE 对话轮数——每轮 3 个线程
+     * （生产者/心跳/消费者），50 并发用户=150+ 线程起，无上限时负载下
+     * JVM 线程膨胀→GC 压力→全站抖动。饱和请求 429 + Retry-After（快速
+     * 失败而非排队——排队只把超时推迟到客户端断连之后）。0 = 不限；
+     * 默认 32 对单机部署是保守健康值。
+     */
+    public int agentRunConcurrency = 32;
 
     public final LlmSettings llm = new LlmSettings();
     public final LlmFastSettings llmFast = new LlmFastSettings();
@@ -401,7 +409,8 @@ public final class Settings {
         }
         // 根级字段的 env/dotenv 键可能全大写（AGENT_MODULES）：归一小写。
         for (String key : List.of("agent_modules", "agent_module_packages", "cors_origins", "env",
-                "agent_recursion_limit", "agent_handoff_max_per_run", "rate_limit_per_minute")) {
+                "agent_recursion_limit", "agent_handoff_max_per_run", "rate_limit_per_minute",
+                "agent_run_concurrency")) {
             String up = key.toUpperCase(Locale.ROOT);
             if (out.containsKey(up) && !out.containsKey(key)) {
                 out.put(key, out.remove(up));
@@ -447,6 +456,13 @@ public final class Settings {
                     throw new SettingsError("RATE_LIMIT_PER_MINUTE must be >= 0 (0 = unlimited), got %d".formatted(value));
                 }
                 s.rateLimitPerMinute = value;
+            }
+            if (vals.containsKey("agent_run_concurrency")) {
+                int value = requireInt("agent_run_concurrency", vals.get("agent_run_concurrency"));
+                if (value < 0) {
+                    throw new SettingsError("AGENT_RUN_CONCURRENCY must be >= 0 (0 = unlimited), got %d".formatted(value));
+                }
+                s.agentRunConcurrency = value;
             }
             switch (section) {
                 case "llm" -> applyLlm(s, vals);

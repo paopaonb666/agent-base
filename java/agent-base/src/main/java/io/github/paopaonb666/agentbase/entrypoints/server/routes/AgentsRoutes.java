@@ -35,6 +35,7 @@ import io.github.paopaonb666.agentbase.entrypoints.server.Background;
 import io.github.paopaonb666.agentbase.entrypoints.server.HttpError;
 import io.github.paopaonb666.agentbase.entrypoints.server.MessageSerializers;
 import io.github.paopaonb666.agentbase.entrypoints.server.RateLimiters;
+import io.github.paopaonb666.agentbase.entrypoints.server.RunGate;
 import io.github.paopaonb666.agentbase.entrypoints.server.SseStreams;
 import io.github.paopaonb666.agentbase.extensions.costmeter.CostBudgetExceededException;
 import io.github.paopaonb666.agentbase.extensions.costmeter.CostGovernor;
@@ -71,6 +72,8 @@ public class AgentsRoutes {
     private final CostGovernor governor;
     /** #78 per-user 令牌桶（invoke 入口 enforcement；0 = 不限）。 */
     private final RateLimiters.PerUserRateLimiter rateLimiter;
+    /** #79 全局 run 并发闸门（0 = 不限）。 */
+    private final RunGate runGate;
 
     public AgentsRoutes(AgentRuntime runtime, AuthBackends.AuthBackend auth,
                         org.springframework.beans.factory.ObjectProvider<CostGovernor> governorProvider) {
@@ -81,6 +84,8 @@ public class AgentsRoutes {
         // #78 per-user 限流：0 = 不限（本机开发），production 由
         // ensureProductionReady 强制显式配置。
         this.rateLimiter = new RateLimiters.PerUserRateLimiter(runtime.settings().rateLimitPerMinute);
+        // #79 全局 run 并发闸门：默认 32，0 = 不限。
+        this.runGate = new RunGate(runtime.settings().agentRunConcurrency);
     }
 
     private String user(String userIdHeader, String sigHeader, String tsHeader, String nonceHeader) {
@@ -405,7 +410,16 @@ public class AgentsRoutes {
                 effectiveExtra.putIfAbsent(e.getKey(), e.getValue());
             }
         }
-        return SseStreams.open(graph, messagesInput, effectiveExtra, config, userThreadId, onComplete);
+        // 全局 run 并发闸门（#79）：开流前一刻才占额度——startStream 此后
+        // 无抛出路径，退出挂在 SSE 终态钩子上（produce 的 finally，全路径
+        // 恰好一次）。饱和快速失败（429+Retry-After），不排队。
+        if (!runGate.tryEnter()) {
+            response.setHeader("Retry-After", "5");
+            throw new HttpError(429, "服务并发已达上限（AGENT_RUN_CONCURRENCY="
+                    + runGate.maxConcurrent() + "），请稍后重试");
+        }
+        return SseStreams.open(graph, messagesInput, effectiveExtra, config, userThreadId,
+                onComplete, runGate::exit);
     }
 
     /** 构造轮次完成后的记忆形成回调（M6c）；管线不可用时返回 null。 */

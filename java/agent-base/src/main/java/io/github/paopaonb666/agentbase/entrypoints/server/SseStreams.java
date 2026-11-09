@@ -81,10 +81,31 @@ public final class SseStreams {
     static SseEmitter open(CompiledGraph graph, java.util.List<dev.langchain4j.data.message.ChatMessage> messagesInput,
                            java.util.Map<String, Object> extra, RunConfig config, String userThreadId,
                            Runnable onComplete, SseEmitter emitter) {
+        return open(graph, messagesInput, extra, config, userThreadId, onComplete, null, emitter);
+    }
+
+    /**
+     * 生产形态（#79）：终态钩子 + 默认 emitter。onTerminate 在 produce 的
+     * finally 里恰好执行一次（正常/失败/取消全路径），并发闸门在此退出。
+     */
+    public static SseEmitter open(CompiledGraph graph, java.util.List<dev.langchain4j.data.message.ChatMessage> messagesInput,
+                                  java.util.Map<String, Object> extra, RunConfig config, String userThreadId,
+                                  Runnable onComplete, Runnable onTerminate) {
+        return open(graph, messagesInput, extra, config, userThreadId, onComplete, onTerminate,
+                new SseEmitter(0L)); // 不超时（Python 无超时语义）
+    }
+
+    /**
+     * 全参形态（#79）：{@code onTerminate} 是 run 终态钩子——produce 的
+     * finally 里恰好执行一次（正常/失败/取消全路径），并发闸门在此退出。
+     */
+    public static SseEmitter open(CompiledGraph graph, java.util.List<dev.langchain4j.data.message.ChatMessage> messagesInput,
+                                  java.util.Map<String, Object> extra, RunConfig config, String userThreadId,
+                                  Runnable onComplete, Runnable onTerminate, SseEmitter emitter) {
         BlockingQueue<Object> queue = new ArrayBlockingQueue<>(SSE_QUEUE_MAXSIZE);
         AtomicBoolean cancelled = new AtomicBoolean(false);
         Thread producer = new Thread(() -> produce(queue, graph, messagesInput, extra, config,
-                userThreadId, onComplete, cancelled), "sse-producer");
+                userThreadId, onComplete, onTerminate, cancelled), "sse-producer");
         producer.setDaemon(true);
         Thread heartbeat = new Thread(() -> heartbeat(queue, cancelled), "sse-heartbeat");
         heartbeat.setDaemon(true);
@@ -111,8 +132,8 @@ public final class SseStreams {
     /** 生产者：把图事件推入队列；哨兵 null 终止（对应 _produce）。 */
     private static void produce(BlockingQueue<Object> queue, CompiledGraph graph,
                                 java.util.List<dev.langchain4j.data.message.ChatMessage> messagesInput,
-                                java.util.Map<String, Object> extra,
-                                RunConfig config, String userThreadId, Runnable onComplete,
+                                java.util.Map<String, Object> extra, RunConfig config,
+                                String userThreadId, Runnable onComplete, Runnable onTerminate,
                                 AtomicBoolean cancelled) {
         // 记忆作用域（M6e）：图节点与记忆工具在本线程运行，据此拿到
         // user/thread（工具线程经 MDC 转发继承）。
@@ -195,6 +216,15 @@ public final class SseStreams {
             putUninterruptibly(queue, new Events.ErrorEvent(safeErrorText(exc)), cancelled);
             putUninterruptibly(queue, new Events.DoneEvent(userThreadId, Events.RunTermination.INTERNAL_ERROR), cancelled);
         } finally {
+            // 终态钩子（#79 并发闸门退出）最先执行：保证后续 put 抛异常时
+            // 配对释放不丢（finally 里后续语句会被新异常跳过）。
+            if (onTerminate != null) {
+                try {
+                    onTerminate.run();
+                } catch (Exception e) {
+                    LOG.debug("sse: terminate hook failed", e);
+                }
+            }
             Thread.interrupted(); // 哨兵必须送达：同上，清过期中断标志
             putUninterruptibly(queue, SENTINEL, cancelled);
             MemoryScope.clear();

@@ -288,6 +288,58 @@ class AgentsRoutesTest {
     }
 
     @Test
+    void globalRunGateGives429WhenSaturatedAndReleasesOnCompletion() throws Exception {
+        // #79：AGENT_RUN_CONCURRENCY=1 → 在途 run 占满闸门时第二发 429；
+        // run 完成后终态钩子释放（produce 的 finally），后续 invoke 恢复。
+        java.util.concurrent.CountDownLatch entered = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        AgentModule blocking = new AgentModule() {
+            @Override public String name() { return "chat"; }
+            @Override public String description() { return "blocking stub for run gate"; }
+            @Override public CompiledGraph buildGraph(ModuleContext ctx) {
+                return GraphBuilder.singleNode("chat", (state, nodeCtx) -> {
+                    entered.countDown();
+                    release.await(10, java.util.concurrent.TimeUnit.SECONDS);
+                    return Map.of();
+                }, ctx.checkpointer());
+            }
+            @Override public List<io.github.paopaonb666.agentbase.core.tools.AgentTool> getTools() {
+                return List.of();
+            }
+        };
+        AgentRuntime runtime = buildRuntime(Settings.load(Map.of(
+                "ENV", "development", "AGENT_RUN_CONCURRENCY", "1")),
+                Map.of("chat", blocking), new InMemoryCheckpointer(),
+                null, null, null, null, null);
+        AgentsRoutes routes = route(runtime);
+
+        assertNotNull(invoke(routes, "chat", invokeBody("hi", "r1", null, null, null), "u1"));
+        assertTrue(entered.await(5, java.util.concurrent.TimeUnit.SECONDS), "阻塞节点应已进入");
+        // 在途 run 占满唯一额度：第二发 429 + Retry-After。
+        var second = new org.springframework.mock.web.MockHttpServletResponse();
+        HttpError error = httpErrorOf(() ->
+                invoke(routes, "chat", invokeBody("hi", "r2", null, null, null), "u1", second));
+        assertEquals(429, error.status());
+        assertTrue(error.getMessage().contains("AGENT_RUN_CONCURRENCY"), error.getMessage());
+        assertEquals("5", second.getHeader("Retry-After"));
+
+        // 释放阻塞节点 → run 完成 → 终态钩子退出闸门 → 后续 invoke 恢复。
+        release.countDown();
+        HttpError last = null;
+        for (int i = 0; i < 200; i++) {
+            try {
+                invoke(routes, "chat", invokeBody("hi", "r3", null, null, null), "u1");
+                last = null;
+                break;
+            } catch (HttpError e) {
+                last = e; // 释放传播有延迟：429 期让位重试
+                Thread.sleep(25);
+            }
+        }
+        assertTrue(last == null, "run 完成后闸门应已释放" + (last == null ? "" : "：" + last.getMessage()));
+    }
+
+    @Test
     void continuePlanWithoutSnapshotGives400() throws Exception {
         // #66：显式要求延续而快照缺席 → 400（静默重拆反而误导）。
         AgentRuntime runtime = buildRuntime(Map.of("planner", stubModule("planner")),
