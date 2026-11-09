@@ -147,12 +147,13 @@ async def test_resilient_llm_semaphore_serializes_concurrency() -> None:
     assert peak == 1
 
 
-async def test_tool_safe_stream_falls_back_to_generate_when_tools_bound(
+async def test_tool_safe_stream_falls_back_to_agenerate_when_tools_bound(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """快档客户端：绑定工具时 _astream 退回非流式聚合（SiliconFlow
-    GLM-4-9B 流式工具调用违反 OpenAI 协议——工具名被拆进 arguments delta）；
-    未绑工具时保持原生流式。"""
+    """快档客户端：绑定工具时 _astream 退回**异步**非流式聚合（SiliconFlow
+    GLM-4-9B 流式工具调用违反 OpenAI 协议——工具名被拆进 arguments delta），
+    且 usage_metadata 必须随分块流出（成本账本在 on_llm_end 从聚合 chunk
+    读它，丢了计量就是全零）；未绑工具时保持原生流式。"""
     from langchain_core.messages import AIMessage, AIMessageChunk
     from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 
@@ -161,19 +162,45 @@ async def test_tool_safe_stream_falls_back_to_generate_when_tools_bound(
     model = _ToolSafeStreamChatOpenAI(model="m", api_key="sk-test")
     calls: list[str] = []
 
-    def _fake_generate(
+    def _sync_generate(
         messages: object, stop: object = None, run_manager: object = None, **kw: object
     ) -> ChatResult:
-        calls.append("generate")
+        raise AssertionError(
+            "工具轮退回路径必须是异步 _agenerate：同步 _generate 会阻塞事件循环"
+        )
+
+    async def _fake_agenerate(
+        messages: object, stop: object = None, run_manager: object = None, **kw: object
+    ) -> ChatResult:
+        calls.append("agenerate")
         assert kw.get("tools")  # 非流式路径必须带上工具定义
-        return ChatResult(generations=[ChatGeneration(message=AIMessage(content="ok"))])
+        return ChatResult(
+            generations=[
+                ChatGeneration(
+                    message=AIMessage(
+                        content="ok",
+                        usage_metadata={
+                            "input_tokens": 10,
+                            "output_tokens": 5,
+                            "total_tokens": 15,
+                        },
+                    )
+                )
+            ]
+        )
 
-    monkeypatch.setattr(model, "_generate", _fake_generate)
+    monkeypatch.setattr(model, "_generate", _sync_generate)
+    monkeypatch.setattr(model, "_agenerate", _fake_agenerate)
 
-    # 绑定工具 → 退回 _generate，聚合出分块。
+    # 绑定工具 → 退回异步 _agenerate，聚合出分块并保留 usage_metadata。
     chunks = [c async for c in model._astream("hi", tools=[{"type": "function"}])]
-    assert calls == ["generate"]
+    assert calls == ["agenerate"]
     assert chunks and chunks[0].message.content == "ok"
+    assert chunks[0].message.usage_metadata == {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "total_tokens": 15,
+    }
 
     # 未绑工具 → 不走 _generate，交回原生流式。
     async def _fake_astream(

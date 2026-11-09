@@ -42,7 +42,11 @@ class _ToolSafeStreamChatOpenAI(ChatOpenAI):
         self, messages: Any, stop: Any = None, run_manager: Any = None, **kwargs: Any
     ) -> Any:
         if kwargs.get("tools"):
-            result = self._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+            # 退回必须走**异步**非流式：``_generate`` 内部是同步 OpenAI
+            # 客户端，在事件循环里直接调用会阻塞整个 worker——真实请求
+            # 期间所有并发请求与 SSE 心跳全部停摆。``_agenerate`` 是
+            # langchain-openai 的原生 AsyncOpenAI 路径。
+            result = await self._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
             for generation in result.generations:
                 message = generation.message
                 yield ChatGenerationChunk(
@@ -51,6 +55,11 @@ class _ToolSafeStreamChatOpenAI(ChatOpenAI):
                         tool_calls=getattr(message, "tool_calls", []) or [],
                         additional_kwargs=message.additional_kwargs,
                         response_metadata=message.response_metadata,
+                        # 用量必须随分块流出：外层 astream 按 yield 出的
+                        # chunk 聚合触发 on_llm_end，CostMeterHandler 从
+                        # 聚合消息读 usage_metadata 入账——丢了这一字段，
+                        # 工具轮的 token 计量就是全零。
+                        usage_metadata=getattr(message, "usage_metadata", None),
                     )
                 )
             return
