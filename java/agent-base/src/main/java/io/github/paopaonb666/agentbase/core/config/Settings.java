@@ -153,6 +153,14 @@ public final class Settings {
          * "max_context_tokens":0}]（max_context_tokens 可省）。
          */
         public List<LlmFallbackSpec> fallbacks = List.of();
+        /**
+         * 熔断器（#72，自研）：连续 N 次 run 级失败 → open 快速失败 →
+         * 冷却到期 half-open 单发探测。0 = 禁用（默认开，阈值 5/冷却 30s
+         * 对单 provider 部署是保守健康值）；逐链元素独立状态机——主力
+         * open 时 fallback 链自动接管。
+         */
+        public int circuitFailureThreshold = 5;
+        public long circuitCooldownSeconds = 30;
     }
 
     /** #71 fallback 链的单个备用模型规格。 */
@@ -648,6 +656,20 @@ public final class Settings {
         }
         if (v.containsKey("fallbacks")) {
             t.fallbacks = parseFallbacks(v.get("fallbacks"));
+        }
+        if (v.containsKey("circuit_failure_threshold")) {
+            int value = requireInt("circuit_failure_threshold", v.get("circuit_failure_threshold"));
+            if (value < 0) {
+                throw new SettingsError("LLM_CIRCUIT_FAILURE_THRESHOLD must be >= 0 (0 = disabled), got %d".formatted(value));
+            }
+            t.circuitFailureThreshold = value;
+        }
+        if (v.containsKey("circuit_cooldown_seconds")) {
+            double value = requireFloat("circuit_cooldown_seconds", v.get("circuit_cooldown_seconds"));
+            if (!(value >= 0)) {
+                throw new SettingsError("LLM_CIRCUIT_COOLDOWN_SECONDS must be >= 0 (0 = no cooldown wait), got %s".formatted(value));
+            }
+            t.circuitCooldownSeconds = (long) value;
         }
     }
 

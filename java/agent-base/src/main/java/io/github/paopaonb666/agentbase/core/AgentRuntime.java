@@ -235,6 +235,15 @@ public final class AgentRuntime {
     }
 
     /** 根据 settings 创建运行时；配置错误时快速失败。 */
+    /** #72：按配置给链元素包熔断器（阈值 0 = 禁用直通）。 */
+    private static ModelRuntime breakered(ModelRuntime inner, Settings settings) {
+        if (settings.llm.circuitFailureThreshold < 1) {
+            return inner;
+        }
+        return new io.github.paopaonb666.agentbase.core.llm.CircuitBreakedModelRuntime(
+                inner, settings.llm.circuitFailureThreshold, settings.llm.circuitCooldownSeconds);
+    }
+
     public static AgentRuntime create(Settings resolved) {
         resolved.ensureProductionReady();
         // 无鉴权部署横幅（#196）：secret 空时 HMAC 整层跳过、全部请求落
@@ -264,15 +273,21 @@ public final class AgentRuntime {
                 resolved.cost.enabled
                         ? io.github.paopaonb666.agentbase.core.llm.UsageSinks.costMeterSink("main")
                         : ModelRuntime.noopUsageSink());
-        // 主路径弹性包（#1/#10/#73/#75/#71）：并发信号量 + 指数退避重试 +
-        // 滑窗重试预算 + LLM_FALLBACKS 备用模型链，图执行节点经
-        // ModuleContext.llm() 透明获得。usage 仍由内层 runtime 的 sink 按
-        // 每次真实调用记账（fallback 各自带 modelName，按实际生效模型入账）。
+        // 主路径弹性包（#1/#10/#73/#75/#71/#72）：并发信号量 + 指数退避重试 +
+        // 滑窗重试预算 + LLM_FALLBACKS 备用模型链 + 逐链元素熔断器（主力
+        // open 时链自动跳备用模型），图执行节点经 ModuleContext.llm() 透明
+        // 获得。usage 仍由内层 runtime 的 sink 按每次真实调用记账（fallback
+        // 各自带 modelName，按实际生效模型入账）。
+        java.util.List<ModelRuntime> chain = new java.util.ArrayList<>();
+        chain.add(breakered(llm, resolved));
+        for (ModelRuntime fallback : LlmFactory.buildFallbacks(resolved,
+                resolved.cost.enabled
+                        ? io.github.paopaonb666.agentbase.core.llm.UsageSinks.costMeterSink("main")
+                        : ModelRuntime.noopUsageSink())) {
+            chain.add(breakered(fallback, resolved));
+        }
         llm = new io.github.paopaonb666.agentbase.core.llm.ResilientModelRuntime(
-                llm, LlmFactory.buildFallbacks(resolved,
-                        resolved.cost.enabled
-                                ? io.github.paopaonb666.agentbase.core.llm.UsageSinks.costMeterSink("main")
-                                : ModelRuntime.noopUsageSink()),
+                chain.get(0), chain.subList(1, chain.size()),
                 resolved.llm.mainRetries, resolved.llm.mainConcurrency);
         Map<String, AgentModule> modules = ModuleRegistry.loadModules(
                 resolved.agentModules, null,
