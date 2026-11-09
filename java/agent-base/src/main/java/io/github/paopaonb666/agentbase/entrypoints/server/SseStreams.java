@@ -32,7 +32,8 @@ import io.github.paopaonb666.agentbase.extensions.events.Events;
  *       completed 每节点结束各一条（updates 模式）；</li>
  *   <li>自定义事件（tool_call/plan/sources）经契约类型校验，未知/畸形
  *       丢弃——坏模块不能把未校验数据透给浏览器；</li>
- *   <li>异常转 ErrorEvent（URL 脱敏 + 300 字符封顶）。</li>
+ *   <li>异常转 ErrorEvent（URL 脱敏 + 300 字符封顶）；每个终态都以
+ *       done(termination) 收尾——统一终止标注由图层判定（#9）。</li>
  * </ul>
  */
 public final class SseStreams {
@@ -147,29 +148,66 @@ public final class SseStreams {
             // 输入 extras（附件元数据等）随首轮输入进入状态通道：extras 按
             // 键合并（apply 语义），缺席的键保留历史值——对应 Python 输入
             // dict 只提供 messages 时其余通道保持原值。
-            io.github.paopaonb666.agentbase.core.graph.GraphState finalState = graph.stream(
+            // #9：终止标注的权威在图层——streamWithTermination 把失败也归一
+            // 为终态（不抛出），SSE 层只负责渲染 done 的 termination 字段。
+            CompiledGraph.RunOutcome outcome = graph.streamWithTermination(
                     new GraphState(messagesInput,
                             extra == null ? java.util.Map.of() : extra), config, sink);
-            // #338：最终回复 [n] 引用解析 → cited sources 事件（在 done 前）。
-            // 与工具执行期的全量 sources 事件互补：这里只发回复真正引用的子集。
-            List<Events.Source> cited = Citations.resolve(
-                    lastReplyText(finalState), Citations.dedup(sourceRegistry));
-            if (!cited.isEmpty()) {
-                putUninterruptibly(queue, new Events.SourcesEvent(cited), cancelled);
-            }
-            putUninterruptibly(queue, new Events.DoneEvent(userThreadId), cancelled);
-            if (onComplete != null) {
-                // 独立任务：随后的哨兵与 finally 取消都不影响它跑完。
-                Background.spawn(onComplete, "memory-capture");
+            // 终态投递前清掉挂起的中断标志：中断的使命（打断图执行）已完成，
+            // 保留它会让下面每个 put 立即抛 CancellationException——done 与
+            // 哨兵全部丢失、消费者永久阻塞在 take()（全量套件实测踩中）。
+            // 清除只影响「过期」标志；put 期间新到的中断仍按 cancelled 语义处理。
+            Thread.interrupted();
+            Events.RunTermination termination = outcome.termination();
+            if (outcome.error() == null) {
+                // 正常返回：DONE（或断连 break 的 CANCELLED——照常走完引用
+                // 解析与记忆钩子，连接已死则入队无害）。
+                // #338：最终回复 [n] 引用解析 → cited sources 事件（在 done 前）。
+                // 与工具执行期的全量 sources 事件互补：这里只发回复真正引用的子集。
+                List<Events.Source> cited = Citations.resolve(
+                        lastReplyText(outcome.state()), Citations.dedup(sourceRegistry));
+                if (!cited.isEmpty()) {
+                    putUninterruptibly(queue, new Events.SourcesEvent(cited), cancelled);
+                }
+                putUninterruptibly(queue, new Events.DoneEvent(userThreadId, termination), cancelled);
+                if (onComplete != null) {
+                    // 独立任务：随后的哨兵与 finally 取消都不影响它跑完。
+                    Background.spawn(onComplete, "memory-capture");
+                }
+            } else if (termination == Events.RunTermination.CANCELLED) {
+                // 断连经 sink 取消传播：连接已死，仍补发标注（#9）——尽力入队。
+                putBestEffort(queue, new Events.DoneEvent(userThreadId, termination), cancelled);
+            } else {
+                // 失败终态：ErrorEvent（既有形状不动）+ done 补 termination
+                // （#9）——前端不再从 error 文本反推结束原因。
+                LOG.error("sse: stream failed", outcome.error());
+                putUninterruptibly(queue, new Events.ErrorEvent(safeErrorText(outcome.error())), cancelled);
+                putUninterruptibly(queue, new Events.DoneEvent(userThreadId, termination), cancelled);
             }
         } catch (java.util.concurrent.CancellationException e) {
-            // 客户端断开：不发终止事件（连接已关）。
+            // 客户端断开（入队被打断）：补发取消标注（#9），入不进队列就放弃。
+            Thread.interrupted(); // 同上：终态投递前清过期中断标志
+            putBestEffort(queue, new Events.DoneEvent(userThreadId, Events.RunTermination.CANCELLED), cancelled);
         } catch (Exception exc) {
+            // 图层之后的失败（引用解析/入队等）：归 INTERNAL_ERROR（#9）。
             LOG.error("sse: stream failed", exc);
+            Thread.interrupted(); // 同上：终态投递前清过期中断标志
             putUninterruptibly(queue, new Events.ErrorEvent(safeErrorText(exc)), cancelled);
+            putUninterruptibly(queue, new Events.DoneEvent(userThreadId, Events.RunTermination.INTERNAL_ERROR), cancelled);
         } finally {
-            putUninterruptibly(queue, SENTINEL, cancelled); // 哨兵必须送达
+            Thread.interrupted(); // 哨兵必须送达：同上，清过期中断标志
+            putUninterruptibly(queue, SENTINEL, cancelled);
             MemoryScope.clear();
+        }
+    }
+
+    /** 尽力入队（取消路径专用）：入不进去就放弃——连接已死，标注无从送达。 */
+    private static void putBestEffort(BlockingQueue<Object> queue, Object event,
+                                      AtomicBoolean cancelled) {
+        try {
+            putUninterruptibly(queue, event, cancelled);
+        } catch (java.util.concurrent.CancellationException ignored) {
+            // 断连后满队列上的 put 永远无人接收（见 putUninterruptibly 的取消分支）。
         }
     }
 

@@ -30,6 +30,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <p>覆盖路线图 #285 圈定的悬空语义：递归触顶、取消丢步、put 失败传播、
  * 条件边未知节点、并发同 thread 快照互踩。其中"取消丢步 / put 失败 /
  * 快照互踩"是 #199/#198/#197 的改造前基线——语义若变，本组测试同步改写。
+ *
+ * <p>另覆盖 #9 的统一终止标注：streamWithTermination 对每个终止点产出
+ * 封闭枚举（DONE/CANCELLED/RECURSION_LIMIT/THREAD_BUSY/INTERNAL_ERROR），
+ * invoke/stream 的既有抛出契约不变。
  */
 class CompiledGraphTest {
 
@@ -490,5 +494,110 @@ class CompiledGraphTest {
 
         GraphState out = graph.invoke(new GraphState(), RunConfig.of("chat:t1", "u1"));
         assertNotNull(out);
+    }
+
+    @Test
+    void streamWithTerminationAnnotatesNormalCompletion() {
+        // #9：正常走到 END（含 put 失败内存续跑后的收尾）→ DONE。
+        CompiledGraph graph = GraphBuilder.singleNode("echo",
+                (state, ctx) -> Map.of(GraphState.MESSAGES, List.of(AiMessage.from("hi"))),
+                new InMemoryCheckpointer());
+
+        CompiledGraph.RunOutcome outcome = graph.streamWithTermination(
+                new GraphState(), RunConfig.of("chat:t1", "u1"), null);
+
+        assertEquals(Events.RunTermination.DONE, outcome.termination());
+        assertNull(outcome.error());
+        assertEquals(1, outcome.state().messages().size());
+    }
+
+    @Test
+    void streamWithTerminationAnnotatesRecursionLimit() {
+        // #9：触顶不抛出——RECURSION_LIMIT 进 outcome，原始异常随 error 携带
+        //（invoke/stream 的抛出契约由 recursionLimitThrowsGraphRecursionError 守住）。
+        CompiledGraph graph = GraphBuilder.begin()
+                .addNode("loop", (state, ctx) -> Map.of())
+                .entry("loop")
+                .addEdge("loop", "loop")
+                .compile(new InMemoryCheckpointer(), "loop");
+
+        CompiledGraph.RunOutcome outcome = graph.streamWithTermination(
+                new GraphState(), new RunConfig("chat:t1", "u1", 3), null);
+
+        assertEquals(Events.RunTermination.RECURSION_LIMIT, outcome.termination());
+        assertTrue(outcome.error() instanceof CompiledGraph.GraphRecursionError,
+                "error 应携带 GraphRecursionError：" + outcome.error());
+        assertNull(outcome.state());
+    }
+
+    @Test
+    void streamWithTerminationAnnotatesCancellation() {
+        // #9：断连 break（#199 丢步基线不变）的出口归 CANCELLED，error 为 null。
+        RecordingSink sink = new RecordingSink();
+        CompiledGraph graph = GraphBuilder.begin()
+                .addNode("agent", (state, ctx) -> {
+                    ctx.emit(RecordingSink.CANCEL_MARKER);
+                    return Map.of();
+                })
+                .entry("agent")
+                .addEdge("agent", GraphBuilder.END)
+                .compile(null, "chat");
+
+        CompiledGraph.RunOutcome outcome = graph.streamWithTermination(
+                new GraphState(), RunConfig.of("chat:t1", "u1"), sink);
+
+        assertEquals(Events.RunTermination.CANCELLED, outcome.termination());
+        assertNull(outcome.error());
+    }
+
+    @Test
+    void streamWithTerminationAnnotatesThreadBusy() throws Exception {
+        // #9：tryLock 失败 → THREAD_BUSY（#197 的快速失败语义投影到终态标注）。
+        InMemoryCheckpointer cp = new InMemoryCheckpointer();
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        CompiledGraph graph = GraphBuilder.begin()
+                .addNode("agent", (state, ctx) -> {
+                    entered.countDown();
+                    release.await();
+                    return Map.of(GraphState.MESSAGES, List.of(AiMessage.from("from-a")));
+                })
+                .entry("agent")
+                .addEdge("agent", GraphBuilder.END)
+                .compile(cp, "chat");
+
+        AtomicReference<CompiledGraph.RunOutcome> outcomeB = new AtomicReference<>();
+        Thread a = new Thread(() -> graph.invoke(new GraphState(), RunConfig.of("chat:t1", "u1")));
+        a.start();
+        assertTrue(entered.await(5, java.util.concurrent.TimeUnit.SECONDS), "A 应先进入节点");
+        Thread b = new Thread(() -> outcomeB.set(graph.streamWithTermination(
+                new GraphState(), RunConfig.of("chat:t1", "u1"), null)));
+        b.start();
+        b.join(5000);
+        assertNotNull(outcomeB.get(), "B 应已返回 outcome");
+        assertEquals(Events.RunTermination.THREAD_BUSY, outcomeB.get().termination());
+        assertTrue(outcomeB.get().error() instanceof CompiledGraph.ThreadBusyError,
+                "error 应携带 ThreadBusyError：" + outcomeB.get().error());
+        release.countDown();
+        a.join(5000);
+    }
+
+    @Test
+    void streamWithTerminationAnnotatesInternalError() {
+        // #9：节点异常/未知节点等其余异常 → INTERNAL_ERROR，异常随 error 携带。
+        CompiledGraph graph = GraphBuilder.begin()
+                .addNode("boom", (state, ctx) -> {
+                    throw new IllegalStateException("boom");
+                })
+                .entry("boom")
+                .addEdge("boom", GraphBuilder.END)
+                .compile(null, "chat");
+
+        CompiledGraph.RunOutcome outcome = graph.streamWithTermination(
+                new GraphState(), RunConfig.of("chat:t1", "u1"), null);
+
+        assertEquals(Events.RunTermination.INTERNAL_ERROR, outcome.termination());
+        assertNotNull(outcome.error());
+        assertNull(outcome.state());
     }
 }

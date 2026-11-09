@@ -13,14 +13,17 @@ import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
@@ -28,9 +31,10 @@ import static org.mockito.Mockito.verify;
 
 /**
  * SSE 流式契约（#292）：事件序（ping 首帧 → 图事件 → done → complete）、
- * step running 首见去重、图异常转 ErrorEvent + completeWithError（URL
- * 脱敏在 safeErrorText）、客户端断连取消传播（sink.cancelled 可见、
- * done 不发）。断言用 send 计数（SseEventBuilder 内容不可反解）。
+ * step running 首见去重、图异常转 ErrorEvent + done 补统一终止标注（#9，
+ * URL 脱敏在 safeErrorText）、客户端断连取消传播（sink.cancelled 可见、
+ * 连接已死时 done 无从送达）。断言用 send 计数 + data 行收集桩
+ * （SseEventBuilder 经 build() 反解出 event/data 内容）。
  */
 class SseStreamsTest {
 
@@ -55,7 +59,10 @@ class SseStreamsTest {
     }
 
     private static boolean await(java.util.function.BooleanSupplier condition) {
-        long deadline = System.currentTimeMillis() + 5000;
+        // 10s：全量套件下 JVM 负载会让「中断→归类→入队→消费」链路显著
+        // 慢于单类跑（实测 5s 预算在满套件偶发超时），条件本身是终态、
+        // 提前满足即提前返回，预算只影响失败路径耗时。
+        long deadline = System.currentTimeMillis() + 10_000;
         while (System.currentTimeMillis() < deadline) {
             if (condition.getAsBoolean()) {
                 return true;
@@ -70,12 +77,37 @@ class SseStreamsTest {
         return condition.getAsBoolean();
     }
 
+    /**
+     * 事件收集桩：把 send 捕获的 SseEventBuilder 反解为 data 行
+     * （SseEventBuilderImpl.build() → DataWithMediaType.getData()）。
+     */
+    private static List<String> collectData(List<Object> builders) {
+        try {
+            List<String> dataLines = new ArrayList<>();
+            for (Object builder : builders) {
+                java.lang.reflect.Method build = builder.getClass().getDeclaredMethod("build");
+                build.setAccessible(true);
+                for (Object item : (java.util.Set<?>) build.invoke(builder)) {
+                    Object data = item.getClass().getMethod("getData").invoke(item);
+                    if (data instanceof String line) {
+                        dataLines.add(line);
+                    }
+                }
+            }
+            return dataLines;
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("SseEventBuilder 反解失败", e);
+        }
+    }
+
     @Test
     void streamsPingFirstThenEventsThenDoneAndCompletes() throws Exception {
         SseEmitter emitter = Mockito.mock(SseEmitter.class);
         AtomicInteger sends = new AtomicInteger();
+        List<Object> builders = new CopyOnWriteArrayList<>();
         doAnswer(inv -> {
             sends.incrementAndGet();
+            builders.add(inv.getArgument(0));
             return null;
         }).when(emitter).send(any(SseEmitter.SseEventBuilder.class));
         CountDownLatch completed = new CountDownLatch(1);
@@ -96,6 +128,10 @@ class SseStreamsTest {
         // 图 completed + delta + done = 5 次 send
         assertEquals(5, sends.get());
         verify(emitter).complete();
+        // #9：正常完成 → done 带统一终止标注 termination=done。
+        assertTrue(collectData(builders).stream().anyMatch(
+                        d -> d.startsWith("{\"type\":\"done\"") && d.contains("\"termination\":\"done\"")),
+                "done 应带 termination=done：" + collectData(builders));
     }
 
     @Test
@@ -136,12 +172,15 @@ class SseStreamsTest {
                 .compile(ctx.checkpointer(), "chat");
         SseEmitter emitter = Mockito.mock(SseEmitter.class);
         AtomicInteger sends = new AtomicInteger();
+        List<Object> builders = new CopyOnWriteArrayList<>();
         doAnswer(inv -> {
             sends.incrementAndGet();
+            builders.add(inv.getArgument(0));
             return null;
         }).when(emitter).send(any(SseEmitter.SseEventBuilder.class));
-        // 错误路径：ErrorEvent 经队列发出，consume 收到哨兵后走 complete()
-        //（completeWithError 只在消费端自身的 send 失败/断连时触发）
+        // 错误路径：ErrorEvent + done(termination) 经队列发出，consume 收到
+        // 哨兵后走 complete()（completeWithError 只在消费端自身的 send
+        // 失败/断连时触发）
         CountDownLatch normalCompleted = new CountDownLatch(1);
         Mockito.doAnswer(inv -> {
             normalCompleted.countDown();
@@ -150,9 +189,17 @@ class SseStreamsTest {
         SseStreams.open(failing, List.of(new dev.langchain4j.data.message.UserMessage("hi")),
                 Map.of(), config(), "sse-t3", null, emitter);
         assertTrue(normalCompleted.await(5, TimeUnit.SECONDS));
-        // ping + 图的 running（节点执行前发出）+ error = 3；done 永不发出
-        assertEquals(3, sends.get());
+        // ping + 图的 running（节点执行前发出）+ error + done = 4；#9 后异常
+        // 路径以 done(termination) 收尾（旧形状为 3 且 done 永不发出）。
+        assertEquals(4, sends.get());
         Mockito.verify(emitter, Mockito.never()).completeWithError(any(Throwable.class));
+        // ErrorEvent（既有形状不动）与 done 的统一终止标注各就各位。
+        List<String> data = collectData(builders);
+        assertTrue(data.stream().anyMatch(d -> d.startsWith("{\"type\":\"error\"")),
+                "error 事件应在场：" + data);
+        assertTrue(data.stream().anyMatch(
+                        d -> d.startsWith("{\"type\":\"done\"") && d.contains("\"termination\":\"internal_error\"")),
+                "done 应带 termination=internal_error：" + data);
     }
 
     @Test
@@ -191,11 +238,52 @@ class SseStreamsTest {
         SseStreams.open(spinner, List.of(new dev.langchain4j.data.message.UserMessage("hi")),
                 Map.of(), config(), "sse-t4", null, emitter);
         assertTrue(errorCompleted.await(5, TimeUnit.SECONDS), "断连应 completeWithError");
-        // done 永不发出（send 总数停在断连时刻，且不再是稳定递增）
+        // done(termination=cancelled) 会被生产者尽力入队（#9），但连接已死
+        // 无从送达——wire 上停发（send 总数停在断连时刻，且不再稳定递增）。
         int sendsAtError = sends.get();
         Thread.sleep(150);
         assertEquals(sendsAtError, sends.get(), "取消后生产者应停发");
         assertTrue(sendsAtError >= 2, "ping 与首个事件都已尝试发送");
+    }
+
+    @Test
+    void clientCancellationEmitsDoneWithCancelledTermination() throws Exception {
+        // #9：取消态的标注可观测路径——经 onCompletion 回调触发 shutdown
+        //（置取消态 + 中断生产者），消费者存活；节点被中断后图层在取消态
+        // 归 CANCELLED（而非 INTERNAL_ERROR），done(termination=cancelled)
+        // 送达 wire。
+        AgentModule.ModuleContext ctx = new AgentModule.ModuleContext(
+                new Settings(), null, new InMemoryCheckpointer(), List.of(), null, null);
+        CompiledGraph spinner = GraphBuilder.begin()
+                .addNode("spin", (GraphState state, NodeContext nodeCtx) -> {
+                    long deadline = System.currentTimeMillis() + 8000;
+                    while (!nodeCtx.cancelled() && System.currentTimeMillis() < deadline) {
+                        Thread.sleep(20);
+                    }
+                    return Map.of();
+                })
+                .entry("spin")
+                .addEdge("spin", GraphBuilder.END)
+                .compile(ctx.checkpointer(), "chat");
+        SseEmitter emitter = Mockito.mock(SseEmitter.class);
+        List<Object> builders = new CopyOnWriteArrayList<>();
+        doAnswer(inv -> {
+            builders.add(inv.getArgument(0));
+            return null;
+        }).when(emitter).send(any(SseEmitter.SseEventBuilder.class));
+        AtomicReference<Runnable> shutdown = new AtomicReference<>();
+        Mockito.doAnswer(inv -> {
+            shutdown.set(inv.getArgument(0));
+            return null;
+        }).when(emitter).onCompletion(any(Runnable.class));
+        SseStreams.open(spinner, List.of(new dev.langchain4j.data.message.UserMessage("hi")),
+                Map.of(), config(), "sse-t5", null, emitter);
+
+        assertNotNull(shutdown.get(), "onCompletion 回调应已注册");
+        shutdown.get().run(); // 模拟容器层取消：置取消态 + 中断生产者
+        assertTrue(await(() -> collectData(builders).stream().anyMatch(
+                        d -> d.startsWith("{\"type\":\"done\"") && d.contains("\"termination\":\"cancelled\""))),
+                "done 应带 termination=cancelled 送达：" + collectData(builders));
     }
 
     @Test

@@ -3,6 +3,8 @@ package io.github.paopaonb666.agentbase.core.graph;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.github.paopaonb666.agentbase.extensions.events.Events;
+
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -92,7 +94,52 @@ public final class CompiledGraph {
         return run(input, config, sink);
     }
 
+    /**
+     * 流式执行并携带权威终止标注（#9）：终止原因由本层在运行结束处判定，
+     * SSE 层据此渲染 done 事件的 termination 字段，不再从异常文本反推。
+     *
+     * <p>失败不抛出——终态以 outcome 携带：ThreadBusyError →
+     * THREAD_BUSY、GraphRecursionError → RECURSION_LIMIT、经 sink 取消
+     * 传播 → CANCELLED、取消态下的其余异常 → CANCELLED（断连 teardown
+     * 期间的中断/关闭失败，客户端已不在，不是服务内部故障）、其余异常 →
+     * INTERNAL_ERROR；原始异常随 error 携带供上层渲染文本。
+     * {@link #invoke}/{@link #stream} 的既有抛出契约保持不变。
+     */
+    public RunOutcome streamWithTermination(GraphState input, RunConfig config, EventSink sink) {
+        try {
+            return runExit(input, config, sink);
+        } catch (ThreadBusyError e) {
+            return new RunOutcome(null, Events.RunTermination.THREAD_BUSY, e);
+        } catch (GraphRecursionError e) {
+            return new RunOutcome(null, Events.RunTermination.RECURSION_LIMIT, e);
+        } catch (java.util.concurrent.CancellationException e) {
+            return new RunOutcome(null, Events.RunTermination.CANCELLED, e);
+        } catch (RuntimeException e) {
+            // 节点内的 InterruptedException 会被上方节点包装点转成
+            // IllegalStateException(cause=interrupt) 的 RuntimeException——
+            // 取消态下（shutdown 先置位再中断）按 CANCELLED 归类，否则
+            // 客户端断开会被误报成服务内部故障。
+            Events.RunTermination termination = sink != null && sink.cancelled()
+                    ? Events.RunTermination.CANCELLED
+                    : Events.RunTermination.INTERNAL_ERROR;
+            return new RunOutcome(null, termination, e);
+        }
+    }
+
+    /**
+     * 一次图运行的终态（#9）：统一终止标注的权威携带。state 为最终（或
+     * 中断时已累积的）状态，失败终态下为 null；error 携带导致终态的原始
+     * 异常（DONE 与图层 break 的 CANCELLED 为 null）。
+     */
+    public record RunOutcome(GraphState state, Events.RunTermination termination, Throwable error) {
+    }
+
     private GraphState run(GraphState input, RunConfig config, EventSink sink) {
+        return runExit(input, config, sink).state();
+    }
+
+    /** 运行出口（#9）：终止标注在本层判定——正常走到 END → DONE、断连 break → CANCELLED。 */
+    private RunOutcome runExit(GraphState input, RunConfig config, EventSink sink) {
         // per-thread 互斥（#197）：拿不到锁说明同 thread 已有 run 在途——
         // 快速失败（last-writer-wins 的快照互踩从根上消除）。
         java.util.concurrent.locks.ReentrantLock lock =
@@ -107,7 +154,7 @@ public final class CompiledGraph {
         }
     }
 
-    private GraphState runLocked(GraphState input, RunConfig config, EventSink sink) {
+    private RunOutcome runLocked(GraphState input, RunConfig config, EventSink sink) {
         GraphState state = loadState(config);
         state.apply(input.updatePayload());
         String current = entry;
@@ -115,7 +162,7 @@ public final class CompiledGraph {
         while (!GraphBuilder.END.equals(current)) {
             if (sink != null && sink.cancelled()) {
                 LOG.debug("图执行被取消（客户端断开）：thread={}", config.threadId());
-                break;
+                return new RunOutcome(state, Events.RunTermination.CANCELLED, null);
             }
             if (steps >= config.recursionLimit()) {
                 throw new GraphRecursionError(recursionMessage(config.recursionLimit()));
@@ -128,7 +175,7 @@ public final class CompiledGraph {
                         .formatted(current, String.join(", ", nodes.keySet())));
             }
             if (sink != null) {
-                sink.accept(io.github.paopaonb666.agentbase.extensions.events.Events.StepEvent.running(current));
+                sink.accept(Events.StepEvent.running(current));
             }
             Map<String, Object> update = executeNode(node, state, config, sink);
             if (sink != null && sink.cancelled()) {
@@ -137,17 +184,17 @@ public final class CompiledGraph {
                 // superstep 不会进 checkpoint，恢复后看不到这半步。
                 LOG.debug("图执行被取消（客户端断开）：thread={}，丢弃步骤 {} 的快照",
                         config.threadId(), current);
-                break;
+                return new RunOutcome(state, Events.RunTermination.CANCELLED, null);
             }
             state.apply(update);
             if (sink != null) {
-                sink.accept(io.github.paopaonb666.agentbase.extensions.events.Events.StepEvent.completed(current));
+                sink.accept(Events.StepEvent.completed(current));
             }
             persistState(config, state);
             steps++;
             current = nextOf(current, state);
         }
-        return state;
+        return new RunOutcome(state, Events.RunTermination.DONE, null);
     }
 
     private Map<String, Object> executeNode(GraphBuilder.Node node, GraphState state,
