@@ -482,18 +482,36 @@ class ToolPoolTest {
     }
 
     @Test
-    void specificationsAndRegisteredToolsFollowAssemblyOrder() {
+    void specificationsAndRegisteredToolsSortedByName() {
+        // #16：乱序装配（模块工具 web_search，工具库逆序 current_time、
+        // calculator）→ 返回面按名字字典序稳定，prompt 工具表前缀逐字节
+        // 稳定（KV-cache 友好）。Map.copyOf 本身不保序，排序在返回时做。
         ToolPool pool = ToolPool.build(
-                List.of(echoTool("m1", "a")),
-                List.of(echoTool("t1", "b"), echoTool("t2", "c")),
+                List.of(echoTool("web_search", "a")),
+                List.of(echoTool("current_time", "b"), echoTool("calculator", "c")),
                 30.0, Map.of(), null);
         assertFalse(pool.isEmpty());
-        // Map.copyOf 不保序：三个名字必须全部在列（顺序契约属 #16 改造范围）。
-        assertEquals(List.of("m1", "t1", "t2"),
-                pool.specifications().stream().map(ToolSpecification::name).sorted().toList());
-        assertEquals(List.of("m1", "t1", "t2"),
-                pool.registeredTools().stream().map(AgentTool::name).sorted().toList());
+        assertEquals(List.of("calculator", "current_time", "web_search"),
+                pool.specifications().stream().map(ToolSpecification::name).toList());
+        assertEquals(List.of("calculator", "current_time", "web_search"),
+                pool.registeredTools().stream().map(AgentTool::name).toList());
         assertEquals(3, pool.specifications().size());
         assertEquals(3, pool.registeredTools().size());
+    }
+
+    @Test
+    void specificationsHandleEmptyAndSingleToolPools() {
+        // #16 边界：空池返回空列表，单工具顺序自然不变。
+        ToolPool empty = ToolPool.build(List.of(), List.of(), 30.0, Map.of(), null);
+        assertTrue(empty.isEmpty());
+        assertEquals(List.of(), empty.specifications());
+        assertEquals(List.of(), empty.registeredTools());
+
+        ToolPool single = ToolPool.build(
+                List.of(echoTool("echo", "pong")), List.of(), 30.0, Map.of(), null);
+        assertEquals(List.of("echo"),
+                single.specifications().stream().map(ToolSpecification::name).toList());
+        assertEquals(List.of("echo"),
+                single.registeredTools().stream().map(AgentTool::name).toList());
     }
 }

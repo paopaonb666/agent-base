@@ -55,8 +55,14 @@ import io.github.paopaonb666.agentbase.extensions.toollog.ToolCallRecorder;
  * 失败（outcome=invalid，#334/#335：不执行、回喂契约文本）四种结局
  * 都会被记录。
  *
- * <p>对应 Python 侧 {@code core/tools.py}。
- */
+     * <p>对应 Python 侧 {@code core/tools.py}。
+     *
+     * <p>#16 工具表稳定排序：{@link #specifications()} /
+     * {@link #registeredTools()} 按工具名字典序返回——装配序会随模块清单
+     * 漂移，排序保证 prompt 工具表前缀逐字节稳定（KV-cache 友好）。Python
+     * 侧 {@code build_tool_pool} 仍按装配序返回（不排序），Java 侧排序属
+     * 单边增强（差异表 #315 后续补行）。
+     */
 public final class ToolPool {
 
     private static final Logger LOG = LoggerFactory.getLogger(ToolPool.class);
@@ -146,14 +152,27 @@ public final class ToolPool {
                 timeouts.getOrDefault(tool.name(), defaultTimeout)));
     }
 
-    /** 池内全部工具的 ToolSpecification（按装配顺序），供绑定模型。 */
+    /**
+     * 池内全部工具的 ToolSpecification（按名字稳定排序，#16），供绑定模型。
+     *
+     * <p>#16：装配序会随模块清单漂移（且 Map.copyOf 本身不保序），模型看到
+     * 的工具表顺序漂移会破坏 prompt 前缀稳定性（KV-cache 命中率）。排序在
+     * 返回时按工具名字典序做（内部存储不动），保证工具表前缀逐字节稳定。
+     */
     public List<ToolSpecification> specifications() {
-        return tools.values().stream().map(Entry::spec).toList();
+        return sortedEntries().stream().map(entry -> entry.getValue().spec()).toList();
     }
 
-    /** 池内登记的原始工具视图（按装配顺序；ModuleContext 交给模块用）。 */
+    /** 池内登记的原始工具视图（按名字稳定排序，同 {@link #specifications()}；ModuleContext 交给模块用）。 */
     public List<AgentTool> registeredTools() {
-        return tools.values().stream().map(Entry::inner).toList();
+        return sortedEntries().stream().map(entry -> entry.getValue().inner()).toList();
+    }
+
+    /** #16：池内条目按工具名字典序（键即工具名）；排序在返回时做，内部存储保持装配态。 */
+    private List<Map.Entry<String, Entry>> sortedEntries() {
+        return tools.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey())
+                .toList();
     }
 
     /** 池是否为空。 */
