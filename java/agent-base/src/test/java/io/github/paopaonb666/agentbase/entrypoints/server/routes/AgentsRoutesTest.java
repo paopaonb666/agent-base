@@ -268,9 +268,11 @@ class AgentsRoutesTest {
     @Test
     void perUserRateLimitGives429WithRetryAfter() throws Exception {
         // #78：RATE_LIMIT_PER_MINUTE=1 → 同一用户第二发 429 + Retry-After；
-        // 限流在认证后、副作用前（不发 SSE、不写索引）。
+        // 限流在认证后、副作用前（不发 SSE、不写索引）。配 secret 走真
+        // per-user 分桶（无鉴权部署是共享降级桶，见下一条）。
         AgentRuntime runtime = buildRuntime(Settings.load(Map.of(
-                "ENV", "development", "RATE_LIMIT_PER_MINUTE", "1")), Map.of("chat", stubModule("chat")),
+                "ENV", "development", "RATE_LIMIT_PER_MINUTE", "1",
+                "MEMORY_AUTH_SECRET", "s")), Map.of("chat", stubModule("chat")),
                 null, null, null, null, null, null);
         AgentsRoutes routes = route(runtime);
         var first = new org.springframework.mock.web.MockHttpServletResponse();
@@ -285,6 +287,21 @@ class AgentsRoutesTest {
         // 不同用户桶独立：bob 首发不受 alice 限流影响。
         var third = new org.springframework.mock.web.MockHttpServletResponse();
         assertNotNull(invoke(routes, "chat", invokeBody("hi", null, null, null, null), "bob", third));
+    }
+
+    @Test
+    void unauthenticatedDeploymentSharesOneRateLimitBucket() throws Exception {
+        // review R1-F2：无鉴权部署下 X-User-Id 客户端可控——按其分桶等于
+        // 发无限个桶（无界表 DoS）。共享降级桶：alice 耗尽后 bob 同样 429。
+        AgentRuntime runtime = buildRuntime(Settings.load(Map.of(
+                "ENV", "development", "RATE_LIMIT_PER_MINUTE", "1")),
+                Map.of("chat", stubModule("chat")),
+                null, null, null, null, null, null);
+        AgentsRoutes routes = route(runtime);
+        assertNotNull(invoke(routes, "chat", invokeBody("hi", null, null, null, null), "alice"));
+        HttpError bob = httpErrorOf(() ->
+                invoke(routes, "chat", invokeBody("hi", null, null, null, null), "bob"));
+        assertEquals(429, bob.status(), "共享桶：bob 应受 alice 已耗尽额度约束");
     }
 
     @Test

@@ -207,8 +207,13 @@ public class AgentsRoutes {
                 : io.github.paopaonb666.agentbase.extensions.Observability.newRequestId();
         String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         // per-user 限流（#78）：认证之后、任何副作用之前——429 优先于半截
-        // SSE（与预算熔断 429 同哲学）。Retry-After 取整窗口秒数。
-        if (!rateLimiter.tryAcquire(userId, System.nanoTime())) {
+        // SSE（与预算熔断 429 同哲学）。无鉴权部署（#196：secret 空，全部
+        // 请求落 default 用户）用共享降级桶——X-User-Id 此时客户端可控，
+        // 按"用户"分桶等于给攻击者发无限个桶（review R1-F2）。
+        String limitKey = AuthBackends.unauthenticatedDeployment(runtime.settings())
+                ? "__unauthenticated__"
+                : userId;
+        if (!rateLimiter.tryAcquire(limitKey, System.nanoTime())) {
             response.setHeader("Retry-After", String.valueOf(60));
             throw new HttpError(429, "请求过于频繁：每用户上限 " + rateLimiter.perMinute()
                     + " 次/分钟，请稍后重试（RATE_LIMIT_PER_MINUTE）");

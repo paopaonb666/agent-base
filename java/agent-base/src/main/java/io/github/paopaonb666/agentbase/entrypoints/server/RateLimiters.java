@@ -62,7 +62,10 @@ public final class RateLimiters {
                     buckets.computeIfAbsent(userId, k -> new AtomicReference<>(new BucketState(perMinute, nowNanos)));
             while (true) {
                 BucketState cur = ref.get();
-                double refill = (nowNanos - cur.lastNanos()) / 60_000_000_000.0 * perMinute;
+                // 跨线程时钟乱序防护（review R1-F4）：now 早于上次结算点时
+                // 回填为 0，避免负 refill 把令牌扣成负数。
+                double refill =
+                        Math.max(0, nowNanos - cur.lastNanos()) / 60_000_000_000.0 * perMinute;
                 double tokens = Math.min(perMinute, cur.tokens() + refill);
                 if (tokens >= 1.0) {
                     if (ref.compareAndSet(cur, new BucketState(tokens - 1.0, nowNanos))) {

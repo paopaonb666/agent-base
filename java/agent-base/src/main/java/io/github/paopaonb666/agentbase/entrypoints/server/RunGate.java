@@ -16,6 +16,7 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class RunGate {
 
     private final Semaphore permits;
+    private final int configured;
     private final AtomicInteger inFlight = new AtomicInteger();
     private final AtomicLong rejected = new AtomicLong();
 
@@ -24,11 +25,12 @@ public final class RunGate {
             throw new IllegalArgumentException("maxConcurrent must be >= 0, got " + maxConcurrent);
         }
         this.permits = maxConcurrent <= 0 ? null : new Semaphore(maxConcurrent);
+        this.configured = maxConcurrent;
     }
 
-    /** 配置的并发上限（0 = 不限）。 */
+    /** 配置的并发上限（0 = 不限）——429 文案引用，不随负载漂移（review R3）。 */
     public int maxConcurrent() {
-        return permits == null ? 0 : Math.max(inFlight.get(), permits.availablePermits());
+        return configured;
     }
 
     /** 在途 run 数（可观测面）。 */
