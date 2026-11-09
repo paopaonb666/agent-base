@@ -200,7 +200,8 @@ class SystemRoutesHealthTest {
 
     @Test
     void componentOrderIsStableForHumans() throws Exception {
-        // 渲染顺序锁定（LinkedHashMap）：checkpointer → model → memory → cost。
+        // 渲染顺序锁定（LinkedHashMap）：checkpointer → model → memory → cost
+        // → pools（#81 观测数值段恒在尾部）。
         Settings s = settingsWith("", "http://health-order-" + System.nanoTime(), false);
         var checkpointer = Mockito.mock(io.github.paopaonb666.agentbase.core.graph.Checkpointer.class);
         Mockito.when(checkpointer.healthy()).thenReturn(true);
@@ -210,7 +211,43 @@ class SystemRoutesHealthTest {
         CostGovernor governor = Mockito.mock(CostGovernor.class);
         Mockito.when(governor.status()).thenReturn("ok");
         Map<String, String> c = components(healthOf(buildRuntime(s, checkpointer, memory), governor));
-        assertEquals("[checkpointer, model, memory, cost]", c.keySet().toString());
+        assertEquals("[checkpointer, model, memory, cost, pools]", c.keySet().toString());
         assertTrue(c.containsKey("memory"));
+    }
+
+    @Test
+    void poolsComponentReportsGaugesWithoutFlippingStatus() throws Exception {
+        // #81：池水位是观测数值段（tool 在飞/排队/泄漏 + bg_pending +
+        // cost_dropped），不参与 ok/degraded 判定；tools 缺席时省 tool 段。
+        Settings s = settingsWith("", "http://health-pools", false);
+        Map<String, String> c = components(healthOf(buildRuntime(s, null, null), null));
+        String pools = c.get("pools");
+        assertTrue(pools != null && pools.startsWith("bg_pending:0")
+                && pools.contains("cost_dropped:0"), String.valueOf(pools));
+        assertFalse(pools.contains("tool:"), "tools 缺席应省 tool 段：" + pools);
+
+        // 带真身工具池 + 健康 checkpointer + 已配 model：tool 段出现且数值为
+        // 运行计数；其余组件全 ok 时整体状态仍 ok（pools 不参与判定）。
+        var pool = io.github.paopaonb666.agentbase.core.tools.ToolPool.build(
+                java.util.List.of(), java.util.List.of(), 30.0, java.util.Map.of(), null);
+        var checkpointer = Mockito.mock(io.github.paopaonb666.agentbase.core.graph.Checkpointer.class);
+        Mockito.when(checkpointer.healthy()).thenReturn(true);
+        Settings allOkSettings = settingsWith("sk-test", "http://health-pools-ok", false);
+        Constructor<AgentRuntime> ctor = AgentRuntime.class.getDeclaredConstructor(
+                Settings.class, io.github.paopaonb666.agentbase.core.llm.ModelRuntime.class,
+                Map.class, io.github.paopaonb666.agentbase.core.tools.ToolPool.class,
+                io.github.paopaonb666.agentbase.core.graph.Checkpointer.class,
+                io.github.paopaonb666.agentbase.extensions.toollog.ToolCallRecorder.class,
+                io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStore.class,
+                AgentModule.MemoryServicePort.class,
+                io.github.paopaonb666.agentbase.core.storage.CoreStore.class,
+                AgentModule.PlanStorePort.class);
+        ctor.setAccessible(true);
+        AgentRuntime withPool = ctor.newInstance(allOkSettings, null, Map.of(), pool, checkpointer, null,
+                null, null, null, null);
+        Map<String, Object> health = healthOf(withPool, null);
+        String withTool = components(health).get("pools");
+        assertTrue(withTool.startsWith("tool:0/0,leaked:0,"), withTool);
+        assertEquals("ok", health.get("status"), "pools 数值段不得翻转整体状态");
     }
 }

@@ -6,6 +6,8 @@ import java.util.List;
 import java.util.Map;
 
 import io.github.paopaonb666.agentbase.core.AgentRuntime;
+import io.github.paopaonb666.agentbase.entrypoints.server.Background;
+import io.github.paopaonb666.agentbase.extensions.costmeter.CostMeters;
 import io.github.paopaonb666.agentbase.core.config.Settings;
 import io.github.paopaonb666.agentbase.extensions.Metrics;
 import io.github.paopaonb666.agentbase.extensions.costmeter.CostGovernor;
@@ -176,7 +178,20 @@ public class SystemRoutes {
         if (governor != null) {
             components.put("cost", governor.status());
         }
-        boolean allOk = components.values().stream().allMatch("ok"::equals);
+        // 池水位（#81）：有界池家族的运行计数——工具池（在飞/排队/泄漏累计）、
+        // Background 队列、成本账本丢弃。观测数值段，不参与 ok/degraded 判定
+        // （与 snapshot debt 同哲学：数值是排障线索，不是健康语义）。
+        var pools = new StringBuilder("bg_pending:").append(Background.pending())
+                .append(",cost_dropped:").append(CostMeters.cost().droppedRecordCount());
+        if (runtime.tools() != null) {
+            pools.insert(0, "tool:" + runtime.tools().activeThreadCount()
+                    + "/" + runtime.tools().queuedCount()
+                    + ",leaked:" + runtime.tools().leakedTaskCount() + ",");
+        }
+        components.put("pools", pools.toString());
+        boolean allOk = components.entrySet().stream()
+                .filter(e -> !"pools".equals(e.getKey()))
+                .allMatch(e -> "ok".equals(e.getValue()));
         return Map.of("status", allOk ? "ok" : "degraded", "components", components);
     }
 
