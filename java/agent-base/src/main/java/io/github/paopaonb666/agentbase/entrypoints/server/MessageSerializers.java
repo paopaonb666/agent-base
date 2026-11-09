@@ -98,6 +98,13 @@ public final class MessageSerializers {
     }
 
     /**
+     * 审计视图下 system 消息文本的码点上限（#154）。注入块可携带整份附件
+     * 提取文本（docParse.maxOutputChars 默认 5 万字符），历史端点只用于
+     * 确认「模型实际看到了什么注入」，全文上屏没必要也放大响应体。
+     */
+    static final int SYSTEM_AUDIT_MAX_CODE_POINTS = 300;
+
+    /**
      * 把一条消息序列化为前端可渲染的简单结构；返回 {@code null} 表示这条
      * 消息不该显示（如 system 注入块）。工具调用可观测（M5）：AI 消息携带
      * {@code tool_calls}（id/name/args），tool 消息携带
@@ -109,11 +116,40 @@ public final class MessageSerializers {
      * {@code attachments} 键，按消息索引对齐——序列化行为一致）。
      */
     public static Map<String, Object> serializeMessage(ChatMessage message, Object attachmentMeta) {
+        return serializeMessage(message, attachmentMeta, false);
+    }
+
+    /**
+     * 三参形态（#154）：{@code includeSystem=true} 时 system 消息以
+     * {@code {"role":"system","content":…}} 上屏——审计 prompt 组装用
+     * （附件注入块、记忆上下文都走 system 消息，默认不上屏意味着
+     * 「模型实际看到了什么」不可审计）。这是 Java wire 单边扩展
+     * （Python 历史端点未跟进该参数），差异登记见 #154。
+     *
+     * <p>system 内容是纯文本注入块（图片走 human 多模态 content，不进
+     * system 消息），但可携带整份附件提取文本——审计视图按码点截断到
+     * {@value #SYSTEM_AUDIT_MAX_CODE_POINTS}（按码点不按 char，surrogate
+     * 对不破）。
+     */
+    public static Map<String, Object> serializeMessage(ChatMessage message, Object attachmentMeta,
+                                                       boolean includeSystem) {
         String text = extractText(message);
         if (message instanceof SystemMessage) {
             // 附件注入的系统消息：内容只在当轮给模型，历史回放由 human 消息
-            // 上的附件元数据承载——blob 永不上屏。
-            return null;
+            // 上的附件元数据承载——blob 永不上屏。includeSystem=true（#154
+            // 审计参数）才以截断文本上屏。
+            if (!includeSystem) {
+                return null;
+            }
+            String auditText = text == null ? "" : text;
+            if (auditText.codePointCount(0, auditText.length()) > SYSTEM_AUDIT_MAX_CODE_POINTS) {
+                auditText = auditText.substring(0,
+                        auditText.offsetByCodePoints(0, SYSTEM_AUDIT_MAX_CODE_POINTS));
+            }
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("role", "system");
+            out.put("content", auditText);
+            return out;
         }
         if (message instanceof UserMessage) {
             Map<String, Object> out = new LinkedHashMap<>();

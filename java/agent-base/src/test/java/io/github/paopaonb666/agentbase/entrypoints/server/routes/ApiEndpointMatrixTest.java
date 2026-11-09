@@ -569,4 +569,60 @@ class ApiEndpointMatrixTest {
                 "pages", 3, "truncated", false, "text_len", 4200)),
                 human.get("attachments"), "附件元数据应逐字段一致地随历史读回");
     }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void threadHistoryIncludeSystemAuditsInjectionBlocks() throws Exception {
+        // #154：默认历史不上屏 system 消息（现行为零变化——附件注入块只在
+        // 当轮给模型，回放由 human 消息附件元数据承载）；include_system=true
+        // （Java wire 单边扩展，Python 端点未跟进）时 system 行上屏，审计
+        // 「模型实际看到了什么 prompt 组装」。两层锁定法同 #291②：直接图
+        // 驱动写快照再读历史（SSE 生产者在测试 servlet 里跑不完落盘）。
+        var index = Mockito.mock(io.github.paopaonb666.agentbase.core.storage.CoreStore.class);
+        when(index.getThreadIndex("chat:sys")).thenReturn(
+                ThreadIndexRecord.create("chat:sys", "alice", "chat", "t"));
+        AgentRuntime runtime = runtime(Map.of("chat", graphStub("chat")),
+                new InMemoryCheckpointer(), index, null, null, null, null);
+        AgentsRoutes routes = new AgentsRoutes(runtime, PASS_THROUGH_AUTH, providerOf(null));
+
+        // 图驱动写快照：附件注入块形状的 system 消息（ATTACHMENT_CONTEXT_PREFIX
+        // 开头，正文按 maxOutputChars 默认 5 万字符量级的巨型提取文本）+ human。
+        String giantBody = "附件正文".repeat(10_000); // 4 万码点，超审计截断阈值
+        String block = io.github.paopaonb666.agentbase.core.context.ContextEngine.ATTACHMENT_CONTEXT_PREFIX
+                + "，供回答时参考：\n\n[附件文件：a.txt（txt，40000 字符）]\n" + giantBody;
+        var graph = runtime.graph("chat");
+        var state = new io.github.paopaonb666.agentbase.core.graph.GraphState(
+                List.of(dev.langchain4j.data.message.SystemMessage.from(block),
+                        dev.langchain4j.data.message.UserMessage.from("总结附件")),
+                Map.of());
+        graph.invoke(state, new io.github.paopaonb666.agentbase.core.graph.RunConfig("chat:sys", "alice", 25));
+
+        // 默认（六参兼容入口=现行为）：system 行不上屏，只回 human。
+        Map<String, Object> legacy = mapOf(routes.threadHistory("chat", "sys", "alice", null, null, null));
+        List<Map<String, Object>> legacyMessages = (List<Map<String, Object>>) legacy.get("messages");
+        assertEquals(1, legacyMessages.size(), "默认历史不应上屏 system 行（现行为回归锁定）");
+        assertEquals("human", legacyMessages.get(0).get("role"));
+
+        // Spring 绑定入口直调：显式 false 与缺省同语义；"1" 是惯用简写。
+        Map<String, Object> explicitOff = mapOf(routes.threadHistory("chat", "sys", "alice",
+                null, null, null, "false"));
+        assertEquals(1, ((List<?>) explicitOff.get("messages")).size());
+        Map<String, Object> on = mapOf(routes.threadHistory("chat", "sys", "alice",
+                null, null, null, "true"));
+        List<Map<String, Object>> withSystem = (List<Map<String, Object>>) on.get("messages");
+        assertEquals(2, withSystem.size(), "include_system=true 时 system 行应在 human 之前上屏");
+        Map<String, Object> systemRow = withSystem.get(0);
+        assertEquals("system", systemRow.get("role"));
+        String content = (String) systemRow.get("content");
+        assertTrue(content.startsWith(
+                io.github.paopaonb666.agentbase.core.context.ContextEngine.ATTACHMENT_CONTEXT_PREFIX),
+                "content 应含注入前缀，可审计注入块");
+        // 审计截断：4 万码点 → 恰 300 码点（按码点不按 char）。
+        assertEquals(300, content.codePointCount(0, content.length()));
+        assertEquals("human", withSystem.get(1).get("role"));
+
+        Map<String, Object> shorthand = mapOf(routes.threadHistory("chat", "sys", "alice",
+                null, null, null, "1"));
+        assertEquals(2, ((List<?>) shorthand.get("messages")).size(), "\"1\" 与 true 同语义");
+    }
 }

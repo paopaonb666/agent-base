@@ -534,6 +534,10 @@ public class AgentsRoutes {
     }
 
     // ── GET /{module}/threads/{thread_id}：持久化消息历史 ────────────────
+    // 可选 ?include_system=true|1（#154，Java 单边增强，Python 端点未跟进
+    // ——差异登记）：system 消息（附件注入块、记忆上下文）默认不上屏
+    // （现行为零变化），prompt 组装审计时显式传 true 才以
+    // {"role":"system","content":…} 上屏（审计视图按码点截断）。
 
     @GetMapping("/{module}/threads/{thread_id}")
     public Map<String, Object> threadHistory(@PathVariable("module") String module,
@@ -541,7 +545,25 @@ public class AgentsRoutes {
                                              @RequestHeader(value = "X-User-Id", required = false) String userIdHeader,
                                              @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
                                              @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,
-                                             @RequestHeader(value = "X-User-Nonce", required = false) String nonceHeader) {
+                                             @RequestHeader(value = "X-User-Nonce", required = false) String nonceHeader,
+                                             @RequestParam(value = "include_system", required = false) String includeSystem) {
+        // 缺省/非 true 值一律视为 false（system 不上屏）；"1" 是惯用简写。
+        // 与 deleteThread 的 purge_memories 解析同款。
+        boolean withSystem = "true".equalsIgnoreCase(includeSystem) || "1".equals(includeSystem);
+        return threadHistory(module, threadId, userIdHeader, sigHeader, tsHeader, nonceHeader, withSystem);
+    }
+
+    /** 六参形态（include_system 缺省 false）：既有调用方/测试的兼容入口。 */
+    public Map<String, Object> threadHistory(String module, String threadId,
+                                             String userIdHeader, String sigHeader,
+                                             String tsHeader, String nonceHeader) {
+        return threadHistory(module, threadId, userIdHeader, sigHeader, tsHeader, nonceHeader, false);
+    }
+
+    public Map<String, Object> threadHistory(String module, String threadId,
+                                             String userIdHeader, String sigHeader,
+                                             String tsHeader, String nonceHeader,
+                                             boolean includeSystem) {
         // 鉴权先行（对应 Python get_current_user 依赖先于一切处理逻辑）。
         String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         validateThreadId(threadId);
@@ -556,7 +578,7 @@ public class AgentsRoutes {
             int idx = 0;
             for (ChatMessage message : snapshot.messages()) {
                 Object meta = attachmentsByIndex.get(String.valueOf(idx));
-                var serialized = MessageSerializers.serializeMessage(message, meta);
+                var serialized = MessageSerializers.serializeMessage(message, meta, includeSystem);
                 if (serialized != null) {
                     messages.add(serialized);
                 }
