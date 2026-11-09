@@ -164,9 +164,11 @@ class MemoryToolsTest {
         assertEquals("记忆保存被拒绝：内容命中敏感信息规则（api_key、phone_number），请移除后重试",
                 multi);
 
-        // 关闭开关（build 重载）：同一内容照常落库。
+        // 关闭开关（build 重载 + 全局设置关）：同一内容照常落库——service 层
+        // 兜底红线（review R3-P1）与工具层共用 MEMORY_SENSITIVE_CONTENT_FILTER。
         MemoryService unfiltered = new MemoryService(store, neverEmbedder(),
-                Settings.load(Map.of(), null), null, null);
+                Settings.load(Map.of("ENV", "development",
+                        "MEMORY_SENSITIVE_CONTENT_FILTER", "false"), null), null, null);
         AgentTool save = MemoryTools.build(unfiltered, false).stream()
                 .filter(t -> t.name().equals("memory_save")).findFirst().orElseThrow();
         String saved = call(save, "{\"content\": \"用户的密钥是 sk-abcdefghijklmnop123456\"}", null);

@@ -131,6 +131,26 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
         return vectors.get(0);
     }
 
+    /**
+     * 敏感内容红线（#48 的 service 层兜底，review R3-P1）：抽取路径由管线
+     * 拦截、memory_save 由工具层拦截，但 REST 写路径（POST/PATCH /v1/memory、
+     * PUT blocks）与 memory_update_block 之前不过滤——模型改走旁路即可把
+     * 密钥写进每轮注入的常驻块。所有写路径在 service 层统一拦截；开关
+     * （MEMORY_SENSITIVE_CONTENT_FILTER）与工具层共用。
+     */
+    private void assertContentClean(String content) {
+        if (!settings.memory.sensitiveContentFilter || content == null || content.isEmpty()) {
+            return;
+        }
+        List<String> rules =
+                io.github.paopaonb666.agentbase.memory.textkit.SensitiveContentPolicy
+                        .INSTANCE.violations(content);
+        if (!rules.isEmpty()) {
+            throw new MemoryStoreError("内容命中敏感信息规则（" + String.join("、", rules)
+                    + "），已拒绝入库；请移除敏感信息后重试");
+        }
+    }
+
     /** 写入一条记忆；向量尽力而为（不可用就存纯文本）。 */
     public MemoryRecord addMemory(String userId, String agentId, String content, String kind,
                                   List<String> tags, double salience, String sourceThreadId) {
@@ -138,6 +158,7 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
             throw new MemoryStoreError("unknown memory kind '" + kind + "'; expected one of "
                     + Models.KNOWN_MEMORY_KINDS);
         }
+        assertContentClean(content);
         long started = System.nanoTime();
         double now = Models.now();
         List<Float> embedding = embedOne(content);
@@ -165,6 +186,9 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
         if (status != null && !Models.KNOWN_MEMORY_STATUSES.contains(status)) {
             throw new MemoryStoreError("unknown memory status '" + status + "'; expected one of "
                     + Models.KNOWN_MEMORY_STATUSES);
+        }
+        if (content != null) {
+            assertContentClean(content);
         }
         long started = System.nanoTime();
         String newContent = content != null ? content : existing.content();
@@ -664,6 +688,7 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
         // （char_limit 只是块的声明容量，注入组装时才按预算裁剪——在这里
         // 截断会永久丢字，版本号还照常递增）。
         MemoryBlock existing = store.getBlock(userId, agentId, label);
+        assertContentClean(content);
         int version = existing != null ? existing.version() + 1 : 1;
         MemoryBlock block = new MemoryBlock(userId, agentId, label,
                 content, charLimit, version, Models.now());

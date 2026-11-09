@@ -34,7 +34,7 @@ import io.github.paopaonb666.agentbase.memory.tools.MemoryTools;
 class MemoryServiceBlockTest {
 
     /** 恒不向量化：MemoryService 各路径对 null 嵌入的降级分支。 */
-    private static EmbeddingClient neverEmbedder() {
+    static EmbeddingClient neverEmbedder() {
         return new EmbeddingClient() {
             @Override public Integer dims() { return null; }
             @Override public List<List<Float>> embed(List<String> texts) { return null; }
