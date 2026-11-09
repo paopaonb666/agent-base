@@ -100,6 +100,13 @@ public final class ResilientModelRuntime implements ModelRuntime {
     }
 
     @Override
+    public boolean toolSafeStreaming() {
+        // 透明层同口径（review R2-F5）：快档将来被本层包装时 tool-safe
+        // 回退不得静默失效。
+        return delegate.toolSafeStreaming();
+    }
+
+    @Override
     public ChatModel chat() {
         return delegate.chat();
     }

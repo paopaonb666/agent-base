@@ -197,4 +197,24 @@ class ResilientModelRuntimeTest {
                 () -> Settings.load(Map.of("ENV", "development", "LLM_MAIN_CONCURRENCY", "0"), null));
         assertTrue(true);
     }
+
+    @Test
+    void transparentLayerDelegatesAuditFaces() {
+        // review R2-F5：弹性包装是透明层——toolSafeStreaming（#128 可观测面）
+        // 与 contextWindowTokens（#4）都必须穿透到内层运行时，否则快档将来
+        // 被包装时 tool-safe 回退静默失效、窗口推导拿 0。
+        ModelRuntime inner = new ModelRuntime() {
+            @Override public ChatModel chat() { throw new UnsupportedOperationException(); }
+            @Override public StreamingChatModel streaming() { return null; }
+            @Override public AiMessage stream(List<ChatMessage> messages,
+                    List<dev.langchain4j.agent.tool.ToolSpecification> tools,
+                    java.util.function.Consumer<String> onDelta) { throw new UnsupportedOperationException(); }
+            @Override public AiMessage invoke(List<ChatMessage> messages) { throw new UnsupportedOperationException(); }
+            @Override public boolean toolSafeStreaming() { return true; }
+            @Override public int contextWindowTokens() { return 8192; }
+        };
+        ModelRuntime wrapped = new ResilientModelRuntime(inner, 2, 4);
+        assertTrue(wrapped.toolSafeStreaming());
+        assertEquals(8192, wrapped.contextWindowTokens());
+    }
 }

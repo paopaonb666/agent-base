@@ -17,11 +17,11 @@ import java.util.function.BiConsumer;
  * 永远不改代码。provider 名已在 {@link Settings} 校验，这里只做拼写兜底。
  *
  * <p>双档位（成本治理）：{@code profile="fast"} 在 {@code LLM_FAST_*} 已配置
- * 时返回独立运行时（免费/低价模型吃批量任务）。与 Python 的差异：
- * Python 侧未配置快档时 {@code build_llm(settings, "fast")} 返回与 main
- * 相同配置的客户端（对象不同、配置相同），而 Java 侧返回 {@code null}，
- * 由调用方（{@link ResilientLlm} / 组合根）显式回落主力运行时——可观察
- * 行为一致：快档流量最终都打到主力配置。
+ * 时返回独立运行时（免费/低价模型吃批量任务）。未配置快档时回落主力配置
+ * 构建（#128：对象不同、配置相同——对齐 Python {@code build_llm} 恒返回
+ * 客户端的语义），且快档恒走工具安全装配（含回落形态，见下）。
+ * 分流决策（要不要用快档）由调用方按 {@code LLM_FAST_*} 是否配置自行做出
+ * ——{@code profileView} 未配置时仍显式 400（API 契约，#289 锁定）。
  *
  * <p>快档走工具安全装配（{@code toolSafeStreaming=true}）：SiliconFlow 的
  * GLM-4-9B 在流式模式下把工具名拆进 {@code arguments} delta（
@@ -50,7 +50,7 @@ public final class LlmFactory {
      *         用主力配置构建——对齐 Python {@code build_llm(profile="fast")
      *         } 的回落语义；且快档恒走工具安全装配（#128：回落路径复用
      *         toolSafe 判定，不把流式 tool_calls 协议缺陷重新暴露给回落
-     *         流量）。调用方按 {@code LLM_FAST_*} 是否配置自行决定分流。
+     *         流量）。分流决策由调用方按 {@code LLM_FAST_*} 是否配置做出。
      */
     public static ModelRuntime buildLlm(Settings settings, String profile, BiConsumer<String, TokenUsage> usageSink) {
         if (!"main".equals(profile) && !"fast".equals(profile)) {
