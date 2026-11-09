@@ -77,6 +77,31 @@ class LangChain4jRuntimeTest {
     }
 
     @Test
+    void rebuiltAiMessageCarriesStableAuditId() {
+        // #123：每次模型调用产出的 AiMessage 带唯一稳定 id（审计/前端锚点）；
+        // 两次调用 id 不同；invoke 路径同口径。
+        ScriptedModels.ScriptedStreamingModel streaming =
+                new ScriptedModels.ScriptedStreamingModel(List.of(
+                        ScriptedModels.ScriptedResponse.of("a"),
+                        ScriptedModels.ScriptedResponse.of("a")));
+        LangChain4jRuntime runtime = new LangChain4jRuntime(
+                new ScriptedModels.ScriptedChatModel(List.of()), streaming, "scripted-main", false, null);
+        AiMessage first = runtime.stream(MESSAGES, List.of(), delta -> {});
+        AiMessage second = runtime.stream(MESSAGES, List.of(), delta -> {});
+        assertTrue(first.attribute("id", String.class) != null
+                        && first.attribute("id", String.class).startsWith("msg-"),
+                "重建消息应带 msg- 前缀的稳定 id");
+        assertEquals("a", first.text());
+        assertTrue(!first.attribute("id", String.class)
+                .equals(second.attribute("id", String.class)), "不同调用 id 唯一");
+        ScriptedModels.ScriptedChatModel chat =
+                new ScriptedModels.ScriptedChatModel(List.of(ScriptedModels.ScriptedResponse.of("b")));
+        LangChain4jRuntime plain = new LangChain4jRuntime(chat, null, "scripted-main", false, null);
+        AiMessage invoked = plain.invoke(MESSAGES);
+        assertTrue(invoked.attribute("id", String.class) != null, "invoke 路径同口径");
+    }
+
+    @Test
     void streamAggregatesToolCallsWithAccumulatedText() {
         ScriptedModels.ScriptedResponse scripted = ScriptedModels.ScriptedResponse.withToolCalls(
                 " I will use the tool. ", List.of(echoCall()));

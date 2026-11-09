@@ -177,6 +177,12 @@ public final class MessageSerializers {
             Map<String, Object> out = new LinkedHashMap<>();
             out.put("role", "assistant");
             out.put("content", text);
+            // #123：稳定 id 上屏（前端锚点）；仅在有 id 时加键——旧快照/其他
+            // 来源的 assistant 行 wire 不变（Java 单边扩展，Python 无此键）。
+            String messageId = ai.attribute("id", String.class);
+            if (messageId != null && !messageId.isEmpty()) {
+                out.put("id", messageId);
+            }
             if (!toolCalls.isEmpty()) {
                 out.put("tool_calls", toolCalls);
             }

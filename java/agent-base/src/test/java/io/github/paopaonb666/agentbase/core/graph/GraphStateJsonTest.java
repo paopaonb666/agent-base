@@ -218,4 +218,26 @@ class GraphStateJsonTest {
         assertEquals("plain",
                 ((dev.langchain4j.data.message.TextContent) user.contents().get(0)).text());
     }
+
+    @Test
+    void aiAuditMetadataRoundTripsAndOldSnapshotsStayCompatible() {
+        // #123：id / finish_reason 随快照往返；旧快照（无 message_id 键）
+        // 兼容读——重建的消息无 attributes，语义不变。
+        AiMessage audited = AiMessage.builder()
+                .text("回答")
+                .attributes(new LinkedHashMap<>(Map.of(
+                        "id", "msg-abc123", "finish_reason", "stop")))
+                .build();
+        AiMessage restored = (AiMessage) roundTrip(new GraphState(List.of(audited), Map.of()))
+                .messages().get(0);
+        assertEquals("msg-abc123", restored.attribute("id", String.class));
+        assertEquals("stop", restored.attribute("finish_reason", String.class));
+        assertEquals("回答", restored.text());
+
+        AiMessage legacy = AiMessage.from("旧快照消息");
+        AiMessage legacyRestored = (AiMessage) roundTrip(new GraphState(List.of(legacy), Map.of()))
+                .messages().get(0);
+        assertNull(legacyRestored.attribute("id", String.class));
+        assertEquals("旧快照消息", legacyRestored.text());
+    }
 }

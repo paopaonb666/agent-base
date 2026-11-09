@@ -146,6 +146,17 @@ public final class GraphStateJson {
         } else if (message instanceof AiMessage ai) {
             node.put("type", "ai");
             node.put("content", ai.text() == null ? "" : ai.text());
+            // #123：稳定 id 与 finish_reason 随快照持久化（审计/前端锚点）。
+            // 兼容读：旧快照无这些键 → 重建的消息无 attributes，语义不变
+            // （不 bump VERSION——读侧容忍缺键，写侧新增键对旧读侧透明）。
+            String auditId = ai.attribute("id", String.class);
+            if (auditId != null) {
+                node.put("message_id", auditId);
+            }
+            String finishReason = ai.attribute("finish_reason", String.class);
+            if (finishReason != null) {
+                node.put("finish_reason", finishReason);
+            }
             if (ai.hasToolExecutionRequests()) {
                 ArrayNode calls = node.putArray("tool_calls");
                 for (dev.langchain4j.agent.tool.ToolExecutionRequest request : ai.toolExecutionRequests()) {
@@ -190,21 +201,25 @@ public final class GraphStateJson {
                 return UserMessage.from(node.path("content").asText(""));
             }
             case "ai" -> {
-                if (node.has("tool_calls") && node.get("tool_calls").isArray()
-                        && !node.get("tool_calls").isEmpty()) {
-                    List<dev.langchain4j.agent.tool.ToolExecutionRequest> requests = new ArrayList<>();
-                    for (JsonNode call : node.get("tool_calls")) {
-                        requests.add(dev.langchain4j.agent.tool.ToolExecutionRequest.builder()
-                                .id(call.path("id").asText(""))
-                                .name(call.path("name").asText(""))
-                                .arguments(call.path("args").asText("{}"))
-                                .build());
-                    }
-                    return node.path("content").asText("").isEmpty()
-                            ? AiMessage.from(requests)
-                            : AiMessage.from(node.path("content").asText(), requests);
+                AiMessage rebuilt = aiFromJson(node);
+                // #123：快照携带的稳定 id / finish_reason 还原进 attributes
+                // （旧快照无键 → 无 attributes，兼容读）。
+                java.util.Map<String, Object> attrs = new java.util.LinkedHashMap<>();
+                if (!node.path("message_id").asText("").isEmpty()) {
+                    attrs.put("id", node.path("message_id").asText());
                 }
-                return AiMessage.from(node.path("content").asText(""));
+                if (!node.path("finish_reason").asText("").isEmpty()) {
+                    attrs.put("finish_reason", node.path("finish_reason").asText());
+                }
+                if (attrs.isEmpty()) {
+                    return rebuilt;
+                }
+                return AiMessage.builder()
+                        .text(rebuilt.text())
+                        .thinking(rebuilt.thinking())
+                        .toolExecutionRequests(rebuilt.toolExecutionRequests())
+                        .attributes(attrs)
+                        .build();
             }
             case "tool" -> {
                 return ToolExecutionResultMessage.from(
@@ -225,6 +240,25 @@ public final class GraphStateJson {
                 return null;
             }
         }
+    }
+
+    /** ai 节点 → AiMessage 的基础重建（#123 前的形态；attributes 由调用方按需挂）。 */
+    private static AiMessage aiFromJson(JsonNode node) {
+        if (node.has("tool_calls") && node.get("tool_calls").isArray()
+                && !node.get("tool_calls").isEmpty()) {
+            List<dev.langchain4j.agent.tool.ToolExecutionRequest> requests = new ArrayList<>();
+            for (JsonNode call : node.get("tool_calls")) {
+                requests.add(dev.langchain4j.agent.tool.ToolExecutionRequest.builder()
+                        .id(call.path("id").asText(""))
+                        .name(call.path("name").asText(""))
+                        .arguments(call.path("args").asText("{}"))
+                        .build());
+            }
+            return node.path("content").asText("").isEmpty()
+                    ? AiMessage.from(requests)
+                    : AiMessage.from(node.path("content").asText(), requests);
+        }
+        return AiMessage.from(node.path("content").asText(""));
     }
 
     /** usage 提取（成本计量从 ChatResponse 侧拿到 TokenUsage 后转 dict）。 */

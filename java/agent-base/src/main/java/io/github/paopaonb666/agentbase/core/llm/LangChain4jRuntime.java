@@ -14,6 +14,7 @@ import dev.langchain4j.model.output.TokenUsage;
 
 import java.util.List;
 import java.util.Objects;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.function.BiConsumer;
@@ -114,7 +115,8 @@ public final class LangChain4jRuntime implements ModelRuntime {
     public AiMessage invoke(List<ChatMessage> messages) {
         ChatResponse response = chatModel.chat(messages);
         usageSink.accept(modelName, response.tokenUsage());
-        return response.aiMessage();
+        AiMessage message = response.aiMessage();
+        return message == null ? null : withAuditMetadata(message, response.finishReason());
     }
 
     @Override
@@ -171,7 +173,32 @@ public final class LangChain4jRuntime implements ModelRuntime {
                 ? List.of()
                 : aggregated.toolExecutionRequests();
         usageSink.accept(modelName, response.tokenUsage());
-        return new AiMessage(deltas.toString(), List.copyOf(toolRequests));
+        AiMessage rebuilt = new AiMessage(deltas.toString(), List.copyOf(toolRequests));
+        return withAuditMetadata(rebuilt, response.finishReason());
+    }
+
+    /**
+     * 给 AiMessage 挂稳定 id 与 finish_reason（#123）：langchain4j 1.4 的
+     * {@code attributes} 是现成承载位（调研候选时的「无承载位」结论对 1.4
+     * 不成立）。id = "msg-" + 12 位随机 hex（与 ToolPool callId 同风格），
+     * 每次模型调用唯一——审计/前端锚点用；既有 attributes 保留。usage 不
+     * 入 attributes：计量走 usageSink 唯一收口，杜绝双计。
+     */
+    private static AiMessage withAuditMetadata(AiMessage message, dev.langchain4j.model.output.FinishReason finishReason) {
+        java.util.Map<String, Object> attrs = new java.util.LinkedHashMap<>();
+        if (message.attributes() != null) {
+            attrs.putAll(message.attributes());
+        }
+        attrs.putIfAbsent("id", "msg-" + UUID.randomUUID().toString().replace("-", "").substring(0, 12));
+        if (finishReason != null) {
+            attrs.putIfAbsent("finish_reason", finishReason.name().toLowerCase(java.util.Locale.ROOT));
+        }
+        return AiMessage.builder()
+                .text(message.text())
+                .thinking(message.thinking())
+                .toolExecutionRequests(message.toolExecutionRequests())
+                .attributes(attrs)
+                .build();
     }
 
     /**
@@ -196,7 +223,7 @@ public final class LangChain4jRuntime implements ModelRuntime {
             onDelta.accept(message.text());
         }
         usageSink.accept(modelName, response.tokenUsage());
-        return message;
+        return withAuditMetadata(message, response.finishReason());
     }
 
     /** 等待流式完成；onError 投递的异常转成 RuntimeException 上抛。 */
