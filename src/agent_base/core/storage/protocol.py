@@ -26,6 +26,12 @@ class ThreadIndexRepo(Protocol):
 
     async def delete_thread_index(self, thread_id: str) -> None: ...
 
+    async def claim_thread_index(self, entry: ThreadIndex) -> ThreadIndex:
+        """原子认领：缺席则按 ``entry`` 插入；在席且属主一致则仅刷新
+        ``updated_at``（标题保持首条语义）；在席但属主不一致则**不改动**。
+        返回权威行——调用方比较 ``user_id`` 判定越权（invoke 端点的 P0
+        属主校验 + 并发首发抢占都收敛在这一个原语里）。"""
+
 
 @runtime_checkable
 class PlanRepo(Protocol):

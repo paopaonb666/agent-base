@@ -43,6 +43,21 @@ class _CoreSqlStoreBase:
             f"VALUES ({', '.join('%s' for _ in columns)})"
         )
 
+    def _insert_ignore_into(self, table: str, columns: tuple[str, ...]) -> str:
+        """缺席才插入：sqlite 是 INSERT OR IGNORE，MySQL 是 INSERT IGNORE
+        ——冲突时保持原行不动（claim 原语的第一步，属主判定交给后面的
+        条件 UPDATE + SELECT）。不用 ON CONFLICT DO UPDATE / ON DUPLICATE
+        KEY UPDATE ... WHERE：MySQL 5.7 不支持这两种条件写法。"""
+        if self._PLACEHOLDER == "?":
+            return (
+                f"INSERT OR IGNORE INTO {table} ({', '.join(columns)}) "
+                f"VALUES ({', '.join('?' for _ in columns)})"
+            )
+        return (
+            f"INSERT IGNORE INTO {table} ({', '.join(columns)}) "
+            f"VALUES ({', '.join('%s' for _ in columns)})"
+        )
+
     # -- 连接原语（子类实现） -------------------------------------------------
     async def _execute(self, sql: str, params: Sequence[Any] = ()) -> int:
         raise NotImplementedError
@@ -91,6 +106,35 @@ class _CoreSqlStoreBase:
             (thread_id,),
         )
         return self._thread_from_row(rows[0]) if rows else None
+
+    async def claim_thread_index(self, entry: ThreadIndex) -> ThreadIndex:
+        # 三条单语句各自原子（_execute/_fetch_all 每语句独立提交）：并发
+        # 首发同一线程时 INSERT OR IGNORE 只有一家生效，输家的 UPDATE 匹配
+        # 0 行、SELECT 读到赢家的行——属主永远不会被翻转。
+        await self._execute(
+            self._insert_ignore_into(
+                "thread_index",
+                ("thread_id", "user_id", "module", "title", "created_at", "updated_at"),
+            ),
+            (
+                entry.thread_id,
+                entry.user_id,
+                entry.module,
+                entry.title,
+                self._to_sql_ts(entry.created_at),
+                self._to_sql_ts(entry.updated_at),
+            ),
+        )
+        await self._execute(
+            "UPDATE thread_index SET updated_at = ? WHERE thread_id = ? AND user_id = ?",
+            (self._to_sql_ts(entry.updated_at), entry.thread_id, entry.user_id),
+        )
+        rows = await self._fetch_all(
+            f"SELECT {self._THREAD_COLUMNS} FROM thread_index WHERE thread_id = ?",
+            (entry.thread_id,),
+        )
+        # INSERT IGNORE 之后行必在席；防御性回退避免类型违约。
+        return self._thread_from_row(rows[0]) if rows else entry
 
     async def list_thread_index(
         self, user_id: str, *, module: str | None = None, limit: int = 50

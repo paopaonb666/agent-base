@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import base64
 import time
-from dataclasses import replace
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
@@ -139,6 +138,13 @@ async def invoke(module: str, body: InvokeRequest, request: Request) -> Streamin
         "recursion_limit": rt.settings.agent_recursion_limit,
         "configurable": {"thread_id": full_thread_id, "user_id": user_id},
     }
+    # 属主预检（S1/P0）：已认证 ≠ 有权访问该线程。invoke 的全部副作用
+    # （读记忆、bind_thread、写 checkpoint、记忆抽取）都必须在通过之后。
+    # 404 文案与 _thread_owner_or_404 一致，不泄露存在性。
+    if rt.thread_index is not None:
+        existing = await rt.thread_index.get_thread_index(full_thread_id)
+        if existing is not None and existing.user_id != user_id:
+            raise HTTPException(status_code=404, detail=f"线程不存在：{user_thread_id}")
     messages_input: list[Any] = []
     # 记忆上下文注入（M6d + T2.1）：冻结段（画像/记忆块/摘要，线程内
     # 快照）在前，召回段（查询相关，逐轮变化）紧随其后、贴着附件与
@@ -220,12 +226,14 @@ async def invoke(module: str, body: InvokeRequest, request: Request) -> Streamin
         )
     else:
         messages_input.append(HumanMessage(content=body.message))
-    # 会话索引 upsert（S1）：属主/模块/标题（首条用户消息前 60 字符）。
+    # 会话索引原子认领（S1）：缺席则按本用户插入（属主/模块/标题=首条
+    # 用户消息前 60 字符），在席且属主一致则仅刷新 updated_at，属主不符
+    # 则不改动并以 404 拒绝。预检（invoke 开头）与认领之间属主被并发
+    # 改变（删除后被他人首发）由权威行在这里兜底——属主永不翻转。
     if rt.thread_index is not None:
         now = time.time()
-        existing = await rt.thread_index.get_thread_index(full_thread_id)
-        if existing is None:
-            entry = ThreadIndex(
+        claimed = await rt.thread_index.claim_thread_index(
+            ThreadIndex(
                 thread_id=full_thread_id,
                 user_id=user_id,
                 module=module,
@@ -233,9 +241,9 @@ async def invoke(module: str, body: InvokeRequest, request: Request) -> Streamin
                 created_at=now,
                 updated_at=now,
             )
-        else:
-            entry = replace(existing, updated_at=now)
-        await rt.thread_index.upsert_thread_index(entry)
+        )
+        if claimed.user_id != user_id:
+            raise HTTPException(status_code=404, detail=f"线程不存在：{user_thread_id}")
     # 记忆形成（M6c）：轮次正常完成后在后台跑抽取/整合/画像/摘要。
     # 需要形成管线可用（llm 已装配）且记忆系统启用。
     on_complete = _build_capture_hook(memory, module, user_thread_id, graph, config)

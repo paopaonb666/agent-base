@@ -7,7 +7,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
+import time
 import uuid
 from dataclasses import replace
 from pathlib import Path
@@ -15,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from agent_base.core.config import Settings
-from agent_base.core.storage import CoreMemoryStore, CoreSqliteStore, CoreStore
+from agent_base.core.storage import CoreMemoryStore, CoreSqliteStore, CoreStore, ThreadIndex
 from agent_base_memory import (
     DocChunk,
     MemoryBlock,
@@ -481,5 +483,60 @@ async def test_plan_semantics_sqlite(tmp_path: Path) -> None:
     store = await CoreSqliteStore.create(str(tmp_path / "plan.db"))
     try:
         await _check_plan_semantics(store)
+    finally:
+        await store.aclose()
+
+
+# ─────────── 会话索引原子认领（claim_thread_index；invoke P0 属主校验）───────
+
+
+async def _check_thread_claim_semantics(store: CoreStore) -> None:
+    now = time.time()
+
+    def _entry(user: str, updated: float) -> ThreadIndex:
+        return ThreadIndex(
+            thread_id="chat:t1",
+            user_id=user,
+            module="chat",
+            title="first message",
+            created_at=now,
+            updated_at=updated,
+        )
+
+    # 缺席 → 按 entry 插入，返回权威行。
+    claimed = await store.claim_thread_index(_entry("alice", now))
+    assert claimed.user_id == "alice" and claimed.title == "first message"
+    # 属主再认领 → 仅刷新 updated_at，标题保持首条语义。
+    refreshed = await store.claim_thread_index(_entry("alice", now + 5))
+    assert refreshed.user_id == "alice" and refreshed.title == "first message"
+    stored = await store.get_thread_index("chat:t1")
+    assert stored is not None
+    assert stored.updated_at == pytest.approx(now + 5)
+    # 他人认领 → 原行不改动，返回现有属主行（调用方据此 404）。
+    foreign = await store.claim_thread_index(_entry("bob", now + 9))
+    assert foreign.user_id == "alice" and foreign.title == "first message"
+    stored = await store.get_thread_index("chat:t1")
+    assert stored is not None
+    assert stored.user_id == "alice"
+    assert stored.updated_at == pytest.approx(now + 5)
+    # 并发首发同一线程：恰一家成为属主，输家拿到赢家的行——属主永不翻转。
+    await store.delete_thread_index("chat:t1")
+    alice_row, bob_row = await asyncio.gather(
+        store.claim_thread_index(_entry("alice", now + 1)),
+        store.claim_thread_index(_entry("bob", now + 1)),
+    )
+    assert alice_row.user_id == bob_row.user_id
+    stored = await store.get_thread_index("chat:t1")
+    assert stored is not None and stored.user_id == alice_row.user_id
+
+
+async def test_thread_claim_semantics_in_memory() -> None:
+    await _check_thread_claim_semantics(CoreMemoryStore())
+
+
+async def test_thread_claim_semantics_sqlite(tmp_path: Path) -> None:
+    store = await CoreSqliteStore.create(str(tmp_path / "claim.db"))
+    try:
+        await _check_thread_claim_semantics(store)
     finally:
         await store.aclose()

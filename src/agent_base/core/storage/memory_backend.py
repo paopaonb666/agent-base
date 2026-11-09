@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from typing import Any
 
 from agent_base.core.storage.models import ThreadIndex
@@ -35,6 +36,18 @@ class CoreMemoryStore:
 
     async def delete_thread_index(self, thread_id: str) -> None:
         self._threads.pop(thread_id, None)
+
+    async def claim_thread_index(self, entry: ThreadIndex) -> ThreadIndex:
+        # get→写之间没有 await：asyncio 单线程事件循环下这段是原子的。
+        current = self._threads.get(entry.thread_id)
+        if current is None:
+            self._threads[entry.thread_id] = entry
+            return entry
+        if current.user_id != entry.user_id:
+            return current
+        refreshed = replace(current, updated_at=entry.updated_at)
+        self._threads[entry.thread_id] = refreshed
+        return refreshed
 
     # -- 计划快照（plan_snapshots；M10 跨轮延续） --------------------------------
     async def save_plan(

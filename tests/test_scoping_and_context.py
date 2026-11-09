@@ -1,7 +1,8 @@
 """S1（线程/附件作用域）与 H3（上下文引擎全模块生效）的回归测试。
 
 - S1：thread_index 在位时，用户 B 无法通过任何线程端点读到/删除用户 A
-  的会话；附件不能引用他人上传的 file_id（IDOR 组合链入口）。
+  的会话，也不能拿 A 的 thread_id 复用 invoke 会话（P0 属主校验）；
+  附件不能引用他人上传的 file_id（IDOR 组合链入口）。
 - H3：writer/hello 经共享图工厂获得与 chat 相同的注入去重——历史里的
   注入型系统消息不再随轮次累积。
 """
@@ -87,6 +88,63 @@ def test_invoke_upserts_thread_index_with_owner() -> None:
         assert rows[0].thread_id.startswith("chat:")
 
 
+def test_invoke_rejects_foreign_thread() -> None:
+    """P0 属主校验：Bob 不能拿 Alice 的 thread_id 复用同一 checkpoint 会话。
+
+    invoke 此前只更新 updated_at 不比较属主——已认证 ≠ 有权访问该线程。
+    修复后：404 掩蔽（与 get/delete 同文案），且零副作用——属主不变、
+    Alice 的 checkpoint 里没有 Bob 的消息。
+    """
+    runtime = _scoped_runtime()
+    with TestClient(create_app(runtime=runtime)) as client:
+        response = client.post(
+            "/v1/agents/chat/invoke",
+            json={"message": "hi", "thread_id": "t1"},
+            headers=ALICE,
+        )
+        assert response.status_code == 200
+        response = client.post(
+            "/v1/agents/chat/invoke",
+            json={"message": "evil", "thread_id": "t1"},
+            headers=BOB,
+        )
+        assert response.status_code == 404
+        assert "线程不存在" in response.json()["detail"]
+        # 属主没有被翻转（get→upsert 的抢占路径已收敛进原子 claim）。
+        rows = asyncio.run(runtime.thread_index.list_thread_index("alice", module="chat"))
+        assert len(rows) == 1 and rows[0].user_id == "alice"
+        # Bob 没有任何线程出现在自己的列表里。
+        assert client.get("/v1/agents/chat/threads", headers=BOB).json()["threads"] == []
+        # Alice 的 checkpoint 历史不含 Bob 注入的消息。
+        history = client.get("/v1/agents/chat/threads/t1", headers=ALICE).json()
+        assert all("evil" not in str(m) for m in history.get("messages", []))
+
+
+def test_invoke_allows_owner_reinvoke_and_keeps_first_title() -> None:
+    runtime = _scoped_runtime()
+    with TestClient(create_app(runtime=runtime)) as client:
+        assert (
+            client.post(
+                "/v1/agents/chat/invoke",
+                json={"message": "hi", "thread_id": "t1"},
+                headers=ALICE,
+            ).status_code
+            == 200
+        )
+        # 属主再 invoke：放行（updated_at 刷新），标题保持首条语义。
+        assert (
+            client.post(
+                "/v1/agents/chat/invoke",
+                json={"message": "again", "thread_id": "t1"},
+                headers=ALICE,
+            ).status_code
+            == 200
+        )
+        rows = asyncio.run(runtime.thread_index.list_thread_index("alice", module="chat"))
+        assert len(rows) == 1
+        assert rows[0].title == "hi"
+
+
 # ─────────────────────────── S1：附件属主 ───────────────────────────
 
 
@@ -104,9 +162,17 @@ def _file_for(runtime: AgentRuntime, user_id: str, file_id: str) -> None:
 
 
 def test_attachments_reject_other_users_files() -> None:
-    runtime = _scoped_runtime()
+    # 两个 200 invoke（bob 建线程 + alice 属主引用），脚本两条响应。
+    runtime = _scoped_runtime(ScriptedChatModel([AIMessage(content="ok"), AIMessage(content="ok")]))
     _file_for(runtime, "alice", "alicefile")
     with TestClient(create_app(runtime=runtime)) as client:
+        # Bob 首发自己的线程 t1（未带附件才 200——这里只关心索引归属）。
+        response = client.post(
+            "/v1/agents/chat/invoke",
+            json={"message": "hi", "thread_id": "t1"},
+            headers=BOB,
+        )
+        assert response.status_code == 200
         # Bob 引用 Alice 的 file_id：400 拒绝（缺失与越权同文案，不给
         # 第三方探测 file_id 存在性的通道）。
         response = client.post(
@@ -116,10 +182,17 @@ def test_attachments_reject_other_users_files() -> None:
         )
         assert response.status_code == 400
         assert "附件不存在或无权访问" in response.json()["detail"]
-        # 缺失的 id 同样 400。
+        # Alice 访问 Bob 的线程：属主预检 404 先于附件校验（P0）。
         response = client.post(
             "/v1/agents/chat/invoke",
             json={"message": "hi", "thread_id": "t1", "attachments": ["ghost"]},
+            headers=ALICE,
+        )
+        assert response.status_code == 404
+        # 自己的线程上缺失的 id 同样 400。
+        response = client.post(
+            "/v1/agents/chat/invoke",
+            json={"message": "hi", "thread_id": "t2", "attachments": ["ghost"]},
             headers=ALICE,
         )
         assert response.status_code == 400
