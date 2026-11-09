@@ -75,7 +75,7 @@ public final class ContextEngine {
                 if (content instanceof dev.langchain4j.data.message.TextContent text) {
                     sb.append(text.text());
                 } else if (content instanceof dev.langchain4j.data.message.ImageContent) {
-                    sb.append("[image]"); // 图片块没有文本段（占位，估算不被低估太多）
+                    sb.append("[image]"); // 图片块没有文本段（占位，渲染语义）
                 }
             }
             return sb.toString();
@@ -90,6 +90,29 @@ public final class ContextEngine {
             return tool.text();
         }
         return String.valueOf(message);
+    }
+
+    /**
+     * 单条消息的 token 计量（预算口径，#130）：文本块走 tokenCounter；
+     * 多模态 UserMessage 的图片块按 {@link io.github.paopaonb666.agentbase.core.text.ImageTokenPolicy}
+     * 固定估价（"[image]" 占位是渲染语义，不用于计费——一张真实图片数千
+     * token，按 2 token 计会让修剪触发点严重失真）。非多模态消息与旧口径
+     * 逐字节等价（单文本块求和 = 全文计数）。
+     */
+    public static int countMessageTokens(ChatMessage message) {
+        if (message instanceof UserMessage user) {
+            int total = 0;
+            for (dev.langchain4j.data.message.Content content : user.contents()) {
+                if (content instanceof dev.langchain4j.data.message.TextContent text) {
+                    total += tokenCounter.countTokens(text.text());
+                } else if (content instanceof dev.langchain4j.data.message.ImageContent image) {
+                    total += io.github.paopaonb666.agentbase.core.text.ImageTokenPolicy
+                            .estimate(image.image().mimeType());
+                }
+            }
+            return total;
+        }
+        return tokenCounter.countTokens(contentText(message));
     }
 
     /** 返回消息的注入类型（匹配的标记前缀）；非注入消息返回 null。 */
@@ -174,11 +197,12 @@ public final class ContextEngine {
         }
 
         // 2) token 预算：从尾部向前累积（每条消息 +4 固定开销）。
+        //    #130：图片块按固定估价计入（真实 vision 成本数量级），文本块口径不变。
         int total = 0;
         int cut = 0; // kept_indices 里保留的起点
         for (int run = keptIndices.size() - 1; run >= 0; run--) {
             int index = keptIndices.get(run);
-            total += tokenCounter.countTokens(contentText(messages.get(index))) + 4;
+            total += countMessageTokens(messages.get(index)) + 4;
             if (total > maxTokens && run < keptIndices.size() - 1) {
                 // 超预算且至少保住最后一条；从这个更早的消息开始丢弃。
                 cut = run + 1;

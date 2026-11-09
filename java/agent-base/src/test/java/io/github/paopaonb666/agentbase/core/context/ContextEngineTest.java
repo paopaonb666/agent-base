@@ -6,6 +6,7 @@ import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.ToolExecutionResultMessage;
 import dev.langchain4j.data.message.UserMessage;
 import io.github.paopaonb666.agentbase.core.text.EstimatingTokenCounter;
+import io.github.paopaonb666.agentbase.core.text.ImageTokenPolicy;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -163,6 +164,28 @@ class ContextEngineTest {
         List<ChatMessage> input = ContextEngine.buildModelInput(List.of(huge), 10);
         assertEquals(1, input.size());
         assertEquals(huge, input.get(0));
+    }
+
+    @Test
+    void imageContentCountsFixedEstimateInBudget() {
+        // #130：图片块按固定估价（1500）计入预算——"[image]" 占位只是渲染
+        // 语义，按 2 token 计会让多模态轮次的修剪触发点严重失真。
+        useEstimator();
+        UserMessage withImage = UserMessage.from(List.of(
+                dev.langchain4j.data.message.TextContent.from("x".repeat(20)),
+                dev.langchain4j.data.message.ImageContent.from("aGk=", "image/png")));
+        // 文本（估算器口径）+ 1500（图）；+4 开销在预算循环层，不在本计数。
+        assertEquals(EstimatingTokenCounter.INSTANCE.countTokens("x".repeat(20))
+                        + ImageTokenPolicy.TOKENS_PER_IMAGE,
+                ContextEngine.countMessageTokens(withImage));
+        // 预算 1500 装不下 → 只保最后一条（原样）；纯文本对照同预算可装下
+        // 多条——图片显著提前触发修剪。
+        List<ChatMessage> history = List.of(shortHuman("a"), withImage);
+        assertEquals(1, ContextEngine.buildModelInput(history, 1500).size());
+        assertEquals(withImage, ContextEngine.buildModelInput(history, 1500).get(0));
+        // 纯文本口径回归：单文本块求和 = 全文计数（旧口径逐字节等价）。
+        assertEquals(EstimatingTokenCounter.INSTANCE.countTokens("abcd"),
+                ContextEngine.countMessageTokens(UserMessage.from("abcd")));
     }
 
     @Test
