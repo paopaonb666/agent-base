@@ -228,7 +228,7 @@ class RetrievalTest {
     @Test
     void missingVectorCountsZeroAndCeilingIsRecencyPlusSalience() {
         double now = 1_700_000_000.0;
-        // 无 embedding 且与查询无关键词交集：score ≤ 0.3（绝对相关度语义）。
+        // 无 embedding 且与查询无关键词交集：score ≤ 0.3（无证据下限语义）。
         MemoryRecord noise = rec("m1", "semantic", "完全无关的内容", null, 1.0, now);
         List<ScoredMemory> out = Retrieval.scoreMemories(List.of(noise), "偏好设置",
                 List.of(1.0f, 0.0f), now, 14.0, Retrieval.Weights.DEFAULT);
