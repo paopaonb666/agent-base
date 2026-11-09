@@ -44,6 +44,12 @@
 | web_search 上下文尾行引用约定 | web_search 注入上下文的末尾追加一行「回答引用以上来源时，请用 [n] 标注对应序号」——引导模型输出可解析的引用锚。Python 侧无此尾行约定；配合 `done` 前发出的 cited sources 事件（`Citations` 把回复里的 [n] 解析回来源子集） | `S/toolkit/search/SearchPipeline.java:98-114`（`formatWebContext`）、`S/entrypoints/server/Citations.java`；progress 登记 Wave 4 `254+338` 行 |
 | knowledge_search [n] 输出格式 | knowledge_search 输出带 [n] 序号锚 + 文件/段位元数据，同序 emit Source 事件（url=null，offsets 留在 tool_calls 审计）——wire 契约不动（保 Python 对齐），文本格式是 Java 侧扩展 | `M/tools/MemoryTools.java`（knowledge_search 工具）、`S/entrypoints/server/Citations.java`；progress 登记 Wave 4 `254+338` 行 |
 | 搜索管线低质黑名单扩展点 | URL/标题低质模式（子串匹配）默认空、刻意作为扩展点：chat-agent 里的「字典站/拼音站」名单是它自己的业务垃圾源，不属于基座；部署方按需覆写。Python 侧该名单随业务代码自带（基座无此挂点）。#99 的其余诉求已兑现：`SEARCH_DDGS_BACKEND` 幽灵键已 WARN（Settings.java:657-664）、死配置清理已随 #30+245+276 收口、java/README 章节已存在 | `S/toolkit/search/SearchPipeline.java:13-27`、`S/core/config/Settings.java:657-664` |
+| #78 per-user 限流 | `RATE_LIMIT_PER_MINUTE`（次/分钟令牌桶，0=不限）在 invoke 入口 enforcement，超限 429+Retry-After；无鉴权部署（secret 空）共享一个降级桶（X-User-Id 客户端可控，分桶无意义）。production 强制显式配置（ensureProductionReady）。Python 服务端无限流 | `S/entrypoints/server/RateLimiters.java`、`S/entrypoints/server/routes/AgentsRoutes.java`（限流点） |
+| #79 全局 run 并发闸门 | `AGENT_RUN_CONCURRENCY`（默认 32，0=不限）限制同时在途的 SSE 对话轮数；饱和快速失败 429+Retry-After（不排队），退出挂在 SSE 终态钩子（produce finally 恰好一次）。Python 服务端无此闸门 | `S/entrypoints/server/RunGate.java`、`S/entrypoints/server/SseStreams.java`（onTerminate） |
+| #4 per-model 窗口 | `LLM_MAX_CONTEXT_TOKENS` / `LLM_FAST_MAX_CONTEXT_TOKENS`（0=未配置）：窗口随运行时走（ModelRuntime.contextWindowTokens），图执行输入预算 = min(contextMaxTokens, 窗口-输出预留 4096)。Python config.py 无 per-model window 概念 | `S/core/llm/{ModelRuntime,LangChain4jRuntime,LlmFactory}.java`、`S/core/context/ContextEngine.java`（resolveInputBudget） |
+| #81 /health pools 数值段 | health components 追加 `pools` 观测数值段（tool 在飞/排队/泄漏、bg_pending、cost_dropped），不参与 ok/degraded 判定。Python /health 无此段——外部消费者若做「全组件==ok」判定需忽略该键 | `S/entrypoints/server/routes/SystemRoutes.java`（pools 段） |
+| #160/#176 审计过滤与游标 | GET /v1/memory/audit 增 `thread`/`since`/`before`（游标）参数与 `next_before` 响应字段（取满 limit 时返回）；002 迁移补 (user_id, created_at) 索引。Python api.py 的 audit 只有 limit | `M/api/MemoryApiController.java`（audit 端点）、`M/store/MemoryStore.java`（OpsCursor） |
+| #226 knowledge_status 上传响应字段 | 上传响应组装层附加 `knowledge_status`（queued/skipped_empty_text/disabled）——摄取是后台任务，同步响应只能给状态不给分块数。UploadedFileInfo.meta() 本身未动（Python 键集对齐保持） | `S/entrypoints/server/routes/FilesRoutes.java`（uploadMeta） |
 
 ## 三、待修（登记待后续）
 
@@ -51,4 +57,8 @@
 | --- | --- | --- |
 | #75 attempt/fallback 列未进账本 schema | LLM 弹性包的重试 attempt 与回落（fast→main fallback）信息当前只进日志，未进 `cost_usage` 账本列——留 #76 做 schema 演进 | `S/core/llm/ResilientModelRuntime.java`；progress 登记 Wave 1 `1+10+73+75` 行 |
 | #157 toolSafeStreaming 逐 provider 文档 | 语义两侧一致：快档一旦绑工具（Tier 1 / planner fast），工具轮走非流式让服务端聚合出合法 tool_calls（SiliconFlow GLM-4-9B 流式拆工具名的协议违例）；不绑工具仍流式。缺的是逐 provider 的行为文档（哪些端点/模型触发）——文档债，不是代码差异 | `S/core/llm/LlmFactory.java:26-33`（javadoc 已写缘由） |
-| #202 条件边未知目标的编译期校验 | 条件边返回未注册目标时当前由运行期兜底（#285 基线锁定执行语义）；编译期声明式「条件边目标集」校验是后续演进项 | `S/core/graph/GraphBuilder.java:87-113`（compile 现有三类校验）、`docs/adr/004-java-mini-graph-engine.md` |
+| code review R1-F6 闸门判定在 claim 之后 | 被 #79 闸门 429 拒绝的请求已经刷新过线程索引 updated_at 并消耗限流令牌——无越权，仅留幽灵活跃痕迹；把闸门判定提前到 claim 之前即可 | `S/entrypoints/server/routes/AgentsRoutes.java`（startStream 尾 tryEnter） |
+| code review R1-F7 半开连接占用并发额度 | SseEmitter(0L) 无超时 × 闸门按 run 生命周期持有：客户端半开（无 RST）时依赖容器 async timeout 兜底；必要时给 emitter 设上限超时 | `S/entrypoints/server/SseStreams.java`（open 的 0L） |
+| code review R2-F1 小窗口语义缝隙 | resolveInputBudget 的 MIN_INPUT_BUDGET（1024）兜底在 window < 预留+1024 时恒返 1024，且 system prompt 在预算外拼接——极小窗口配置下超窗由 provider 拒绝兜底；#13/#15（PromptComposer/四域预算）落地时一并收口 | `S/core/context/ContextEngine.java`（resolveInputBudget）、`S/core/graphs/Graphs.java`（system prompt 拼接） |
+| code review R2-F2 Error/Throwable 不入终止枚举 | streamWithTermination 的 catch 链只到 RuntimeException——Error（如 OOM）路径的 done 事件无 termination 标注（sentinel/闸门释放仍正常）；补 catch(Error) 属低收益高敏感改动，登记观察 | `S/core/graph/CompiledGraph.java`（catch 链） |
+| code review R3 MySQL 审计游标同秒跨页 | MySQL memory_ops.created_at 是秒精度 TIMESTAMP：同秒超过 limit 条时 API 游标（仅秒值）翻页会漏行——复合游标（秒:op_id）是终解 | `M/api/MemoryApiController.java`（audit next_before）、`M/store/AbstractSqlMemoryStore.java`（OpsCursor 下推） |
