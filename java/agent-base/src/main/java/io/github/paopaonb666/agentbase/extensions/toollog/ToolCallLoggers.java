@@ -170,15 +170,65 @@ public final class ToolCallLoggers {
                     drainRemaining();
                     return;
                 }
-                insertQuietly(record);
+                // 微批提交：单条自动提交 = 每行一次 fsync（实测慢盘上
+                // 15s 仅落 772/1001，回归门被磁盘状态卡爆）。同一批连带
+                // 排空队列再 commit——审计语义不变（未丢弃的记录最终全部
+                // 落库），吞吐提一个量级。坏记录跳过不回滚整批（与原
+                // 逐条 insertQuietly 的失败语义一致）。
+                try {
+                    conn.setAutoCommit(false);
+                    try {
+                        insert(record);
+                        while ((record = queue.poll()) != null) {
+                            insertQuietly(record);
+                        }
+                        conn.commit();
+                    } catch (SQLException e) {
+                        rollbackQuietly();
+                        LOG.error("toollog: sqlite batch insert failed", e);
+                    } finally {
+                        conn.setAutoCommit(true);
+                    }
+                } catch (SQLException e) {
+                    LOG.error("toollog: sqlite autocommit switch failed", e);
+                }
+            }
+        }
+
+        private void rollbackQuietly() {
+            try {
+                conn.rollback();
+            } catch (SQLException e) {
+                LOG.debug("toollog: rollback failed", e);
             }
         }
 
         /** 中断后的尽力排空：把队列剩余记录写完（写失败只记日志，不抛出）。 */
         private void drainRemaining() {
             ToolCallRecord record;
-            while ((record = queue.poll()) != null) {
-                insertQuietly(record);
+            if (queue.isEmpty()) {
+                return;
+            }
+            try {
+                conn.setAutoCommit(false);
+            } catch (SQLException e) {
+                LOG.error("toollog: sqlite autocommit switch failed", e);
+                return;
+            }
+            try {
+                while ((record = queue.poll()) != null) {
+                    insertQuietly(record);
+                }
+                conn.commit();
+            } catch (SQLException e) {
+                rollbackQuietly();
+                LOG.error("toollog: sqlite drain commit failed", e);
+            } finally {
+                try {
+                    conn.setAutoCommit(true);
+                } catch (SQLException e) {
+                    LOG.debug("toollog: autocommit restore failed", e);
+                }
             }
         }
 
