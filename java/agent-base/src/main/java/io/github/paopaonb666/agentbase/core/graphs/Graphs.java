@@ -75,7 +75,7 @@ public final class Graphs {
         builder.addNode("agent", (GraphState state, NodeContext nodeCtx) -> {
             // 上下文工程（H3）：注入去重 + token 预算修剪，对所有模块生效。
             List<ChatMessage> modelInput =
-                    ContextEngine.buildModelInput(state.messages(), maxTokens);
+                    ContextEngine.buildModelInput(state.messages(), maxTokens, ctx.llm().tokenFactor());
             if (systemPrompt != null) {
                 // 模块提示词临时拼装在最前：不落库，也不属于"注入型系统消息"。
                 List<ChatMessage> withPrompt = new ArrayList<>();

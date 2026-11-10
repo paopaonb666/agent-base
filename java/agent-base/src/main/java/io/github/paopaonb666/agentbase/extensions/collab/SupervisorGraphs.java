@@ -123,7 +123,7 @@ public final class SupervisorGraphs {
                     // prompt: str 语义）；上下文工程对所有模块生效。
                     List<ChatMessage> input = new ArrayList<>();
                     input.add(SystemMessage.from(DEFAULT_PROMPT));
-                    input.addAll(ContextEngine.buildModelInput(state.messages(), maxTokens));
+                    input.addAll(ContextEngine.buildModelInput(state.messages(), maxTokens, ctx.llm().tokenFactor()));
                     AiMessage message = ctx.llm().stream(input, boundSpecs, nodeCtx::emitDelta);
                     if (message == null) {
                         return Map.of();

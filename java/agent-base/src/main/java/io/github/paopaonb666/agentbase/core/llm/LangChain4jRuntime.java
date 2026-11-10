@@ -57,6 +57,8 @@ public final class LangChain4jRuntime implements ModelRuntime {
     /** #74：流式 idle 超时（毫秒）；0 = 禁用（旧行为，唯一兜底为 HTTP 总超时）。 */
     private final long streamIdleMillis;
     private final BiConsumer<String, TokenUsage> usageSink;
+    /** #340：估算 token 修正系数（LLM_TOKEN_FACTOR；默认 1.0）。 */
+    private final double tokenFactor;
 
     /**
      * @param chatModel         非流式客户端（单次调用 + 流式不可用时的回退）
@@ -91,13 +93,33 @@ public final class LangChain4jRuntime implements ModelRuntime {
                               int contextWindowTokens,
                               long streamIdleMillis,
                               BiConsumer<String, TokenUsage> usageSink) {
+        this(chatModel, streamingModel, modelName, toolSafeStreaming, contextWindowTokens,
+                streamIdleMillis, 1.0, usageSink);
+    }
+
+    /** 全参形态（#340）：tokenFactor = 估算修正系数（随 profile 运行时走）。 */
+    public LangChain4jRuntime(ChatModel chatModel,
+                              StreamingChatModel streamingModel,
+                              String modelName,
+                              boolean toolSafeStreaming,
+                              int contextWindowTokens,
+                              long streamIdleMillis,
+                              double tokenFactor,
+                              BiConsumer<String, TokenUsage> usageSink) {
         this.chatModel = Objects.requireNonNull(chatModel, "chatModel is required");
         this.streamingModel = streamingModel;
         this.modelName = Objects.requireNonNull(modelName, "modelName is required");
         this.toolSafeStreaming = toolSafeStreaming;
         this.contextWindowTokens = Math.max(0, contextWindowTokens);
         this.streamIdleMillis = Math.max(0, streamIdleMillis);
+        this.tokenFactor = tokenFactor > 0 ? tokenFactor : 1.0;
         this.usageSink = usageSink == null ? ModelRuntime.noopUsageSink() : usageSink;
+    }
+
+    /** #340：估算修正系数（透明面，Graphs/ExecuteNode 等取值点经 ctx.llm() 读取）。 */
+    @Override
+    public double tokenFactor() {
+        return tokenFactor;
     }
 
     @Override

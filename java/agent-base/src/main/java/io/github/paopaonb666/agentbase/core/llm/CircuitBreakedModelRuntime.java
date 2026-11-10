@@ -129,6 +129,11 @@ public final class CircuitBreakedModelRuntime implements ModelRuntime {
     }
 
     @Override
+    public double tokenFactor() {
+        return delegate.tokenFactor();
+    }
+
+    @Override
     public int contextWindowTokens() {
         return delegate.contextWindowTokens();
     }

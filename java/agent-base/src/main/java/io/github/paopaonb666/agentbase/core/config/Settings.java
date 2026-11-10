@@ -146,6 +146,14 @@ public final class Settings {
          */
         public int maxContextTokens = 0;
         /**
+         * 估算 token 修正系数（#340）：provider 自有分词与 JTokkit 预算
+         * 口径的系统性比值，乘在 ContextEngine 消息计量出口（含 +4/条 固定
+         * 开销）。>1 = 预算更保守（更早修剪）；(0,10] 校验；默认 1.0 逐字节
+         * 兼容。运维对账：cost_usage.prompt_tokens 增速 vs 预算估算——
+         * 差异登记簿 #340 行承载口径说明。
+         */
+        public double tokenFactor = 1.0;
+        /**
          * fallback 链（#71，Java 单边增强）：主力重试耗尽后按序尝试的备用
          * 模型（openai 兼容三元组；api_key 留空共用主力 key）。每个元素
          * 独立构建运行时、usage 按实际生效模型记账。LLM_FALLBACKS 是
@@ -187,6 +195,8 @@ public final class Settings {
         public int concurrency = 2;
         /** 快档模型上下文窗口（token，#4）；0 = 未配置（语义见主档同名字段）。 */
         public int maxContextTokens = 0;
+        /** #340：快档估算修正系数（LLM_FAST_TOKEN_FACTOR；默认 1.0）。 */
+        public double tokenFactor = 1.0;
 
         public boolean isConfigured() {
             return !baseUrl.strip().isEmpty() && !model.strip().isEmpty();
@@ -696,6 +706,13 @@ public final class Settings {
             }
             t.maxContextTokens = value;
         }
+        if (v.containsKey("token_factor")) {
+            double value = requireFloat("token_factor", v.get("token_factor"));
+            if (!(value > 0 && value <= 10)) {
+                throw new SettingsError("LLM_TOKEN_FACTOR must be in (0, 10], got %s".formatted(value));
+            }
+            t.tokenFactor = value;
+        }
         if (v.containsKey("fallbacks")) {
             t.fallbacks = parseFallbacks(v.get("fallbacks"));
         }
@@ -781,6 +798,13 @@ public final class Settings {
                 throw new SettingsError("LLM_FAST_MAX_CONTEXT_TOKENS must be >= 0 (0 = unset), got %d".formatted(value));
             }
             t.maxContextTokens = value;
+        }
+        if (v.containsKey("token_factor")) {
+            double value = requireFloat("token_factor", v.get("token_factor"));
+            if (!(value > 0 && value <= 10)) {
+                throw new SettingsError("LLM_FAST_TOKEN_FACTOR must be in (0, 10], got %s".formatted(value));
+            }
+            t.tokenFactor = value;
         }
     }
 

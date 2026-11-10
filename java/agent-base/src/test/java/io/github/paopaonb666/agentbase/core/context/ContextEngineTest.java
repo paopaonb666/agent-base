@@ -292,4 +292,22 @@ class ContextEngineTest {
         assertFalse(ContextEngine.isExternalDataTool("memory_search"));
         assertFalse(ContextEngine.isExternalDataTool(null));
     }
+
+    @Test
+    void tokenFactorScalesCountsAndKeepsUnityIdentical() {
+        // #340：factor=1.0 与旧口径逐字节等价；factor>1 每条消息计量放大
+        // （含 +4 固定开销）→ 同预算下修剪更早。
+        useEstimator();
+        List<ChatMessage> messages = List.of(
+                UserMessage.from("第一条足够长的消息内容甲乙丙丁"),
+                UserMessage.from("第二条足够长的消息内容戊己庚辛"));
+        List<ChatMessage> unity = ContextEngine.buildModelInput(messages, 40);
+        List<ChatMessage> same = ContextEngine.buildModelInput(messages, 40, 1.0);
+        assertEquals(unity, same, "factor=1.0 必须与旧口径逐字节一致");
+
+        List<ChatMessage> conservative = ContextEngine.buildModelInput(messages, 40, 2.0);
+        assertTrue(conservative.size() <= unity.size(),
+                "factor=2.0 的保留条数不得多于 factor=1.0：" + conservative.size());
+        assertFalse(conservative.isEmpty(), "至少保留最后一条的守卫不因系数失效");
+    }
 }

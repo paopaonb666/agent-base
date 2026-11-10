@@ -68,7 +68,8 @@ public final class ExecuteNode {
             PlanStreaming.emitPlan(nodeCtx, tasks, "progress",
                     "子任务 " + (cursor + 1) + "/" + tasks.size() + " 执行中");
 
-            List<ChatMessage> inputs = subtaskInput(state, task, tasks, cursor, maxTokens);
+            List<ChatMessage> inputs = subtaskInput(state, task, tasks, cursor, maxTokens,
+                        ctx.llm().tokenFactor());
             List<ChatMessage> produced = new ArrayList<>();
             boolean exhausted = true;
             String summary = "";
@@ -148,7 +149,7 @@ public final class ExecuteNode {
      */
     private static List<ChatMessage> subtaskInput(GraphState state, Map<String, Object> task,
                                                   List<Map<String, Object>> tasks, int cursor,
-                                                  int maxTokens) {
+                                                  int maxTokens, double tokenFactor) {
         StringBuilder done = new StringBuilder();
         for (int i = 0; i < cursor && i < tasks.size(); i++) {
             Map<String, Object> t = tasks.get(i);
@@ -168,7 +169,7 @@ public final class ExecuteNode {
         input.add(SystemMessage.from(PlannerPrompts.execute(
                 goal, done.isEmpty() ? "（无）" : done.toString(),
                 PlannerState.str(task, PlannerState.GOAL))));
-        input.addAll(ContextEngine.buildModelInput(messages, maxTokens));
+        input.addAll(ContextEngine.buildModelInput(messages, maxTokens, tokenFactor));
         return input;
     }
 }

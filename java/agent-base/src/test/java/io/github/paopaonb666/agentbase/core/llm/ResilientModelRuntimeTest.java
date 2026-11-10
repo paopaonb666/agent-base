@@ -309,4 +309,36 @@ class ResilientModelRuntimeTest {
         assertEquals("ok", chain2.stream(oneMessage(), List.of(), delta -> {}).text());
         assertEquals(1, backup.invocations());
     }
+
+    @Test
+    void tokenFactorDelegatesThroughTransparencyContract() {
+        // #340：ResilientModelRuntime/CircuitBreakedModelRuntime 是透明层
+        // ——tokenFactor 必须委托内层（R2-F5 同款教训：漏委托=静默回 1.0）。
+        io.github.paopaonb666.agentbase.core.llm.ModelRuntime inner =
+                new io.github.paopaonb666.agentbase.core.llm.ModelRuntime() {
+                    @Override public dev.langchain4j.model.chat.ChatModel chat() {
+                        throw new UnsupportedOperationException();
+                    }
+                    @Override public dev.langchain4j.model.chat.StreamingChatModel streaming() {
+                        throw new UnsupportedOperationException();
+                    }
+                    @Override public dev.langchain4j.data.message.AiMessage stream(
+                            java.util.List<dev.langchain4j.data.message.ChatMessage> m,
+                            java.util.List<dev.langchain4j.agent.tool.ToolSpecification> t,
+                            java.util.function.Consumer<String> c) {
+                        throw new UnsupportedOperationException();
+                    }
+                    @Override public dev.langchain4j.data.message.AiMessage invoke(
+                            java.util.List<dev.langchain4j.data.message.ChatMessage> m) {
+                        throw new UnsupportedOperationException();
+                    }
+                    @Override public double tokenFactor() { return 1.75; }
+                };
+        var resilient = new io.github.paopaonb666.agentbase.core.llm.ResilientModelRuntime(
+                inner, java.util.List.of(), 2, 4);
+        assertEquals(1.75, resilient.tokenFactor(), 1e-12);
+        var breaked = new io.github.paopaonb666.agentbase.core.llm.CircuitBreakedModelRuntime(
+                resilient, 3, 30);
+        assertEquals(1.75, breaked.tokenFactor(), 1e-12);
+    }
 }

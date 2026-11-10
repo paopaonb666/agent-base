@@ -51,6 +51,16 @@ public interface ModelRuntime {
      * （含未配置回落主力配置的形态——回落路径同样要规避流式 tool_calls
      * 协议缺陷），主档 false。
      */
+    /**
+     * 估算 token 修正系数（#340）：provider 自有分词与 JTokkit 预算口径
+     * 的系统性比值——按 profile 配置（LLM_TOKEN_FACTOR /
+     * LLM_FAST_TOKEN_FACTOR，默认 1.0），乘在 ContextEngine 的消息计量
+     * 出口上。透明层必须委托（与 contextWindowTokens 同契约）。
+     */
+    default double tokenFactor() {
+        return 1.0;
+    }
+
     default boolean toolSafeStreaming() {
         return false;
     }

@@ -220,6 +220,18 @@ public final class ContextEngine {
      * </ul>
      */
     public static List<ChatMessage> buildModelInput(List<ChatMessage> messages, int maxTokens) {
+        return buildModelInput(messages, maxTokens, 1.0);
+    }
+
+    /**
+     * 带估算修正系数的变体（#340）：每条消息的计量（含 +4/条 固定开销）
+     * 乘 {@code tokenFactor}——provider 自有分词系统性偏离 JTokkit 口径时
+     * 的保守修正（>1 = 更早触发修剪）；1.0 与旧口径逐字节等价。系数随
+     * profile 运行时走（{@code ModelRuntime.tokenFactor()}），4 个取值点
+     * 经 ctx.llm() 传入。
+     */
+    public static List<ChatMessage> buildModelInput(List<ChatMessage> messages, int maxTokens,
+                                                    double tokenFactor) {
         if (messages == null || messages.isEmpty()) {
             return List.of();
         }
@@ -266,7 +278,7 @@ public final class ContextEngine {
         int cut = 0; // kept_indices 里保留的起点
         for (int run = keptIndices.size() - 1; run >= 0; run--) {
             int index = keptIndices.get(run);
-            total += countMessageTokens(messages.get(index)) + 4;
+            total += (int) Math.round((countMessageTokens(messages.get(index)) + 4) * tokenFactor);
             if (total > maxTokens && run < keptIndices.size() - 1) {
                 // 超预算且至少保住最后一条；从这个更早的消息开始丢弃。
                 cut = run + 1;

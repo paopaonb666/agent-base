@@ -109,6 +109,11 @@ public final class ResilientModelRuntime implements ModelRuntime {
     }
 
     @Override
+    public double tokenFactor() {
+        return delegate.tokenFactor();
+    }
+
+    @Override
     public int contextWindowTokens() {
         // 弹性包装是透明层：窗口由内层运行时携带（#4）。
         return delegate.contextWindowTokens();

@@ -219,7 +219,7 @@ public final class CheckNodes {
             }
             List<ChatMessage> input = new ArrayList<>();
             input.add(SystemMessage.from(PlannerPrompts.synth(plan.toString())));
-            input.addAll(ContextEngine.buildModelInput(PlannerState.messages(state), maxTokens));
+            input.addAll(ContextEngine.buildModelInput(PlannerState.messages(state), maxTokens, ctx.llm().tokenFactor()));
             AiMessage finalMessage = ctx.llm().stream(input, null, nodeCtx::emitDelta);
             PlanStreaming.emitPlan(nodeCtx, PlannerState.tasks(state), "done", null);
             PlanPersist.persistPlan(ctx, nodeCtx, PlannerState.tasks(state),

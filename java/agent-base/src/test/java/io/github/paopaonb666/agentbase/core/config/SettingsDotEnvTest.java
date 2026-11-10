@@ -40,4 +40,27 @@ class SettingsDotEnvTest {
         Settings s = Settings.load(Map.of(), env);
         assertEquals("a #b", s.memory.authSecret.value());
     }
+
+    @Test
+    void tokenFactorParsesPerProfileAndValidates() {
+        // #340：LLM_TOKEN_FACTOR / LLM_FAST_TOKEN_FACTOR 独立解析；(0,10]
+        // 校验；缺省 1.0。
+        Settings settings = Settings.load(java.util.Map.of(
+                "ENV", "development",
+                "LLM_TOKEN_FACTOR", "1.25",
+                "LLM_FAST_TOKEN_FACTOR", "1.5"), null);
+        assertEquals(1.25, settings.llm.tokenFactor, 1e-12);
+        assertEquals(1.5, settings.llmFast.tokenFactor, 1e-12);
+
+        Settings defaults = Settings.load(java.util.Map.of("ENV", "development"), null);
+        assertEquals(1.0, defaults.llm.tokenFactor, 1e-12);
+        assertEquals(1.0, defaults.llmFast.tokenFactor, 1e-12);
+
+        org.junit.jupiter.api.Assertions.assertThrows(Settings.SettingsError.class,
+                () -> Settings.load(java.util.Map.of(
+                        "ENV", "development", "LLM_TOKEN_FACTOR", "0"), null));
+        org.junit.jupiter.api.Assertions.assertThrows(Settings.SettingsError.class,
+                () -> Settings.load(java.util.Map.of(
+                        "ENV", "development", "LLM_FAST_TOKEN_FACTOR", "11"), null));
+    }
 }
