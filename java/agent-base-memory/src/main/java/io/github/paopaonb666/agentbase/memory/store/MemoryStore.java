@@ -24,6 +24,12 @@ public interface MemoryStore extends AutoCloseable {
      * 列出记忆；{@code agentId} 为 null 时跨模块；{@code includeGlobal}
      * 控制 {@code (agent_id=? OR agent_id='*')} 的全局分支；
      * {@code excludeProfile} 排除画像记录（id 前缀 profile:）。
+     *
+     * <p><b>已知口径分歧（#168 锁定，勿当 bug 修）</b>：{@code kinds} 传
+     * <b>空表</b>时——InMemory 后端「什么匹配不上」（严格），SQL 后端空表
+     * 不加 IN 子句 = 不过滤（宽松）。根源是 Python 两后端自身的同构分歧，
+     * Java 忠实移植；调用方传 {@code null} 表示「不过滤 kind」，跨后端
+     * 语义一致。
      */
     List<Models.MemoryRecord> listMemories(String userId, String agentId, boolean includeGlobal,
                                            List<String> kinds, List<String> statuses,

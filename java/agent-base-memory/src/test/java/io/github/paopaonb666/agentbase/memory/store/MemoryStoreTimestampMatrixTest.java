@@ -143,6 +143,51 @@ class MemoryStoreTimestampMatrixTest {
         }
     }
 
+    @Test
+    void ttlPushdownAndOpDetailSnapshotMatchAcrossBackends() {
+        // #168 矩阵种子 2：InMemory 覆写 8 参 TTL 下推后，与 SQL 的
+        // 「过期 episodic 不占候选名额（恰等边界行保留）」语义一致；
+        // recordOp 的 detail 是快照（调用方事后 mutate 不回溯审计行）。
+        try (SqliteMemoryStore sqlite = new SqliteMemoryStore(
+                tempDir.resolve("ttl-" + System.nanoTime() + ".db").toString())) {
+            InMemoryMemoryStore inMemory = new InMemoryMemoryStore();
+            for (MemoryStore store : List.of(inMemory, sqlite)) {
+                store.upsertMemory(new Models.MemoryRecord("fresh", "u", "chat", "episodic",
+                        "新事件", List.of(), null, null, 0.5, "active", "", List.of(),
+                        5000.0, 5000.0, null, 0));
+                // updatedAt == 截止线（恰等边界，保留）。
+                store.upsertMemory(new Models.MemoryRecord("boundary", "u", "chat", "episodic",
+                        "边界事件", List.of(), null, null, 0.5, "active", "", List.of(),
+                        4000.0, 4000.0, null, 0));
+                store.upsertMemory(new Models.MemoryRecord("stale", "u", "chat", "episodic",
+                        "过期事件", List.of(), null, null, 0.5, "active", "", List.of(),
+                        3000.0, 3999.0, null, 0));
+                store.upsertMemory(new Models.MemoryRecord("old-semantic", "u", "chat", "semantic",
+                        "旧但非 episodic（不受 TTL 影响）", List.of(), null, null,
+                        0.5, "active", "", List.of(), 2000.0, 2000.0, null, 0));
+            }
+            for (MemoryStore store : List.of(inMemory, sqlite)) {
+                List<Models.MemoryRecord> view = store.listMemories("u", null, true, null,
+                        List.of("active"), 100, false, 4000.0);
+                assertEquals(List.of("fresh", "boundary", "old-semantic"),
+                        view.stream().map(Models.MemoryRecord::memoryId).toList(),
+                        store.getClass().getSimpleName() + "：过期行不占名额、边界行保留");
+            }
+
+            // detail 快照：recordOp 后 mutate 原 Map，listOps 读回不变（两后端）。
+            for (MemoryStore store : List.of(inMemory, sqlite)) {
+                java.util.Map<String, Object> detail = new java.util.LinkedHashMap<>();
+                detail.put("k", "v");
+                store.recordOp(new Models.MemoryOp("mx", "extract", "mu", "chat", "",
+                        detail, "ok", "", 0, 6000.0));
+                detail.put("k", "mutated-after-record");
+                List<Models.MemoryOp> ops = store.listOps("mu", 10);
+                assertEquals("v", ops.get(0).detail().get("k"),
+                        store.getClass().getSimpleName() + "：detail 应是写入时快照");
+            }
+        }
+    }
+
     /** 固定时间戳的种子数据（µs 可表示值，避免 sqlite 微秒精度漂移）。 */
     private static void seed(MemoryStore store) {
         store.upsertMemory(new Models.MemoryRecord("m1", "u", "chat", "semantic", "内容一",

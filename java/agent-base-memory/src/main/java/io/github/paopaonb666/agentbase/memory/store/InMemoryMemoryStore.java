@@ -104,6 +104,33 @@ public final class InMemoryMemoryStore implements MemoryStore {
     }
 
     /**
+     * episodic TTL 下推（#168 对齐 #180 SQL 语义）：过期 episodic 行在此
+     * 被排除，不再挤占候选名额（此前靠 Retrieval.filterExpired 内存兜底，
+     * 该兜底保留为幂等二次过滤）。边界与 SQL 的 {@code updated_at >= ?}
+     * 对齐：恰等于截止线的行保留。
+     */
+    @Override
+    public List<Models.MemoryRecord> listMemories(String userId, String agentId,
+                                                  boolean includeGlobal, List<String> kinds,
+                                                  List<String> statuses, int limit,
+                                                  boolean excludeProfile,
+                                                  Double episodicCutoffBefore) {
+        List<Models.MemoryRecord> matched = listMemories(userId, agentId, includeGlobal,
+                kinds, statuses, limit, excludeProfile);
+        if (episodicCutoffBefore == null) {
+            return matched;
+        }
+        List<Models.MemoryRecord> filtered = new ArrayList<>(matched.size());
+        for (Models.MemoryRecord record : matched) {
+            if ("episodic".equals(record.kind()) && record.updatedAt() < episodicCutoffBefore) {
+                continue;
+            }
+            filtered.add(record);
+        }
+        return filtered;
+    }
+
+    /**
      * 关键词下推 brute-force（#326 默认实现）：进程内逐条分词求交集，
      * 词项重叠数降序 top-N。候选池语义 = 与查询有任一词项交集（等价于
      * BM25>0 的必要条件）；limit ≥ 语料规模时候选集与全量打分的关键词
@@ -337,7 +364,14 @@ public final class InMemoryMemoryStore implements MemoryStore {
     @Override
     public void recordOp(Models.MemoryOp op) {
         synchronized (lock) {
-            ops.add(new OpEntry(op, ++opCounter));
+            // detail 防御拷贝（#168 对齐 SQL 的 writeDetail 快照语义）：
+            // 调用方事后 mutate 原 Map 不得回溯改审计行。
+            ops.add(new OpEntry(
+                    new Models.MemoryOp(op.opId(), op.op(), op.userId(), op.agentId(),
+                            op.threadId(), op.detail() == null ? null
+                                    : new java.util.LinkedHashMap<>(op.detail()),
+                            op.status(), op.errorText(), op.durationMs(), op.createdAt()),
+                    ++opCounter));
         }
     }
 
