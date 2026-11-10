@@ -463,6 +463,24 @@ abstract class AbstractSqlMemoryStore implements MemoryStore {
                         record.lastAccessedAt() == null ? null : toSqlTs(record.lastAccessedAt()),
                         record.accessCount(),
                 }));
+        // 关键词索引同步（#326）：sqlite 覆写同步 FTS 表；MySQL FULLTEXT
+        // 引擎自维护（默认 no-op）。
+        indexAfterUpsert(record);
+    }
+
+    /** 关键词索引同步钩子（#326）：REPLACE 覆盖写后重建该行的索引项。 */
+    protected void indexAfterUpsert(Models.MemoryRecord record) {
+    }
+
+    /** 关键词索引同步钩子（#326）：行删除后清索引项。 */
+    protected void indexAfterDelete(String memoryId) {
+    }
+
+    /**
+     * 关键词索引同步钩子（#326）：按线程清理前调用——sqlite 需在
+     * memories 行仍可见时按 source_thread_id 子查询定位索引项。
+     */
+    protected void indexBeforeThreadDelete(String threadId) {
     }
 
     /** 拼接两段参数（模拟 Python 的元组解包追加）。 */
@@ -482,7 +500,11 @@ abstract class AbstractSqlMemoryStore implements MemoryStore {
 
     @Override
     public boolean deleteMemory(String memoryId) {
-        return execute("DELETE FROM memories WHERE memory_id = ?", memoryId) > 0;
+        boolean deleted = execute("DELETE FROM memories WHERE memory_id = ?", memoryId) > 0;
+        if (deleted) {
+            indexAfterDelete(memoryId);
+        }
+        return deleted;
     }
 
     @Override
@@ -729,6 +751,9 @@ abstract class AbstractSqlMemoryStore implements MemoryStore {
     /** #172：显式按线程清理跨会话记忆（purge_memories=true 才会走到）。 */
     @Override
     public int deleteMemoriesForThread(String threadId) {
+        // 索引清理先于行删除（#326）：sqlite 需按仍可见的 memories 行定位
+        // FTS 索引项；MySQL 无独立索引表（no-op）。
+        indexBeforeThreadDelete(threadId);
         return execute("DELETE FROM memories WHERE source_thread_id = ?", threadId);
     }
 

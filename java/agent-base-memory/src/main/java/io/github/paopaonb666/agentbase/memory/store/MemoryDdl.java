@@ -143,7 +143,17 @@ public final class MemoryDdl {
                     "002_idx_ops_user_created",
                     "memory_ops 审计主路径索引 (#160)",
                     List.of("CREATE INDEX IF NOT EXISTS idx_ops_user_created "
-                            + "ON memory_ops (user_id, created_at)")));
+                            + "ON memory_ops (user_id, created_at)")),
+            new io.github.paopaonb666.agentbase.core.storage.SchemaMigrations.Migration(
+                    "003_fts_keyword_index",
+                    "memories 关键词索引：FTS5 表存 QueryTerms bigram 预切分文本"
+                            + "（#326）。【Java 单边 DDL】Python alembic 无此表——"
+                            + "external-content/trigger 方案与 INSERT OR REPLACE 写语义"
+                            + "冲突（recursive_triggers=OFF 下 REPLACE 不触发 DELETE "
+                            + "trigger），故用独立表 + 应用层同步；切词在 Java 侧，"
+                            + "勿在 alembic 侧补齐",
+                    List.of("CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts "
+                            + "USING fts5(content, memory_id UNINDEXED)")));
 
     /**
      * MySQL 侧为存量表补 #159 索引的守卫 ALTER（内联 KEY 只对新建表
@@ -160,6 +170,17 @@ public final class MemoryDdl {
      */
     public static final String MYSQL_INDEX_OPS_USER_CREATED =
             "ALTER TABLE memory_ops ADD KEY idx_ops_user_created (user_id, created_at)";
+
+    /**
+     * MySQL 侧关键词全文索引的守卫 ALTER（#327，Java 单边 DDL）：ngram
+     * parser 需 MySQL 5.7.6+ 且 {@code ngram_token_size=2}（服务端启动
+     * 变量，默认 2——与 Java CJK bigram 对齐）。parser 不可用（<5.7.6）
+     * 时守卫捕获失败降级为无关键词下推，检索不受损。FULLTEXT 由引擎
+     * 随 INSERT/UPDATE/DELETE 自维护，无应用层同步面。
+     */
+    public static final String MYSQL_FULLTEXT_MEM_CONTENT =
+            "ALTER TABLE memories ADD FULLTEXT INDEX idx_mem_content_ft "
+                    + "(content) WITH PARSER ngram";
 
     /**
      * MySQL 建表语句（与 Python _MYSQL_DDLS 逐条一致 + #159 检索索引 +

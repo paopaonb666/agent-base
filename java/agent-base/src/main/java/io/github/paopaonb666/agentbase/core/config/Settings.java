@@ -271,6 +271,14 @@ public final class Settings {
          * ——全量打分语义不变；sqlite-vec 真下推（#323）就绪后按需打开。
          */
         public boolean vectorPushdown = false;
+        /**
+         * 关键词下推（#326/327/旧 #36）：启用后召回候选池先经
+         * {@code MemoryStore.searchMemoryIds} 的关键词 top-200 收窄——
+         * sqlite 走 FTS5 bigram 表、MySQL 走 ngram FULLTEXT（Java 单边
+         * 增强，Python 侧无下推）。默认关闭——全量打分语义不变；与
+         * vectorPushdown 独立（可只开一个，都开时候选池 = 两者并集）。
+         */
+        public boolean bm25Pushdown = false;
         public double timeDecayHalfLifeDays = 14.0;
         public int extractionMaxInputChars = 8000;
         public int extractionMaxMessages = 24;
@@ -986,6 +994,9 @@ public final class Settings {
         }
         if (v.containsKey("vector_pushdown")) {
             t.vectorPushdown = requireBool("vector_pushdown", v.get("vector_pushdown"));
+        }
+        if (v.containsKey("bm25_pushdown")) {
+            t.bm25Pushdown = requireBool("bm25_pushdown", v.get("bm25_pushdown"));
         }
         if (v.containsKey("extraction_max_input_chars")) {
             int value = requireInt("extraction_max_input_chars", v.get("extraction_max_input_chars"));

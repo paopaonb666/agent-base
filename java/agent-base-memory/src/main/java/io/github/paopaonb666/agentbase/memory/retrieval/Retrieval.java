@@ -47,6 +47,13 @@ public final class Retrieval {
     /** 向量下推的 KNN 候选池大小（#323/#324 方案口径：KNN top-100 再混合打分）。 */
     public static final int KNN_CANDIDATES = 100;
 
+    /**
+     * 关键词下推的候选池大小（#326/327）：宽松取值——BM25>0 但排在
+     * SQL top-N 之外的候选会被挤出（关键词下推无天然豁免类），200 给
+     * 生产 minScore 证据门槛下的真实命中留足余量。
+     */
+    public static final int BM25_CANDIDATES = 200;
+
     // 混合权重默认值（和为 1）。向量是语义召回的主力，BM25 兜关键词，
     // 时间与显著度做轻量排序先验。可经 MEMORY_WEIGHT_* 配置覆盖
     // （Settings 校验和与范围）；调权是检索质量工程，改动应有评测依据。
@@ -520,8 +527,21 @@ public final class Retrieval {
                 queryEmbedding = vectors.get(0);
             }
         }
+        // 关键词下推（#326/327，MEMORY_BM25_PUSHDOWN）：后端关键词索引的
+        // top-N id 集收窄候选池。后端未实现（null）→ 回退全量。SQL 侧分数
+        // 不进混合打分——池内候选回进程内 hybridScores 重打分（分数归一
+        // 基准=池内 max，与基线的差异由 golden 门守护不降）。
+        java.util.Set<String> keywordPool = null;
+        if (config.memory.bm25Pushdown) {
+            List<String> keywordIds = store.searchMemoryIds(userId, agentId, query, BM25_CANDIDATES);
+            if (keywordIds != null) {
+                keywordPool = new java.util.HashSet<>(keywordIds);
+            }
+        }
         // 向量下推（#324）：仅在索引、查询向量与库内向量三者齐备时收窄
-        // 混合打分候选池——无向量的候选（关键词路径）永远保留。
+        // 混合打分候选池——无向量的候选（关键词路径）永远保留。与关键词
+        // 下推都开时候选池 = 关键词 top-N ∪ KNN top-100（并集）。
+        boolean vectorNarrowed = false;
         if (vectorIndex != null && queryEmbedding != null) {
             boolean anyEmbedded = false;
             for (Models.MemoryRecord record : records) {
@@ -531,20 +551,35 @@ public final class Retrieval {
                 }
             }
             if (anyEmbedded) {
+                vectorNarrowed = true;
                 List<VectorIndexPort.VectorHit> hits =
                         vectorIndex.search(queryEmbedding, KNN_CANDIDATES);
-                java.util.Set<String> knnIds = new java.util.HashSet<>(hits.size());
+                java.util.Set<String> keepIds = new java.util.HashSet<>(hits.size());
                 for (VectorIndexPort.VectorHit hit : hits) {
-                    knnIds.add(hit.id());
+                    keepIds.add(hit.id());
+                }
+                if (keywordPool != null) {
+                    keepIds.addAll(keywordPool);
                 }
                 List<Models.MemoryRecord> pooled = new ArrayList<>(records.size());
                 for (Models.MemoryRecord record : records) {
-                    if (record.embedding() == null || knnIds.contains(record.memoryId())) {
+                    if (record.embedding() == null || keepIds.contains(record.memoryId())) {
                         pooled.add(record);
                     }
                 }
                 records = pooled;
             }
+        }
+        if (keywordPool != null && !vectorNarrowed) {
+            // 向量分支未运行（索引缺席/无查询向量/库内无向量）：关键词
+            // 下推独立收窄——严格按 top-N 集合（无豁免类，见容量声明）。
+            List<Models.MemoryRecord> pooled = new ArrayList<>(records.size());
+            for (Models.MemoryRecord record : records) {
+                if (keywordPool.contains(record.memoryId())) {
+                    pooled.add(record);
+                }
+            }
+            records = pooled;
         }
         List<ScoredMemory> scored = new ArrayList<>(scoreMemories(records, query, queryEmbedding,
                 timestamp, config.memory.timeDecayHalfLifeDays, Weights.fromSettings(config)));

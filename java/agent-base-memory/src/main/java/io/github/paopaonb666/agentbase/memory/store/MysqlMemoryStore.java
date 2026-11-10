@@ -71,6 +71,11 @@ public final class MysqlMemoryStore extends AbstractSqlMemoryStore {
         // #160：存量 memory_ops 表补审计索引（守卫语义同上）。
         ensureIndex(conn, "memory_ops", "idx_ops_user_created",
                 MemoryDdl.MYSQL_INDEX_OPS_USER_CREATED);
+        // #327：关键词全文索引（ngram parser 需 MySQL 5.7.6+ 且
+        // ngram_token_size=2）。守卫失败只降级为无关键词下推（searchMemoryIds
+        // 的 MATCH 会失败 → 下推分支回退全量），检索不受损。
+        ensureIndex(conn, "memories", "idx_mem_content_ft",
+                MemoryDdl.MYSQL_FULLTEXT_MEM_CONTENT);
         tableReady = true;
     }
 
@@ -134,6 +139,56 @@ public final class MysqlMemoryStore extends AbstractSqlMemoryStore {
             }
         } catch (SQLException e) {
             throw new IllegalStateException("mysql memory store: 查询失败", e);
+        }
+    }
+
+    /** FULLTEXT 索引可用性（#327）：守卫 ALTER 失败/MATCH 报错后降级。 */
+    private volatile boolean fulltextAvailable = true;
+    private volatile boolean fulltextWarned = false;
+
+    /**
+     * 关键词候选下推（#327）：ngram FULLTEXT 的 MATCH … AGAINST 自然语言
+     * 模式（服务端 ngram_token_size=2 与 Java CJK bigram 对齐；ASCII 语义
+     * 差异登记差异表）。相关度只做 ORDER BY，分数不回传（混合打分在进程
+     * 内）。索引缺席（守卫失败）或 MATCH 失败 → 返回 null，下推分支回退
+     * 全量拉取（检索不受损，只丢下推收益）。
+     */
+    @Override
+    public List<String> searchMemoryIds(String userId, String agentId, String query, int limit) {
+        if (!fulltextAvailable) {
+            return null;
+        }
+        if (query == null || query.isBlank()) {
+            return List.of();
+        }
+        StringBuilder sql = new StringBuilder(
+                "SELECT memory_id FROM memories "
+                        + "WHERE MATCH(content) AGAINST (? IN NATURAL LANGUAGE MODE) "
+                        + "AND user_id = ? AND status = 'active'");
+        List<Object> params = new ArrayList<>(List.of(query, userId));
+        if (agentId != null) {
+            sql.append(" AND (agent_id = ? OR agent_id = '*')");
+            params.add(agentId);
+        }
+        sql.append(" ORDER BY MATCH(content) AGAINST (? IN NATURAL LANGUAGE MODE) DESC LIMIT ?");
+        params.add(query);
+        params.add(Math.max(1, limit));
+        try {
+            List<Object[]> rows = fetchAll(sql.toString(), params.toArray());
+            List<String> out = new ArrayList<>(rows.size());
+            for (Object[] row : rows) {
+                out.add(String.valueOf(row[0]));
+            }
+            return out;
+        } catch (IllegalStateException e) {
+            // MATCH 失败 = 索引缺席（守卫 ALTER 失败的部署）或连接故障：
+            // 前者永久失败（降级不重试），后者下次 ensureTables 后自然恢复
+            // ——按一次性降级处理（WARN 一次）。
+            if (!fulltextWarned) {
+                fulltextWarned = true;
+                LOG.warn("mysql memory store: 关键词下推查询失败，回退全量拉取：{}", e.getMessage());
+            }
+            return null;
         }
     }
 

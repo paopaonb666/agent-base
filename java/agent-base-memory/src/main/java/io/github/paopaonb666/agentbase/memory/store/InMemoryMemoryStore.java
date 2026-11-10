@@ -103,6 +103,47 @@ public final class InMemoryMemoryStore implements MemoryStore {
         }
     }
 
+    /**
+     * 关键词下推 brute-force（#326 默认实现）：进程内逐条分词求交集，
+     * 词项重叠数降序 top-N。候选池语义 = 与查询有任一词项交集（等价于
+     * BM25>0 的必要条件）；limit ≥ 语料规模时候选集与全量打分的关键词
+     * 命中集一致（#325 语义基线的池级断言基础）。
+     */
+    @Override
+    public List<String> searchMemoryIds(String userId, String agentId, String query, int limit) {
+        List<String> queryTokens = io.github.paopaonb666.agentbase.core.text.QueryTerms.tokenize(query);
+        if (queryTokens.isEmpty()) {
+            return List.of();
+        }
+        java.util.Set<String> querySet = new java.util.HashSet<>(queryTokens);
+        List<Models.MemoryRecord> matched = listMemories(userId, agentId, true, null,
+                List.of("active"), Integer.MAX_VALUE, false);
+        List<Models.MemoryRecord> hits = new ArrayList<>();
+        for (Models.MemoryRecord record : matched) {
+            java.util.Set<String> tokens = new java.util.HashSet<>(
+                    io.github.paopaonb666.agentbase.core.text.QueryTerms.tokenize(record.content()));
+            tokens.retainAll(querySet);
+            if (!tokens.isEmpty()) {
+                hits.add(record);
+            }
+        }
+        // 稳定排序：重叠数降序、同数保持 updatedAt 降序（listMemories 的次序）。
+        hits.sort((a, b) -> Integer.compare(
+                overlap(b, querySet), overlap(a, querySet)));
+        List<String> out = new ArrayList<>();
+        for (Models.MemoryRecord record : hits.subList(0, Math.min(hits.size(), Math.max(1, limit)))) {
+            out.add(record.memoryId());
+        }
+        return out;
+    }
+
+    private static int overlap(Models.MemoryRecord record, java.util.Set<String> querySet) {
+        java.util.Set<String> tokens = new java.util.HashSet<>(
+                io.github.paopaonb666.agentbase.core.text.QueryTerms.tokenize(record.content()));
+        tokens.retainAll(querySet);
+        return tokens.size();
+    }
+
     @Override
     public void touchMemories(List<String> memoryIds) {
         if (memoryIds == null || memoryIds.isEmpty()) {

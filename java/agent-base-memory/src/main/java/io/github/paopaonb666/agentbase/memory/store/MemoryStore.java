@@ -45,6 +45,19 @@ public interface MemoryStore extends AutoCloseable {
     /** 访问记账：批量更新 last_accessed_at + access_count。 */
     void touchMemories(List<String> memoryIds);
 
+    /**
+     * 关键词候选下推（#326/327）：返回与 query 有词项交集的 memory_id
+     * top-N（相关性降序；语义对齐 {@code MEMORY_BM25_PUSHDOWN}）。返回
+     * null = 本后端未实现关键词索引，下推分支回退全量拉取——开关打开但
+     * 后端不支持时检索结果不受损（只是没有下推收益）。SQL 侧的相关度
+     * 分数不进混合打分：候选池只做集合收窄，打分仍在进程内按既有
+     * hybridScores 重算（分数口径单一来源）。
+     */
+    default java.util.List<String> searchMemoryIds(String userId, String agentId,
+                                                   String query, int limit) {
+        return null;
+    }
+
     /** 换模型后的向量回填查询（embedding 缺失或维度不符）。 */
     List<Models.MemoryRecord> listMemoriesNeedingEmbedding(int dims, int limit);
 
