@@ -8,7 +8,9 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 
 import io.github.paopaonb666.agentbase.core.AgentModule;
@@ -46,6 +48,13 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
 
     private static final Logger LOG = LoggerFactory.getLogger(MemoryService.class);
 
+    /** #182 capture 重试队列容量（有界；满则丢弃可观测——对齐 #212 有界池风格）。 */
+    private static final int CAPTURE_RETRY_QUEUE_CAPACITY = 32;
+    /** #182 重试上限：累计失败次数（含首次实时失败）达到即丢弃。 */
+    private static final int CAPTURE_RETRY_MAX_ATTEMPTS = 3;
+    /** #182 tryLock 让路后的退避毫秒：实时轮持锁期间不空转。 */
+    private static final long CAPTURE_RETRY_BACKOFF_MS = 100;
+
     private final MemoryStore store;
     private final EmbeddingClient embedder;
     private final Settings settings;
@@ -56,6 +65,18 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
 
     /** 按 user_id 的捕获串行化锁（锐评 #10：并发轮次重复 ADD 防护）。 */
     private final Map<String, ReentrantLock> locks = new ConcurrentHashMap<>();
+
+    /** #182 capture 失败重试队列：有界、满则丢弃可观测；不做持久化死信——
+     * 每轮 captureTurn 持全量快照（非增量），下一轮成功的 capture 天然
+     * 覆盖丢轮，内存队列足够。 */
+    private final ArrayBlockingQueue<CaptureTask> captureRetries =
+            new ArrayBlockingQueue<>(CAPTURE_RETRY_QUEUE_CAPACITY);
+    /** 重试线程懒启动单飞锁（首次入队时创建，单守护线程）。 */
+    private final Object captureRetryStartLock = new Object();
+    /** 重试单守护线程；volatile 供 close() 中断与判空。 */
+    private volatile Thread captureRetryWorker;
+    /** 关闭标志：置位后不再入队/重放（关闭期不再打 LLM），剩余任务由 close 排空计数。 */
+    private volatile boolean stopped = false;
 
     /** 线程级冻结注入段的 LRU 缓存（成本治理 T2.1），键 (user,agent,thread)。
      * accessOrder=true：get 即 touch（对应 Python orchestrator 的
@@ -78,6 +99,27 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
         this.llm = llm;
         this.vectorIndex = vectorIndex;
         this.pipeline = llm == null ? null : new MemoryPipeline(llm, fastLlm, settings, new Ops());
+    }
+
+    /**
+     * 包私有（测试注入点）：直接给定已装配的管线——{@link MemoryPipeline}
+     * 为 final 类且由服务内部构造，手写桩测试经其公开构造器注入脚本化模型
+     * 与 MemoryOps，才能驱动服务级 catch 兜底（#182 重试队列的入队口）。
+     * 静态工厂形态：不与公开构造器在 null 字面量下产生重载二义性。
+     */
+    static MemoryService withPipeline(MemoryStore store, EmbeddingClient embedder,
+                                      Settings settings, MemoryPipeline pipeline) {
+        return new MemoryService(store, embedder, settings, pipeline, null);
+    }
+
+    private MemoryService(MemoryStore store, EmbeddingClient embedder, Settings settings,
+                          MemoryPipeline pipeline, VectorIndexPort vectorIndex) {
+        this.store = store;
+        this.embedder = embedder;
+        this.settings = settings;
+        this.llm = null;
+        this.vectorIndex = vectorIndex;
+        this.pipeline = pipeline;
     }
 
     /** 按配置装配；未启用或后端不可用返回 null（对应 build_memory_service）。 */
@@ -811,14 +853,157 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
         }
         ReentrantLock lock = locks.computeIfAbsent(userId, k -> new ReentrantLock());
         lock.lock();
+        Map<String, Object> detail;
+        boolean captureFailed = false;
         try {
-            return pipeline.captureTurn(userId, agentId, threadId, transcript, humanCount, force);
+            detail = pipeline.captureTurn(userId, agentId, threadId, transcript, humanCount, force);
         } catch (Exception e) {
             // 管线内部已逐步失败安全；这里兜底防任何漏网异常干扰调用方。
             LOG.error("memory: capture_turn 意外失败", e);
-            return null;
+            detail = null;
+            captureFailed = true;
         } finally {
             lock.unlock();
+        }
+        if (captureFailed) {
+            // #182：解锁后再入队——重试线程的 tryLock 不与本轮持锁窗口相撞。
+            // 队列有界、入队失败只 WARN（可观测不阻塞）；本轮丢失由下一轮
+            // 全量快照 capture 天然覆盖，无需持久化死信。
+            enqueueCaptureRetry(userId, agentId, threadId, transcript, humanCount, force, 1);
+        }
+        return detail;
+    }
+
+    // ── capture 失败重试队列（#182） ─────────────────────────────────────
+
+    /** 重试任务载荷：已渲染转写快照（不重渲染）+ 定位元组 + 失败计数
+     * （attempt = 已失败次数，含首次实时失败；初值 1 = 实时轮失败后入队）。 */
+    private record CaptureTask(String userId, String agentId, String threadId,
+                               String transcript, int humanCount, boolean force, int attempt) {
+
+        CaptureTask withAttempt(int nextAttempt) {
+            return new CaptureTask(userId, agentId, threadId, transcript,
+                    humanCount, force, nextAttempt);
+        }
+    }
+
+    /**
+     * 失败转写入队（包私有：catch 分支与测试共用入口）。队列满或已关闭时
+     * 丢弃（WARN 可观测、不阻塞调用方）；首次入队懒启动单守护重试线程
+     * （daemon、名字 {@code memory-capture-retry}，风格对齐 backfill worker
+     * 先例——M 包不反向依赖基座 Background 池，自建线程）。
+     */
+    void enqueueCaptureRetry(String userId, String agentId, String threadId,
+                             String transcript, int humanCount, boolean force, int attempt) {
+        if (stopped) {
+            return; // 已关闭：不再接收（close 之后的 captureTurn 不属于正常流程）
+        }
+        if (!captureRetries.offer(new CaptureTask(userId, agentId, threadId,
+                transcript, humanCount, force, attempt))) {
+            LOG.warn("memory: capture 重试队列已满（{}），丢弃本轮失败转写（user='{}'）",
+                    CAPTURE_RETRY_QUEUE_CAPACITY, userId);
+            return;
+        }
+        synchronized (captureRetryStartLock) {
+            if (captureRetryWorker == null) {
+                Thread worker = new Thread(this::drainCaptureRetries, "memory-capture-retry");
+                worker.setDaemon(true);
+                worker.start();
+                captureRetryWorker = worker;
+            }
+        }
+    }
+
+    /** 待重试任务数（包私有：测试观测面）。 */
+    int pendingCaptureRetries() {
+        return captureRetries.size();
+    }
+
+    /**
+     * 重试主循环：单守护线程串行消费。取任务用带超时的 poll（响应 close
+     * 的中断，中断即退）；执行前抢同一 per-user 锁——tryLock 失败说明实时
+     * 轮持锁，任务回队尾让路（锐评 #10：重试绝不拖慢实时路径），短退避
+     * 防持锁期间空转。
+     */
+    private void drainCaptureRetries() {
+        while (!stopped) {
+            CaptureTask task;
+            try {
+                task = captureRetries.poll(500, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                break; // close() 中断：退出（剩余任务由 close 排空计数 WARN）
+            }
+            if (task == null) {
+                continue;
+            }
+            if (stopped) {
+                // close 竞态：任务已出队但服务在关闭——不执行（关闭期不打 LLM）。
+                LOG.warn("memory: 关闭时丢弃 1 条已出队待重试 capture 任务（user='{}'）",
+                        task.userId());
+                break;
+            }
+            ReentrantLock lock = locks.computeIfAbsent(task.userId(), k -> new ReentrantLock());
+            if (!lock.tryLock()) {
+                requeueCapture(task);
+                sleepQuietly(CAPTURE_RETRY_BACKOFF_MS);
+                continue;
+            }
+            try {
+                replayCapture(task);
+            } finally {
+                lock.unlock();
+            }
+        }
+    }
+
+    /** 单次重放（持 per-user 锁调用）：成功或达上限丢弃都写 capture_retry
+     * 审计 + 指标；中间失败仅 attempt+1 回队（不写终态审计）。 */
+    private void replayCapture(CaptureTask task) {
+        long started = System.nanoTime();
+        try {
+            pipeline.captureTurn(task.userId(), task.agentId(), task.threadId(),
+                    task.transcript(), task.humanCount(), task.force());
+        } catch (Exception e) {
+            long durationMs = (System.nanoTime() - started) / 1_000_000;
+            String errorText = e.getClass().getSimpleName() + ": " + e.getMessage();
+            if (errorText.length() > 300) {
+                errorText = errorText.substring(0, 300);
+            }
+            int attempts = task.attempt() + 1;
+            if (attempts >= CAPTURE_RETRY_MAX_ATTEMPTS) {
+                LOG.warn("memory: capture 重试 {} 次仍失败，丢弃（user='{}', thread='{}'）：{}",
+                        attempts, task.userId(), task.threadId(), e.toString());
+                recordOp("capture_retry", task.userId(), task.agentId(), task.threadId(),
+                        Map.of("attempts", attempts), "error", errorText, durationMs);
+                Metrics.memory().observe("capture_retry", "error", durationMs / 1000.0);
+            } else {
+                requeueCapture(task.withAttempt(attempts));
+            }
+            return;
+        }
+        long durationMs = (System.nanoTime() - started) / 1_000_000;
+        recordOp("capture_retry", task.userId(), task.agentId(), task.threadId(),
+                Map.of("attempts", task.attempt()), "ok", "", durationMs);
+        Metrics.memory().observe("capture_retry", "ok", durationMs / 1000.0);
+    }
+
+    /** 回队尾；服务已关闭或队列满时丢弃（WARN 可观测不阻塞，对齐 #212 风格）。 */
+    private void requeueCapture(CaptureTask task) {
+        if (stopped) {
+            return; // 关闭竞态：close 的排空计数已覆盖剩余任务
+        }
+        if (!captureRetries.offer(task)) {
+            LOG.warn("memory: capture 重试任务回队失败（队列已满 {}），丢弃（user='{}'）",
+                    CAPTURE_RETRY_QUEUE_CAPACITY, task.userId());
+        }
+    }
+
+    private static void sleepQuietly(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            // close 中断：恢复标志位即可，外层循环按 stopped 退出。
+            Thread.currentThread().interrupt();
         }
     }
 
@@ -933,6 +1118,24 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
 
     @Override
     public void close() {
+        // #182：先停 capture 重试队列——置 stopped + 中断重试线程（有界 join
+        // 等它退出，保证 close 返回后不再有新重放起跑），剩余任务只计数 WARN
+        // 不执行（关闭期不再打 LLM）；丢轮由下一轮全量快照 capture 覆盖。
+        stopped = true;
+        Thread worker = captureRetryWorker;
+        if (worker != null) {
+            worker.interrupt();
+            try {
+                worker.join(1000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        int dropped = captureRetries.size();
+        captureRetries.clear();
+        if (dropped > 0) {
+            LOG.warn("memory: 关闭时丢弃 {} 条待重试 capture 任务（不再执行）", dropped);
+        }
         try {
             store.close();
         } catch (Exception ignored) {
