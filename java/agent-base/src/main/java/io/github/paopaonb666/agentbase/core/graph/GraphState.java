@@ -20,6 +20,12 @@ public final class GraphState {
 
     private List<ChatMessage> messages;
     private Map<String, Object> extra;
+    /**
+     * #199 快照行元数据：本步落盘时是否为「取消的半截轮」。只进快照
+     * （{@code GraphStateJson.toJson} 据此写 {@code cancelled} 键），不是
+     * 状态通道——新 round 加载快照时复位，正常 persistState 整行覆盖后消失。
+     */
+    private boolean cancelledRound;
 
     public GraphState() {
         this(List.of(), Map.of());
@@ -79,7 +85,19 @@ public final class GraphState {
 
     /** 深拷贝（checkpointer 存快照前用，防止后续节点修改影响已存状态）。 */
     public GraphState copy() {
-        return new GraphState(new ArrayList<>(messages), new LinkedHashMap<>(extra));
+        GraphState copied = new GraphState(new ArrayList<>(messages), new LinkedHashMap<>(extra));
+        copied.cancelledRound = cancelledRound;
+        return copied;
+    }
+
+    /** #199 取消轮标记的读取（快照元数据，见字段 javadoc）。 */
+    public boolean cancelledRound() {
+        return cancelledRound;
+    }
+
+    /** #199 取消轮标记的写入（仅取消落盘路径与加载复位使用）。 */
+    public void cancelledRound(boolean cancelledRound) {
+        this.cancelledRound = cancelledRound;
     }
 
     /** 以本状态作为 invoke 输入载荷（messages 追加 + extra 合并）。 */

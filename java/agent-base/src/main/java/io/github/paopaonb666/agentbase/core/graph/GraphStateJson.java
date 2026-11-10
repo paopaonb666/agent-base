@@ -56,6 +56,12 @@ public final class GraphStateJson {
     public static String toJson(GraphState state) {
         ObjectNode root = MAPPER.createObjectNode();
         root.put("v", VERSION);
+        if (state.cancelledRound()) {
+            // #199：取消轮快照带标记——「这轮是被中断的」在快照行上可审计。
+            // 读侧不解析该键（行元数据不进状态通道），新 round 首次正常
+            // 落盘整行覆盖后自然消失。
+            root.put("cancelled", true);
+        }
         ArrayNode messages = root.putArray("messages");
         for (ChatMessage message : state.messages()) {
             messages.add(messageToJson(message));
@@ -93,7 +99,8 @@ public final class GraphStateJson {
                         "snapshot v=" + v + " (supported: " + VERSION + ")");
             }
         }
-        // 无 v 的存量行是 v1 兼容格式，照常解析。
+        // 无 v 的存量行是 v1 兼容格式，照常解析。根级 cancelled 键（#199
+        // 取消轮标记）是快照行元数据，读侧刻意不解析——不属于状态通道。
         List<ChatMessage> messages = new ArrayList<>();
         if (root.has("messages") && root.get("messages").isArray()) {
             for (JsonNode node : root.get("messages")) {

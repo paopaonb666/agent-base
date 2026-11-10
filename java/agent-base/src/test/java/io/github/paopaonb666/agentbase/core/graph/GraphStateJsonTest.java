@@ -134,6 +134,28 @@ class GraphStateJsonTest {
     }
 
     @Test
+    void cancelledRoundMarkerWritesOnlyForCancelledRoundsAndReadsAreTolerant() {
+        // #199：取消轮快照带根级 cancelled 键；正常快照逐字节不变（无键）；
+        // 读侧把该键当行元数据（不进状态通道），消息无损、存量行兼容。
+        GraphState normal = new GraphState(List.of(UserMessage.from("hi")), Map.of());
+        assertFalse(GraphStateJson.toJson(normal).contains("cancelled"));
+
+        GraphState cancelled = new GraphState(List.of(UserMessage.from("hi")), Map.of());
+        cancelled.cancelledRound(true);
+        String json = GraphStateJson.toJson(cancelled);
+        assertTrue(json.contains("\"cancelled\":true"), json);
+
+        GraphState parsed = GraphStateJson.fromJson(json);
+        assertEquals(1, parsed.messages().size());
+        assertEquals("hi", ((UserMessage) parsed.messages().get(0)).singleText());
+        assertFalse(parsed.cancelledRound(), "标记是行元数据，不随状态通道回读");
+        // 存量行已带 cancelled 键（新写侧+旧读侧混跑）同样无害。
+        GraphState legacy = GraphStateJson.fromJson(
+                "{\"v\":1,\"cancelled\":true,\"messages\":[{\"type\":\"human\",\"content\":\"old\"}],\"extra\":{}}");
+        assertEquals("old", ((UserMessage) legacy.messages().get(0)).singleText());
+    }
+
+    @Test
     void snapshotsCarryAVersionFieldAndUnknownVersionsAreRefused() throws Exception {
         // #200：写侧带 v=1；读侧未知版本拒载（返回 null），无 v 的存量行
         // （v1 兼容格式）照常解析。

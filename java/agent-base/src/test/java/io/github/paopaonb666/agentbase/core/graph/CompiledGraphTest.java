@@ -27,9 +27,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * 图引擎执行语义测试（对应 LangGraph ainvoke/astream/get_state 的受控子集）。
  *
- * <p>覆盖路线图 #285 圈定的悬空语义：递归触顶、取消丢步、put 失败传播、
+ * <p>覆盖路线图 #285 圈定的悬空语义：递归触顶、取消半步落盘、put 失败传播、
  * 条件边未知节点、并发同 thread 快照互踩。其中"取消丢步 / put 失败 /
- * 快照互踩"是 #199/#198/#197 的改造前基线——语义若变，本组测试同步改写。
+ * 快照互踩"原是 #199/#198/#197 的改造前基线——#199 已翻转（半步带
+ * cancelled 标记落盘）、#198/#197 已落地，语义若再变，本组测试同步改写。
  *
  * <p>另覆盖 #9 的统一终止标注：streamWithTermination 对每个终止点产出
  * 封闭枚举（DONE/CANCELLED/RECURSION_LIMIT/THREAD_BUSY/INTERNAL_ERROR），
@@ -148,9 +149,10 @@ class CompiledGraphTest {
     }
 
     @Test
-    void cancelAfterNodeExecutionDropsStepFromCheckpointer() {
-        // #199 基线：节点已在途执行完（无法回滚），但取消后不再落盘——
-        // 中断的 superstep 不进 checkpoint（恢复后看不到这半步）。
+    void cancelAfterNodeExecutionPersistsPartialStateWithCancelledMarker() {
+        // #199 翻转基线：节点已在途执行完（无法回滚），取消后半步产出带
+        // cancelled 标记落盘——「取消的轮次」不再从历史里凭空消失（对齐
+        // Python asyncio 取消语义的显式偏离，差异登记簿承载）。
         InMemoryCheckpointer cp = new InMemoryCheckpointer();
         RecordingSink sink = new RecordingSink();
         AtomicBoolean nodeRan = new AtomicBoolean(false);
@@ -158,7 +160,7 @@ class CompiledGraphTest {
                 .addNode("agent", (state, ctx) -> {
                     nodeRan.set(true);
                     // 节点在途期间客户端断开：emit 仍尽力送达，取消态在
-                    // 节点返回后由步间检查发现。
+                    // 节点返回后由步后检查发现。
                     ctx.emit(RecordingSink.CANCEL_MARKER);
                     return Map.of(GraphState.MESSAGES, List.of(AiMessage.from("partial")));
                 })
@@ -169,11 +171,141 @@ class CompiledGraphTest {
         GraphState out = graph.stream(new GraphState(), RunConfig.of("chat:t1", "u1"), sink);
 
         assertTrue(nodeRan.get());
-        // 取消后的步间检查先于 state.apply：这一步的产出既不落盘、也不进
-        // 返回值（对应 Python await 点被取消的 superstep——历史里凭空消失，
-        // #199 的改造基线）。
-        assertEquals(0, out.messages().size());
-        assertNull(cp.get("chat:t1"));
+        // 半步产出既进返回值、也落盘（基线翻转：原先两处皆为空）。
+        assertEquals(1, out.messages().size());
+        assertEquals("partial", ((AiMessage) out.messages().get(0)).text());
+        GraphState persisted = cp.get("chat:t1");
+        assertNotNull(persisted);
+        assertEquals(1, persisted.messages().size());
+        assertTrue(persisted.cancelledRound(), "快照行应携带取消标记");
+    }
+
+    @Test
+    void cancelledRoundStripsDanglingToolCallsFromSnapshot() {
+        // #199 兜底：取消落在「chat 已产出 tool_calls、tools 未执行」的窗口
+        // 时，快照剥掉未配对 tool_calls——下一轮模型输入不再以悬挂
+        // assistant(tool_calls) 结尾被 OpenAI 兼容 provider 拒收（400）。
+        InMemoryCheckpointer cp = new InMemoryCheckpointer();
+        RecordingSink sink = new RecordingSink();
+        CompiledGraph graph = GraphBuilder.begin()
+                .addNode("chat", (state, ctx) -> {
+                    ctx.emit(RecordingSink.CANCEL_MARKER);
+                    return Map.of(GraphState.MESSAGES, List.of(AiMessage.from(
+                            "让我查一下",
+                            List.of(dev.langchain4j.agent.tool.ToolExecutionRequest.builder()
+                                    .id("call_1").name("web_search")
+                                    .arguments("{\"query\":\"x\"}").build()))));
+                })
+                .entry("chat")
+                .addEdge("chat", GraphBuilder.END)
+                .compile(cp, "chat");
+
+        graph.stream(new GraphState(), RunConfig.of("chat:t1", "u1"), sink);
+
+        GraphState persisted = cp.get("chat:t1");
+        assertNotNull(persisted);
+        assertEquals(1, persisted.messages().size());
+        AiMessage stripped = (AiMessage) persisted.messages().get(0);
+        assertFalse(stripped.hasToolExecutionRequests(), "悬挂 tool_calls 必须剥除");
+        assertEquals("让我查一下", stripped.text());
+    }
+
+    @Test
+    void cancelledRoundPersistFailureStillCountsAsDebtAndStaysCancelled() {
+        // 取消落盘复用 #198 的重试+欠账语义：put 恒失败时半步留在内存续跑
+        // （返回值完整），终态仍是 CANCELLED——不因快照欠账把取消变成异常。
+        long debtBefore = CompiledGraph.persistDebtSteps();
+        InMemoryCheckpointer good = new InMemoryCheckpointer();
+        Checkpointer flaky = new Checkpointer() {
+            @Override
+            public void put(String threadId, GraphState state) {
+                throw new IllegalStateException("checkpoint put failed: disk full");
+            }
+
+            @Override
+            public GraphState get(String threadId) {
+                return good.get(threadId);
+            }
+
+            @Override
+            public void deleteThread(String threadId) {
+                good.deleteThread(threadId);
+            }
+
+            @Override
+            public List<String> listThreadIds() {
+                return good.listThreadIds();
+            }
+
+            @Override
+            public boolean healthy() {
+                return false;
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        RecordingSink sink = new RecordingSink();
+        CompiledGraph graph = GraphBuilder.begin()
+                .addNode("agent", (state, ctx) -> {
+                    ctx.emit(RecordingSink.CANCEL_MARKER);
+                    return Map.of(GraphState.MESSAGES, List.of(AiMessage.from("partial")));
+                })
+                .entry("agent")
+                .addEdge("agent", GraphBuilder.END)
+                .compile(flaky, "chat");
+
+        CompiledGraph.RunOutcome outcome = graph.streamWithTermination(
+                new GraphState(), RunConfig.of("chat:t1", "u1"), sink);
+
+        // 终态仍是 CANCELLED（不因快照欠账变成异常/其他终止点），半步在
+        // 内存态完整（#198 内存续跑语义对取消落盘同样成立）。
+        assertEquals(Events.RunTermination.CANCELLED, outcome.termination());
+        assertNull(outcome.error());
+        assertEquals(1, outcome.state().messages().size());
+        assertTrue(CompiledGraph.persistInDebt());
+        assertEquals(debtBefore + 1, CompiledGraph.persistDebtSteps());
+    }
+
+    @Test
+    void cancelledPartialRoundIsVisibleToNextRoundHistory() {
+        // #199 主诉闭环：半截轮落盘后同 thread 再 invoke——新 round 的节点
+        // 看到的历史含半截消息（模型输入组装兼容），且新 round 首次正常
+        // 落盘后快照行的取消标记被整行覆盖消失。
+        InMemoryCheckpointer cp = new InMemoryCheckpointer();
+        RecordingSink sink = new RecordingSink();
+        CompiledGraph round1 = GraphBuilder.begin()
+                .addNode("agent", (state, ctx) -> {
+                    ctx.emit(RecordingSink.CANCEL_MARKER);
+                    return Map.of(GraphState.MESSAGES, List.of(AiMessage.from("partial")));
+                })
+                .entry("agent")
+                .addEdge("agent", GraphBuilder.END)
+                .compile(cp, "chat");
+        round1.stream(new GraphState(), RunConfig.of("chat:t1", "u1"), sink);
+        assertTrue(cp.get("chat:t1").cancelledRound());
+
+        AtomicReference<List<ChatMessage>> seen = new AtomicReference<>();
+        CompiledGraph round2 = GraphBuilder.begin()
+                .addNode("agent", (state, ctx) -> {
+                    seen.set(List.copyOf(state.messages()));
+                    return Map.of(GraphState.MESSAGES, List.of(AiMessage.from("round2")));
+                })
+                .entry("agent")
+                .addEdge("agent", GraphBuilder.END)
+                .compile(cp, "chat");
+        round2.invoke(new GraphState(List.of(UserMessage.from("next")), Map.of()),
+                RunConfig.of("chat:t1", "u1"));
+
+        // 节点视角：半截 partial（上轮取消产出）+ 本轮输入 next。
+        assertEquals(2, seen.get().size());
+        assertEquals("partial", ((AiMessage) seen.get().get(0)).text());
+        assertEquals("next", ((UserMessage) seen.get().get(1)).singleText());
+        // 正常落盘后标记消失（行元数据，非状态通道）。
+        GraphState after = cp.get("chat:t1");
+        assertFalse(after.cancelledRound());
+        assertEquals(3, after.messages().size());
     }
 
     @Test
@@ -532,7 +664,7 @@ class CompiledGraphTest {
 
     @Test
     void streamWithTerminationAnnotatesCancellation() {
-        // #9：断连 break（#199 丢步基线不变）的出口归 CANCELLED，error 为 null。
+        // #9：断连 break（#199：半步已带标记落盘）的出口归 CANCELLED，error 为 null。
         RecordingSink sink = new RecordingSink();
         CompiledGraph graph = GraphBuilder.begin()
                 .addNode("agent", (state, ctx) -> {

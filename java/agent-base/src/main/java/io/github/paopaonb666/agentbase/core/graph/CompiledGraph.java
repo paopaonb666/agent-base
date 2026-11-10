@@ -1,5 +1,7 @@
 package io.github.paopaonb666.agentbase.core.graph;
 
+import dev.langchain4j.data.message.AiMessage;
+import dev.langchain4j.data.message.ChatMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -179,10 +181,17 @@ public final class CompiledGraph {
             }
             Map<String, Object> update = executeNode(node, state, config, sink);
             if (sink != null && sink.cancelled()) {
-                // 节点已在途执行完（无法回滚），但取消后不再把这一步落盘：
-                // 对应 Python asyncio 任务在节点 await 点被取消——中断的
-                // superstep 不会进 checkpoint，恢复后看不到这半步。
-                LOG.debug("图执行被取消（客户端断开）：thread={}，丢弃步骤 {} 的快照",
+                // 节点已在途执行完（无法回滚）：半步产出照常进状态并落盘
+                // （#199 翻转基线——取消的轮次不再从历史里凭空消失），快照
+                // 带 cancelled 标记；对应 Python asyncio 取消语义的显式偏离
+                // （中断的 superstep 不进 checkpoint），登记为 Java 单边增强。
+                // 不再 emit StepEvent.completed：断连 sink 的入队在取消态是
+                // 有界放弃（R1-F1），事件也只会被消费端丢弃。
+                state.apply(update);
+                stripDanglingToolCalls(state);
+                state.cancelledRound(true);
+                persistState(config, state);
+                LOG.debug("图执行被取消（客户端断开）：thread={}，半步 {} 已带标记落盘",
                         config.threadId(), current);
                 return new RunOutcome(state, Events.RunTermination.CANCELLED, null);
             }
@@ -287,10 +296,36 @@ public final class CompiledGraph {
         if (checkpointer != null) {
             GraphState persisted = checkpointer.get(config.threadId());
             if (persisted != null) {
+                // #199：cancelled 标记是快照行元数据不是状态通道——新 round
+                // 加载时复位（首个正常 persistState 整行覆盖后标记消失）。
+                persisted.cancelledRound(false);
                 return persisted;
             }
         }
         return new GraphState();
+    }
+
+    /**
+     * 半截轮的悬挂 tool_calls 剥除（#199 兜底）：取消落在「chat 节点已产出
+     * 工具调用请求、tools 节点未执行」的窗口时，快照若保留未配对的
+     * tool_calls，下一轮模型输入以「assistant(tool_calls) 无配对 tool 结果」
+     * 结尾——OpenAI 兼容 provider 普遍拒收（400）。剥掉后以纯文本
+     * assistant 消息续接（协议要求 tool 消息配对；调用明细在
+     * tool_call_records 审计不受影响）。
+     */
+    private static void stripDanglingToolCalls(GraphState state) {
+        List<ChatMessage> messages = state.messages();
+        if (messages.isEmpty()) {
+            return;
+        }
+        ChatMessage last = messages.get(messages.size() - 1);
+        if (last instanceof AiMessage ai && ai.hasToolExecutionRequests()) {
+            messages.set(messages.size() - 1, AiMessage.builder()
+                    .text(ai.text())
+                    .thinking(ai.thinking())
+                    .attributes(ai.attributes() == null ? Map.of() : ai.attributes())
+                    .build());
+        }
     }
 
     private void persistState(RunConfig config, GraphState state) {
