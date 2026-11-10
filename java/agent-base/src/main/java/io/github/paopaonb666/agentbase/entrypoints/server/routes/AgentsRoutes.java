@@ -33,6 +33,7 @@ import io.github.paopaonb666.agentbase.core.storage.ThreadIndexRecord;
 import io.github.paopaonb666.agentbase.entrypoints.server.Attachments;
 import io.github.paopaonb666.agentbase.entrypoints.server.AuthBackends;
 import io.github.paopaonb666.agentbase.entrypoints.server.Background;
+import io.github.paopaonb666.agentbase.entrypoints.server.ErrorCode;
 import io.github.paopaonb666.agentbase.entrypoints.server.HttpError;
 import io.github.paopaonb666.agentbase.entrypoints.server.MessageSerializers;
 import io.github.paopaonb666.agentbase.entrypoints.server.RateLimiters;
@@ -101,7 +102,7 @@ public class AgentsRoutes {
         try {
             return runtime.graph(module);
         } catch (AgentRuntime.UnknownModuleError exc) {
-            throw new HttpError(404, String.valueOf(exc.getMessage()));
+            throw new HttpError(404, ErrorCode.NOT_FOUND, String.valueOf(exc.getMessage()));
         }
     }
 
@@ -116,7 +117,7 @@ public class AgentsRoutes {
      */
     private void requireIndexForDegradedPath(String operation) {
         if ("production".equals(runtime.settings().env)) {
-            throw new HttpError(503, "线程索引不可用，生产环境拒绝降级" + operation
+            throw new HttpError(503, ErrorCode.STORAGE_UNAVAILABLE, "线程索引不可用，生产环境拒绝降级" + operation
                     + "：无索引即无属主校验（fail-safe 而非 fail-open）；"
                     + "请修复索引存储后重启，本地调试请用 ENV=development");
         }
@@ -133,7 +134,7 @@ public class AgentsRoutes {
         }
         var entry = index.getThreadIndex(new ThreadId(module, threadId).toString());
         if (entry == null || !entry.userId().equals(userId)) {
-            throw new HttpError(404, "线程不存在：" + threadId);
+            throw new HttpError(404, ErrorCode.NOT_FOUND, "线程不存在：" + threadId);
         }
     }
 
@@ -162,31 +163,31 @@ public class AgentsRoutes {
         // （Pydantic max_length 语义），代理对内容与 Python 侧同界。
         if (body.message() == null || body.message().isEmpty()
                 || CharMetrics.len(body.message()) > 100_000) {
-            throw new HttpError(422, "message 必须是 1..100000 字符");
+            throw new HttpError(422, ErrorCode.VALIDATION, "message 必须是 1..100000 字符");
         }
         if (body.threadId() != null && (body.threadId().length() > 128
                 // (?U)：Python re 的 \w 是 unicode 语义（中文 thread id 合法），
                 // Java 默认 ASCII——不加标志会把 Python 接受的 id 422 掉。
                 || !body.threadId().matches("(?U)^[\\w.-]+$"))) {
-            throw new HttpError(422, "thread_id 格式非法（[\\w.-]{1,128}）");
+            throw new HttpError(422, ErrorCode.VALIDATION, "thread_id 格式非法（[\\w.-]{1,128}）");
         }
         if (body.attachments() != null && body.attachments().size() > 5) {
-            throw new HttpError(422, "attachments 最多 5 个");
+            throw new HttpError(422, ErrorCode.VALIDATION, "attachments 最多 5 个");
         }
         String mode = body.mode() == null ? "chat" : body.mode();
         String profile = body.profile() == null ? "main" : body.profile();
         if (!MODES.contains(mode)) {
-            throw new HttpError(422, "mode 必须是 " + String.join("|", MODES));
+            throw new HttpError(422, ErrorCode.VALIDATION, "mode 必须是 " + String.join("|", MODES));
         }
         if (!LlmFactory.PROFILES.contains(profile)) {
-            throw new HttpError(422, "profile 必须是 " + String.join("|", LlmFactory.PROFILES));
+            throw new HttpError(422, ErrorCode.VALIDATION, "profile 必须是 " + String.join("|", LlmFactory.PROFILES));
         }
         // 预算熔断（T4.2）：在建流之前检查——429 优先于半截 SSE。
         if (governor != null) {
             try {
                 governor.check();
             } catch (CostBudgetExceededException exc) {
-                throw new HttpError(429, String.valueOf(exc.getMessage()));
+                throw new HttpError(429, ErrorCode.BUDGET_BLOCKED, String.valueOf(exc.getMessage()));
             }
         }
         // 难度分流（M9）：mode 只决定调哪张图——thread 前缀、记忆 agent_id、
@@ -196,14 +197,14 @@ public class AgentsRoutes {
                         || (body.attachments() != null && !body.attachments().isEmpty())));
         if (usePlan && !runtime.modules().containsKey("planner")) {
             if ("plan".equals(mode)) {
-                throw new HttpError(503, "planner 模块未启用（AGENT_MODULES 不含 planner）");
+                throw new HttpError(503, ErrorCode.MODULE_UNAVAILABLE, "planner 模块未启用（AGENT_MODULES 不含 planner）");
             }
             usePlan = false; // auto：静默降级
         }
         // 模型档位（T1.2）：快档视图共享 checkpointer/memory，未配置显式 400。
         AgentRuntime view = runtime.profileView(profile);
         if (view == null) {
-            throw new HttpError(400, "LLM_FAST_* 未配置：profile=\"fast\" 不可用（配置快速档或使用默认档）");
+            throw new HttpError(400, ErrorCode.BAD_REQUEST, "LLM_FAST_* 未配置：profile=\"fast\" 不可用（配置快速档或使用默认档）");
         }
         CompiledGraph graph = graphOr404(usePlan ? "planner" : module);
         String userThreadId = body.threadId() != null && !body.threadId().isEmpty()
@@ -219,7 +220,7 @@ public class AgentsRoutes {
                 : userId;
         if (!rateLimiter.tryAcquire(limitKey, System.nanoTime())) {
             response.setHeader("Retry-After", String.valueOf(60));
-            throw new HttpError(429, "请求过于频繁：每用户上限 " + rateLimiter.perMinute()
+            throw new HttpError(429, ErrorCode.RATE_LIMITED, "请求过于频繁：每用户上限 " + rateLimiter.perMinute()
                     + " 次/分钟，请稍后重试（RATE_LIMIT_PER_MINUTE）");
         }
         String fullThreadId = new ThreadId(module, userThreadId).toString();
@@ -231,14 +232,14 @@ public class AgentsRoutes {
         if (threadIndex != null) {
             var existing = threadIndex.getThreadIndex(fullThreadId);
             if (existing != null && !existing.userId().equals(userId)) {
-                throw new HttpError(404, "线程不存在：" + userThreadId);
+                throw new HttpError(404, ErrorCode.NOT_FOUND, "线程不存在：" + userThreadId);
             }
         }
         // 同 thread 并发 invoke → 409（#197）：权威判定在图执行的 tryLock，
         // 探针只把报错时机提前到响应提交前（SSE 开始后只能以 error 事件收口）。
         if (graph.isThreadBusy(fullThreadId)) {
             response.setHeader("Retry-After", "5");
-            throw new HttpError(409, "线程忙：该 thread 已有进行中的对话（" + userThreadId
+            throw new HttpError(409, ErrorCode.THREAD_BUSY, "线程忙：该 thread 已有进行中的对话（" + userThreadId
                     + "），请等待当前轮完成或稍后重试");
         }
         RunConfig config = new RunConfig(fullThreadId, userId, runtime.settings().agentRecursionLimit);
@@ -263,7 +264,7 @@ public class AgentsRoutes {
         if (body.attachments() != null && !body.attachments().isEmpty()) {
             UploadedFileStore fileStore = runtime.fileStore();
             if (fileStore == null) {
-                throw new HttpError(503, "附件存储未启用（存储后端不可用）");
+                throw new HttpError(503, ErrorCode.STORAGE_UNAVAILABLE, "附件存储未启用（存储后端不可用）");
             }
             List<UploadedFileInfo> attachmentInfos = fileStore.getMany(body.attachments());
             List<String> missingOrUnauthorized = new ArrayList<>();
@@ -280,7 +281,7 @@ public class AgentsRoutes {
                 // 缺失与越权同文案同状态码——不给第三方探测 file_id 存在性的通道。
                 List<String> sorted = new ArrayList<>(missingOrUnauthorized);
                 java.util.Collections.sort(sorted);
-                throw new HttpError(400, "附件不存在或无权访问：" + String.join("，", sorted)
+                throw new HttpError(400, ErrorCode.BAD_REQUEST, "附件不存在或无权访问：" + String.join("，", sorted)
                         + "；请重新上传");
             }
             fileStore.bindThread(body.attachments(), fullThreadId);
@@ -336,13 +337,13 @@ public class AgentsRoutes {
             return Map.of();
         }
         if (!usePlan) {
-            throw new HttpError(400,
+            throw new HttpError(400, ErrorCode.BAD_REQUEST,
                     "continue_plan 需要与 planner 一起使用（mode=plan，或 mode=auto 且本轮分流到 planner）");
         }
         var planStore = runtime.planStore();
         Map<String, Object> snapshot = planStore == null ? null : planStore.getPlan(fullThreadId);
         if (snapshot == null || !(snapshot.get("tasks") instanceof List<?> tasks) || tasks.isEmpty()) {
-            throw new HttpError(400,
+            throw new HttpError(400, ErrorCode.BAD_REQUEST,
                     "没有可延续的计划快照（该线程首轮或快照已清理）；请正常发起 plan");
         }
         Map<String, Object> seed = new LinkedHashMap<>();
@@ -380,7 +381,7 @@ public class AgentsRoutes {
                     io.github.paopaonb666.agentbase.core.storage.ThreadIndexRecord.create(
                             config.threadId(), userId, module, title));
             if (!claimed.userId().equals(userId)) {
-                throw new HttpError(404, "线程不存在：" + userThreadId);
+                throw new HttpError(404, ErrorCode.NOT_FOUND, "线程不存在：" + userThreadId);
             }
         }
         // 记忆形成（M6c）：轮次正常完成后在后台跑抽取/整合/画像/摘要。
@@ -424,7 +425,7 @@ public class AgentsRoutes {
         // 恰好一次）。饱和快速失败（429+Retry-After），不排队。
         if (!runGate.tryEnter()) {
             response.setHeader("Retry-After", "5");
-            throw new HttpError(429, "服务并发已达上限（AGENT_RUN_CONCURRENCY="
+            throw new HttpError(429, ErrorCode.RUN_GATE_SATURATED, "服务并发已达上限（AGENT_RUN_CONCURRENCY="
                     + runGate.maxConcurrent() + "），请稍后重试");
         }
         return SseStreams.open(graph, messagesInput, effectiveExtra, config, userThreadId,
@@ -473,7 +474,7 @@ public class AgentsRoutes {
         // 鉴权先行（对应 Python get_current_user 依赖）。
         String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         if (!knownModule(module)) {
-            throw new HttpError(404, "unknown module '" + module + "'");
+            throw new HttpError(404, ErrorCode.NOT_FOUND, "unknown module '" + module + "'");
         }
         // 分页（#204，Java 侧 wire 扩展）：limit/offset 可选，缺省 = Python
         // 同构（50 条、零偏移）。limit 钳 1..200，offset 非负，取数上限
@@ -642,7 +643,7 @@ public class AgentsRoutes {
         String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         validateThreadId(threadId);
         if (!knownModule(module)) {
-            throw new HttpError(404, "unknown module '" + module + "'");
+            throw new HttpError(404, ErrorCode.NOT_FOUND, "unknown module '" + module + "'");
         }
         threadOwnerOr404(module, threadId, userId);
         var recorder = runtime.toolRecorder();
@@ -666,10 +667,10 @@ public class AgentsRoutes {
         String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         validateThreadId(threadId);
         if (!knownModule(module)) {
-            throw new HttpError(404, "unknown module '" + module + "'");
+            throw new HttpError(404, ErrorCode.NOT_FOUND, "unknown module '" + module + "'");
         }
         if (!runtime.modules().containsKey("planner")) {
-            throw new HttpError(503, "planner 模块未启用，无计划状态可读");
+            throw new HttpError(503, ErrorCode.MODULE_UNAVAILABLE, "planner 模块未启用，无计划状态可读");
         }
         threadOwnerOr404(module, threadId, userId);
         String fullThreadId = new ThreadId(module, threadId).toString();
@@ -731,7 +732,7 @@ public class AgentsRoutes {
         String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         validateThreadId(threadId);
         if (!knownModule(module)) {
-            throw new HttpError(404, "unknown module '" + module + "'");
+            throw new HttpError(404, ErrorCode.NOT_FOUND, "unknown module '" + module + "'");
         }
         threadOwnerOr404(module, threadId, userId);
         if (runtime.checkpointer() == null) {
@@ -766,7 +767,7 @@ public class AgentsRoutes {
         // Java 默认 ASCII——不加标志会把 invoke 创建的中文 id 在读侧 422 掉
         // （创建后即失联）。与 invoke 请求体侧的校验（本文件上方）同标志。
         if (threadId.length() > 128 || !threadId.matches("(?U)^[\\w.-]+$")) {
-            throw new HttpError(422, "thread_id 格式非法（[\\w.-]{1,128}）");
+            throw new HttpError(422, ErrorCode.VALIDATION, "thread_id 格式非法（[\\w.-]{1,128}）");
         }
     }
 

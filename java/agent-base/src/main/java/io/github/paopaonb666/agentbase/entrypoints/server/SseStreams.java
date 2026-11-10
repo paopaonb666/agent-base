@@ -61,6 +61,26 @@ public final class SseStreams {
         return text.length() > 300 ? text.substring(0, 300) : text;
     }
 
+    /**
+     * 失败终态的错误码判型（#91）：按异常类型映射封闭枚举——前端只认
+     * code 不认文案。可判型的只有携带类型信息的弹性层/图核异常；普通
+     * provider 错误重试耗尽后原样上抛（RuntimeException），无法可靠判型
+     * → 返回 null（wire 省键，与旧形态逐字节一致）。
+     */
+    static String errorCodeOf(Throwable error) {
+        if (error instanceof CompiledGraph.ThreadBusyError) {
+            return ErrorCode.THREAD_BUSY.wire();
+        }
+        if (error instanceof CompiledGraph.GraphRecursionError) {
+            return ErrorCode.RECURSION_LIMIT.wire();
+        }
+        if (error instanceof io.github.paopaonb666.agentbase.core.llm.CircuitBreakedModelRuntime.CircuitOpenException
+                || error instanceof io.github.paopaonb666.agentbase.core.llm.LangChain4jRuntime.StreamStalledException) {
+            return ErrorCode.LLM_UNAVAILABLE.wire();
+        }
+        return null;
+    }
+
     private SseStreams() {}
 
     /**
@@ -203,7 +223,8 @@ public final class SseStreams {
                 // 失败终态：ErrorEvent（既有形状不动）+ done 补 termination
                 // （#9）——前端不再从 error 文本反推结束原因。
                 LOG.error("sse: stream failed", outcome.error());
-                putUninterruptibly(queue, new Events.ErrorEvent(safeErrorText(outcome.error())), cancelled);
+                putUninterruptibly(queue, new Events.ErrorEvent(safeErrorText(outcome.error()),
+                        errorCodeOf(outcome.error())), cancelled);
                 putUninterruptibly(queue, new Events.DoneEvent(userThreadId, termination), cancelled);
             }
         } catch (java.util.concurrent.CancellationException e) {
@@ -214,7 +235,8 @@ public final class SseStreams {
             // 图层之后的失败（引用解析/入队等）：归 INTERNAL_ERROR（#9）。
             LOG.error("sse: stream failed", exc);
             Thread.interrupted(); // 同上：终态投递前清过期中断标志
-            putUninterruptibly(queue, new Events.ErrorEvent(safeErrorText(exc)), cancelled);
+            putUninterruptibly(queue, new Events.ErrorEvent(safeErrorText(exc),
+                    ErrorCode.INTERNAL_ERROR.wire()), cancelled);
             putUninterruptibly(queue, new Events.DoneEvent(userThreadId, Events.RunTermination.INTERNAL_ERROR), cancelled);
         } finally {
             // 终态钩子（#79 并发闸门退出）最先执行：保证后续 put 抛异常时

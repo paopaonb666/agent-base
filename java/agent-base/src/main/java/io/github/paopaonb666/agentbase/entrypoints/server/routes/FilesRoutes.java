@@ -11,6 +11,7 @@ import io.github.paopaonb666.agentbase.core.AgentRuntime;
 import io.github.paopaonb666.agentbase.core.config.Settings;
 import io.github.paopaonb666.agentbase.entrypoints.server.AuthBackends;
 import io.github.paopaonb666.agentbase.entrypoints.server.Background;
+import io.github.paopaonb666.agentbase.entrypoints.server.ErrorCode;
 import io.github.paopaonb666.agentbase.entrypoints.server.HttpError;
 import io.github.paopaonb666.agentbase.entrypoints.server.MessageSerializers;
 import io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileInfo;
@@ -62,7 +63,7 @@ public class FilesRoutes {
 
     private void requireModule(String module) {
         if (!knownModule(module)) {
-            throw new HttpError(404, "unknown module '" + module + "'");
+            throw new HttpError(404, ErrorCode.NOT_FOUND, "unknown module '" + module + "'");
         }
     }
 
@@ -70,13 +71,13 @@ public class FilesRoutes {
     private UploadedFileInfo ownedFile(String fileId, String userId) {
         UploadedFileStore fileStore = runtime.fileStore();
         if (fileStore == null) {
-            throw new HttpError(503, "附件存储未启用（存储后端不可用）");
+            throw new HttpError(503, ErrorCode.STORAGE_UNAVAILABLE, "附件存储未启用（存储后端不可用）");
         }
         List<UploadedFileInfo> infos = fileStore.getMany(List.of(fileId));
         UploadedFileInfo info = infos.isEmpty() ? null : infos.get(0);
         if (info == null || !(info.userId().isEmpty() || info.userId().equals(userId))) {
             // 404 而非 403：不向第三方泄露文件 id 的存在性。
-            throw new HttpError(404, "文件不存在：" + fileId);
+            throw new HttpError(404, ErrorCode.NOT_FOUND, "文件不存在：" + fileId);
         }
         return info;
     }
@@ -112,7 +113,7 @@ public class FilesRoutes {
         requireModule(module);
         UploadedFileStore fileStore = runtime.fileStore();
         if (fileStore == null) {
-            throw new HttpError(503, "附件存储未启用（存储后端不可用）");
+            throw new HttpError(503, ErrorCode.STORAGE_UNAVAILABLE, "附件存储未启用（存储后端不可用）");
         }
         // 大小上限（M5/#144）：声明 size（getSize）只是早退优化——容器
         // 解析前不可信，真正的大小约束在流式读取里边读边判（分块
@@ -121,7 +122,7 @@ public class FilesRoutes {
         Settings settings = runtime.settings();
         int maxBytes = settings.docParse.maxInputBytes;
         if (file.getSize() > maxBytes) {
-            throw new HttpError(413, "文件超出大小上限：> " + maxBytes + " 字节");
+            throw new HttpError(413, ErrorCode.BAD_REQUEST, "文件超出大小上限：> " + maxBytes + " 字节");
         }
         byte[] data;
         try (java.io.InputStream in = file.getInputStream()) {
@@ -133,14 +134,14 @@ public class FilesRoutes {
             while ((read = in.read(chunk)) != -1) {
                 total += read;
                 if (total > maxBytes) {
-                    throw new HttpError(413, "文件超出大小上限：> " + maxBytes + " 字节");
+                    throw new HttpError(413, ErrorCode.BAD_REQUEST, "文件超出大小上限：> " + maxBytes + " 字节");
                 }
                 buffer.write(chunk, 0, read);
             }
             data = buffer.toByteArray();
         }
         if (data.length == 0) {
-            throw new HttpError(400, "上传文件为空");
+            throw new HttpError(400, ErrorCode.BAD_REQUEST, "上传文件为空");
         }
         String filename = file.getOriginalFilename() == null ? "" : file.getOriginalFilename();
         String suffix = filename.contains(".")
@@ -150,7 +151,7 @@ public class FilesRoutes {
             // 图片：不走文本解析，按 magic bytes 校验后整字节入库。
             String mime = MessageSerializers.sniffImageMime(data);
             if (mime == null) {
-                throw new HttpError(400, "文件内容不是有效的图片：扩展名 '" + suffix
+                throw new HttpError(400, ErrorCode.BAD_REQUEST, "文件内容不是有效的图片：扩展名 '" + suffix
                         + "' 与实际内容不符（magic 校验失败）");
             }
             UploadedFileInfo info = new UploadedFileInfo(UUID.randomUUID().toString()
@@ -165,7 +166,7 @@ public class FilesRoutes {
             doc = DocumentParsers.parseDocument(data, filename, null, null,
                     settings.docParse.maxInputBytes, settings.docParse.maxOutputChars);
         } catch (io.github.paopaonb666.agentbase.toolkit.parsing.DocumentParseError exc) {
-            throw new HttpError(400, String.valueOf(exc.getMessage()));
+            throw new HttpError(400, ErrorCode.BAD_REQUEST, String.valueOf(exc.getMessage()));
         }
         // 空提取文本（扫描件/纯图片 PDF）不是错误，但要显式告知前端。
         String warning = doc.text().strip().isEmpty()
@@ -277,7 +278,7 @@ public class FilesRoutes {
         requireModule(module);
         UploadedFileInfo info = ownedFile(fileId, userId);
         if (info.content() == null || info.content().length == 0) {
-            throw new HttpError(404, "文件内容不可用");
+            throw new HttpError(404, ErrorCode.NOT_FOUND, "文件内容不可用");
         }
         org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
         if (MessageSerializers.IMAGE_STORED_FORMATS.contains(info.format())) {
@@ -309,11 +310,11 @@ public class FilesRoutes {
         String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         var memory = runtime.memory();
         if (memory == null) {
-            throw new HttpError(503, "记忆系统未启用（MEMORY_ENABLED=false）");
+            throw new HttpError(503, ErrorCode.MODULE_UNAVAILABLE, "记忆系统未启用（MEMORY_ENABLED=false）");
         }
         String query = q == null ? "" : q.strip();
         if (query.isEmpty()) {
-            throw new HttpError(422, "q 不能为空");
+            throw new HttpError(422, ErrorCode.VALIDATION, "q 不能为空");
         }
         List<Map<String, Object>> scored =
                 new ArrayList<>(memory.searchKnowledge(userId, null, query,
@@ -355,7 +356,7 @@ public class FilesRoutes {
         String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         UploadedFileStore fileStore = runtime.fileStore();
         if (fileStore == null) {
-            throw new HttpError(503, "附件存储未启用（存储后端不可用）");
+            throw new HttpError(503, ErrorCode.STORAGE_UNAVAILABLE, "附件存储未启用（存储后端不可用）");
         }
         List<UploadedFileInfo> files = fileStore.listForUser(userId);
         Map<String, Integer> counts = Map.of();

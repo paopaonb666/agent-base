@@ -71,7 +71,13 @@ java -jar agent-base-memory/target/agent-base-memory-0.3.0-exec.jar --server
 
 配套前端 `agent-base-ui` 无需任何改动：SSE 事件契约（`ping/step/delta/
 tool_call/plan/sources/done/error`）、端点路径与状态码语义与 Python 版逐
-字节对齐（见仓库根 README 的「事件契约（SSE）」节）。
+字节对齐（见仓库根 README 的「事件契约（SSE）」节）。Java 侧扩展（#91，
+向后兼容加键）：HTTP 错误体与 `error` 事件在人类可读 `detail`/`message`
+旁挂结构化 `code`（封闭枚举 `rate_limited/budget_blocked/run_gate_saturated/
+thread_busy/unauthorized/not_found/validation/bad_request/module_unavailable/
+storage_unavailable/llm_unavailable/recursion_limit/internal_error` 等）——
+前端只认 code 不认文案；缺省场景省键（旧 wire 逐字节不变），Python 版无
+此字段。
 
 ## 与 Python 版的已知差异
 

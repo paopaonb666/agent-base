@@ -129,7 +129,7 @@ public final class AuthBackends {
             if (userIdHeader == null || userIdHeader.isEmpty()) {
                 userId = "default";
             } else if (!REQUEST_ID_RE.matcher(userIdHeader).matches()) {
-                throw new HttpError(400,
+                throw new HttpError(400, ErrorCode.BAD_REQUEST,
                         "X-User-Id 非法：仅允许字母/数字/点/下划线/连字符，1-64 字符");
             } else {
                 userId = userIdHeader;
@@ -142,23 +142,23 @@ public final class AuthBackends {
                 if (window > 0) {
                     timestamp = timestampHeader == null ? "" : timestampHeader;
                     if (timestamp.isEmpty()) {
-                        throw new HttpError(401,
+                        throw new HttpError(401, ErrorCode.UNAUTHORIZED,
                                 "缺少 X-User-Timestamp：该部署已启用防重放时间窗");
                     }
                     long ts;
                     try {
                         ts = Long.parseLong(timestamp.trim());
                     } catch (NumberFormatException e) {
-                        throw new HttpError(401, "X-User-Timestamp 必须是 unix 秒（整数）");
+                        throw new HttpError(401, ErrorCode.UNAUTHORIZED, "X-User-Timestamp 必须是 unix 秒（整数）");
                     }
                     if (Math.abs(nowSeconds - ts) > window) {
-                        throw new HttpError(401,
+                        throw new HttpError(401, ErrorCode.UNAUTHORIZED,
                                 "X-User-Timestamp 超出容忍窗口：请求已过期或时钟漂移过大");
                     }
                     String rawNonce = nonceHeader == null ? "" : nonceHeader;
                     if (!rawNonce.isEmpty()) {
                         if (!REQUEST_ID_RE.matcher(rawNonce).matches()) {
-                            throw new HttpError(400,
+                            throw new HttpError(400, ErrorCode.BAD_REQUEST,
                                     "X-User-Nonce 非法：仅允许字母/数字/点/下划线/连字符，1-64 字符");
                         }
                         nonce = rawNonce;
@@ -182,7 +182,7 @@ public final class AuthBackends {
             // 常量时间比较（对应 hmac.compare_digest 的防时序语义）。
             if (!java.security.MessageDigest.isEqual(
                     sig.getBytes(StandardCharsets.UTF_8), expected.getBytes(StandardCharsets.UTF_8))) {
-                throw new HttpError(401, "X-User-Sig 缺失或不正确：该部署已启用记忆身份鉴权");
+                throw new HttpError(401, ErrorCode.UNAUTHORIZED, "X-User-Sig 缺失或不正确：该部署已启用记忆身份鉴权");
             }
         }
 
@@ -196,7 +196,7 @@ public final class AuthBackends {
             synchronized (lock) {
                 Double seenUntil = seenNonces.get(nonce);
                 if (seenUntil != null && seenUntil > nowSeconds) {
-                    throw new HttpError(401, "X-User-Nonce 已使用：重放被拒绝");
+                    throw new HttpError(401, ErrorCode.UNAUTHORIZED, "X-User-Nonce 已使用：重放被拒绝");
                 }
                 seenNonces.remove(nonce);
                 seenNonces.put(nonce, expiresAt);

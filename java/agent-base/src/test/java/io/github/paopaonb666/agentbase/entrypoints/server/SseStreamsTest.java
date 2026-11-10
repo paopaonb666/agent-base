@@ -203,6 +203,41 @@ class SseStreamsTest {
     }
 
     @Test
+    void errorEventCarriesStructuredCodeForTypedFailures() throws Exception {
+        // #91：可判型的失败（递归触顶）在 error 事件带 code=recursion_limit；
+        // 不可判型的普通 provider 异常不带 code（wire 省键，旧形态）。
+        AgentModule.ModuleContext ctx = new AgentModule.ModuleContext(
+                new Settings(), null, new InMemoryCheckpointer(), List.of(), null, null);
+        CompiledGraph looping = GraphBuilder.begin()
+                .addNode("loop", (GraphState state, NodeContext nodeCtx) -> Map.of())
+                .entry("loop")
+                .addEdge("loop", "loop")
+                .compile(ctx.checkpointer(), "chat");
+        SseEmitter emitter = Mockito.mock(SseEmitter.class);
+        List<Object> builders = new CopyOnWriteArrayList<>();
+        doAnswer(inv -> {
+            builders.add(inv.getArgument(0));
+            return null;
+        }).when(emitter).send(any(SseEmitter.SseEventBuilder.class));
+        CountDownLatch completed = new CountDownLatch(1);
+        Mockito.doAnswer(inv -> {
+            completed.countDown();
+            return null;
+        }).when(emitter).complete();
+        SseStreams.open(looping, List.of(new dev.langchain4j.data.message.UserMessage("hi")),
+                Map.of(), new io.github.paopaonb666.agentbase.core.graph.RunConfig("sse-t9", "u1", 3),
+                "sse-t9", null, emitter);
+        assertTrue(completed.await(5, TimeUnit.SECONDS));
+        List<String> data = collectData(builders);
+        assertTrue(data.stream().anyMatch(d -> d.contains("\"code\":\"recursion_limit\"")),
+                "递归触顶的 error 应带 code=recursion_limit：" + data);
+        // 终止标注同源：done.termination=recursion_limit。
+        assertTrue(data.stream().anyMatch(
+                d -> d.startsWith("{\"type\":\"done\"") && d.contains("\"termination\":\"recursion_limit\"")),
+                "done 应带 termination=recursion_limit：" + data);
+    }
+
+    @Test
     void clientDisconnectCancelsProducerAndSkipsDone() throws Exception {
         // 节点自旋直到 sink 报告取消（模拟在途 LLM 工作）；第 2 次 send 抛
         // IOException 触发 shutdown → 取消传播。

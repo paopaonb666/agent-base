@@ -64,6 +64,16 @@ class EventsTest {
     }
 
     @Test
+    void errorCarriesCodeOnlyWhenPresent() {
+        // #91：code 旁挂（NON_NULL）——单参旧形态 wire 逐字节不变；带码时
+        // 前端只认 code 不认文案。
+        assertEquals("event: error\ndata: {\"type\":\"error\",\"message\":\"llm 不可用\",\"code\":\"llm_unavailable\"}\n\n",
+                Events.encodeSse(new Events.ErrorEvent("llm 不可用", "llm_unavailable")));
+        assertEquals("event: error\ndata: {\"type\":\"error\",\"message\":\"出错了\"}\n\n",
+                Events.encodeSse(new Events.ErrorEvent("出错了", null)));
+    }
+
+    @Test
     void sourcesReserved() {
         assertEquals("event: sources\ndata: {\"type\":\"sources\",\"sources\":[]}\n\n",
                 Events.encodeSse(new Events.SourcesEvent(List.of())));

@@ -110,11 +110,24 @@ public final class Events {
         public RunTermination termination() { return termination; }
     }
 
-    /** 终止性的失败标记，带有人类可读的消息。 */
-    @JsonPropertyOrder({"type", "message"})
-    public record ErrorEvent(String message) {
+    /**
+     * 终止性的失败标记，带有人类可读的消息 + 结构化错误码（#91——前端
+     * 只认 code 不认文案）。code 缺省（单参旧构造）时 wire 上省键，旧
+     * 消费端逐字节兼容；枚举值见 {@link io.github.paopaonb666.agentbase.entrypoints.server.ErrorCode}
+     * （extensions 不 import server 包，此处持 wire 字符串形态）。
+     */
+    @JsonPropertyOrder({"type", "message", "code"})
+    public record ErrorEvent(String message, String code) {
+        /** 既有单参形态：不带错误码（wire 上不出现 code 字段）。 */
+        public ErrorEvent(String message) {
+            this(message, null);
+        }
+
         @JsonProperty("type")
         public String type() { return "error"; }
+        @JsonInclude(JsonInclude.Include.NON_NULL)
+        @JsonProperty("code")
+        public String code() { return code; }
     }
 
     /** 心跳，防止中间环节关闭空闲的流。 */

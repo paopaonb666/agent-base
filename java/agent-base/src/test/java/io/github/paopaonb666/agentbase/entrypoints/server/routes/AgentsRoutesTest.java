@@ -8,6 +8,7 @@ import io.github.paopaonb666.agentbase.core.graph.GraphBuilder;
 import io.github.paopaonb666.agentbase.core.graph.InMemoryCheckpointer;
 import io.github.paopaonb666.agentbase.core.storage.ThreadIndexRecord;
 import io.github.paopaonb666.agentbase.entrypoints.server.AuthBackends;
+import io.github.paopaonb666.agentbase.entrypoints.server.ErrorCode;
 import io.github.paopaonb666.agentbase.entrypoints.server.HttpError;
 import io.github.paopaonb666.agentbase.extensions.costmeter.CostBudgetExceededException;
 import io.github.paopaonb666.agentbase.extensions.costmeter.CostGovernor;
@@ -241,6 +242,24 @@ class AgentsRoutesTest {
                 invoke(routes, "chat", invokeBody("hi", null, null, "plan", null), "u1"));
         assertEquals(503, error.status());
         assertTrue(error.getMessage().contains("planner"), error.getMessage());
+        // #91：结构化错误码与状态码同源——前端只认 code 不认文案。
+        assertEquals(ErrorCode.MODULE_UNAVAILABLE.wire(), error.code().wire());
+    }
+
+    @Test
+    void errorCodesCoverRepresentativeRoutes() throws Exception {
+        // #91 抽样锁定：422→validation、400 语义拒绝→bad_request（409/429/503
+        // 的码断言分别在 ConsistencyLockTest/限流矩阵/planMode 三处）。
+        AgentRuntime runtime = buildRuntime(Map.of("chat", stubModule("chat")),
+                null, null, null, null, null, null);
+        AgentsRoutes routes = route(runtime);
+        HttpError validation = httpErrorOf(() -> invoke(routes, "chat",
+                invokeBody("hi", null, null, "research", null), null));
+        assertEquals(ErrorCode.VALIDATION.wire(), validation.code().wire());
+        HttpError fastMissing = httpErrorOf(() -> invoke(routes, "chat",
+                invokeBody("hi", null, null, null, "fast"), "u1"));
+        assertEquals(400, fastMissing.status());
+        assertEquals(ErrorCode.BAD_REQUEST.wire(), fastMissing.code().wire());
     }
 
     @Test
