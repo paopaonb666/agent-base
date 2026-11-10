@@ -587,11 +587,17 @@ public final class Retrieval {
         // 最低分门槛：双条件——总分达标，且至少有一个**相关性证据**
         // （关键词命中或语义相似）。纯 recency+salience 凑数（天花板 0.3）
         // 的噪音记忆，宁可空手也不召回（UI 实测发现 F3）。
+        // 高显著度豁免（#181）：salience ≥ 阈值的记忆两道同豁——常驻记忆
+        // 与 query 无词面/向量交集时不再永不召回；仍按总分排序（排尾）。
         if (minScore > 0) {
             List<ScoredMemory> gated = new ArrayList<>(scored.size());
             for (ScoredMemory item : scored) {
-                if (item.score() >= minScore
-                        && (item.keywordScore() > 0 || item.vectorScore() > 0)) {
+                // 两道同豁（#181）：只豁证据门则总分门（0.3 天花板 < 0.5）
+                // 仍拦死，豁免无效——豁免 = 整个双门槛旁路，排序照旧。
+                boolean exempt = config.memory.salienceExemptThreshold > 0
+                        && item.record().salience() >= config.memory.salienceExemptThreshold;
+                if (exempt || (item.score() >= minScore
+                        && (item.keywordScore() > 0 || item.vectorScore() > 0))) {
                     gated.add(item);
                 }
             }

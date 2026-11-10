@@ -226,6 +226,58 @@ class RetrievalTest {
     }
 
     @Test
+    void highSalienceMemoryExemptFromEvidenceGate() {
+        // #181：salience≥0.9 的常驻记忆豁免双门槛——与 query 无词面/向量
+        // 交集（总分=0.15+0.15=0.3 < minScore 0.5）时仍召回；豁免后仍按
+        // 总分排序，排在有证据的高分记忆之后（排尾）。
+        double now = Models.now();
+        Settings settings = Settings.load(java.util.Map.of("ENV", "development"), null);
+        MemoryRecord evidence = rec("ev", "semantic", "数据库备份在凌晨三点", null, 0.5, now);
+        MemoryRecord resident = new MemoryRecord("res", "u1", "*", "semantic",
+                "完全无关的常驻事实", List.of(), null, null, 1.0, "active", "", List.of(),
+                now, now, null, 0);
+        List<ScoredMemory> out = Retrieval.recallMemories(
+                new FakeStore(new ArrayList<>(List.of(resident, evidence))),
+                null, "u1", null, "数据库", 10, 0.5, settings);
+        assertEquals(List.of("ev", "res"), out.stream().map(s -> s.record().memoryId()).toList(),
+                "豁免记忆在召回集合里但排尾");
+    }
+
+    @Test
+    void salienceExemptDisabledByZeroThreshold() {
+        // 0=关闭：同一语料回到旧行为（零证据记忆被双门槛拦死）。
+        double now = Models.now();
+        Settings settings = Settings.load(java.util.Map.of(
+                "ENV", "development", "MEMORY_SALIENCE_EXEMPT_THRESHOLD", "0"), null);
+        MemoryRecord evidence = rec("ev", "semantic", "数据库备份在凌晨三点", null, 0.5, now);
+        MemoryRecord resident = new MemoryRecord("res", "u1", "*", "semantic",
+                "完全无关的常驻事实", List.of(), null, null, 1.0, "active", "", List.of(),
+                now, now, null, 0);
+        List<ScoredMemory> out = Retrieval.recallMemories(
+                new FakeStore(new ArrayList<>(List.of(resident, evidence))),
+                null, "u1", null, "数据库", 10, 0.5, settings);
+        assertEquals(List.of("ev"), out.stream().map(s -> s.record().memoryId()).toList());
+    }
+
+    @Test
+    void exemptMemoryDoesNotEvictEvidenceHitsWithinTopK() {
+        // topK 内名额：豁免记忆按低总分排尾，不会顶掉有证据的记忆
+        // （对照用例：2 条有证据 + 1 条豁免常驻，topK=2 只含证据记忆）。
+        double now = Models.now();
+        Settings settings = Settings.load(java.util.Map.of("ENV", "development"), null);
+        MemoryRecord ev1 = rec("ev1", "semantic", "数据库备份在凌晨三点", null, 0.5, now);
+        MemoryRecord ev2 = rec("ev2", "semantic", "数据库扩容加只读副本", null, 0.5, now - 3600);
+        MemoryRecord resident = new MemoryRecord("res", "u1", "*", "semantic",
+                "完全无关的常驻事实", List.of(), null, null, 1.0, "active", "", List.of(),
+                now, now, null, 0);
+        List<ScoredMemory> out = Retrieval.recallMemories(
+                new FakeStore(new ArrayList<>(List.of(resident, ev1, ev2))),
+                null, "u1", null, "数据库", 2, 0.5, settings);
+        assertEquals(List.of("ev1", "ev2"), out.stream().map(s -> s.record().memoryId()).toList(),
+                "topK 名额由证据记忆占满，豁免记忆被低总分自然排尾");
+    }
+
+    @Test
     void missingVectorCountsZeroAndCeilingIsRecencyPlusSalience() {
         double now = 1_700_000_000.0;
         // 无 embedding 且与查询无关键词交集：score ≤ 0.3（无证据下限语义）。

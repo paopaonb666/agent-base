@@ -248,6 +248,14 @@ public final class Settings {
         public int recallTopK = 6;
         /** 召回最低分阈值（0..1）：低于该分数的候选不召回。 */
         public double recallMinScore = 0.5;
+        /**
+         * 高显著度豁免（#181）：salience ≥ 阈值的记忆豁免召回双门槛
+         * （两道同豁：只豁证据门则总分门仍拦死 0.3 天花板，豁免无效）。
+         * 画像类/高频常驻记忆与 query 无词面/向量交集时不再永不召回；
+         * 豁免后仍按总分排序（零证据记忆自然排尾）。0 = 关闭（旧行为）。
+         * 权衡：REST 可批量标 salience=1.0 旁路门槛——部署方自行约束。
+         */
+        public double salienceExemptThreshold = 0.9;
         public double weightVector = 0.40;
         public double weightKeyword = 0.30;
         public double weightRecency = 0.15;
@@ -913,6 +921,13 @@ public final class Settings {
                 throw new SettingsError("MEMORY_RECALL_MIN_SCORE must be in [0, 1), got %s".formatted(value));
             }
             t.recallMinScore = value;
+        }
+        if (v.containsKey("salience_exempt_threshold")) {
+            double value = requireFloat("salience_exempt_threshold", v.get("salience_exempt_threshold"));
+            if (!(value >= 0.0 && value < 1.0)) {
+                throw new SettingsError("MEMORY_SALIENCE_EXEMPT_THRESHOLD must be in [0, 1), got %s".formatted(value));
+            }
+            t.salienceExemptThreshold = value;
         }
         if (v.containsKey("weight_vector")) {
             double value = requireFloat("weight_vector", v.get("weight_vector"));
