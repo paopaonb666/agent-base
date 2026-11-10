@@ -93,6 +93,18 @@ public final class McpStdioTransport implements McpTransport {
         return r == null ? null : r.readLine();
     }
 
+    /** #29：子进程死亡 = 通道不可用（/health mcp 组件与惰性重连的判据）。 */
+    @Override
+    public boolean alive() {
+        Process p = process;
+        return p != null && p.isAlive();
+    }
+
+    /** 测试观察面（#29）：子进程句柄——包内可见，不进公共契约。 */
+    Process process() {
+        return process;
+    }
+
     @Override
     public void close() {
         if (process == null) {

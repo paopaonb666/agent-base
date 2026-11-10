@@ -42,12 +42,25 @@ public final class McpSources {
     private McpSources() {
     }
 
-    /** 一次装配的产物：工具、per-tool 超时表与关闭句柄。 */
-    public record McpAssembly(List<AgentTool> tools, Map<String, Double> timeouts)
+    /**
+     * 一次装配的产物：工具、per-tool 超时表、server 客户端健康面与关闭句柄。
+     */
+    public record McpAssembly(List<AgentTool> tools, Map<String, Double> timeouts,
+                              Map<String, McpClient> servers)
             implements AutoCloseable {
 
         public static final McpAssembly EMPTY =
-                new McpAssembly(List.of(), Map.of());
+                new McpAssembly(List.of(), Map.of(), Map.of());
+
+        /**
+         * server → 连接健康态（#29）：true=connected()。/health 的 mcp
+         * 组件据此渲染；空 map（未启用）= 组件缺席。
+         */
+        public Map<String, Boolean> health() {
+            Map<String, Boolean> out = new LinkedHashMap<>();
+            servers.forEach((name, client) -> out.put(name, client.connected()));
+            return out;
+        }
 
         /** 关闭全部 server 客户端（幂等；重复调用无副作用）。 */
         @Override
@@ -72,11 +85,13 @@ public final class McpSources {
         Map<String, McpServerSpec> specs = McpServerSpecs.parse(settings.mcp.serversJson);
         List<AgentTool> tools = new ArrayList<>();
         Map<String, Double> timeouts = new LinkedHashMap<>();
+        Map<String, McpClient> servers = new LinkedHashMap<>();
         List<McpClient> opened = new ArrayList<>();
         try {
             for (McpServerSpec spec : specs.values()) {
                 McpClient client = connect(spec);
                 opened.add(client);
+                servers.put(spec.name(), client);
                 double budget = spec.timeoutSeconds() == null
                         ? ToolPool.DEFAULT_TOOL_TIMEOUT_SECONDS : spec.timeoutSeconds();
                 for (McpToolDef def : client.listTools(HANDSHAKE_TIMEOUT_SECONDS)) {
@@ -103,12 +118,13 @@ public final class McpSources {
                     "MCP server 连接失败（server 进程起来了吗？）："
                             + e.getClass().getSimpleName() + ": " + e.getMessage(), e);
         }
-        return new McpAssembly(List.copyOf(tools), Map.copyOf(timeouts));
+        return new McpAssembly(List.copyOf(tools), Map.copyOf(timeouts), Map.copyOf(servers));
     }
 
     private static McpClient connect(McpServerSpec spec) {
-        McpTransport transport = openTransport(spec);
-        McpClient client = new McpClient(spec.name(), transport);
+        // 工厂形态（#29）：断开后惰性重建通道（stdio=新子进程；HTTP=新会话）
+        // ——server 崩溃后下一次工具调用自愈，无需重启进程。
+        McpClient client = new McpClient(spec.name(), () -> openTransport(spec));
         double handshake = spec.timeoutSeconds() == null
                 ? HANDSHAKE_TIMEOUT_SECONDS : spec.timeoutSeconds();
         client.connect(CLIENT_NAME, CLIENT_VERSION, handshake);

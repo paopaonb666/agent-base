@@ -250,4 +250,52 @@ class SystemRoutesHealthTest {
         assertTrue(withTool.startsWith("tool:0/0,leaked:0,"), withTool);
         assertEquals("ok", health.get("status"), "pools 数值段不得翻转整体状态");
     }
+
+    @Test
+    void mcpComponentAbsentWhenNotEnabled() throws Exception {
+        // #29：MCP 未启用 → 组件缺席（与 memory 可选先例同构）。
+        Settings s = settingsWith("", "http://health-mcp-absent", false);
+        Map<String, String> c = components(healthOf(buildRuntime(s, null, null), null));
+        assertFalse(c.containsKey("mcp"));
+    }
+
+    @Test
+    void mcpComponentRendersOkAndDownAndFlipsOverallStatus() throws Exception {
+        // #29：启用即承诺——server 断开即 degraded；down 列表按名排序。
+        Settings s = settingsWith("sk-test", "http://health-mcp", false);
+        var healthyCp = Mockito.mock(io.github.paopaonb666.agentbase.core.graph.Checkpointer.class);
+        Mockito.when(healthyCp.healthy()).thenReturn(true);
+
+        AgentRuntime allUp = withMcpHealth(buildRuntime(s, healthyCp, null),
+                Map.of("fs", true));
+        Map<String, Object> health = healthOf(allUp, null);
+        assertEquals("ok", components(health).get("mcp"));
+        assertEquals("ok", health.get("status"));
+
+        java.util.Map<String, Boolean> mixed = new java.util.LinkedHashMap<>();
+        mixed.put("alpha", true);
+        mixed.put("beta", false);
+        AgentRuntime oneDown = withMcpHealth(buildRuntime(s, healthyCp, null), mixed);
+        Map<String, Object> degraded = healthOf(oneDown, null);
+        assertEquals("down:beta", components(degraded).get("mcp"));
+        assertEquals("degraded", degraded.get("status"));
+    }
+
+    /** 反射注入 MCP 装配句柄：mock 客户端的 connected() 即注入的健康态。 */
+    private static AgentRuntime withMcpHealth(AgentRuntime runtime,
+                                              Map<String, Boolean> health) throws Exception {
+        java.util.Map<String, io.github.paopaonb666.agentbase.toolkit.mcp.McpClient> servers =
+                new java.util.LinkedHashMap<>();
+        for (Map.Entry<String, Boolean> e : health.entrySet()) {
+            var client = Mockito.mock(io.github.paopaonb666.agentbase.toolkit.mcp.McpClient.class);
+            Mockito.when(client.connected()).thenReturn(e.getValue());
+            servers.put(e.getKey(), client);
+        }
+        var assembly = new io.github.paopaonb666.agentbase.toolkit.mcp.McpSources.McpAssembly(
+                java.util.List.of(), Map.of(), servers);
+        var field = AgentRuntime.class.getDeclaredField("mcpAssembly");
+        field.setAccessible(true);
+        field.set(runtime, assembly);
+        return runtime;
+    }
 }

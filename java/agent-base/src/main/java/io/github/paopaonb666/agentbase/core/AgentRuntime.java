@@ -54,6 +54,8 @@ public final class AgentRuntime {
     private final AgentModule.MemoryServicePort memory;
     private final CoreStore threadIndex;
     private final AgentModule.PlanStorePort planStore;
+    /** MCP 装配句柄（#29 健康可见）：null 或空 servers = MCP 未启用。 */
+    private final io.github.paopaonb666.agentbase.toolkit.mcp.McpSources.McpAssembly mcpAssembly;
     // 惰性缓存被并发 HTTP 请求线程读写（Python dict 有事件循环串行化 +
     // GIL 兜底；Java 侧必须自己保证并发安全——LinkedHashMap 并发 put 可
     // 能丢条目甚至损坏结构）。
@@ -65,6 +67,15 @@ public final class AgentRuntime {
                  ToolPool tools, Checkpointer checkpointer, ToolCallRecorder toolRecorder,
                  UploadedFileStore fileStore, AgentModule.MemoryServicePort memory,
                  CoreStore threadIndex, AgentModule.PlanStorePort planStore) {
+        this(settings, llm, modules, tools, checkpointer, toolRecorder, fileStore,
+                memory, threadIndex, planStore, null);
+    }
+
+    AgentRuntime(Settings settings, ModelRuntime llm, Map<String, AgentModule> modules,
+                 ToolPool tools, Checkpointer checkpointer, ToolCallRecorder toolRecorder,
+                 UploadedFileStore fileStore, AgentModule.MemoryServicePort memory,
+                 CoreStore threadIndex, AgentModule.PlanStorePort planStore,
+                 io.github.paopaonb666.agentbase.toolkit.mcp.McpSources.McpAssembly mcpAssembly) {
         this.settings = settings;
         this.llm = llm;
         this.modules = modules;
@@ -75,6 +86,7 @@ public final class AgentRuntime {
         this.memory = memory;
         this.threadIndex = threadIndex;
         this.planStore = planStore;
+        this.mcpAssembly = mcpAssembly;
     }
 
     /** 请求的模块不在 AGENT_MODULES 清单中（入口层据此给出友好报错）。 */
@@ -101,6 +113,15 @@ public final class AgentRuntime {
     public CoreStore threadIndex() { return threadIndex; }
 
     public AgentModule.PlanStorePort planStore() { return planStore; }
+
+    /**
+     * MCP server 连接健康态（#29）：server 名 → connected()。MCP 未启用
+     * 返回 null（/health 据此省略 mcp 组件，与 memory 可选先例同构）。
+     */
+    public java.util.Map<String, Boolean> mcpServerHealth() {
+        return mcpAssembly == null || mcpAssembly.servers().isEmpty()
+                ? null : mcpAssembly.health();
+    }
 
     /** 启动时的清单完整性检查：supervisor 是保留名，不能被业务模块占用。 */
     public static void validateModuleNames(Map<String, AgentModule> modules) {
@@ -358,7 +379,8 @@ public final class AgentRuntime {
                 resolved.toolkit.timeoutSeconds, timeouts, recorder);
         return new AgentRuntime(resolved, llm, modules, pool, checkpointer, recorder,
                 fileStore, memoryService, coreStore,
-                coreStore == null ? null : new io.github.paopaonb666.agentbase.core.storage.PlanStoreAdapter(coreStore));
+                coreStore == null ? null : new io.github.paopaonb666.agentbase.core.storage.PlanStoreAdapter(coreStore),
+                mcp);
     }
 
     private static java.util.List<AgentTool> moduleTools(Map<String, AgentModule> modules) {

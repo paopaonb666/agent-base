@@ -185,6 +185,22 @@ public class SystemRoutes {
         if (governor != null) {
             components.put("cost", governor.status());
         }
+        // MCP（#29）：启用即承诺——server 断开即 degraded（模型面已缺工具，
+        // 惰性重连在下次调用自愈）。未启用组件缺席（与 memory 可选先例同构）。
+        var mcpHealth = runtime.mcpServerHealth();
+        if (mcpHealth != null) {
+            boolean allUp = mcpHealth.values().stream().allMatch(Boolean::booleanValue);
+            if (allUp) {
+                components.put("mcp", "ok");
+            } else {
+                String down = mcpHealth.entrySet().stream()
+                        .filter(e -> !e.getValue())
+                        .map(Map.Entry::getKey)
+                        .sorted()
+                        .collect(java.util.stream.Collectors.joining(","));
+                components.put("mcp", "down:" + down);
+            }
+        }
         // 池水位（#81）：有界池家族的运行计数——工具池（在飞/排队/泄漏累计）、
         // Background 队列、成本账本丢弃。观测数值段，不参与 ok/degraded 判定
         // （与 snapshot debt 同哲学：数值是排障线索，不是健康语义）。

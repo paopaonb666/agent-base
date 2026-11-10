@@ -30,6 +30,15 @@ public interface McpTransport extends AutoCloseable {
     default void onProtocolVersion(String version) {
     }
 
+    /**
+     * 传输层存活信号（#29 健康可见）：stdio 覆写为子进程存活检查；
+     * HTTP 系默认 true——连接态只能由发送失败暴露（惰性重连在写失败
+     * 路径触发），没有廉价的预检手段。
+     */
+    default boolean alive() {
+        return true;
+    }
+
     @Override
     void close();
 }

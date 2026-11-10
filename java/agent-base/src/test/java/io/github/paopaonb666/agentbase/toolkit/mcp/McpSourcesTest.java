@@ -14,6 +14,7 @@ import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -226,6 +227,66 @@ class McpSourcesTest {
         } finally {
             fixture.close();
         }
+    }
+
+    @Test
+    void assemblyHealthReportsServerConnectivity() throws Exception {
+        // #29 健康可见：装配携带 server 健康面——存续=ok，close 后=down。
+        Settings settings = enabledSettings(serverJson("fake", "echo"));
+        McpSources.McpAssembly assembly = McpSources.load(settings);
+        try {
+            assertEquals(Map.of("fake", true), assembly.health());
+            assertEquals(1, assembly.servers().size());
+        } finally {
+            assembly.close();
+        }
+        assertEquals(Map.of("fake", false), assembly.health());
+    }
+
+    @Test
+    void stdioServerReconnectsAfterProcessDeath() throws Exception {
+        // #29 重连最小面：server 子进程被杀后，下一次工具调用经惰性重连
+        // 自愈（工厂产新子进程 + 重新握手）——无需重启进程、无需重建池。
+        Settings settings = enabledSettings(serverJson("fake", "echo"));
+        McpSources.McpAssembly assembly = McpSources.load(settings);
+        try {
+            McpClient client = assembly.servers().get("fake");
+            assertTrue(client.connected());
+            // 杀掉 server 子进程（stdio transport 的 process 句柄，包内可见）。
+            McpStdioTransport transport = transportOf(client);
+            Process process = transport.process();
+            assertNotNull(process);
+            process.destroy();
+            process.waitFor(10, java.util.concurrent.TimeUnit.SECONDS);
+            long deadline = System.currentTimeMillis() + 5000;
+            while (client.connected() && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50);
+            }
+            // 进程死亡后 connected() 翻转（读线程退出或 alive() 判负）。
+            boolean reconnected = false;
+            deadline = System.currentTimeMillis() + 15000;
+            while (System.currentTimeMillis() < deadline) {
+                try {
+                    client.listTools(3.0);
+                    reconnected = true;
+                    break;
+                } catch (McpException e) {
+                    Thread.sleep(100);
+                }
+            }
+            assertTrue(reconnected, "惰性重连应恢复工具列表");
+            assertTrue(client.connected(), "重连后必须恢复连接");
+            assertEquals("echo:重生",
+                    client.callTool("echo", MAPPER.readTree("{\"query\":\"重生\"}"), 5.0));
+        } finally {
+            assembly.close();
+        }
+    }
+
+    private static McpStdioTransport transportOf(McpClient client) throws Exception {
+        var field = McpClient.class.getDeclaredField("transport");
+        field.setAccessible(true);
+        return (McpStdioTransport) field.get(client);
     }
 
     @Test
