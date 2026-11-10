@@ -95,28 +95,72 @@ public final class Graphs {
             builder.entry("agent");
             builder.addEdge("agent", GraphBuilder.END);
         } else {
+            // 条目 5：工具循环检测阈值在构建期读取（运行期零开销；0 = 关闭）。
+            int loopThreshold = ctx.settings() == null
+                    ? ToolLoopDetector.DEFAULT_THRESHOLD : ctx.settings().agentToolLoopThreshold;
             // 工具失败在池内归一成模型可读文本反馈（坏掉的工具绝不打断对话）。
             builder.addNode("tools", (GraphState state, NodeContext nodeCtx) -> {
                 AiMessage last = lastAi(state);
                 if (last == null || !last.hasToolExecutionRequests()) {
                     return Map.of();
                 }
-                List<ChatMessage> results = new ArrayList<>();
                 List<ToolExecutionRequest> requests = last.toolExecutionRequests();
-                // #337：只读并发、有副作用串行；池未接（测试直构）退化为串行。
-                List<String> outputs = nodeCtx.tools() == null
-                        ? requests.stream().map(r -> nodeCtx.callTool(r.name(), r.arguments())).toList()
-                        : nodeCtx.tools().callAll(requests, nodeCtx.config(), nodeCtx,
-                                request -> nodeCtx.callTool(request.name(), request.arguments()));
+                // 条目 5：循环检测在 callAll 之前分桶——被拦截的请求不执行
+                // （省成本的前提），每个拦截请求回喂一条结构化提示 ToolMessage
+                // （配对完整、协议安全，#68 handoff 预算先例形态）。
+                int[] loopRepeats = ToolLoopDetector.consecutiveRepeatCounts(state.messages(), requests);
+                boolean[] loopIntercepted = new boolean[requests.size()];
+                boolean anyIntercepted = false;
+                for (int i = 0; i < requests.size(); i++) {
+                    loopIntercepted[i] = ToolLoopDetector.isIntercepted(loopRepeats[i], loopThreshold);
+                    anyIntercepted |= loopIntercepted[i];
+                    if (loopIntercepted[i]) {
+                        ToolLoopDetector.logIntercepted(
+                                requests.get(i).name() == null ? "" : requests.get(i).name(),
+                                loopRepeats[i], loopThreshold);
+                    }
+                }
+                List<String> outputs;
+                if (anyIntercepted) {
+                    // 分桶：拦截槽位不执行、先填提示文本；正常请求子列表照常
+                    // 执行后按请求序回填（ToolPool.callAll 槽位重组先例）。
+                    List<String> slots = new ArrayList<>(requests.size());
+                    List<ToolExecutionRequest> executable = new ArrayList<>();
+                    List<Integer> executableSlots = new ArrayList<>();
+                    for (int i = 0; i < requests.size(); i++) {
+                        if (loopIntercepted[i]) {
+                            slots.add(ToolLoopDetector.loopHintText(
+                                    requests.get(i).name() == null ? "" : requests.get(i).name(),
+                                    loopRepeats[i]));
+                        } else {
+                            slots.add(null); // 待执行回填
+                            executable.add(requests.get(i));
+                            executableSlots.add(i);
+                        }
+                    }
+                    // #337：只读并发、有副作用串行；池未接（测试直构）退化为串行。
+                    List<String> executed = nodeCtx.tools() == null
+                            ? executable.stream().map(r -> nodeCtx.callTool(r.name(), r.arguments())).toList()
+                            : nodeCtx.tools().callAll(executable, nodeCtx.config(), nodeCtx,
+                                    request -> nodeCtx.callTool(request.name(), request.arguments()));
+                    for (int k = 0; k < executed.size(); k++) {
+                        slots.set(executableSlots.get(k), executed.get(k));
+                    }
+                    outputs = slots;
+                } else {
+                    // 无拦截：既有执行通道逐字节不变（#337）。
+                    outputs = nodeCtx.tools() == null
+                            ? requests.stream().map(r -> nodeCtx.callTool(r.name(), r.arguments())).toList()
+                            : nodeCtx.tools().callAll(requests, nodeCtx.config(), nodeCtx,
+                                    request -> nodeCtx.callTool(request.name(), request.arguments()));
+                }
+                List<ChatMessage> results = new ArrayList<>();
                 int index = 0;
                 for (ToolExecutionRequest request : requests) {
                     String toolName = request.name() == null ? "" : request.name();
-                    String output = outputs.get(index);
-                    if (untrustedMarker) {
-                        // #84①：外部数据结果包标记进上下文；ToolCallEvent/
-                        // 审计日志在池内用原文（事件与上下文分离）。
-                        output = ContextEngine.wrapUntrusted(toolName, output);
-                    }
+                    String output = loopIntercepted[index]
+                            ? outputs.get(index) // 提示文本不包不可信标记（系统引导，非外部数据）
+                            : decorateOutput(toolName, outputs.get(index), untrustedMarker);
                     results.add(ToolExecutionResultMessage.from(
                             request.id() == null ? "" : request.id(),
                             toolName,
@@ -131,7 +175,14 @@ public final class Graphs {
             builder.addConditionalEdges("agent",
                     state -> hasPendingToolCalls(state) ? "tools" : GraphBuilder.END,
                     Set.of("tools", GraphBuilder.END));
-            builder.addEdge("tools", "agent");
+            // 条目 5：tools 轮后路由——本批请求全部被拦截 → END（提示
+            // ToolMessage 已配对，协议安全）；部分拦截 → 回 agent（拦截的
+            // 提示已在 ToolMessage 里，模型据此换参数/换工具/收尾）。
+            // #202：封闭目标集显式声明，compile 校验笔误。
+            builder.addConditionalEdges("tools",
+                    state -> ToolLoopDetector.allInterceptedAfterRound(state.messages(), loopThreshold)
+                            ? GraphBuilder.END : "agent",
+                    Set.of("agent", GraphBuilder.END));
         }
 
         // 工具池（#131/#238）：生产装配经 ModuleContext 带入共享池（超时
@@ -165,6 +216,18 @@ public final class Graphs {
     private static boolean hasPendingToolCalls(GraphState state) {
         AiMessage last = lastAi(state);
         return last != null && last.hasToolExecutionRequests();
+    }
+
+    /**
+     * 单请求输出 → ToolMessage 文本的装饰（条目 6 外置改造预留的函数级
+     * 接缝）：#84① 开关开时外部数据结果包标记进上下文；ToolCallEvent/
+     * 审计日志在池内用原文（事件与上下文分离）。行为与抽方法前逐字节一致。
+     */
+    private static String decorateOutput(String toolName, String output, boolean untrustedMarker) {
+        if (untrustedMarker) {
+            return ContextEngine.wrapUntrusted(toolName, output);
+        }
+        return output;
     }
 
     /** 供 planner 等自定义模块复用：把「本轮贴尾注入」风格的无更新空 Map 返回。 */

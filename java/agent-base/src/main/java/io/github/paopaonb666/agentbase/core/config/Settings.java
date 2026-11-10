@@ -89,6 +89,13 @@ public final class Settings {
      * recursionLimit 才被用户看到。0 = 不限。
      */
     public int agentHandoffMaxPerRun = 10;
+    /**
+     * 工具循环检测阈值（条目 5）：连续以相同 (工具名, 参数) 调用达到阈值后，
+     * 第 {@code threshold + 1} 次同参请求被拦截——不执行，回喂一条结构化
+     * 提示 ToolMessage 引导模型换参数/换工具/直接收尾（判据单源
+     * {@code ToolLoopDetector}）。0 = 关闭（逐字节旧行为）。
+     */
+    public int agentToolLoopThreshold = 2;
     /** 允许跨域调用本服务的来源（浏览器客户端，如 agent-base-ui）。 */
     public List<String> corsOrigins = List.of("http://localhost:3000");
     /** 运行环境：development | production。 */
@@ -499,7 +506,8 @@ public final class Settings {
         }
         // 根级字段的 env/dotenv 键可能全大写（AGENT_MODULES）：归一小写。
         for (String key : List.of("agent_modules", "agent_module_packages", "cors_origins", "env",
-                "agent_recursion_limit", "agent_handoff_max_per_run", "rate_limit_per_minute",
+                "agent_recursion_limit", "agent_handoff_max_per_run", "agent_tool_loop_threshold",
+                "rate_limit_per_minute", "agent_run_concurrency")) {
             String up = key.toUpperCase(Locale.ROOT);
             if (out.containsKey(up) && !out.containsKey(key)) {
                 out.put(key, out.remove(up));
@@ -535,6 +543,14 @@ public final class Settings {
                     throw new SettingsError("AGENT_HANDOFF_MAX_PER_RUN must be >= 0, got %d".formatted(value));
                 }
                 s.agentHandoffMaxPerRun = value;
+            }
+            if (vals.containsKey("agent_tool_loop_threshold")) {
+                int value = requireInt("agent_tool_loop_threshold", vals.get("agent_tool_loop_threshold"));
+                if (value < 0) {
+                    throw new SettingsError(
+                            "AGENT_TOOL_LOOP_THRESHOLD must be >= 0 (0 = disabled), got %d".formatted(value));
+                }
+                s.agentToolLoopThreshold = value;
             }
             if (vals.containsKey("cors_origins")) {
                 s.corsOrigins = parseCsvOrJsonList(vals.get("cors_origins"), "cors_origins");
@@ -1290,6 +1306,10 @@ public final class Settings {
         }
         if (agentRecursionLimit < 1) {
             throw new SettingsError("AGENT_RECURSION_LIMIT must be >= 1, got %d".formatted(agentRecursionLimit));
+        }
+        if (agentToolLoopThreshold < 0) {
+            throw new SettingsError(
+                    "AGENT_TOOL_LOOP_THRESHOLD must be >= 0 (0 = disabled), got %d".formatted(agentToolLoopThreshold));
         }
         if (!KNOWN_ENVIRONMENTS.contains(env)) {
             throw new SettingsError("unknown ENV '%s'; expected one of %s".formatted(env, sorted(KNOWN_ENVIRONMENTS)));

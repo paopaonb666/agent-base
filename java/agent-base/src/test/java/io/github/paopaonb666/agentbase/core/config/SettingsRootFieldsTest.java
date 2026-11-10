@@ -287,3 +287,19 @@ class SettingsRootFieldsTest {
                         "ENV", "development", "LLM_FALLBACKS", "not-json"), null));
     }
 
+    @Test
+    void agentToolLoopThresholdParsesWithZeroMeaningDisabled() {
+        // 条目 5：默认 2（连续 2 次同参重复后第 3 次拦截）；0 = 关闭（逐字节
+        // 旧行为）；负数解析期 fail-fast（ensureValid 收敛校验另有同款守卫）。
+        assertEquals(2, Settings.load(Map.of("ENV", "development"), null).agentToolLoopThreshold);
+        assertEquals(5, Settings.load(Map.of(
+                "ENV", "development", "AGENT_TOOL_LOOP_THRESHOLD", "5"), null).agentToolLoopThreshold);
+        assertEquals(0, Settings.load(Map.of(
+                "ENV", "development", "AGENT_TOOL_LOOP_THRESHOLD", "0"), null).agentToolLoopThreshold);
+        Settings.SettingsError error = assertThrows(Settings.SettingsError.class,
+                () -> Settings.load(Map.of(
+                        "ENV", "development", "AGENT_TOOL_LOOP_THRESHOLD", "-1"), null));
+        assertTrue(error.getMessage().contains("AGENT_TOOL_LOOP_THRESHOLD"),
+                "拒绝文案要点名出错键：" + error.getMessage());
+    }
+}

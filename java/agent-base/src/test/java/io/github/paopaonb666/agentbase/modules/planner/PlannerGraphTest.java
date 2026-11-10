@@ -2,11 +2,14 @@ package io.github.paopaonb666.agentbase.modules.planner;
 
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.data.message.ToolExecutionResultMessage;
 import dev.langchain4j.data.message.UserMessage;
+import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.StreamingChatModel;
 import dev.langchain4j.model.chat.request.ChatRequest;
+import dev.langchain4j.model.chat.request.json.JsonObjectSchema;
 import dev.langchain4j.model.chat.response.ChatResponse;
 import io.github.paopaonb666.agentbase.core.AgentModule;
 import io.github.paopaonb666.agentbase.core.config.Settings;
@@ -15,7 +18,9 @@ import io.github.paopaonb666.agentbase.core.graph.GraphState;
 import io.github.paopaonb666.agentbase.core.graph.InMemoryCheckpointer;
 import io.github.paopaonb666.agentbase.core.graph.RunConfig;
 import io.github.paopaonb666.agentbase.core.context.ContextEngine;
+import io.github.paopaonb666.agentbase.core.graphs.ToolLoopDetector;
 import io.github.paopaonb666.agentbase.core.llm.ModelRuntime;
+import io.github.paopaonb666.agentbase.core.tools.AgentTool;
 import io.github.paopaonb666.agentbase.extensions.events.Events;
 import io.github.paopaonb666.agentbase.modules.planner.graph.PlannerGraphs;
 import io.github.paopaonb666.agentbase.modules.planner.graph.PlannerState;
@@ -343,5 +348,70 @@ class PlannerGraphTest {
         assertEquals("created", planEvents(events).get(0).status());
         assertEquals("拆解出 1 个子任务", planEvents(events).get(0).detail());
         assertFalse(planEvents(events).isEmpty());
+    }
+
+    private static AiMessage aiWithCall(String id, String tool, String args) {
+        return AiMessage.from("", List.of(ToolExecutionRequest.builder()
+                .id(id).name(tool).arguments(args).build()));
+    }
+
+    private static AgentTool stubTool(String name) {
+        return new AgentTool() {
+            @Override public String name() { return name; }
+
+            @Override public String description() {
+                return "循环检测测试桩：返回占位结果（图未接池时不触达本工具体）。";
+            }
+
+            @Override public ToolSpecification specification() {
+                return ToolSpecification.builder().name(name()).description(description())
+                        .parameters(JsonObjectSchema.builder().build()).build();
+            }
+
+            @Override public String call(String argsJson, ToolContext ctx) {
+                return name + " 结果";
+            }
+        };
+    }
+
+    /** 条目 5：execute 轮次连续同参 tool_calls → 循环中断（提示 ToolMessage、FAILED、摘要点名）。 */
+    @Test
+    void toolLoopBreakFailsSubtaskWithHint() {
+        ScriptedModel model = new ScriptedModel(
+                AiMessage.from("[{\"id\": 1, \"goal\": \"A\"}]"),
+                aiWithCall("c1", "probe", "{}"),
+                aiWithCall("c2", "probe", "{}"),
+                aiWithCall("c3", "probe", "{}"), // 阈值 2：第 3 次同参请求被拦截
+                AiMessage.from("收尾答复"));
+        Settings settings = new Settings();
+        settings.planner.maxReplans = 0; // failed 不再 replan → 直接 synthesize 收尾
+        RecordingPlanStore planStore = new RecordingPlanStore();
+        CompiledGraph graph = PlannerGraphs.buildPlannerGraph(new AgentModule.ModuleContext(
+                settings, model, new InMemoryCheckpointer(), List.of(stubTool("probe")), null, planStore));
+        GraphState result = graph.stream(
+                new GraphState(List.of(UserMessage.from("做 A")), Map.of()),
+                new RunConfig("planner:t1", "u1", 25),
+                event -> { /* 事件旁路：本测试只看状态 */ });
+
+        // 子任务按 FAILED 收尾，摘要点名循环中断（区别于"工具轮数耗尽"）。
+        List<Map<String, Object>> tasks = result.getOrDefault(PlannerState.TASKS, List.of());
+        assertEquals(1, tasks.size());
+        assertEquals("failed", tasks.get(0).get(PlannerState.STATUS));
+        assertTrue(String.valueOf(tasks.get(0).get(PlannerState.SUMMARY))
+                        .contains("工具循环中断"),
+                "摘要应含「工具循环中断」：" + tasks.get(0).get(PlannerState.SUMMARY));
+
+        // produced 尾部是提示 ToolMessage：3 条请求全部配对（拦截请求回喂提示）。
+        List<ToolExecutionResultMessage> toolMessages = result.messages().stream()
+                .filter(m -> m instanceof ToolExecutionResultMessage)
+                .map(m -> (ToolExecutionResultMessage) m)
+                .toList();
+        assertEquals(3, toolMessages.size());
+        assertEquals(ToolLoopDetector.loopHintText("probe", 2),
+                toolMessages.get(toolMessages.size() - 1).text(),
+                "尾部 ToolMessage 是结构化收敛提示");
+        // 图收尾：synthesize 的综合答复是最后一条消息。
+        assertEquals("收尾答复",
+                ContextEngine.contentText(result.messages().get(result.messages().size() - 1)).strip());
     }
 }

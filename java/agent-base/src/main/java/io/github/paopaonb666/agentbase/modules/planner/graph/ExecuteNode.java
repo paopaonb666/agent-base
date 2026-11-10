@@ -11,6 +11,7 @@ import io.github.paopaonb666.agentbase.core.context.ContextEngine;
 import io.github.paopaonb666.agentbase.core.graph.GraphBuilder;
 import io.github.paopaonb666.agentbase.core.graph.GraphState;
 import io.github.paopaonb666.agentbase.core.graph.NodeContext;
+import io.github.paopaonb666.agentbase.core.graphs.ToolLoopDetector;
 import io.github.paopaonb666.agentbase.core.tools.AgentTool;
 
 import java.util.ArrayList;
@@ -73,6 +74,10 @@ public final class ExecuteNode {
             List<ChatMessage> produced = new ArrayList<>();
             boolean exhausted = true;
             String summary = "";
+            // 条目 5：工具循环检测阈值（0 = 关闭）；loopBrokenTool 非空 =
+            // 本子任务因连续同参循环中断收尾（区别于"工具轮数耗尽"）。
+            int loopThreshold = ctx.settings().agentToolLoopThreshold;
+            String loopBrokenTool = null;
             for (int round = 0; round < subtaskToolRounds; round++) {
                 List<ChatMessage> callInput = new ArrayList<>(inputs.size() + produced.size());
                 callInput.addAll(inputs);
@@ -93,13 +98,40 @@ public final class ExecuteNode {
                 if (pool.isEmpty()) {
                     break; // 无工具池可执行（对应 Python run_tool_calls is None）
                 }
-                produced.addAll(executeToolCalls(finalMessage.toolExecutionRequests(), nodeCtx,
-                        untrustedMarker));
+                List<ToolExecutionRequest> toolCalls = finalMessage.toolExecutionRequests();
+                // 条目 5：连续同参循环检测（判据单源 ToolLoopDetector）。
+                // produced 即本子任务局部的工具轮序列——循环本就 per-subtask
+                // 局部，从 produced 派生免状态通道，也不会误伤跨子任务的历史。
+                int[] loopRepeats = ToolLoopDetector.consecutiveRepeatCounts(produced, toolCalls);
+                boolean anyIntercepted = false;
+                for (int i = 0; i < toolCalls.size(); i++) {
+                    anyIntercepted |= ToolLoopDetector.isIntercepted(loopRepeats[i], loopThreshold);
+                }
+                if (anyIntercepted) {
+                    // 达阈值：被拦截的请求不执行、回喂提示 ToolMessage（配对
+                    // 完整）；其余照常执行后中断 ReAct 循环，子任务按 FAILED
+                    // 收尾（check 的空输出门/verdict 语义不受影响）。
+                    for (int i = 0; i < toolCalls.size(); i++) {
+                        if (ToolLoopDetector.isIntercepted(loopRepeats[i], loopThreshold)) {
+                            String name = toolCalls.get(i).name() == null ? "" : toolCalls.get(i).name();
+                            ToolLoopDetector.logIntercepted(name, loopRepeats[i], loopThreshold);
+                            loopBrokenTool = name;
+                            break;
+                        }
+                    }
+                    produced.addAll(executeToolCallsWithLoopBreaks(toolCalls, loopRepeats,
+                            loopThreshold, nodeCtx, untrustedMarker));
+                    break;
+                }
+                produced.addAll(executeToolCalls(toolCalls, nodeCtx, untrustedMarker));
             }
-            String status = exhausted ? PlannerState.FAILED : PlannerState.DONE;
+            String status = exhausted || loopBrokenTool != null
+                    ? PlannerState.FAILED : PlannerState.DONE;
             Map<String, Object> updated = PlannerState.copyTask(task);
             updated.put(PlannerState.STATUS, status);
-            updated.put(PlannerState.SUMMARY, exhausted ? "工具轮数耗尽" : summary);
+            updated.put(PlannerState.SUMMARY, loopBrokenTool != null
+                    ? ToolLoopDetector.loopBreakSummary(loopBrokenTool)
+                    : exhausted ? "工具轮数耗尽" : summary);
             tasks.set(cursor, updated);
             PlanStreaming.emitPlan(nodeCtx, tasks, "progress", "子任务 " + (cursor + 1) + " " + status);
             return Map.of(
@@ -138,6 +170,38 @@ public final class ExecuteNode {
             results.add(ToolExecutionResultMessage.from(
                     call.id() == null ? "" : call.id(), name, output));
             index++;
+        }
+        return results;
+    }
+
+    /**
+     * 一轮 tool_calls 的循环中断执行（条目 5）：被拦截的请求不执行、回喂
+     * 提示 ToolMessage（配对完整，#68 先例形态）；其余照常执行，结果按
+     * 请求序（与 Graphs tools 节点同规则，判据单源 ToolLoopDetector）。
+     */
+    private static List<ChatMessage> executeToolCallsWithLoopBreaks(List<ToolExecutionRequest> toolCalls,
+                                                                    int[] loopRepeats,
+                                                                    int loopThreshold,
+                                                                    NodeContext nodeCtx,
+                                                                    boolean untrustedMarker) {
+        List<ChatMessage> results = new ArrayList<>(toolCalls.size());
+        List<ToolExecutionRequest> executable = new ArrayList<>();
+        List<Integer> executableSlots = new ArrayList<>();
+        for (int i = 0; i < toolCalls.size(); i++) {
+            ToolExecutionRequest call = toolCalls.get(i);
+            if (ToolLoopDetector.isIntercepted(loopRepeats[i], loopThreshold)) {
+                String name = call.name() == null ? "" : call.name();
+                results.add(ToolExecutionResultMessage.from(
+                        call.id() == null ? "" : call.id(), name,
+                        ToolLoopDetector.loopHintText(name, loopRepeats[i])));
+            } else {
+                executable.add(call);
+                executableSlots.add(i);
+            }
+        }
+        List<ChatMessage> executed = executeToolCalls(executable, nodeCtx, untrustedMarker);
+        for (int k = 0; k < executed.size(); k++) {
+            results.add(executableSlots.get(k), executed.get(k));
         }
         return results;
     }
