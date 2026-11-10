@@ -28,6 +28,7 @@ import io.github.paopaonb666.agentbase.core.context.ContextEngine;
 import io.github.paopaonb666.agentbase.core.graph.CompiledGraph;
 import io.github.paopaonb666.agentbase.core.graph.GraphState;
 import io.github.paopaonb666.agentbase.core.graph.RunConfig;
+import io.github.paopaonb666.agentbase.core.llm.LlmFactory;
 import io.github.paopaonb666.agentbase.core.storage.ThreadIndexRecord;
 import io.github.paopaonb666.agentbase.entrypoints.server.Attachments;
 import io.github.paopaonb666.agentbase.entrypoints.server.AuthBackends;
@@ -66,6 +67,9 @@ public class AgentsRoutes {
     private static final int THREAD_LIST_PAGE_MAX = 200;
     /** 单次取数上限：offset+limit 的扫描预算（#204）。 */
     private static final int THREAD_LIST_FETCH_MAX = 1000;
+
+    /** mode 单源（#220）：chat=直答、plan=任务拆解、auto=难度分流——校验、错误文案与 /v1/modules 发现面共用。 */
+    public static final List<String> MODES = List.of("chat", "plan", "auto");
 
     private final AgentRuntime runtime;
     private final AuthBackends.AuthBackend auth;
@@ -171,11 +175,11 @@ public class AgentsRoutes {
         }
         String mode = body.mode() == null ? "chat" : body.mode();
         String profile = body.profile() == null ? "main" : body.profile();
-        if (!List.of("chat", "plan", "auto").contains(mode)) {
-            throw new HttpError(422, "mode 必须是 chat|plan|auto");
+        if (!MODES.contains(mode)) {
+            throw new HttpError(422, "mode 必须是 " + String.join("|", MODES));
         }
-        if (!List.of("main", "fast").contains(profile)) {
-            throw new HttpError(422, "profile 必须是 main|fast");
+        if (!LlmFactory.PROFILES.contains(profile)) {
+            throw new HttpError(422, "profile 必须是 " + String.join("|", LlmFactory.PROFILES));
         }
         // 预算熔断（T4.2）：在建流之前检查——429 优先于半截 SSE。
         if (governor != null) {

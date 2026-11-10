@@ -123,7 +123,7 @@ public final class AgentRuntime {
         if ("main".equals(profile)) {
             return this;
         }
-        if (!"fast".equals(profile)) {
+        if (!LlmFactory.PROFILES.contains(profile)) {
             throw new IllegalArgumentException("unknown llm profile '%s'; expected 'main' or 'fast'".formatted(profile));
         }
         AgentRuntime cached = profileViews.get(profile);

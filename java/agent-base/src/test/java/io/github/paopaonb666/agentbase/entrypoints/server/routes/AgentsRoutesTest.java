@@ -207,6 +207,17 @@ class AgentsRoutesTest {
             HttpError error = httpErrorOf(() -> invoke(routes, "chat", bad, null));
             assertEquals(422, error.status(), error.getMessage());
         }
+        // #220：422 文案与常量单源——mode/profile 的全部合法值都出现在文案里。
+        HttpError modeError = httpErrorOf(() -> invoke(routes, "chat",
+                invokeBody("hi", null, null, "research", null), null));
+        for (String mode : AgentsRoutes.MODES) {
+            assertTrue(modeError.getMessage().contains(mode), modeError.getMessage());
+        }
+        HttpError profileError = httpErrorOf(() -> invoke(routes, "chat",
+                invokeBody("hi", null, null, null, "turbo"), null));
+        for (String profile : io.github.paopaonb666.agentbase.core.llm.LlmFactory.PROFILES) {
+            assertTrue(profileError.getMessage().contains(profile), profileError.getMessage());
+        }
     }
 
     @Test

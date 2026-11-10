@@ -97,6 +97,9 @@ class ConsistencyLockTest {
         assertEquals(AgentRuntime.SUPERVISOR_MODULE, modules.get(1).get("name"));
         assertEquals("supervisor", AgentRuntime.SUPERVISOR_MODULE);
         assertEquals("多 Agent 协作：把所有已注册模块编排为 sub-agent", modules.get(1).get("description"));
+        // #220：mode/profile 支持值在顶层键暴露，且与路由/工厂常量单源同值。
+        assertEquals(AgentsRoutes.MODES, body.get("modes"));
+        assertEquals(io.github.paopaonb666.agentbase.core.llm.LlmFactory.PROFILES, body.get("profiles"));
     }
 
     // ── 409 忙闲：Retry-After 头值 ───────────────────────────────────────

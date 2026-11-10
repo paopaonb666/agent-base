@@ -35,6 +35,9 @@ import java.util.function.BiConsumer;
  */
 public final class LlmFactory {
 
+    /** LLM 档位单源（#220）：main=主力、fast=快档——校验、错误文案与 /v1/modules 发现面共用。 */
+    public static final List<String> PROFILES = List.of("main", "fast");
+
     private LlmFactory() {
     }
 
@@ -54,9 +57,9 @@ public final class LlmFactory {
      *         流量）。分流决策由调用方按 {@code LLM_FAST_*} 是否配置做出。
      */
     public static ModelRuntime buildLlm(Settings settings, String profile, BiConsumer<String, TokenUsage> usageSink) {
-        if (!"main".equals(profile) && !"fast".equals(profile)) {
+        if (!PROFILES.contains(profile)) {
             throw new IllegalArgumentException(
-                    "unknown llm profile '%s'; expected 'main' or 'fast'".formatted(profile));
+                    "unknown llm profile '%s'; expected '%s'".formatted(profile, String.join("' or '", PROFILES)));
         }
 
         String model;

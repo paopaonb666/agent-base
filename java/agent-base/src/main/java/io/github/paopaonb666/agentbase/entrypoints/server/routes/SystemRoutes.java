@@ -6,6 +6,7 @@ import java.util.List;
 import java.util.Map;
 
 import io.github.paopaonb666.agentbase.core.AgentRuntime;
+import io.github.paopaonb666.agentbase.core.llm.LlmFactory;
 import io.github.paopaonb666.agentbase.entrypoints.server.Background;
 import io.github.paopaonb666.agentbase.extensions.costmeter.CostMeters;
 import io.github.paopaonb666.agentbase.core.config.Settings;
@@ -136,7 +137,13 @@ public class SystemRoutes {
         supervisor.put("name", AgentRuntime.SUPERVISOR_MODULE);
         supervisor.put("description", "多 Agent 协作：把所有已注册模块编排为 sub-agent");
         modules.add(supervisor);
-        return Map.of("modules", modules);
+        // invoke 契约发现面（#220）：mode/profile 支持值与路由校验单源同批——
+        // 新增 mode/profile 只改一处，前端按此渲染选择器而不是写死字面。
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("modules", modules);
+        body.put("modes", AgentsRoutes.MODES);
+        body.put("profiles", LlmFactory.PROFILES);
+        return body;
     }
 
     // ── GET /health：组件健康；degraded 表示部分失败 ────────────────────
