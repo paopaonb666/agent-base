@@ -331,6 +331,81 @@ class CompactionServiceTest {
         assertFalse(new Settings().memory.compactionEnabled, "默认关（vectorPushdown 先例）");
     }
 
+    @Test
+    void queueFullSubmissionResetsInFlightGuardForThatThread() throws Exception {
+        // R4-a F1 回归：队列满被拒的提交必须复位该线程的在途守卫——否则该
+        // 线程的压缩静默永久失效（自定义吞掉式 handler 使 catch 不可达的
+        // 缺陷已在产品码修复，本用例锁守卫复位语义）。
+        useEstimator();
+        InMemoryCheckpointer cp = new InMemoryCheckpointer();
+        for (int i = 1; i <= 10; i++) {
+            cp.put("chat:t" + i, new GraphState(history(8), Map.of()));
+        }
+        ScriptedSummarizer summarizer = new ScriptedSummarizer();
+        for (int i = 0; i < 11; i++) {
+            summarizer.responses.add(SUMMARY_TEXT);
+        }
+        CountDownLatch hold = new CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicBoolean gate =
+                new java.util.concurrent.atomic.AtomicBoolean(true);
+        summarizer.beforeRespond = () -> {
+            // 仅首个任务阻塞（占住单 worker），其余照常返回。
+            if (gate.compareAndSet(true, false)) {
+                try {
+                    hold.await(5, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        };
+        CompactionService service = new CompactionService(cp, settings(), 250, summarizer);
+        try {
+            service.onRunTerminated(RunConfig.of("chat:t1", "u1"), null);
+            assertTrue(summarizer.entered.await(5, TimeUnit.SECONDS), "t1 已占住 worker");
+            // t2..t9 填满 8 槽队列，t10 被拒（AbortPolicy 抛出 → 提交侧复位守卫）。
+            for (int i = 2; i <= 10; i++) {
+                service.onRunTerminated(RunConfig.of("chat:t" + i, "u1"), null);
+            }
+            hold.countDown();
+            waitFor(() -> service.compactedRounds() == 9);
+            // 被拒的 t10 守卫已复位：再次终态可正常评估并执行。
+            service.onRunTerminated(RunConfig.of("chat:t10", "u1"), null);
+            waitFor(() -> service.compactedRounds() == 10);
+        } finally {
+            service.close();
+        }
+    }
+
+    @Test
+    void secondCompactionFoldsPriorSummaryIntoTranscript() throws Exception {
+        // R4-a F2 回归：二次压缩必须把上一轮压缩摘要并入本轮转写——否则旧
+        // 摘要承载的更早历史在新状态（新摘要+近 N 轮）中被静默销毁。
+        useEstimator();
+        InMemoryCheckpointer cp = new InMemoryCheckpointer();
+        List<ChatMessage> prior = new ArrayList<>();
+        prior.add(SystemMessage.from(ContextEngine.COMPACTION_SUMMARY_PREFIX
+                + "旧摘要内容：用户偏好深色主题，项目代号夜莺"));
+        prior.addAll(history(8));
+        cp.put("chat:t1", new GraphState(prior, Map.of()));
+        ScriptedSummarizer summarizer = new ScriptedSummarizer();
+        summarizer.responses.add(SUMMARY_TEXT);
+        CompactionService service = new CompactionService(cp, settings(), 250, summarizer);
+        try {
+            service.onRunTerminated(RunConfig.of("chat:t1", "u1"), null);
+            waitFor(() -> service.compactedRounds() == 1);
+            // 旧摘要内容进转写（折叠链不断档）。
+            assertTrue(summarizer.transcripts.get(0)
+                    .contains("此前会话摘要：旧摘要内容：用户偏好深色主题"),
+                    summarizer.transcripts.get(0));
+            // 新状态头部 = 新摘要（旧摘要消息被新摘要替换，不叠加）。
+            assertEquals(7, cp.get("chat:t1").messages().size());
+            assertEquals(ContextEngine.COMPACTION_SUMMARY_PREFIX + SUMMARY_TEXT,
+                    ((SystemMessage) cp.get("chat:t1").messages().get(0)).text());
+        } finally {
+            service.close();
+        }
+    }
+
     @SuppressWarnings("unchecked")
     private static Map<String, Object> castMap(Object value) {
         assertTrue(value instanceof Map, "compaction 元数据应为 Map：" + value);

@@ -100,8 +100,9 @@ public final class CompactionService implements AutoCloseable {
                     thread.setDaemon(true);
                     return thread;
                 });
-        this.executor.setRejectedExecutionHandler((r, pool) ->
-                LOG.warn("graph: 压缩评估队列已满（{}），丢弃本轮评估", EVALUATION_QUEUE_CAPACITY));
+        // 拒绝策略保持默认 AbortPolicy（R4-a F1）：队列满抛
+        // RejectedExecutionException——提交侧 catch 负责 inFlight 守卫复位，
+        // 自定义吞掉式 handler 会让守卫条目永久泄漏、该线程压缩静默失效。
     }
 
     /** 放弃轮累计（#330：压缩静默失效不可诊断——对齐 #198 欠账计数风格）。 */
@@ -142,9 +143,14 @@ public final class CompactionService implements AutoCloseable {
                 }
             });
         } catch (RejectedExecutionException e) {
-            // 服务已关闭（shutdownNow 后提交被拒）：复位守卫并放弃。
+            // 队列满（有界丢弃）或服务已关闭（shutdownNow 后提交被拒）：
+            // 守卫条目必须在这里复位——否则该线程的压缩静默永久失效
+            // （R4-a F1）；放弃可观测，计一次放弃轮。
             inFlight.remove(threadId);
-            LOG.warn("graph: 压缩评估被拒绝（服务已关闭）：thread={}", threadId);
+            abandonedRounds.incrementAndGet();
+            LOG.warn("graph: 压缩评估提交被拒（{}），放弃本轮：thread={}",
+                    executor.isShutdown() ? "服务已关闭" : "评估队列已满 " + EVALUATION_QUEUE_CAPACITY,
+                    threadId);
         }
     }
 
@@ -280,12 +286,16 @@ public final class CompactionService implements AutoCloseable {
     private String renderTranscript(List<ChatMessage> messages) {
         List<String> lines = new ArrayList<>();
         for (ChatMessage message : messages) {
-            // SystemMessage 不进转写（与 MemoryPipeline.renderTranscript 同构：
-            // 快照里的 system 消息只有注入块与压缩摘要——历史注入块随
-            // checkpoint 轮轮累积、不是对话内容；压缩摘要是上一轮折叠产物，
-            // 不重复摘要）。折叠段里的注入块随折叠一并消失——模型输入侧它们
-            // 本就被注入去重剔除，每轮仍有新注入。
-            if (message instanceof SystemMessage) {
+            // SystemMessage 分流（R4-a F2）：注入型 system（历史注入块）不是
+            // 对话内容，跳过——随折叠一并消失是设计语义（模型输入侧它们本就
+            // 被注入去重剔除，每轮仍有新注入）；压缩摘要是上一轮折叠产物，
+            // **必须并入本轮转写**——否则二次压缩会把旧摘要内容从折叠链中
+            // 销毁（新状态只含新摘要+近 N 轮，旧摘要承载的更早历史静默丢失）。
+            if (message instanceof SystemMessage system) {
+                if (system.text().startsWith(ContextEngine.COMPACTION_SUMMARY_PREFIX)) {
+                    lines.add("此前会话摘要：" + system.text()
+                            .substring(ContextEngine.COMPACTION_SUMMARY_PREFIX.length()).strip());
+                }
                 continue;
             }
             String text = ContextEngine.contentText(message).strip();
