@@ -29,6 +29,7 @@ import io.github.paopaonb666.agentbase.core.graph.CompiledGraph;
 import io.github.paopaonb666.agentbase.core.graph.GraphState;
 import io.github.paopaonb666.agentbase.core.graph.RunConfig;
 import io.github.paopaonb666.agentbase.core.llm.LlmFactory;
+import io.github.paopaonb666.agentbase.core.prompt.PromptComposer;
 import io.github.paopaonb666.agentbase.core.storage.ThreadIndexRecord;
 import io.github.paopaonb666.agentbase.entrypoints.server.Attachments;
 import io.github.paopaonb666.agentbase.entrypoints.server.AuthBackends;
@@ -253,6 +254,16 @@ public class AgentsRoutes {
         if (memory != null) {
             String contextBlock = memory.composeContext(userId, module, fullThreadId, body.message());
             String recallBlock = memory.recallContext(userId, body.message());
+            // 条目 13（PromptComposer）：注入层只在日志侧标注层 id/版本——
+            // composeContext/recallContext 返回值与下方 SystemMessage 消息
+            // 构造逐字节不动（冻结段快照缓存语义不受影响）。graph 字段=发起
+            // 模块名（usePlan 分流到 planner 图时注入内容仍是该模块的记忆）。
+            if (contextBlock != null && !contextBlock.isEmpty()) {
+                PromptComposer.logLayer(PromptComposer.Layer.memoryFrozen(contextBlock), module);
+            }
+            if (recallBlock != null && !recallBlock.isEmpty()) {
+                PromptComposer.logLayer(PromptComposer.Layer.memoryRecall(recallBlock), module);
+            }
             // Arrays.asList 允许 null 元素：记忆缺席（null）= 该段静默降级。
             for (String block : java.util.Arrays.asList(contextBlock, recallBlock)) {
                 if (block != null && !block.isEmpty()) {
@@ -293,8 +304,13 @@ public class AgentsRoutes {
                 }
             }
             if (!blocks.isEmpty()) {
-                messagesInput.add(SystemMessage.from(ContextEngine.ATTACHMENT_CONTEXT_PREFIX
-                        + "，供回答时参考：\n\n" + String.join("\n\n", blocks)));
+                // 条目 13（PromptComposer）：附件注入段只在日志侧标注
+                // input.attachment 层——拼接出的文本与收口前逐字节相同，
+                // SystemMessage 消息构造不动。
+                String attachmentBlock = ContextEngine.ATTACHMENT_CONTEXT_PREFIX
+                        + "，供回答时参考：\n\n" + String.join("\n\n", blocks);
+                PromptComposer.logLayer(PromptComposer.Layer.inputAttachment(attachmentBlock), module);
+                messagesInput.add(SystemMessage.from(attachmentBlock));
             }
             // 图片：多模态 content blocks（vision 模型直接看图）。
             List<Map<String, Object>> imageMeta = new ArrayList<>();

@@ -4,7 +4,6 @@ import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
-import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.ToolExecutionResultMessage;
 import dev.langchain4j.model.chat.request.json.JsonObjectSchema;
 import io.github.paopaonb666.agentbase.core.AgentModule;
@@ -15,6 +14,7 @@ import io.github.paopaonb666.agentbase.core.graph.GraphBuilder;
 import io.github.paopaonb666.agentbase.core.graph.GraphState;
 import io.github.paopaonb666.agentbase.core.graph.NodeContext;
 import io.github.paopaonb666.agentbase.core.graph.RunConfig;
+import io.github.paopaonb666.agentbase.core.prompt.PromptComposer;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -122,9 +122,11 @@ public final class SupervisorGraphs {
                 .addNode("supervisor", (GraphState state, NodeContext nodeCtx) -> {
                     // prompt 作为 SystemMessage 加在消息列表开头（库的
                     // prompt: str 语义）；上下文工程对所有模块生效。
-                    List<ChatMessage> input = new ArrayList<>();
-                    input.add(SystemMessage.from(DEFAULT_PROMPT));
-                    input.addAll(ContextEngine.buildModelInput(state.messages(), maxTokens, ctx.llm().tokenFactor()));
+                    // 条目 13：收口 collab.supervisor 层（逐字节等价；层
+                    // id/版本/token 只进日志）。
+                    List<ChatMessage> input = PromptComposer.assemble(
+                            PromptComposer.Layer.collabSupervisor(DEFAULT_PROMPT), MODULE_NAME,
+                            ContextEngine.buildModelInput(state.messages(), maxTokens, ctx.llm().tokenFactor()));
                     AiMessage message = ctx.llm().stream(input, boundSpecs, nodeCtx::emitDelta);
                     if (message == null) {
                         return Map.of();

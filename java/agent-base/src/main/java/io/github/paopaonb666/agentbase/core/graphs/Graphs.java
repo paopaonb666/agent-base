@@ -3,7 +3,6 @@ package io.github.paopaonb666.agentbase.core.graphs;
 import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
-import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.ToolExecutionResultMessage;
 import io.github.paopaonb666.agentbase.core.AgentModule;
 import io.github.paopaonb666.agentbase.core.context.ContextEngine;
@@ -11,6 +10,7 @@ import io.github.paopaonb666.agentbase.core.graph.CompiledGraph;
 import io.github.paopaonb666.agentbase.core.graph.GraphBuilder;
 import io.github.paopaonb666.agentbase.core.graph.GraphState;
 import io.github.paopaonb666.agentbase.core.graph.NodeContext;
+import io.github.paopaonb666.agentbase.core.prompt.PromptComposer;
 import io.github.paopaonb666.agentbase.core.tools.AgentTool;
 
 import java.util.ArrayList;
@@ -86,13 +86,11 @@ public final class Graphs {
             // 上下文工程（H3）：注入去重 + token 预算修剪，对所有模块生效。
             List<ChatMessage> modelInput =
                     ContextEngine.buildModelInput(state.messages(), maxTokens, ctx.llm().tokenFactor());
-            if (systemPrompt != null) {
-                // 模块提示词临时拼装在最前：不落库，也不属于"注入型系统消息"。
-                List<ChatMessage> withPrompt = new ArrayList<>();
-                withPrompt.add(SystemMessage.from(systemPrompt));
-                withPrompt.addAll(modelInput);
-                modelInput = withPrompt;
-            }
+            // 模块提示词临时拼装在最前：不落库，也不属于"注入型系统消息"。
+            // 条目 13：拼装收口 PromptComposer.assemble——null 提示直通（chat/
+            // hello 形态不变）；层 id/版本/token 只进日志（逐字节不变）。
+            modelInput = PromptComposer.assemble(
+                    PromptComposer.Layer.modulePersona(systemPrompt), name, modelInput);
             AiMessage finalMessage = ctx.llm().stream(modelInput, specs(pool),
                     nodeCtx::emitDelta);
             if (finalMessage == null) {

@@ -4,7 +4,6 @@ import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
-import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.ToolExecutionResultMessage;
 import io.github.paopaonb666.agentbase.core.AgentModule;
 import io.github.paopaonb666.agentbase.core.context.ContextEngine;
@@ -12,6 +11,7 @@ import io.github.paopaonb666.agentbase.core.graph.GraphBuilder;
 import io.github.paopaonb666.agentbase.core.graph.GraphState;
 import io.github.paopaonb666.agentbase.core.graph.NodeContext;
 import io.github.paopaonb666.agentbase.core.graphs.ToolLoopDetector;
+import io.github.paopaonb666.agentbase.core.prompt.PromptComposer;
 import io.github.paopaonb666.agentbase.core.tools.AgentTool;
 
 import java.util.ArrayList;
@@ -245,7 +245,8 @@ public final class ExecuteNode {
     /**
      * 子任务输入组装：EXECUTE_SYSTEM（总目标 + 已完成结果 + 当前子任务）
      * + 注入去重与预算修剪后的历史（对应 Python {@code _subtask_input}，
-     * 提示词文案逐字见 {@link PlannerPrompts#execute}）。
+     * 提示词文案逐字见 {@link PlannerPrompts#execute}）。条目 13：拼装收口
+     * {@link PromptComposer#assemble}（planner.execute 层，逐字节等价）。
      *
      * <p>预算推导（条目 15 / R2-F1）：execute 提示运行期才存在（含 goal 与
      * 已完成子任务文本），SYSTEM 域扣减随节点执行走
@@ -274,9 +275,10 @@ public final class ExecuteNode {
                 goal, done.isEmpty() ? "（无）" : done.toString(),
                 PlannerState.str(task, PlannerState.GOAL));
         int maxTokens = ContextEngine.budgetAfterSystem(ctx.settings(), ctx.llm(), prompt);
-        List<ChatMessage> input = new ArrayList<>();
-        input.add(SystemMessage.from(prompt));
-        input.addAll(ContextEngine.buildModelInput(messages, maxTokens, ctx.llm().tokenFactor()));
-        return input;
+        // 条目 13：execute 提示收口 planner.execute 层（逐字节等价：SystemMessage
+        // 仍在最前；层 id/版本/token 只进日志）。graph 名字面量传入——避免
+        // ExecuteNode → PlannerModule 反向依赖。
+        return PromptComposer.assemble(PromptComposer.Layer.plannerExecute(prompt), "planner",
+                ContextEngine.buildModelInput(messages, maxTokens, ctx.llm().tokenFactor()));
     }
 }

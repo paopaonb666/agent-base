@@ -2,13 +2,13 @@ package io.github.paopaonb666.agentbase.modules.planner.graph;
 
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
-import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
 import io.github.paopaonb666.agentbase.core.AgentModule;
 import io.github.paopaonb666.agentbase.core.context.ContextEngine;
 import io.github.paopaonb666.agentbase.core.graph.GraphBuilder;
 import io.github.paopaonb666.agentbase.core.graph.GraphState;
 import io.github.paopaonb666.agentbase.core.graph.NodeContext;
+import io.github.paopaonb666.agentbase.core.prompt.PromptComposer;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -220,9 +220,10 @@ public final class CheckNodes {
             // 提示计入预算挤占历史体；window=0 与旧口径逐字节一致）。
             String prompt = PlannerPrompts.synth(plan.toString());
             int maxTokens = ContextEngine.budgetAfterSystem(ctx.settings(), ctx.llm(), prompt);
-            List<ChatMessage> input = new ArrayList<>();
-            input.add(SystemMessage.from(prompt));
-            input.addAll(ContextEngine.buildModelInput(PlannerState.messages(state), maxTokens, ctx.llm().tokenFactor()));
+            // 条目 13：synth 提示收口 planner.synth 层（逐字节等价：SystemMessage
+            // 仍在最前；层 id/版本/token 只进日志）。
+            List<ChatMessage> input = PromptComposer.assemble(PromptComposer.Layer.plannerSynth(prompt), "planner",
+                    ContextEngine.buildModelInput(PlannerState.messages(state), maxTokens, ctx.llm().tokenFactor()));
             AiMessage finalMessage = ctx.llm().stream(input, null, nodeCtx::emitDelta);
             PlanStreaming.emitPlan(nodeCtx, PlannerState.tasks(state), "done", null);
             PlanPersist.persistPlan(ctx, nodeCtx, PlannerState.tasks(state),
