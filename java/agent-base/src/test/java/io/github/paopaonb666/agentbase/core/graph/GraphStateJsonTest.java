@@ -156,6 +156,41 @@ class GraphStateJsonTest {
     }
 
     @Test
+    void compactionSummarySystemMessageRoundTripsWithMetadataAndStaysRealHistory() {
+        // #328/#330：压缩摘要 SystemMessage（新标记前缀，非注入前缀）type=
+        // "system" 天然往返；extra 的 compaction 元数据原样保存；VERSION 不
+        // bump（读侧不解析压缩键，只有 extra 通道）。
+        Map<String, Object> extra = new LinkedHashMap<>();
+        extra.put("compaction", Map.of(
+                "original_message_count", 16,
+                "original_token_estimate", 208,
+                "at", "2026-11-11T00:00:00Z"));
+        GraphState state = new GraphState(List.of(
+                SystemMessage.from(io.github.paopaonb666.agentbase.core.context.ContextEngine
+                        .COMPACTION_SUMMARY_PREFIX
+                        + "【任务态】任务态\n【关键实体】实体\n【未决问题】问题"),
+                UserMessage.from("下一轮")), extra);
+
+        GraphState restored = roundTrip(state);
+        assertEquals(2, restored.messages().size());
+        assertTrue(restored.messages().get(0) instanceof SystemMessage);
+        assertTrue(((SystemMessage) restored.messages().get(0)).text()
+                .startsWith(io.github.paopaonb666.agentbase.core.context.ContextEngine
+                        .COMPACTION_SUMMARY_PREFIX));
+        assertEquals("下一轮", ((UserMessage) restored.messages().get(1)).singleText());
+        @SuppressWarnings("unchecked")
+        Map<String, Object> meta = (Map<String, Object>) restored.extra().get("compaction");
+        assertEquals(16, ((Number) meta.get("original_message_count")).intValue());
+        assertEquals("2026-11-11T00:00:00Z", meta.get("at"));
+        // 新前缀不得命中三个注入前缀（否则 buildModelInput 会把压缩摘要当
+        // 注入块去重/提升——互斥契约，见 ContextEngine.COMPACTION_SUMMARY_PREFIX）。
+        assertNull(io.github.paopaonb666.agentbase.core.context.ContextEngine
+                .injectedKind(restored.messages().get(0)));
+        // VERSION 维持 1：压缩元数据走 extra 通道，不 bump 格式版本。
+        assertEquals(1, GraphStateJson.VERSION);
+    }
+
+    @Test
     void snapshotsCarryAVersionFieldAndUnknownVersionsAreRefused() throws Exception {
         // #200：写侧带 v=1；读侧未知版本拒载（返回 null），无 v 的存量行
         // （v1 兼容格式）照常解析。

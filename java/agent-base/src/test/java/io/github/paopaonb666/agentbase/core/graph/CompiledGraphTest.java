@@ -2,6 +2,7 @@ package io.github.paopaonb666.agentbase.core.graph;
 
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
 import io.github.paopaonb666.agentbase.core.config.Settings;
 import io.github.paopaonb666.agentbase.extensions.events.Events;
@@ -731,5 +732,150 @@ class CompiledGraphTest {
         assertEquals(Events.RunTermination.INTERNAL_ERROR, outcome.termination());
         assertNotNull(outcome.error());
         assertNull(outcome.state());
+    }
+
+    // ── 压缩写回互斥入口（#330 方案 B） ──────────────────────────────────
+
+    @Test
+    void compactThreadFailsFastWhileRunHoldsLock() throws Exception {
+        // #330：run 持锁期间 compactThread 快速失败（与 run 同语义不排队）；
+        // 锁释放后写回成功且持久化。
+        InMemoryCheckpointer cp = new InMemoryCheckpointer();
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        CompiledGraph graph = GraphBuilder.begin()
+                .addNode("agent", (state, ctx) -> {
+                    entered.countDown();
+                    release.await();
+                    return Map.of(GraphState.MESSAGES, List.of(AiMessage.from("run")));
+                })
+                .entry("agent")
+                .addEdge("agent", GraphBuilder.END)
+                .compile(cp, "chat");
+
+        Thread run = new Thread(() -> graph.invoke(
+                new GraphState(List.of(UserMessage.from("u1")), Map.of()),
+                RunConfig.of("chat:t1", "u1")));
+        run.start();
+        assertTrue(entered.await(5, java.util.concurrent.TimeUnit.SECONDS), "run 应先进入节点");
+        // run 持锁：写回快速返回 false（不排队）。
+        assertFalse(graph.compactThread("chat:t1", fresh -> java.util.Optional.of(fresh)));
+        release.countDown();
+        run.join(5000);
+        // 锁释放：写回成功、快照被整行替换。
+        boolean written = graph.compactThread("chat:t1", fresh -> java.util.Optional.of(
+                new GraphState(List.of(SystemMessage.from("摘要")), Map.of())));
+        assertTrue(written);
+        GraphState persisted = cp.get("chat:t1");
+        assertEquals(1, persisted.messages().size());
+        assertEquals("摘要", ((SystemMessage) persisted.messages().get(0)).text());
+    }
+
+    @Test
+    void compactThreadAbandonsOnEmptyRewriteWithoutHalfWrite() {
+        // #330：rewriter 返回 empty = 基准不一致/放弃——快照保持原样
+        // （放弃路径不产生半写）。
+        InMemoryCheckpointer cp = new InMemoryCheckpointer();
+        cp.put("chat:t1", new GraphState(
+                List.of(UserMessage.from("u1"), AiMessage.from("a1")), Map.of()));
+        CompiledGraph graph = GraphBuilder.singleNode("echo", (state, ctx) -> Map.of(), cp);
+
+        assertFalse(graph.compactThread("chat:t1", fresh -> java.util.Optional.empty()));
+        GraphState persisted = cp.get("chat:t1");
+        assertEquals(2, persisted.messages().size());
+        assertEquals("u1", ((UserMessage) persisted.messages().get(0)).singleText());
+        assertEquals("a1", ((AiMessage) persisted.messages().get(1)).text());
+    }
+
+    @Test
+    void compactThreadHandsFreshStateAndNullCheckpointerIsNoop() {
+        // #330：rewriter 拿到的是锁内 re-read 的最新快照（不是调用方缓存）；
+        // checkpointer 缺席（测试直构图）为无操作。
+        InMemoryCheckpointer cp = new InMemoryCheckpointer();
+        cp.put("chat:t1", new GraphState(List.of(UserMessage.from("u1")), Map.of()));
+        CompiledGraph graph = GraphBuilder.singleNode("echo", (state, ctx) -> Map.of(), cp);
+        AtomicReference<Integer> seenCount = new AtomicReference<>();
+        assertTrue(graph.compactThread("chat:t1", fresh -> {
+            seenCount.set(fresh.messages().size());
+            return java.util.Optional.of(fresh);
+        }));
+        assertEquals(1, seenCount.get());
+
+        CompiledGraph hookless = GraphBuilder.singleNode("echo", (state, ctx) -> Map.of(), null);
+        assertFalse(hookless.compactThread("chat:t2", fresh -> java.util.Optional.of(fresh)));
+    }
+
+    @Test
+    void compactionHookFiresOnDoneAndSkipsCancelled() {
+        // #328：非 CANCELLED 终态触发钩子（锁释放后）；仅 CANCELLED 跳过。
+        InMemoryCheckpointer cp = new InMemoryCheckpointer();
+        List<String> fired = new java.util.concurrent.CopyOnWriteArrayList<>();
+        CompiledGraph.CompactionHook hook = (config, finalState) -> fired.add(config.threadId());
+
+        CompiledGraph doneGraph = GraphBuilder.begin()
+                .addNode("agent", (state, ctx) ->
+                        Map.of(GraphState.MESSAGES, List.of(AiMessage.from("hi"))))
+                .entry("agent")
+                .addEdge("agent", GraphBuilder.END)
+                .compile(cp, "chat", null, hook);
+        doneGraph.invoke(new GraphState(), RunConfig.of("chat:t1", "u1"));
+        assertEquals(List.of("chat:t1"), fired);
+
+        // 取消轮：半步落盘（#199）但钩子不触发。
+        RecordingSink sink = new RecordingSink();
+        CompiledGraph cancelGraph = GraphBuilder.begin()
+                .addNode("agent", (state, ctx) -> {
+                    ctx.emit(RecordingSink.CANCEL_MARKER);
+                    return Map.of();
+                })
+                .entry("agent")
+                .addEdge("agent", GraphBuilder.END)
+                .compile(cp, "chat", null, hook);
+        cancelGraph.stream(new GraphState(), RunConfig.of("chat:t2", "u1"), sink);
+        assertEquals(List.of("chat:t1"), fired, "CANCELLED 终态不得触发钩子");
+    }
+
+    @Test
+    void compactionHookFiresOnFailureAndThreadBusyDoesNotFire() throws Exception {
+        // #328：failed（节点异常）/触顶轮的快照同样会无界增长——failed 也触发；
+        // THREAD_BUSY 的 run 根本没执行，不触发。钩子异常被吞掉记 WARN，
+        // 绝不影响 invoke 的抛出契约。
+        List<String> fired = new java.util.concurrent.CopyOnWriteArrayList<>();
+        CompiledGraph.CompactionHook hook = (config, finalState) -> {
+            fired.add(config.threadId());
+            throw new IllegalStateException("hook boom");
+        };
+        CompiledGraph boomGraph = GraphBuilder.begin()
+                .addNode("boom", (state, ctx) -> {
+                    throw new IllegalStateException("node boom");
+                })
+                .entry("boom")
+                .addEdge("boom", GraphBuilder.END)
+                .compile(null, "chat", null, hook);
+        assertThrows(IllegalStateException.class, () -> boomGraph.invoke(
+                new GraphState(), RunConfig.of("chat:t1", "u1")));
+        assertEquals(List.of("chat:t1"), fired, "failed 轮也要触发（异常被钩子内抛出吞掉）");
+
+        // THREAD_BUSY：第二个 run 快速失败，不触发钩子。
+        InMemoryCheckpointer cp = new InMemoryCheckpointer();
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        CompiledGraph graph = GraphBuilder.begin()
+                .addNode("agent", (state, ctx) -> {
+                    entered.countDown();
+                    release.await();
+                    return Map.of();
+                })
+                .entry("agent")
+                .addEdge("agent", GraphBuilder.END)
+                .compile(cp, "chat", null, hook);
+        Thread a = new Thread(() -> graph.invoke(new GraphState(), RunConfig.of("chat:t9", "u1")));
+        a.start();
+        assertTrue(entered.await(5, java.util.concurrent.TimeUnit.SECONDS));
+        assertThrows(CompiledGraph.ThreadBusyError.class, () -> graph.invoke(
+                new GraphState(), RunConfig.of("chat:t9", "u1")));
+        assertEquals(List.of("chat:t1"), fired, "THREAD_BUSY 不触发");
+        release.countDown();
+        a.join(5000);
     }
 }
