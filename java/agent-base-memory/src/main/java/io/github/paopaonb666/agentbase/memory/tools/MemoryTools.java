@@ -379,30 +379,64 @@ public final class MemoryTools {
                         // #254/#338：[n] 引用锚 + 来源事件——回复引用约定的一半。
                         // 序号与 emit 的 sources 事件同序对齐，模型在最终回复里
                         // 用 [n] 标注后由服务侧解析回 cited sources。
+                        // #50：父块口径渲染——同父块（file+span 相同）的多个
+                        // 命中合一条（段号范围表述）；旧数据 parent 缺失 →
+                        // 逐块条目（与旧渲染逐字节一致）。
                         StringBuilder sb = new StringBuilder(
                                 "知识库检索结果（回答引用以上内容时请用 [n] 标注来源序号）：");
                         List<io.github.paopaonb666.agentbase.extensions.events.Events.Source>
                                 sources = new java.util.ArrayList<>();
-                        int index = 0;
+                        java.util.LinkedHashMap<String, java.util.List<Map<String, Object>>> groups =
+                                new java.util.LinkedHashMap<>();
                         for (Map<String, Object> item : scored) {
-                            String text = String.valueOf(item.get("text"));
-                            String fileId = String.valueOf(item.get("file_id"));
-                            int ordinal = item.get("ordinal") instanceof Number n ? n.intValue() : 0;
+                            groups.computeIfAbsent(parentGroupKey(item), k -> new java.util.ArrayList<>()).add(item);
+                        }
+                        int index = 0;
+                        for (java.util.List<Map<String, Object>> group : groups.values()) {
+                            Map<String, Object> first = group.get(0);
+                            String fileId = String.valueOf(first.get("file_id"));
+                            String label = sectionLabel(group);
+                            String text = first.get("parent_text") != null
+                                    ? String.valueOf(first.get("parent_text"))
+                                    : String.valueOf(first.get("text"));
                             index++;
                             sb.append("\n[").append(index).append("]（相关度 ")
                                     .append(String.format(java.util.Locale.ROOT, "%.2f",
-                                            ((Number) item.get("score")).doubleValue()))
+                                            ((Number) first.get("score")).doubleValue()))
                                     .append(" · 文件 ").append(fileId)
-                                    .append(" 第 ").append(ordinal + 1).append(" 段）")
+                                    .append(" ").append(label).append("）")
                                     .append(CharMetrics.head(text, KNOWLEDGE_SNIPPET_CHARS));
                             sources.add(new io.github.paopaonb666.agentbase.extensions.events.Events.Source(
-                                    "文件 " + fileId + " 第 " + (ordinal + 1) + " 段", null));
+                                    "文件 " + fileId + " " + label, null));
                         }
                         if (ctx != null) {
                             ctx.emit(new io.github.paopaonb666.agentbase.extensions.events.Events.SourcesEvent(
                                     sources));
                         }
                         return sb.toString();
+                    }
+
+                    /** 父块分组键：span 可用按 file+span 聚；否则退化为逐块。 */
+                    private static String parentGroupKey(Map<String, Object> item) {
+                        Object span = item.get("parent_span");
+                        if (span instanceof List<?> range && range.size() == 2) {
+                            return "p:" + item.get("file_id") + ":" + range.get(0) + ":" + range.get(1);
+                        }
+                        return "c:" + item.get("chunk_id");
+                    }
+
+                    /** 段号表述：单块「第 N 段」、父块「第 N-M 段」（1 起始）。 */
+                    private static String sectionLabel(java.util.List<Map<String, Object>> group) {
+                        int first = ordinalOf(group.get(0)) + 1;
+                        if (group.size() == 1) {
+                            return "第 " + first + " 段";
+                        }
+                        int last = ordinalOf(group.get(group.size() - 1)) + 1;
+                        return first == last ? "第 " + first + " 段" : "第 " + first + "-" + last + " 段";
+                    }
+
+                    private static int ordinalOf(Map<String, Object> item) {
+                        return item.get("ordinal") instanceof Number n ? n.intValue() : 0;
                     }
                 });
     }

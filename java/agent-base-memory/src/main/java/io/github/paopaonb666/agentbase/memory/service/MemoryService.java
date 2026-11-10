@@ -412,7 +412,18 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
         Metrics.memory().observe("search_knowledge", embedder.dims() != null ? "ok" : "degraded",
                 (System.nanoTime() - started) / 1_000_000_000.0);
         List<Map<String, Object>> out = new ArrayList<>();
-        for (Retrieval.ScoredChunk item : filtered.subList(0, Math.min(filtered.size(), limit))) {
+        List<Retrieval.ScoredChunk> selected = new ArrayList<>(
+                filtered.subList(0, Math.min(filtered.size(), limit)));
+        List<DocChunk> selectedChunks = new ArrayList<>();
+        for (Retrieval.ScoredChunk item : selected) {
+            selectedChunks.add(item.chunk());
+        }
+        // 父块推导（#50 small-to-big）：检索命中子块、返回父块上下文——
+        // 同 file 内 ordinal 连续的命中块合并为一个父区间（段落级），零
+        // schema 变更（offsets 天然支持推导）。独立块 parent=自身；旧数据
+        // offsets 缺失 → parent_span=null（消费端降级为逐块口径）。
+        Map<String, ParentView> parents = deriveParents(selectedChunks);
+        for (Retrieval.ScoredChunk item : selected) {
             DocChunk chunk = item.chunk();
             Map<String, Object> view = new LinkedHashMap<>();
             view.put("score", Math.round(item.score() * 10000.0) / 10000.0);
@@ -423,9 +434,66 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
             view.put("offsets", chunk.offsets().isEmpty() ? null
                     : chunk.offsets().stream().map(seg -> List.of(seg[0], seg[1])).toList());
             view.put("has_embedding", chunk.embedding().length > 0);
+            ParentView parent = parents.get(chunk.chunkId());
+            view.put("parent_text", parent == null ? null : parent.text());
+            view.put("parent_span", parent == null || parent.span() == null ? null
+                    : List.of(parent.span()[0], parent.span()[1]));
             out.add(view);
         }
         return out;
+    }
+
+    /** 父块推导的产物：合并文本 + 原文区间（null = offsets 缺失不可推导）。 */
+    private record ParentView(String text, long[] span) {
+    }
+
+    /**
+     * 把本轮命中的分块按「同 file_id + ordinal 连续」聚成父块：跨 file 不
+     * 合并（父块是文档内概念）；offsets 拼不齐（旧数据 null/空）时 span
+     * 为 null 但文本仍合并（拼接近似，可视化降级）。合并文本以
+     * {@code "\n\n"} 连接——chunkText 的段落打包即以该分隔符组段。
+     */
+    private static Map<String, ParentView> deriveParents(List<DocChunk> selected) {
+        Map<String, ParentView> parents = new LinkedHashMap<>();
+        int i = 0;
+        while (i < selected.size()) {
+            int j = i + 1;
+            while (j < selected.size()
+                    && selected.get(j).fileId().equals(selected.get(j - 1).fileId())
+                    && selected.get(j).ordinal() == selected.get(j - 1).ordinal() + 1) {
+                j++;
+            }
+            List<DocChunk> run = selected.subList(i, j);
+            StringBuilder text = new StringBuilder();
+            long minStart = -1;
+            long maxEnd = -1;
+            boolean spanKnown = true;
+            for (DocChunk chunk : run) {
+                if (text.length() > 0) {
+                    text.append("\n\n");
+                }
+                text.append(chunk.text());
+                if (chunk.offsets().isEmpty()) {
+                    spanKnown = false;
+                    continue;
+                }
+                for (long[] seg : chunk.offsets()) {
+                    if (minStart < 0 || seg[0] < minStart) {
+                        minStart = seg[0];
+                    }
+                    if (maxEnd < 0 || seg[1] > maxEnd) {
+                        maxEnd = seg[1];
+                    }
+                }
+            }
+            ParentView parent = new ParentView(text.toString(),
+                    spanKnown && minStart >= 0 ? new long[]{minStart, maxEnd} : null);
+            for (DocChunk chunk : run) {
+                parents.put(chunk.chunkId(), parent);
+            }
+            i = j;
+        }
+        return parents;
     }
 
     @Override

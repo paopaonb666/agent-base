@@ -100,6 +100,50 @@ class KnowledgeSearchCitationTest {
     }
 
     @Test
+    void knowledgeSearchMergesAdjacentHitsIntoParentSection() throws Exception {
+        // #50：相邻命中（ordinal 连续）合一条——段号范围「第 1-2 段」、
+        // 文本取父块（两段全文），sources 事件同序同标签；[n] 按父块条目计数。
+        // 直插相邻分块（短文档经 ingestDocument 只产 1 块，构不成相邻对）。
+        store = new InMemoryMemoryStore();
+        MemoryService service = new MemoryService(store, stubEmbedder(),
+                Settings.load(Map.of("ENV", "development")), null, null);
+        store.putChunks(List.of(
+                new io.github.paopaonb666.agentbase.memory.store.Models.DocChunk(
+                        "k1", "f1", "chat:cite", "u1", "chat", 0,
+                        "镜像阶段理论认为自我经由镜像认同而建构。",
+                        List.of(new long[]{0, 18}),
+                        io.github.paopaonb666.agentbase.memory.store.Models.encodeEmbedding(List.of(0.5f, 0.5f)), 2,
+                        io.github.paopaonb666.agentbase.memory.store.Models.now()),
+                new io.github.paopaonb666.agentbase.memory.store.Models.DocChunk(
+                        "k2", "f1", "chat:cite", "u1", "chat", 1,
+                        "第二段讲镜像阶段之后的想象界与象征界的区分。",
+                        List.of(new long[]{19, 36}),
+                        io.github.paopaonb666.agentbase.memory.store.Models.encodeEmbedding(List.of(0.5f, 0.5f)), 2,
+                        io.github.paopaonb666.agentbase.memory.store.Models.now())));
+        AgentTool tool = MemoryTools.build(service).stream()
+                .filter(t -> t.name().equals("knowledge_search")).findFirst()
+                .orElseThrow(() -> new IllegalStateException("knowledge_search 工具未注册"));
+        String out = tool.call("{\"query\": \"镜像\", \"limit\": 5}",
+                new AgentTool.ToolContext(nodeCtx.config(), nodeCtx));
+
+        assertTrue(out.contains("第 1-2 段"), out);
+        assertTrue(out.contains("想象界与象征界"), "父块文本应含第二段全文：" + out);
+        assertEquals(1, nodeCtx.events.size());
+        Events.SourcesEvent sources = (Events.SourcesEvent) nodeCtx.events.get(0);
+        assertEquals(1, sources.sources().size());
+        assertEquals("文件 f1 第 1-2 段", sources.sources().get(0).title());
+    }
+
+    @Test
+    void knowledgeSearchSingleHitKeepsLegacyRendering() throws Exception {
+        // 独立命中（无相邻块）→ 渲染保持旧形态（第 N 段单数）。
+        AgentTool tool = knowledgeTool("唯一段落谈镜像阶段。另一段谈不相关的事。");
+        String out = tool.call("{\"query\": \"镜像阶段\"}",
+                new AgentTool.ToolContext(nodeCtx.config(), nodeCtx));
+        assertTrue(out.contains("文件 f1 第 1 段"), out);
+    }
+
+    @Test
     void knowledgeSearchEmptyResultHasNoCitations() throws Exception {
         // 空知识库：searchKnowledge 返回空表 → 无锚无事件
         store = new InMemoryMemoryStore();
