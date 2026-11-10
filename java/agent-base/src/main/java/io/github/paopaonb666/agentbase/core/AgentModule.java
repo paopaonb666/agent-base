@@ -155,6 +155,17 @@ public interface AgentModule {
         /** file_id -> 分块计数（M8 文件列表）。 */
         Map<String, Integer> chunkCountsByFile(String userId);
 
+        /**
+         * 会话历史折叠摘要（#328/#329，compaction 角色）：把待折叠段转写压成
+         * {@code targetChars} 字以内的结构化摘要。返回渲染后的摘要文本；
+         * 不可用（未配 LLM / 输出为空 / 内部失败）返回 null——调用方按放弃
+         * 本轮处理。default 返回 null 对既有实现零破坏（#172/#184 先例：
+         * core 不依赖记忆包，装饰器/替身无需逐个跟进）。
+         */
+        default String compactTranscript(String transcript, int targetChars) {
+            return null;
+        }
+
         /** 健康探针：store 可读 + embedding 探活；返回 ok/degraded。 */
         String healthProbe();
     }

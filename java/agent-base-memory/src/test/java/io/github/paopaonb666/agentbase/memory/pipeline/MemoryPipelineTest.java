@@ -2,6 +2,7 @@ package io.github.paopaonb666.agentbase.memory.pipeline;
 
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.ToolExecutionResultMessage;
 import dev.langchain4j.data.message.UserMessage;
 import io.github.paopaonb666.agentbase.core.AgentModule;
@@ -439,6 +440,103 @@ class MemoryPipelineTest {
     }
 
     // ── 画像与摘要 ────────────────────────────────────────────────────────
+
+    // ── 三键结构化摘要模板（#329） ────────────────────────────────────────
+
+    @Test
+    void structuredSummaryParsesLegalJsonAndFenceWithTrailingProse() {
+        // 合法 JSON（裸）。
+        assertEquals("【任务态】a\n【关键实体】b\n【未决问题】c",
+                MemoryPipeline.structuredSummaryText(
+                        "{\"task_state\": \"a\", \"key_entities\": \"b\", \"open_questions\": \"c\"}"));
+        // 围栏 + 尾注：剥围栏后取 JSON，尾注不进渲染结果。
+        assertEquals("【任务态】t\n【关键实体】（无）\n【未决问题】（无）",
+                MemoryPipeline.structuredSummaryText("""
+                        ```json
+                        {"task_state": "t"}
+                        ```
+                        以上就是摘要，谢谢！"""));
+    }
+
+    @Test
+    void structuredSummaryFallsBackToRawTextOnGarbageAndNonSummaryJson() {
+        // 垃圾输出：解析失败回退原文（旧行为可回退的根基）。
+        String garbage = "这场对话主要围绕部署问题展开……";
+        assertEquals(garbage, MemoryPipeline.structuredSummaryText(garbage));
+        // 合法 JSON 但不含任何三键：同样回退原文（不是摘要形状）。
+        assertEquals("{\"op\": \"NONE\"}",
+                MemoryPipeline.structuredSummaryText("{\"op\": \"NONE\"}"));
+        // 空输出 → 空串（调用方按无摘要处理）。
+        assertEquals("", MemoryPipeline.structuredSummaryText("   "));
+        assertEquals("", MemoryPipeline.structuredSummaryText(null));
+    }
+
+    @Test
+    void renderStructuredSummaryFormatIsLocked() {
+        // 渲染出口即持久化格式（冻结段字节 = 供应商前缀缓存地基）——
+        // 三节定序、缺值占位「（无）」。改格式必须一次性切换并同步改本断言。
+        assertEquals("【任务态】x\n【关键实体】y\n【未决问题】z",
+                MemoryPipeline.renderStructuredSummary(java.util.Map.of(
+                        "task_state", "x", "key_entities", "y", "open_questions", "z")));
+        assertEquals("【任务态】（无）\n【关键实体】（无）\n【未决问题】（无）",
+                MemoryPipeline.renderStructuredSummary(java.util.Map.of()));
+    }
+
+    @Test
+    void updateSummaryParsesThreeKeyJsonAndStoresRenderedText() {
+        ScriptedFast fast = new ScriptedFast();
+        fast.responses.add("""
+                {"task_state": "用户在调试登录问题，已定位到 token 过期",
+                  "key_entities": "用户 Alice、服务 chat",
+                  "open_questions": "等运维确认密钥轮换窗口"}""");
+        RecordingOps ops = new RecordingOps();
+        ops.summaryToReturn = new Models.SessionSummary("u1", "t", "旧摘要", "chat", 5, 1.0);
+        MemoryPipeline pipeline = pipelineWith(new ScriptedMain(), fast, ops);
+
+        assertTrue(pipeline.updateSummary("u1", "chat", "t", "transcript"));
+        // 存储的是三键渲染文本（格式锁定）。
+        assertTrue(ops.calls.contains("upsertSummary:【任务态】用户在调试登录问题，已定位到 token 过期"
+                + "\n【关键实体】用户 Alice、服务 chat"
+                + "\n【未决问题】等运维确认密钥轮换窗口"), ops.calls.toString());
+        // rolling 角色 prompt 保持既有角色头（会话滚动、300 字引导）。
+        assertTrue(fast.prompts.get(0).contains("会话摘要器"), fast.prompts.get(0));
+        assertTrue(fast.prompts.get(0).contains("300 字"), fast.prompts.get(0));
+        assertTrue(fast.prompts.get(0).contains("task_state"), "三键体单源进 rolling prompt");
+    }
+
+    @Test
+    void compactSummaryUsesCompactionRoleOnFastLane() {
+        ScriptedFast fast = new ScriptedFast();
+        fast.responses.add("```json\n{\"task_state\": \"t\", \"key_entities\": \"e\", "
+                + "\"open_questions\": \"q\"}\n```");
+        ScriptedMain main = new ScriptedMain();
+        RecordingOps ops = new RecordingOps();
+        MemoryPipeline pipeline = pipelineWith(main, fast, ops);
+
+        String summary = pipeline.compactSummary("用户：你好", 500);
+        assertEquals("【任务态】t\n【关键实体】e\n【未决问题】q", summary);
+        // compaction 角色走快档（complete(fast)：快档缺席才回落主力）。
+        assertEquals(1, fast.prompts.size());
+        assertEquals(0, main.prompts.size(), "compaction 不应消耗主力");
+        // 角色差异进 prompt 头部：历史压缩器 + 目标字数参数化 + 转写注入。
+        String prompt = fast.prompts.get(0);
+        assertTrue(prompt.contains("历史压缩器"), prompt);
+        assertTrue(prompt.contains("500"), prompt);
+        assertTrue(prompt.contains("用户：你好"), prompt);
+        // 三键体单源：compaction 与 rolling 共享同一输出契约。
+        assertTrue(prompt.contains("key_entities"), prompt);
+    }
+
+    @Test
+    void renderTranscriptSkipsCompactionSummarySystemMessage() {
+        // #328/#330：压缩摘要 SystemMessage 不重复进抽取转写。
+        String transcript = MemoryPipeline.renderTranscript(List.of(
+                SystemMessage.from(io.github.paopaonb666.agentbase.core.context.ContextEngine
+                        .COMPACTION_SUMMARY_PREFIX + "【任务态】旧摘要"),
+                UserMessage.from("新消息")), 10_000);
+        assertFalse(transcript.contains("旧摘要"));
+        assertTrue(transcript.contains("用户：新消息"));
+    }
 
     @Test
     void mergeProfileBuildsSkeletonWhenAbsent() {

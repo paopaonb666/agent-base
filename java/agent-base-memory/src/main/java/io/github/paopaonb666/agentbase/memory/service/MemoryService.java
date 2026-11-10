@@ -874,6 +874,25 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
         return detail;
     }
 
+    /**
+     * 会话历史折叠摘要（#328/#329 端口桥）：委托形成管线的 compaction 角色
+     * （走快档，快档缺席回落主力）。管线未装配（未配 LLM）或输出不可用时
+     * 返回 null——压缩任务按放弃本轮处理，绝不向上抛。
+     */
+    @Override
+    public String compactTranscript(String transcript, int targetChars) {
+        if (pipeline == null) {
+            return null;
+        }
+        try {
+            String summary = pipeline.compactSummary(transcript, targetChars);
+            return summary == null || summary.isBlank() ? null : summary;
+        } catch (Exception e) {
+            LOG.warn("memory: 压缩摘要失败（放弃本轮，不影响对话）：{}", e.toString());
+            return null;
+        }
+    }
+
     // ── capture 失败重试队列（#182） ─────────────────────────────────────
 
     /** 重试任务载荷：已渲染转写快照（不重渲染）+ 定位元组 + 失败计数

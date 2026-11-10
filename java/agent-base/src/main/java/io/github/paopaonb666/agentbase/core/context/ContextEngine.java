@@ -44,6 +44,19 @@ public final class ContextEngine {
     public static final String ATTACHMENT_CONTEXT_PREFIX = "以下是用户上传的附件内容";
 
     /**
+     * 压缩摘要消息的标记前缀（#328/#330）：会话历史折叠产物以
+     * SystemMessage 形式写回历史头部，内容是三键结构化摘要的渲染文本。
+     *
+     * <p><b>与上方三个注入前缀互斥（契约）</b>：它<b>不是</b>注入块——
+     * {@link #injectedKind} 刻意不匹配此前缀（否则 buildModelInput 会把它
+     * 当注入块去重/提升，压缩摘要永远到不了模型面前）；它按真实历史参与
+     * 预算修剪与工具配对边界。转写渲染侧（MemoryPipeline.renderTranscript）
+     * 按此前缀跳过——摘要内容不重复进抽取转写。格式即契约：改前缀 = 全部
+     * 存量压缩快照失配，须一次性切换。
+     */
+    public static final String COMPACTION_SUMMARY_PREFIX = "【会话历史摘要（自动压缩生成）】\n";
+
+    /**
      * 工具结果不可信标记（#84①）：外部数据类工具的结果进上下文时头部
      * 包一行——间接 prompt injection（OWASP LLM Top 10）的第一道护栏：
      * 网页/文档内容里植入的「忽略以上指令」类文本不是系统指示。只包头部

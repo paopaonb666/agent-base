@@ -30,7 +30,11 @@ import io.github.paopaonb666.agentbase.extensions.Metrics;
  * 快档是优化不是依赖。
  *
  * <p>对应 Python 侧 {@code agent_base_memory/pipeline.py}；四个 prompt
- * 常量逐字节复制。
+ * 常量逐字节复制——例外：SUMMARY_PROMPT 已改造为「三键结构化模板 +
+ * 角色参数」（#329，Java 单边先行，Python 对齐需求登记差异登记簿）：
+ * rolling（会话滚动）与 compaction（历史折叠，#328 消费）两角色共享同一
+ * 三键 JSON 输出契约（task_state / key_entities / open_questions），
+ * 解析失败回退原文保证旧行为可回退。
  */
 public final class MemoryPipeline {
 
@@ -94,6 +98,18 @@ public final class MemoryPipeline {
 
             输出合并后的完整画像 JSON（不要 markdown 围栏、不要解释）。""";
 
+    /**
+     * 摘要三键输出契约（#329 单源）：rolling 与 compaction 两角色拼接共用，
+     * 键集 {@link #SUMMARY_KEYS}。三键体单源——改这里 = 两个角色同步改。
+     */
+    public static final String SUMMARY_KEYS_BODY = """
+            输出纯 JSON 对象（不要 markdown 围栏、不要解释），三键固定：
+            {"task_state": "任务态：进行到哪一步、已有哪些结论、正在做什么",
+              "key_entities": "关键实体：人名/项目/数字与用户表达的关键诉求（保留具体值）",
+              "open_questions": "未决问题：悬而未决的事项、待确认的约定、下一步计划"}
+            三个键都是字符串，缺内容给空串；不要新增键、不要嵌套。""";
+
+    /** 滚动摘要角色（#329）：300 字引导维持、存储 1000 硬截维持。 */
     public static final String SUMMARY_PROMPT = """
             你是会话摘要器。把既有摘要与新对话合并为一份更新的滚动摘要。
 
@@ -101,18 +117,38 @@ public final class MemoryPipeline {
             - 摘要覆盖"到目前为止这个会话聊过什么"：主题、结论、未决事项、
               用户表达的关键诉求
             - 既有摘要中仍然成立的内容保留；被新对话推翻的以新对话为准
-            - 第三人称、简洁，不超过 300 字
+            - 第三人称、简洁，总字数不超过 300 字
+            """ + SUMMARY_KEYS_BODY + """
+
 
             既有摘要（可能为空）：
             {prior}
 
             最近对话转写：
-            {transcript}
+            {transcript}""";
 
-            输出新摘要的纯文本（不要 JSON、不要标题、不要解释）。""";
+    /**
+     * 历史折叠角色（#328 压缩任务消费）：把待折叠段转写压成 {target} 字
+     * 以内的三键摘要。{target} 由调用方按预算参数化（targetChars）。
+     */
+    public static final String COMPACTION_SUMMARY_PROMPT = """
+            你是会话历史压缩器。把下面这段较长的历史对话折叠为一份紧凑摘要，
+            供后续对话替代被折叠的原文使用。
+
+            规则：
+            - 覆盖整段历史：任务进展与结论、关键实体与数字、未决事项
+            - 第三人称、信息密集；总字数控制在 {target} 字以内
+            """ + SUMMARY_KEYS_BODY + """
+
+
+            历史对话转写：
+            {transcript}""";
 
     /** 整合决策的合法操作集。 */
     public static final List<String> DECISION_OPS = List.of("ADD", "UPDATE", "DELETE", "NONE");
+
+    /** 摘要模板三键（#329）：渲染顺序即持久化顺序（任务态/关键实体/未决问题）。 */
+    public static final List<String> SUMMARY_KEYS = List.of("task_state", "key_entities", "open_questions");
 
     /** 画像分节（Python PROFILE_SECTIONS）。 */
     public static final List<String> PROFILE_SECTIONS =
@@ -230,10 +266,61 @@ public final class MemoryPipeline {
                 "无法从 LLM 输出解析 JSON：" + cleaned.substring(0, Math.min(cleaned.length(), 200)));
     }
 
+    /**
+     * 三键摘要 → 可读文本（#329 渲染契约）：注入出口的持久化格式，一旦
+     * 定死不得再改（改 = 冻结段字节变化 = 破坏供应商前缀缓存，须一次性
+     * 切换）。三节定序渲染，缺值占位「（无）」。
+     */
+    public static String renderStructuredSummary(Map<?, ?> keys) {
+        return "【任务态】" + summarySection(keys.get("task_state")) + '\n'
+                + "【关键实体】" + summarySection(keys.get("key_entities")) + '\n'
+                + "【未决问题】" + summarySection(keys.get("open_questions"));
+    }
+
+    private static String summarySection(Object value) {
+        String text = value == null ? "" : String.valueOf(value).strip();
+        return text.isEmpty() ? "（无）" : text;
+    }
+
+    /**
+     * LLM 原始输出 → 摘要文本（#329）：按三键契约解析（{@link #parseJsonBlock}
+     * 容围栏/尾注），命中至少一个三键才渲染；解析失败或非三键输出回退原文
+     * ——rolling 角色的旧行为（自由文本原样存储）由此可回退。空输出返回
+     * 空串（调用方按无摘要处理）。
+     */
+    public static String structuredSummaryText(String raw) {
+        String text = raw == null ? "" : raw.strip();
+        if (text.isEmpty()) {
+            return "";
+        }
+        try {
+            Object parsed = parseJsonBlock(text);
+            if (parsed instanceof Map<?, ?> map) {
+                for (String key : SUMMARY_KEYS) {
+                    if (map.containsKey(key)) {
+                        return renderStructuredSummary(map);
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+            // 解析失败回退原文（consolidate 的 fallback 先例）。
+        }
+        return text;
+    }
+
     /** 把消息渲染成抽取/摘要用的对话转写（保尾部，超限截断）。 */
     public static String renderTranscript(List<ChatMessage> messages, int maxChars) {
         List<String> lines = new ArrayList<>();
         for (ChatMessage message : messages) {
+            // #328/#330：压缩摘要的 SystemMessage 是历史折叠产物，跳过——
+            // 摘要内容不重复进抽取转写（否则会被再抽取/再摘要）。SystemMessage
+            // 本就不进转写行（下方无分支），此处显式守卫防未来加分支时漏掉。
+            if (message instanceof SystemMessage system
+                    && system.text().startsWith(
+                            io.github.paopaonb666.agentbase.core.context.ContextEngine
+                                    .COMPACTION_SUMMARY_PREFIX)) {
+                continue;
+            }
             String text = textOf(message).strip();
             if (text.isEmpty()) {
                 continue;
@@ -480,21 +567,38 @@ public final class MemoryPipeline {
 
     // ── 滚动摘要 ─────────────────────────────────────────────────────────
 
-    /** 把既有摘要与最新对话合并为新的滚动摘要。 */
+    /**
+     * 把既有摘要与最新对话合并为新的滚动摘要（#329 模板化）：LLM 响应 →
+     * 三键解析 → 渲染 → 1000 码点截断。解析失败回退原文——旧行为
+     * （自由文本原样存储、空响应 no-op）逐字节可回退。
+     */
     public boolean updateSummary(String userId, String agentId, String threadId, String transcript) {
         var prior = ops.getSummary(userId, threadId);
         String raw = complete(SUMMARY_PROMPT
                 .replace("{prior}", prior == null ? "（空）" : prior.summary())
                 .replace("{transcript}", transcript), bulkFast());
-        String text = raw.strip();
+        String text = structuredSummaryText(raw);
         if (text.isEmpty()) {
             return false;
         }
         var priorCount = prior == null ? 0 : prior.coveredMessageCount();
         ops.upsertSummary(new io.github.paopaonb666.agentbase.memory.store.Models.SessionSummary(
-                userId, threadId, text.substring(0, Math.min(text.length(), 1000)),
+                userId, threadId, CharMetrics.head(text, 1000),
                 agentId, priorCount, io.github.paopaonb666.agentbase.memory.store.Models.now()));
         return true;
+    }
+
+    /**
+     * 历史折叠摘要（#328 压缩任务消费，compaction 角色）：把待折叠段转写
+     * 压成 {@code targetChars} 字以内的三键摘要。走快档通道（complete(fast)
+     * ——快档未装配时回落主力，既有逻辑）。返回渲染后的摘要文本；模型输出
+     * 不可用（空）时返回空串，调用方按放弃本轮处理。
+     */
+    public String compactSummary(String transcript, int targetChars) {
+        String raw = complete(COMPACTION_SUMMARY_PROMPT
+                .replace("{target}", String.valueOf(targetChars))
+                .replace("{transcript}", transcript), true);
+        return structuredSummaryText(raw);
     }
 
     // ── 编排 ─────────────────────────────────────────────────────────────
