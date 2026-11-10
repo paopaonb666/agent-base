@@ -268,4 +268,28 @@ class ContextEngineTest {
         ContextEngine.buildModelInput(history, 10_000);
         assertEquals(3, history.size());
     }
+
+    @Test
+    void wrapUntrustedMarksExternalToolsOnly() {
+        // #84①：外部数据工具（web_search/knowledge_search/MCP 前缀）的
+        // 非空结果包头部标记；豁免名单与 null/空结果原样返回。
+        String marked = ContextEngine.wrapUntrusted("web_search", "网页正文");
+        assertTrue(marked.startsWith(ContextEngine.UNTRUSTED_TOOL_RESULT_PREFIX), marked);
+        assertTrue(marked.endsWith("网页正文"));
+        assertTrue(ContextEngine.wrapUntrusted("knowledge_search", "文档内容")
+                .startsWith(ContextEngine.UNTRUSTED_TOOL_RESULT_PREFIX));
+        assertTrue(ContextEngine.wrapUntrusted("mcp_fs_read", "x")
+                .startsWith(ContextEngine.UNTRUSTED_TOOL_RESULT_PREFIX));
+        // 豁免：用户自有数据与无外部内容工具。
+        assertEquals("记忆内容", ContextEngine.wrapUntrusted("memory_search", "记忆内容"));
+        assertEquals("42", ContextEngine.wrapUntrusted("calculator", "42"));
+        assertEquals("y", ContextEngine.wrapUntrusted("current_time", "y"));
+        // null/空结果不包（包裹后空串会产生孤儿标记行）。
+        assertNull(ContextEngine.wrapUntrusted("web_search", null));
+        assertEquals("", ContextEngine.wrapUntrusted("web_search", ""));
+        // 判据单源：Graphs/ExecuteNode 共用同一函数。
+        assertTrue(ContextEngine.isExternalDataTool("web_search"));
+        assertFalse(ContextEngine.isExternalDataTool("memory_search"));
+        assertFalse(ContextEngine.isExternalDataTool(null));
+    }
 }

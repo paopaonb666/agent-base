@@ -48,6 +48,9 @@ public final class ExecuteNode {
                 : pool.stream().map(AgentTool::specification).toList();
         int maxTokens = io.github.paopaonb666.agentbase.core.context.ContextEngine.resolveInputBudget(
                 ctx.settings(), ctx.llm()); // #4：per-model 窗口推导
+        // #84①：不可信标记开关在节点构造期固化（与 Graphs 同款判据单源）。
+        boolean untrustedMarker = ctx.settings() != null
+                && ctx.settings().toolkit.toolResultUntrustedMarker;
 
         return (GraphState state, NodeContext nodeCtx) -> {
             int subtaskToolRounds = ctx.settings().planner.subtaskToolRounds;
@@ -89,7 +92,8 @@ public final class ExecuteNode {
                 if (pool.isEmpty()) {
                     break; // 无工具池可执行（对应 Python run_tool_calls is None）
                 }
-                produced.addAll(executeToolCalls(finalMessage.toolExecutionRequests(), nodeCtx));
+                produced.addAll(executeToolCalls(finalMessage.toolExecutionRequests(), nodeCtx,
+                        untrustedMarker));
             }
             String status = exhausted ? PlannerState.FAILED : PlannerState.DONE;
             Map<String, Object> updated = PlannerState.copyTask(task);
@@ -109,7 +113,8 @@ public final class ExecuteNode {
      * 归一成模型可读文本（坏掉的工具绝不打断对话）。
      */
     private static List<ChatMessage> executeToolCalls(List<ToolExecutionRequest> toolCalls,
-                                                      NodeContext nodeCtx) {
+                                                      NodeContext nodeCtx,
+                                                      boolean untrustedMarker) {
         List<ChatMessage> results = new ArrayList<>(toolCalls.size());
         // #337：只读工具并发、有副作用串行，结果按请求序（池内通道保归一）；
         // 池未接（测试直构）退化为串行 callTool。
@@ -123,8 +128,14 @@ public final class ExecuteNode {
         int index = 0;
         for (ToolExecutionRequest call : toolCalls) {
             String name = call.name() == null ? "" : call.name();
+            String output = outputs.get(index);
+            if (untrustedMarker) {
+                // #84①：与 Graphs 同规则（判据单源在 ContextEngine）。
+                output = io.github.paopaonb666.agentbase.core.context.ContextEngine
+                        .wrapUntrusted(name, output);
+            }
             results.add(ToolExecutionResultMessage.from(
-                    call.id() == null ? "" : call.id(), name, outputs.get(index)));
+                    call.id() == null ? "" : call.id(), name, output));
             index++;
         }
         return results;

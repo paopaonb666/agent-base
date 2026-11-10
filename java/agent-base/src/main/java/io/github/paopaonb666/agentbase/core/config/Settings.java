@@ -212,6 +212,14 @@ public final class Settings {
         public double timeoutSeconds = 30.0;
         /** 工具调用审计（M5）：每条调用落 tool_call_records 表。 */
         public boolean callLogEnabled = true;
+        /**
+         * 工具结果不可信标记（#84①，默认关）：外部数据类工具
+         * （web_search/knowledge_search/MCP）的结果进上下文时头部包一行
+         * 「非系统指令」标记——间接 prompt injection 的第一道护栏。事件与
+         * 审计日志保持原文（标记只进模型上下文）。默认关闭观察一期：
+         * 标记文本会进 prompt，开启前需灰度确认无行为回归。
+         */
+        public boolean toolResultUntrustedMarker = false;
     }
 
     /** 网络搜索（tools/search）配置节：env 前缀 {@code SEARCH_} / {@code TAVILY_}。 */
@@ -416,6 +424,7 @@ public final class Settings {
                 Map.entry("toolkit_", "toolkit"),
                 Map.entry("tool_timeout_seconds", "toolkit"),
                 Map.entry("tool_call_log_enabled", "toolkit"),
+                Map.entry("tool_result_untrusted_marker", "toolkit"),
                 Map.entry("search_", "search"),
                 Map.entry("tavily_api_key", "search"),
                 Map.entry("doc_parse_", "doc_parse"),
@@ -427,6 +436,7 @@ public final class Settings {
         Map<String, String> sectionInner = Map.of(
                 "tool_timeout_seconds", "timeout_seconds",
                 "tool_call_log_enabled", "call_log_enabled",
+                "tool_result_untrusted_marker", "tool_result_untrusted_marker",
                 "log_json", "log_json",
                 "health_probe_model", "health_probe_model",
                 "tavily_api_key", "tavily_api_key");
@@ -832,6 +842,10 @@ public final class Settings {
             t.timeoutSeconds = value;
         }
         if (v.containsKey("call_log_enabled")) t.callLogEnabled = requireBool("call_log_enabled", v.get("call_log_enabled"));
+        if (v.containsKey("tool_result_untrusted_marker")) {
+            t.toolResultUntrustedMarker = requireBool("tool_result_untrusted_marker",
+                    v.get("tool_result_untrusted_marker"));
+        }
     }
 
     private static void applySearch(Settings s, Map<String, String> v) {

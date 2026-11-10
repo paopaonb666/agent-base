@@ -67,6 +67,9 @@ public final class Graphs {
         List<AgentTool> pool = tools == null ? ctx.tools() : tools;
         int maxTokens = io.github.paopaonb666.agentbase.core.context.ContextEngine.resolveInputBudget(
                 ctx.settings(), ctx.llm()); // #4：per-model 窗口推导
+        // #84①：不可信标记开关在图构建期固化（build 期读配置，运行期零开销）。
+        boolean untrustedMarker = ctx.settings() != null
+                && ctx.settings().toolkit.toolResultUntrustedMarker;
 
         GraphBuilder builder = GraphBuilder.begin();
         builder.addNode("agent", (GraphState state, NodeContext nodeCtx) -> {
@@ -107,10 +110,17 @@ public final class Graphs {
                                 request -> nodeCtx.callTool(request.name(), request.arguments()));
                 int index = 0;
                 for (ToolExecutionRequest request : requests) {
+                    String toolName = request.name() == null ? "" : request.name();
+                    String output = outputs.get(index);
+                    if (untrustedMarker) {
+                        // #84①：外部数据结果包标记进上下文；ToolCallEvent/
+                        // 审计日志在池内用原文（事件与上下文分离）。
+                        output = ContextEngine.wrapUntrusted(toolName, output);
+                    }
                     results.add(ToolExecutionResultMessage.from(
                             request.id() == null ? "" : request.id(),
-                            request.name() == null ? "" : request.name(),
-                            outputs.get(index)));
+                            toolName,
+                            output));
                     index++;
                 }
                 return Map.<String, Object>of(GraphState.MESSAGES, results);
