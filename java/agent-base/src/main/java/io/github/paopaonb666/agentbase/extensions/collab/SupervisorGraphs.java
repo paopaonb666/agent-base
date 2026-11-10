@@ -188,15 +188,28 @@ public final class SupervisorGraphs {
 
     /**
      * handoff 工具规格：名字 {@code transfer_to_<module>}，description =
-     * 模块 description（supervisor 模型据此路由），参数 schema 为空对象
-     * （无参数——与 create_handoff_tool 的零参工具一致）。
+     * 模块 description + capabilities 附加段（#69——supervisor 模型据此
+     * 路由与判断能力边界），参数 schema 为空对象（无参数——与
+     * create_handoff_tool 的零参工具一致）。
      */
     private static ToolSpecification handoffSpec(AgentModule module) {
         return ToolSpecification.builder()
                 .name(HANDOFF_TOOL_PREFIX + module.name())
-                .description(module.description())
+                .description(handoffDescription(module))
                 .parameters(JsonObjectSchema.builder().build())
                 .build();
+    }
+
+    /**
+     * handoff 工具描述（#69）：capabilities 缺省（空串）时与
+     * {@code description()} 逐字节一致（向后兼容）；非空时追加
+     * 「适用场景」段——模块声明的能力边界是 supervisor 路由的判据素材。
+     */
+    static String handoffDescription(AgentModule module) {
+        String capabilities = module.capabilities();
+        return capabilities == null || capabilities.isBlank()
+                ? module.description()
+                : module.description() + "\n\n适用场景：" + capabilities.strip();
     }
 
     /**

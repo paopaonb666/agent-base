@@ -33,6 +33,12 @@ public final class PlannerModule implements AgentModule {
     }
 
     @Override
+    public String capabilities() {
+        return "复杂多步任务：需要拆解、逐步执行且允许中途重规划的目标"
+                + "（调研、批量处理、多阶段产出）；单轮可直答的简单请求不适用。";
+    }
+
+    @Override
     public CompiledGraph buildGraph(AgentModule.ModuleContext ctx) {
         return PlannerGraphs.buildPlannerGraph(ctx);
     }

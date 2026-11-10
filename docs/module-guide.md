@@ -60,6 +60,12 @@ module = HelloModule()
 运行时服务一律从 `ctx` 取（`ctx.llm`、`ctx.checkpointer`、`ctx.tools`、
 `ctx.memory`），模块不自行创建 LLM、数据库连接或工具池。
 
+Java 侧契约另有一个可选成员 `capabilities()`（缺省空串）：非空时 supervisor
+的 handoff 工具描述会在 `description` 之后追加「适用场景：」段——supervisor
+据此判断「什么该交给这个模块」，能力边界写得越清楚路由越准。Python 契约
+无此成员（Python 侧 handoff 描述恒为 `description` 单行）；纯 Java 部署的
+模块建议填写。
+
 ### 第 3 步：构图
 
 绝大多数模块是"单 LLM 节点 + 可选工具循环"，直接用共享工厂：
@@ -181,6 +187,8 @@ assert list(modules) == ["report"]
 - [ ] 包名 = 模块 `name`，匹配 `^[a-z][a-z0-9_]*$`，且不是 `supervisor`
 - [ ] `__init__.py` 暴露 `module` 对象
 - [ ] `description` 非空，能一句话说明模块能力
+- [ ] （Java 部署）`capabilities()` 已按需填写——handoff 工具描述的
+      「适用场景」段来源；留空则与 `description` 单行一致
 - [ ] `build_graph` 用 `ctx.checkpointer` 编译、`name=<模块名>`
 - [ ] 需要模型时用 `ctx.llm`，不自行构造客户端
 - [ ] 工具名全局唯一；长任务遵守超时约定

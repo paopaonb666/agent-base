@@ -37,6 +37,13 @@ public final class ChatModule implements AgentModule {
     }
 
     @Override
+    public String capabilities() {
+        return "Everyday conversation and Q&A: direct answers, follow-up questions, "
+                + "tool-assisted lookups. Not for multi-step task execution or "
+                + "polished document deliverables.";
+    }
+
+    @Override
     public CompiledGraph buildGraph(AgentModule.ModuleContext ctx) {
         return ChatGraphs.buildChatGraph(ctx);
     }

@@ -145,11 +145,14 @@ class SupervisorGraphTest {
                         && "transfer_to_chat".equals(tool.toolName())
                         && tool.text().contains("draft: the essay body")));
 
-        // supervisor 的模型输入只绑定 handoff 工具：名字与 description 来自模块契约。
+        // supervisor 的模型输入只绑定 handoff 工具：名字与 description 来自
+        // 模块契约（#69：description + capabilities 附加段，与 handoffDescription
+        // 单源同值——ChatModule 声明了 capabilities，文案含「适用场景」段）。
         List<ToolSpecification> specs = model.receivedSpecs.get(0);
         assertEquals(1, specs.size());
         assertEquals("transfer_to_chat", specs.get(0).name());
-        assertEquals(new ChatModule().description(), specs.get(0).description());
+        assertEquals(SupervisorGraphs.handoffDescription(new ChatModule()), specs.get(0).description());
+        assertTrue(specs.get(0).description().contains("适用场景："));
         // 第二次绑定是 chat 子图自己的（无工具：ctx.tools 为空）。
         assertTrue(model.receivedSpecs.get(1).isEmpty());
 
@@ -167,6 +170,33 @@ class SupervisorGraphTest {
         assertTrue(stepNames.contains("handoffs"));
         assertTrue(stepNames.contains("agent")); // 子图的 LLM 节点事件被转发到父 sink
         assertTrue(deltas > 0); // 子 agent 与 supervisor 的 token 增量都直达流
+    }
+
+    @Test
+    void handoffDescriptionComposesCapabilitiesWithBackwardCompat() {
+        // #69 拼接规则：capabilities 缺省（空串）→ 与 description() 逐字节一致
+        // （外部既有模块零强制、wire 不变）；非空 → 追加「适用场景」段。
+        AgentModule plain = new AgentModule() {
+            @Override public String name() { return "plain"; }
+            @Override public String description() { return "单行描述"; }
+            @Override public CompiledGraph buildGraph(AgentModule.ModuleContext ctx) { return null; }
+            @Override public java.util.List<io.github.paopaonb666.agentbase.core.tools.AgentTool> getTools() {
+                return java.util.List.of();
+            }
+        };
+        assertEquals("单行描述", SupervisorGraphs.handoffDescription(plain));
+
+        AgentModule capable = new AgentModule() {
+            @Override public String name() { return "capable"; }
+            @Override public String description() { return "单行描述"; }
+            @Override public String capabilities() { return "  只做 A 类任务  "; }
+            @Override public CompiledGraph buildGraph(AgentModule.ModuleContext ctx) { return null; }
+            @Override public java.util.List<io.github.paopaonb666.agentbase.core.tools.AgentTool> getTools() {
+                return java.util.List.of();
+            }
+        };
+        String composed = SupervisorGraphs.handoffDescription(capable);
+        assertEquals("单行描述\n\n适用场景：只做 A 类任务", composed);
     }
 
     @Test

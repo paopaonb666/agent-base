@@ -28,6 +28,12 @@ public final class HelloModule implements AgentModule {
     }
 
     @Override
+    public String capabilities() {
+        return "Connectivity sample only: demonstrates the module onboarding "
+                + "recipe. Route nothing here in real deployments.";
+    }
+
+    @Override
     public CompiledGraph buildGraph(AgentModule.ModuleContext ctx) {
         return HelloGraphs.buildHelloGraph(ctx);
     }

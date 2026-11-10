@@ -30,6 +30,13 @@ public final class WriterModule implements AgentModule {
     }
 
     @Override
+    public String capabilities() {
+        return "Writing deliverables: articles, emails, reports, summaries, "
+                + "rewrites and polish passes. Not for factual Q&A that needs no "
+                + "document artifact.";
+    }
+
+    @Override
     public CompiledGraph buildGraph(AgentModule.ModuleContext ctx) {
         return WriterGraphs.buildWriterGraph(ctx);
     }

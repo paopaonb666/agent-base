@@ -27,6 +27,16 @@ public interface AgentModule {
     String description();
 
     /**
+     * 能力自述（#69）：handoff 工具描述的附加段——supervisor 据此判断
+     * 「什么场景该交给这个模块」。缺省空串 = 不拼接，handoff 描述与
+     * {@code description()} 单行逐字节一致（向后兼容；既有模块零强制）。
+     * Python 侧模块类无此契约字段（差异登记簿承载）。
+     */
+    default String capabilities() {
+        return "";
+    }
+
+    /**
      * 构建该模块编译后的图；以模块名命名，supervisor 据此把图作为
      * sub-agent 编排。
      */
