@@ -163,11 +163,13 @@
               <goal>check</goal>
             </goals>
             <configuration>
-              <!-- 实测基线：agent-base 行覆盖 54%、agent-base-memory 58%
-                   （Wave-0 测试组 #285–296 已计入）。路线图目标 80% 在
-                   server/toolkit/planner 大块无测试类（Wave-5 #290–307）
-                   落地前不可达——先钉在 52% 防回退，随测试组落地分步收紧
-                   到 80%（收紧时只需改本行）。 -->
+              <!-- 覆盖率门演进（#310→#93）：52%（起步）→ 75%（2026-11-11，
+                   #93 收紧——两 bundle 实测达标）。80% 余量 ≈650 行，最大
+                   缺口：Settings 224、MemoryApiController 143、MemoryOpsCli
+                   107、AgentsRoutes 54、Observability 53、JsonQueryTool 49
+                   ——可测目标；MysqlCheckpointer/MysqlCoreStore/
+                   MysqlMemoryStore/MySqlUploadedFileStore（~350 行）需活体
+                   MySQL 服务器，暂不可测。收紧时只需改本行。 -->
               <rules>
                 <rule>
                   <element>BUNDLE</element>
@@ -175,7 +177,7 @@
                     <limit>
                       <counter>LINE</counter>
                       <value>COVEREDRATIO</value>
-                      <minimum>0.52</minimum>
+                      <minimum>0.75</minimum>
                     </limit>
                   </limits>
                 </rule>
