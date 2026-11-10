@@ -1028,6 +1028,24 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
 
     // ── 上下文注入（M6d + T2.1） ────────────────────────────────────────
 
+    /**
+     * INJECTION 域组装期字符上限（条目 15）：{@code contextBudgetInjectionTokens}
+     * = 0（默认）时沿用 {@code contextMaxChars} 字符口径（逐字节现状）；&gt;0
+     * 时按 {@code ceil(capTokens × 5/3)} 折算字符上限并与 contextMaxChars 取小。
+     * 5/3 是 CJK 0.6 token/char（EstimatingTokenCounter 口径）的保守换算上界：
+     * chars ≥ 1.67 × tokens 则估算 tokens ≤ cap 恒成立——近似口径（真实
+     * tokenizer 与估算同量级），只收紧不改语义；MemoryContext.pack 的既有
+     * 收缩序（召回逐条丢 → 摘要截断 → 硬截断）原样生效。
+     */
+    private int injectionMaxChars() {
+        int capTokens = settings.memory.contextBudgetInjectionTokens;
+        if (capTokens <= 0) {
+            return settings.memory.contextMaxChars;
+        }
+        int tokenDerivedChars = (int) Math.ceil(capTokens * 5.0 / 3.0);
+        return Math.min(settings.memory.contextMaxChars, tokenDerivedChars);
+    }
+
     @Override
     public String composeContext(String userId, String agentId, String threadId, String query) {
         // 线程级冻结注入段（画像+记忆块+摘要快照）：同线程返回逐字节相同的
@@ -1054,7 +1072,7 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
             blocks.addAll(agentBlocks);
             frozen = MemoryContext.composeFrozenContext(profile, blocks,
                     summaryRecord != null ? summaryRecord.summary() : null,
-                    settings.memory.contextMaxChars);
+                    injectionMaxChars()); // 条目 15 INJECTION 域：token 上限折算字符口径
         } catch (Exception e) {
             LOG.warn("memory: 冻结注入段组装失败（本轮不注入）", e);
             return null;
@@ -1079,7 +1097,7 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
     public String recallContext(String userId, String query) {
         try {
             List<Retrieval.ScoredMemory> recalled = searchScored(userId, null, query, null);
-            return MemoryContext.composeRecallContext(recalled, settings.memory.contextMaxChars);
+            return MemoryContext.composeRecallContext(recalled, injectionMaxChars()); // 条目 15 INJECTION 域
         } catch (Exception e) {
             LOG.warn("memory: 召回注入段组装失败（本轮不注入召回）", e);
             return null;

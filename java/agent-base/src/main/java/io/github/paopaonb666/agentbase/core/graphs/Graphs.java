@@ -65,11 +65,16 @@ public final class Graphs {
     public static CompiledGraph buildSingleAgentGraph(
             AgentModule.ModuleContext ctx, String name, String systemPrompt, List<AgentTool> tools) {
         List<AgentTool> pool = tools == null ? ctx.tools() : tools;
-        int maxTokens = io.github.paopaonb666.agentbase.core.context.ContextEngine.resolveInputBudget(
-                ctx.settings(), ctx.llm()); // #4：per-model 窗口推导
+        // 条目 15 / R2-F1 收口：SYSTEM 域扣减——窗口生效时把 systemPrompt 计入
+        // 预算（window=0 原样，逐字节兼容）；窗口=0 的旧口径不变。
+        int maxTokens = ContextEngine.budgetAfterSystem(ctx.settings(), ctx.llm(), systemPrompt);
         // #84①：不可信标记开关在图构建期固化（build 期读配置，运行期零开销）。
         boolean untrustedMarker = ctx.settings() != null
                 && ctx.settings().toolkit.toolResultUntrustedMarker;
+        // 条目 15：TOOL_RESULTS 域观测上限在构建期固化进闭包（0 = 完全跳过，
+        // 零开销零日志；>0 只告警不截断——外置由条目 6 承接）。
+        int toolResultCapTokens = ctx.settings() == null
+                ? 0 : ctx.settings().memory.contextBudgetToolResultTokens;
 
         GraphBuilder builder = GraphBuilder.begin();
         builder.addNode("agent", (GraphState state, NodeContext nodeCtx) -> {
@@ -160,7 +165,7 @@ public final class Graphs {
                     String toolName = request.name() == null ? "" : request.name();
                     String output = loopIntercepted[index]
                             ? outputs.get(index) // 提示文本不包不可信标记（系统引导，非外部数据）
-                            : decorateOutput(toolName, outputs.get(index), untrustedMarker);
+                            : decorateOutput(toolName, outputs.get(index), untrustedMarker, toolResultCapTokens);
                     results.add(ToolExecutionResultMessage.from(
                             request.id() == null ? "" : request.id(),
                             toolName,
@@ -222,12 +227,18 @@ public final class Graphs {
      * 单请求输出 → ToolMessage 文本的装饰（条目 6 外置改造预留的函数级
      * 接缝）：#84① 开关开时外部数据结果包标记进上下文；ToolCallEvent/
      * 审计日志在池内用原文（事件与上下文分离）。行为与抽方法前逐字节一致。
+     *
+     * <p>条目 15 TOOL_RESULTS 域：{@code toolResultCapTokens > 0} 时对装饰后
+     * 的最终文本（含不可信标记行）做超限观测告警（helper 单源
+     * ContextEngine.warnIfToolResultOverCap；不截断不外置）。
      */
-    private static String decorateOutput(String toolName, String output, boolean untrustedMarker) {
-        if (untrustedMarker) {
-            return ContextEngine.wrapUntrusted(toolName, output);
-        }
-        return output;
+    private static String decorateOutput(String toolName, String output, boolean untrustedMarker,
+                                         int toolResultCapTokens) {
+        String decorated = untrustedMarker
+                ? ContextEngine.wrapUntrusted(toolName, output)
+                : output;
+        ContextEngine.warnIfToolResultOverCap(toolName, decorated, toolResultCapTokens);
+        return decorated;
     }
 
     /** 供 planner 等自定义模块复用：把「本轮贴尾注入」风格的无更新空 Map 返回。 */

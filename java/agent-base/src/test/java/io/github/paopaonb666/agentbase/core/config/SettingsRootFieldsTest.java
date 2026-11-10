@@ -200,6 +200,44 @@ class SettingsRootFieldsTest {
     }
 
     @Test
+    void memoryContextBudgetKeysParseWithDefaultsAndNegativeRejected() {
+        // 条目 15 四域预算键：默认全 0（=关/沿用既有口径，现状逐字节）；
+        // >0 生效；负数一律 SettingsError 且点名出错字段。
+        Settings defaults = Settings.load(Map.of("ENV", "development"), null);
+        assertEquals(0, defaults.memory.contextBudgetSystemTokens);
+        assertEquals(0, defaults.memory.contextBudgetHistoryTokens);
+        assertEquals(0, defaults.memory.contextBudgetToolResultTokens);
+        assertEquals(0, defaults.memory.contextBudgetInjectionTokens);
+
+        Settings tuned = Settings.load(Map.of(
+                "ENV", "development",
+                "MEMORY_CONTEXT_BUDGET_SYSTEM_TOKENS", "512",
+                "MEMORY_CONTEXT_BUDGET_HISTORY_TOKENS", "4096",
+                "MEMORY_CONTEXT_BUDGET_TOOL_RESULT_TOKENS", "1024",
+                "MEMORY_CONTEXT_BUDGET_INJECTION_TOKENS", "2048"), null);
+        assertEquals(512, tuned.memory.contextBudgetSystemTokens);
+        assertEquals(4096, tuned.memory.contextBudgetHistoryTokens);
+        assertEquals(1024, tuned.memory.contextBudgetToolResultTokens);
+        assertEquals(2048, tuned.memory.contextBudgetInjectionTokens);
+
+        // 0 是合法值（=关）；负数拒绝（>=0 语义：0 不是无效配置而是开关）。
+        for (String key : new String[] {
+                "MEMORY_CONTEXT_BUDGET_SYSTEM_TOKENS",
+                "MEMORY_CONTEXT_BUDGET_HISTORY_TOKENS",
+                "MEMORY_CONTEXT_BUDGET_TOOL_RESULT_TOKENS",
+                "MEMORY_CONTEXT_BUDGET_INJECTION_TOKENS"}) {
+            Settings.SettingsError error = assertThrows(Settings.SettingsError.class,
+                    () -> Settings.load(Map.of(
+                            "ENV", "development",
+                            key, "-1"), null),
+                    key + " 负数应拒绝");
+            assertTrue(error.getMessage().contains(
+                            key.substring("MEMORY_".length()).toLowerCase(java.util.Locale.ROOT)),
+                    "拒绝文案要点名出错字段：" + error.getMessage());
+        }
+    }
+
+    @Test
     void perModelContextWindowsParseIndependently() {
         // #4：主/快档窗口独立解析；0 = 未配置（预算沿用现状）；负数拒绝。
         Settings s = Settings.load(Map.of(

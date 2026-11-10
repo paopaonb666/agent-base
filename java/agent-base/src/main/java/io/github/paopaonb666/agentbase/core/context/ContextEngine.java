@@ -6,6 +6,9 @@ import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.ToolExecutionResultMessage;
 import dev.langchain4j.data.message.UserMessage;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -31,6 +34,8 @@ import java.util.Set;
  * <p>对应 Python 侧 {@code core/context.py}，逐算法移植。
  */
 public final class ContextEngine {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ContextEngine.class);
 
     private ContextEngine() {}
 
@@ -96,6 +101,26 @@ public final class ContextEngine {
             return result;
         }
         return UNTRUSTED_TOOL_RESULT_PREFIX + result;
+    }
+
+    /**
+     * 工具结果超 TOOL_RESULTS 域上限的观测告警（条目 15）：{@code capTokens > 0}
+     * 时对最终进上下文的工具结果文本计量（含 #84 不可信标记行——它同样占模型
+     * 输入），超限 {@code LOG.warn} 带工具名与估算 token 数。<b>只告警不截断
+     * 不外置</b>——结果外置由条目 6 承接（下一批），告警是过渡态观测面；
+     * {@code capTokens = 0}（默认）时零开销零日志（判定前置，计量都不发生）。
+     * Graphs.decorateOutput 与 ExecuteNode.executeToolCalls 两个组装点共用
+     * 本 helper（判据/计量单源，与 wrapUntrusted 同规则）。
+     */
+    public static void warnIfToolResultOverCap(String toolName, String output, int capTokens) {
+        if (capTokens <= 0 || output == null || output.isEmpty()) {
+            return;
+        }
+        int tokens = countMessageTokens(ToolExecutionResultMessage.from("", "", output));
+        if (tokens > capTokens) {
+            LOG.warn("工具结果超 TOOL_RESULTS 域预算上限（观测告警，不截断不外置——外置由条目 6 承接）："
+                            + "tool={} 估算 {} token > 上限 {} token", toolName, tokens, capTokens);
+        }
     }
 
     // token 计量（#339/旧 #2）：默认真实 tokenizer（jtokkit cl100k_base）
@@ -181,15 +206,73 @@ public final class ContextEngine {
      * {@code min(contextMaxTokens, 窗口 - 输出预留)}——上下文窗口是硬顶，
      * 超窗请求会被 provider 直接拒绝；未配置窗口（0）沿用
      * {@code memory.contextMaxTokens} 现状，行为逐字节不变。
+     *
+     * <p>条目 15 HISTORY 域：{@code memory.contextBudgetHistoryTokens > 0}
+     * 时在结果上追加一段 min 封顶——历史体（尾部预算段）的<b>独立上限</b>，
+     * 与窗口无关（window=0 路径同样生效）；预算退化到极小时由
+     * {@link #buildModelInput} 的「至少保留最后一条」守卫兜底。
      */
     public static int resolveInputBudget(io.github.paopaonb666.agentbase.core.config.Settings settings,
                                          io.github.paopaonb666.agentbase.core.llm.ModelRuntime llm) {
         int memoryBudget = settings.memory.contextMaxTokens;
         int window = llm == null ? 0 : llm.contextWindowTokens();
-        if (window <= 0) {
-            return memoryBudget;
+        int budget = window <= 0
+                ? memoryBudget
+                : Math.min(memoryBudget, Math.max(MIN_INPUT_BUDGET, window - OUTPUT_RESERVE_TOKENS));
+        if (settings.memory.contextBudgetHistoryTokens > 0) {
+            budget = Math.min(budget, settings.memory.contextBudgetHistoryTokens);
         }
-        return Math.min(memoryBudget, Math.max(MIN_INPUT_BUDGET, window - OUTPUT_RESERVE_TOKENS));
+        return budget;
+    }
+
+    /**
+     * SYSTEM 域预算推导（条目 15 / R2-F1 收口）：在 {@link #resolveInputBudget}
+     * 同口径的基础上，窗口生效（{@code llm.contextWindowTokens() > 0}）时把
+     * {@code systemPrompt} 计量并从预算扣除——system prompt 过去加在预算外，
+     * 真实输入 = 预算内修剪结果 + 未计量 prompt，仍可能超窗（provider 侧 400
+     * 而非本地修剪）。system 不可超=硬性：<b>不截断不丢 prompt 本体</b>，挤占
+     * 的是历史体（尾部修剪更早触发）；扣减恒诚实生效（R2-F1 的目标恰是
+     * 小窗口模型——budget 可能 ≤ 下限，floor 恒兜底会吞掉扣减、修复失效），
+     * 仅当扣减吞掉全部预算（raw &lt; 1）才回落 {@code min(budget,
+     * MIN_INPUT_BUDGET)}——不为负、不高于扣减前预算（独立上限不得被抬高）。
+     *
+     * <p>window=0（未配置窗口）原样返回 {@link #resolveInputBudget} 结果——
+     * 逐字节兼容（R2-F1 的缝只在窗口面）；{@code systemPrompt == null} 同样
+     * 原样返回（无 prompt 可计量，Graphs 的 null 提示形态）。
+     *
+     * <p>{@code memory.contextBudgetSystemTokens > 0} 是 systemPrompt 的独立
+     * 硬顶（默认 0 = 只做上述收口扣减）：计得 tokens 超顶即抛
+     * {@code SettingsError}——超限是配置错误不是裁剪场景（system 不可超=硬性）。
+     * Graphs/SupervisorGraphs 在构建期调用（装配期校验）；planner 两个取值点的
+     * prompt 运行期才存在，校验随节点执行触发。计量乘 {@code llm.tokenFactor()}
+     * （#340 口径，1.0 透明）。
+     */
+    public static int budgetAfterSystem(io.github.paopaonb666.agentbase.core.config.Settings settings,
+                                        io.github.paopaonb666.agentbase.core.llm.ModelRuntime llm,
+                                        String systemPrompt) {
+        int budget = resolveInputBudget(settings, llm);
+        int window = llm == null ? 0 : llm.contextWindowTokens();
+        if (window <= 0 || systemPrompt == null) {
+            return budget;
+        }
+        int systemTokens = (int) Math.round(
+                countMessageTokens(SystemMessage.from(systemPrompt)) * llm.tokenFactor());
+        int systemCap = settings.memory.contextBudgetSystemTokens;
+        if (systemCap > 0 && systemTokens > systemCap) {
+            throw new io.github.paopaonb666.agentbase.core.config.Settings.SettingsError(
+                    "system prompt tokens (%d) exceed memory.context_budget_system_tokens (%d)"
+                            .formatted(systemTokens, systemCap));
+        }
+        int raw = budget - systemTokens;
+        if (raw >= 1) {
+            return raw;
+        }
+        // 扣减吞掉全部预算（极端大 prompt）才回落 floor：min(budget, 下限)
+        // ——不高于扣减前预算（historyCap/contextMaxTokens 本身低于下限时
+        // 不得被抬高），防 0/负预算让修剪退化；正常扣减（raw >= 1）一律
+        // 诚实生效——R2-F1 的目标恰是小窗口模型（budget 可能 ≤ 下限），
+        // floor 恒兜底会吞掉扣减、修复失效。
+        return Math.min(budget, MIN_INPUT_BUDGET);
     }
 
     /**

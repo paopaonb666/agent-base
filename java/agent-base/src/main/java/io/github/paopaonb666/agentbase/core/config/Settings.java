@@ -356,6 +356,35 @@ public final class Settings {
          * 不拆散。其余历史折叠进摘要。
          */
         public int compactionKeepRecentTurns = 3;
+        /**
+         * 四域预算拆分（条目 15）——SYSTEM 域：systemPrompt 的独立硬顶
+         * （token）。默认 0 = 只做收口扣减（R2-F1：窗口生效时 system 计入
+         * 输入总预算，挤占历史体，不截断 prompt 本体——ContextEngine
+         * .budgetAfterSystem）；&gt;0 = 另设硬顶，计得的 systemTokens 超顶即
+         * SettingsError（system 不可超=硬性，超限是配置错误不是裁剪场景）。
+         */
+        public int contextBudgetSystemTokens = 0;
+        /**
+         * 四域预算拆分（条目 15）——HISTORY 域：历史体（尾部预算段）的独立
+         * 上限（token）。默认 0 = 沿用 {@link #contextMaxTokens} 语义；
+         * &gt;0 时 resolveInputBudget 结果额外 min 封顶该值（与窗口无关）。
+         */
+        public int contextBudgetHistoryTokens = 0;
+        /**
+         * 四域预算拆分（条目 15）——TOOL_RESULTS 域：单条工具结果的观测上限
+         * （token）。默认 0 = 零开销零日志；&gt;0 时工具结果超限 LOG.warn
+         * （ContextEngine.warnIfToolResultOverCap，含 #84 不可信标记行）——
+         * <b>不截断不外置</b>，结果外置由条目 6 承接，告警是过渡态观测面。
+         */
+        public int contextBudgetToolResultTokens = 0;
+        /**
+         * 四域预算拆分（条目 15）——INJECTION 域：注入块（冻结段/召回段）的
+         * token 上限。默认 0 = 沿用 {@link #contextMaxChars} 字符口径；&gt;0
+         * 时 MemoryService 按 ceil(capTokens × 5/3) 折算字符上限并与
+         * {@link #contextMaxChars} 取小（CJK 0.6 token/char 的保守换算上界；
+         * MemoryContext.pack 既有收缩序不变）。
+         */
+        public int contextBudgetInjectionTokens = 0;
     }
 
     /** planner 模块的预算与防护（M9）：env 前缀 {@code PLANNER_}。 */
@@ -1167,6 +1196,27 @@ public final class Settings {
                 throw new SettingsError("MEMORY_COMPACTION_KEEP_RECENT_TURNS must be >= 1, got %d".formatted(value));
             }
             t.compactionKeepRecentTurns = value;
+        }
+        // 四域预算拆分（条目 15）：四键均 >= 0（0 = 关/沿用既有口径，负数拒绝）。
+        if (v.containsKey("context_budget_system_tokens")) {
+            int value = requireInt("context_budget_system_tokens", v.get("context_budget_system_tokens"));
+            if (value < 0) throw new SettingsError("context_budget_system_tokens must be >= 0, got %d".formatted(value));
+            t.contextBudgetSystemTokens = value;
+        }
+        if (v.containsKey("context_budget_history_tokens")) {
+            int value = requireInt("context_budget_history_tokens", v.get("context_budget_history_tokens"));
+            if (value < 0) throw new SettingsError("context_budget_history_tokens must be >= 0, got %d".formatted(value));
+            t.contextBudgetHistoryTokens = value;
+        }
+        if (v.containsKey("context_budget_tool_result_tokens")) {
+            int value = requireInt("context_budget_tool_result_tokens", v.get("context_budget_tool_result_tokens"));
+            if (value < 0) throw new SettingsError("context_budget_tool_result_tokens must be >= 0, got %d".formatted(value));
+            t.contextBudgetToolResultTokens = value;
+        }
+        if (v.containsKey("context_budget_injection_tokens")) {
+            int value = requireInt("context_budget_injection_tokens", v.get("context_budget_injection_tokens"));
+            if (value < 0) throw new SettingsError("context_budget_injection_tokens must be >= 0, got %d".formatted(value));
+            t.contextBudgetInjectionTokens = value;
         }
     }
 

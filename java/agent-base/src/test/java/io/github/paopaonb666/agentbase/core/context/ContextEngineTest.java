@@ -1,5 +1,9 @@
 package io.github.paopaonb666.agentbase.core.context;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.SystemMessage;
@@ -9,12 +13,14 @@ import io.github.paopaonb666.agentbase.core.text.EstimatingTokenCounter;
 import io.github.paopaonb666.agentbase.core.text.ImageTokenPolicy;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -357,5 +363,135 @@ class ContextEngineTest {
         assertTrue(ContextEngine.compactionNeeded(history, 40, 0.7));
         assertFalse(ContextEngine.compactionNeeded(history, 40, 0.8));
         assertEquals(4, history.size(), "纯函数不得修改入参");
+    }
+
+    // ── 四域预算拆分（条目 15 / R2-F1 收口） ──────────────────────────────
+
+    /** 带 tokenFactor 的窗口桩（budgetAfterSystem 的系数透明口径用）。 */
+    private static io.github.paopaonb666.agentbase.core.llm.ModelRuntime stubRuntime(int window,
+                                                                                     double factor) {
+        return new io.github.paopaonb666.agentbase.core.llm.ModelRuntime() {
+            @Override public dev.langchain4j.model.chat.ChatModel chat() { throw new UnsupportedOperationException(); }
+            @Override public dev.langchain4j.model.chat.StreamingChatModel streaming() { return null; }
+            @Override public dev.langchain4j.data.message.AiMessage stream(java.util.List<ChatMessage> messages,
+                    java.util.List<dev.langchain4j.agent.tool.ToolSpecification> tools,
+                    java.util.function.Consumer<String> onDelta) { throw new UnsupportedOperationException(); }
+            @Override public dev.langchain4j.data.message.AiMessage invoke(java.util.List<ChatMessage> messages) { throw new UnsupportedOperationException(); }
+            @Override public int contextWindowTokens() { return window; }
+            @Override public double tokenFactor() { return factor; }
+        };
+    }
+
+    @Test
+    void budgetAfterSystemFollowsWindowMatrix() {
+        useEstimator();
+        var settings = new io.github.paopaonb666.agentbase.core.config.Settings();
+        settings.memory.contextMaxTokens = 1000;
+        // window=0：原样返回（逐字节兼容，R2-F1 的缝只在窗口面）；prompt 有无都一样。
+        assertEquals(1000, ContextEngine.budgetAfterSystem(settings, stubRuntime(0), "系统提示"));
+        assertEquals(ContextEngine.resolveInputBudget(settings, stubRuntime(0)),
+                ContextEngine.budgetAfterSystem(settings, stubRuntime(0), "x".repeat(400)));
+        // window>0：systemPrompt 计量后从预算扣除（40 ASCII 字符 = 10 token）。
+        assertEquals(1000 - 10,
+                ContextEngine.budgetAfterSystem(settings, stubRuntime(8192), "x".repeat(40)));
+        // null prompt：无 prompt 可计量，原样返回（Graphs 的 null 提示形态）。
+        assertEquals(1000, ContextEngine.budgetAfterSystem(settings, stubRuntime(8192), null));
+        // floor 兜底：扣减吞掉全部预算（raw < 1）→ 回落 min(budget, 下限)=1024，
+        // 不为负不超预算；正常扣减（raw >= 1）诚实生效。
+        settings.memory.contextMaxTokens = 1030;
+        assertEquals(1024,
+                ContextEngine.budgetAfterSystem(settings, stubRuntime(8192), "x".repeat(4200)));
+        // tokenFactor 透明：1.0 与默认口径同值；2.0 计量放大（含 prompt）。
+        settings.memory.contextMaxTokens = 1000;
+        assertEquals(ContextEngine.budgetAfterSystem(settings, stubRuntime(8192), "x".repeat(40)),
+                ContextEngine.budgetAfterSystem(settings, stubRuntime(8192, 1.0), "x".repeat(40)));
+        assertEquals(1000 - 20,
+                ContextEngine.budgetAfterSystem(settings, stubRuntime(8192, 2.0), "x".repeat(40)));
+    }
+
+    @Test
+    void budgetAfterSystemFloorsBelowPreBudgetWithoutRaisingIt() {
+        // floor 不高于扣减前预算：historyCap 把预算压到 MIN_INPUT_BUDGET 以下
+        // 时，SYSTEM 扣减诚实生效（490），floor 只防 0/负、不得把预算抬回去
+        // （下限不破独立上限——R2-F1 的目标恰是小预算场景）。
+        useEstimator();
+        var settings = new io.github.paopaonb666.agentbase.core.config.Settings();
+        settings.memory.contextMaxTokens = 1000;
+        settings.memory.contextBudgetHistoryTokens = 500;
+        // 500 - 10 = 490（诚实扣减）；floor 仅在 raw < 1 时回落 min(budget, 1024)。
+        assertEquals(490,
+                ContextEngine.budgetAfterSystem(settings, stubRuntime(8192), "x".repeat(40)));
+    }
+
+    @Test
+    void budgetAfterSystemEnforcesOptionalSystemHardCap() {
+        // contextBudgetSystemTokens > 0 = systemPrompt 独立硬顶：计得 tokens
+        // 超顶即 SettingsError（装配期校验语义；=顶不超、window=0 不计量）。
+        useEstimator();
+        var settings = new io.github.paopaonb666.agentbase.core.config.Settings();
+        settings.memory.contextMaxTokens = 1000;
+        settings.memory.contextBudgetSystemTokens = 5;
+        var error = assertThrows(io.github.paopaonb666.agentbase.core.config.Settings.SettingsError.class,
+                () -> ContextEngine.budgetAfterSystem(settings, stubRuntime(8192), "x".repeat(40)));
+        assertTrue(error.getMessage().contains("context_budget_system_tokens"), error.getMessage());
+        // 恰好到顶（10 = 10）不算超；cap=0（默认）不做硬顶；window=0 不计量。
+        settings.memory.contextBudgetSystemTokens = 10;
+        assertEquals(990, ContextEngine.budgetAfterSystem(settings, stubRuntime(8192), "x".repeat(40)));
+        settings.memory.contextBudgetSystemTokens = 1;
+        assertEquals(1000, ContextEngine.budgetAfterSystem(settings, stubRuntime(0), "x".repeat(40)));
+    }
+
+    @Test
+    void resolveInputBudgetAppliesHistoryCapTopping() {
+        // 条目 15 HISTORY 域：contextBudgetHistoryTokens > 0 = 历史体独立上限
+        // （追加 min 封顶，与窗口无关）；=0 不影响既有公式。
+        var settings = new io.github.paopaonb666.agentbase.core.config.Settings();
+        int memoryBudget = settings.memory.contextMaxTokens;
+        assertEquals(memoryBudget, ContextEngine.resolveInputBudget(settings, stubRuntime(0)));
+
+        settings.memory.contextBudgetHistoryTokens = 5000;
+        // window=0：min(12000, 5000) = 5000（独立上限与窗口无关）。
+        assertEquals(5000, ContextEngine.resolveInputBudget(settings, stubRuntime(0)));
+        assertEquals(5000, ContextEngine.resolveInputBudget(settings, null));
+        // window>0：窗口推导已把预算压到 4096 → 更小的 cap(3000) 再封顶；
+        // 更大的 cap(5000) 不抬高预算。
+        assertEquals(4096, ContextEngine.resolveInputBudget(settings, stubRuntime(8192)));
+        settings.memory.contextBudgetHistoryTokens = 3000;
+        assertEquals(3000, ContextEngine.resolveInputBudget(settings, stubRuntime(8192)));
+        // cap 大于 memoryBudget：取小后仍是 memoryBudget（封顶不抬高）。
+        settings.memory.contextBudgetHistoryTokens = 5000;
+        settings.memory.contextMaxTokens = 2000;
+        assertEquals(2000, ContextEngine.resolveInputBudget(settings, stubRuntime(0)));
+    }
+
+    @Test
+    void warnIfToolResultOverCapWarnsOnlyWhenOver() {
+        // 条目 15 TOOL_RESULTS 域观测面：cap>0 且超限 → WARN 一条（带工具名
+        // 与估算 token 数）；未超 / cap=0 / null/空输出 → 静默零事件。
+        useEstimator();
+        Logger engineLogger = (Logger) LoggerFactory.getLogger(ContextEngine.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        engineLogger.addAppender(appender);
+        try {
+            ContextEngine.warnIfToolResultOverCap("web_search", "x".repeat(400), 0);  // cap=0：零开销零日志
+            ContextEngine.warnIfToolResultOverCap("web_search", "x".repeat(400), 200); // 100 token ≤ 200：静默
+            ContextEngine.warnIfToolResultOverCap("web_search", null, 50);             // null：静默
+            ContextEngine.warnIfToolResultOverCap("web_search", "", 50);               // 空：静默
+            assertEquals(0, warnCount(appender));
+            ContextEngine.warnIfToolResultOverCap("web_search", "x".repeat(400), 50); // 100 > 50：告警
+            assertEquals(1, warnCount(appender));
+            assertTrue(appender.list.stream()
+                    .filter(e -> e.getLevel() == Level.WARN)
+                    .findFirst().orElseThrow().getFormattedMessage().contains("web_search"));
+        } finally {
+            engineLogger.detachAppender(appender);
+            appender.stop();
+        }
+    }
+
+    /** ContextEngine 日志的 WARN 计数（MetricsRenderTest 同款模式）。 */
+    private static long warnCount(ListAppender<ILoggingEvent> appender) {
+        return appender.list.stream().filter(e -> e.getLevel() == Level.WARN).count();
     }
 }

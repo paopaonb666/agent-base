@@ -109,8 +109,9 @@ public final class SupervisorGraphs {
             handoffSpecs.add(handoffSpec(module));
         }
         List<ToolSpecification> boundSpecs = List.copyOf(handoffSpecs);
-        int maxTokens = io.github.paopaonb666.agentbase.core.context.ContextEngine.resolveInputBudget(
-                ctx.settings(), ctx.llm()); // #4：per-model 窗口推导
+        // 条目 15 / R2-F1 收口：SYSTEM 域扣减——窗口生效时 DEFAULT_PROMPT 计入
+        // 预算（window=0 原样，逐字节兼容）；窗口=0 的旧口径不变。
+        int maxTokens = ContextEngine.budgetAfterSystem(ctx.settings(), ctx.llm(), DEFAULT_PROMPT);
 
         return GraphBuilder.begin()
                 // #68：run 级 handoff 预算的清零点——每轮 invoke 从 entry

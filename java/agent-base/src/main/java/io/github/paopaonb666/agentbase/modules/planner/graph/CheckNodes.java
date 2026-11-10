@@ -202,8 +202,6 @@ public final class CheckNodes {
 
     /** synthesize 节点：无工具的 best-effort 综合，emit PlanEvent(done)。 */
     public static GraphBuilder.Node makeSynthesize(AgentModule.ModuleContext ctx) {
-        int maxTokens = io.github.paopaonb666.agentbase.core.context.ContextEngine.resolveInputBudget(
-                ctx.settings(), ctx.llm()); // #4：per-model 窗口推导
         return (GraphState state, NodeContext nodeCtx) -> {
             // 保持无工具（决策 2）：不在 replan 预算之外开第二条执行路径。
             StringBuilder plan = new StringBuilder();
@@ -217,8 +215,13 @@ public final class CheckNodes {
                         .append(PlannerState.str(t, PlannerState.GOAL)).append("：")
                         .append(summary, 0, Math.min(summary.length(), SYNTH_SUMMARY_MAX_CHARS));
             }
+            // 条目 15 / R2-F1 收口：SYSTEM 域扣减——synth 提示运行期才存在
+            // （含任务计划文本），预算推导随节点执行走 helper（窗口生效时
+            // 提示计入预算挤占历史体；window=0 与旧口径逐字节一致）。
+            String prompt = PlannerPrompts.synth(plan.toString());
+            int maxTokens = ContextEngine.budgetAfterSystem(ctx.settings(), ctx.llm(), prompt);
             List<ChatMessage> input = new ArrayList<>();
-            input.add(SystemMessage.from(PlannerPrompts.synth(plan.toString())));
+            input.add(SystemMessage.from(prompt));
             input.addAll(ContextEngine.buildModelInput(PlannerState.messages(state), maxTokens, ctx.llm().tokenFactor()));
             AiMessage finalMessage = ctx.llm().stream(input, null, nodeCtx::emitDelta);
             PlanStreaming.emitPlan(nodeCtx, PlannerState.tasks(state), "done", null);

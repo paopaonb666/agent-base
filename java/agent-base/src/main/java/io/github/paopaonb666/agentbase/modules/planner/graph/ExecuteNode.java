@@ -47,11 +47,15 @@ public final class ExecuteNode {
         List<ToolSpecification> specs = pool.isEmpty()
                 ? List.of()
                 : pool.stream().map(AgentTool::specification).toList();
-        int maxTokens = io.github.paopaonb666.agentbase.core.context.ContextEngine.resolveInputBudget(
-                ctx.settings(), ctx.llm()); // #4：per-model 窗口推导
         // #84①：不可信标记开关在节点构造期固化（与 Graphs 同款判据单源）。
         boolean untrustedMarker = ctx.settings() != null
                 && ctx.settings().toolkit.toolResultUntrustedMarker;
+        // 条目 15：TOOL_RESULTS 域观测上限在构造期固化（0 = 完全跳过，零开销
+        // 零日志；>0 只告警不截断——外置由条目 6 承接）。SYSTEM 域扣减随
+        // subtaskInput 运行期走 helper（execute 提示含 goal/子任务文本，
+        // 构造期不存在——与 Graphs 的静态 prompt 形态不同）。
+        int toolResultCapTokens = ctx.settings() == null
+                ? 0 : ctx.settings().memory.contextBudgetToolResultTokens;
 
         return (GraphState state, NodeContext nodeCtx) -> {
             int subtaskToolRounds = ctx.settings().planner.subtaskToolRounds;
@@ -69,8 +73,7 @@ public final class ExecuteNode {
             PlanStreaming.emitPlan(nodeCtx, tasks, "progress",
                     "子任务 " + (cursor + 1) + "/" + tasks.size() + " 执行中");
 
-            List<ChatMessage> inputs = subtaskInput(state, task, tasks, cursor, maxTokens,
-                        ctx.llm().tokenFactor());
+            List<ChatMessage> inputs = subtaskInput(state, task, tasks, cursor, ctx);
             List<ChatMessage> produced = new ArrayList<>();
             boolean exhausted = true;
             String summary = "";
@@ -120,10 +123,10 @@ public final class ExecuteNode {
                         }
                     }
                     produced.addAll(executeToolCallsWithLoopBreaks(toolCalls, loopRepeats,
-                            loopThreshold, nodeCtx, untrustedMarker));
+                            loopThreshold, nodeCtx, untrustedMarker, toolResultCapTokens));
                     break;
                 }
-                produced.addAll(executeToolCalls(toolCalls, nodeCtx, untrustedMarker));
+                produced.addAll(executeToolCalls(toolCalls, nodeCtx, untrustedMarker, toolResultCapTokens));
             }
             String status = exhausted || loopBrokenTool != null
                     ? PlannerState.FAILED : PlannerState.DONE;
@@ -144,10 +147,16 @@ public final class ExecuteNode {
      * 一轮 tool_calls 的执行：每个结果/失败都归一为 ToolMessage（对应
      * Python {@code _execute_tool_calls}）。未知工具与执行失败都由共享池
      * 归一成模型可读文本（坏掉的工具绝不打断对话）。
+     *
+     * <p>条目 15 TOOL_RESULTS 域：{@code toolResultCapTokens > 0} 时对最终
+     * 进上下文的文本（含 #84 不可信标记行）做超限观测告警（helper 单源
+     * ContextEngine.warnIfToolResultOverCap，与 Graphs.decorateOutput 同规则；
+     * 不截断不外置）。
      */
     private static List<ChatMessage> executeToolCalls(List<ToolExecutionRequest> toolCalls,
                                                       NodeContext nodeCtx,
-                                                      boolean untrustedMarker) {
+                                                      boolean untrustedMarker,
+                                                      int toolResultCapTokens) {
         List<ChatMessage> results = new ArrayList<>(toolCalls.size());
         // #337：只读工具并发、有副作用串行，结果按请求序（池内通道保归一）；
         // 池未接（测试直构）退化为串行 callTool。
@@ -167,6 +176,8 @@ public final class ExecuteNode {
                 output = io.github.paopaonb666.agentbase.core.context.ContextEngine
                         .wrapUntrusted(name, output);
             }
+            io.github.paopaonb666.agentbase.core.context.ContextEngine
+                    .warnIfToolResultOverCap(name, output, toolResultCapTokens);
             results.add(ToolExecutionResultMessage.from(
                     call.id() == null ? "" : call.id(), name, output));
             index++;
@@ -176,14 +187,16 @@ public final class ExecuteNode {
 
     /**
      * 一轮 tool_calls 的循环中断执行（条目 5）：被拦截的请求不执行、回喂
-     * 提示 ToolMessage（配对完整，#68 先例形态）；其余照常执行，结果按
+     * 提示 ToolMessage（配对完整，#68 先例形态——提示文本不包不可信标记、
+     * 不做 TOOL_RESULTS 域计量，系统引导非外部数据）；其余照常执行，结果按
      * 请求序（与 Graphs tools 节点同规则，判据单源 ToolLoopDetector）。
      */
     private static List<ChatMessage> executeToolCallsWithLoopBreaks(List<ToolExecutionRequest> toolCalls,
                                                                     int[] loopRepeats,
                                                                     int loopThreshold,
                                                                     NodeContext nodeCtx,
-                                                                    boolean untrustedMarker) {
+                                                                    boolean untrustedMarker,
+                                                                    int toolResultCapTokens) {
         List<ChatMessage> results = new ArrayList<>(toolCalls.size());
         List<ToolExecutionRequest> executable = new ArrayList<>();
         List<Integer> executableSlots = new ArrayList<>();
@@ -199,7 +212,7 @@ public final class ExecuteNode {
                 executableSlots.add(i);
             }
         }
-        List<ChatMessage> executed = executeToolCalls(executable, nodeCtx, untrustedMarker);
+        List<ChatMessage> executed = executeToolCalls(executable, nodeCtx, untrustedMarker, toolResultCapTokens);
         for (int k = 0; k < executed.size(); k++) {
             results.add(executableSlots.get(k), executed.get(k));
         }
@@ -210,10 +223,15 @@ public final class ExecuteNode {
      * 子任务输入组装：EXECUTE_SYSTEM（总目标 + 已完成结果 + 当前子任务）
      * + 注入去重与预算修剪后的历史（对应 Python {@code _subtask_input}，
      * 提示词文案逐字见 {@link PlannerPrompts#execute}）。
+     *
+     * <p>预算推导（条目 15 / R2-F1）：execute 提示运行期才存在（含 goal 与
+     * 已完成子任务文本），SYSTEM 域扣减随节点执行走
+     * {@link ContextEngine#budgetAfterSystem}——窗口生效时提示计入预算挤占
+     * 历史体，window=0 与旧口径逐字节一致。
      */
     private static List<ChatMessage> subtaskInput(GraphState state, Map<String, Object> task,
                                                   List<Map<String, Object>> tasks, int cursor,
-                                                  int maxTokens, double tokenFactor) {
+                                                  AgentModule.ModuleContext ctx) {
         StringBuilder done = new StringBuilder();
         for (int i = 0; i < cursor && i < tasks.size(); i++) {
             Map<String, Object> t = tasks.get(i);
@@ -229,11 +247,13 @@ public final class ExecuteNode {
         }
         List<ChatMessage> messages = PlannerState.messages(state);
         String goal = messages.isEmpty() ? "（未知）" : ContextEngine.contentText(messages.get(messages.size() - 1));
-        List<ChatMessage> input = new ArrayList<>();
-        input.add(SystemMessage.from(PlannerPrompts.execute(
+        String prompt = PlannerPrompts.execute(
                 goal, done.isEmpty() ? "（无）" : done.toString(),
-                PlannerState.str(task, PlannerState.GOAL))));
-        input.addAll(ContextEngine.buildModelInput(messages, maxTokens, tokenFactor));
+                PlannerState.str(task, PlannerState.GOAL));
+        int maxTokens = ContextEngine.budgetAfterSystem(ctx.settings(), ctx.llm(), prompt);
+        List<ChatMessage> input = new ArrayList<>();
+        input.add(SystemMessage.from(prompt));
+        input.addAll(ContextEngine.buildModelInput(messages, maxTokens, ctx.llm().tokenFactor()));
         return input;
     }
 }
