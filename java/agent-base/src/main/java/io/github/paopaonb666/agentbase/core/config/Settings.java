@@ -256,6 +256,15 @@ public final class Settings {
          * 权衡：REST 可批量标 salience=1.0 旁路门槛——部署方自行约束。
          */
         public double salienceExemptThreshold = 0.9;
+        /**
+         * 去重硬阈值预筛（#38）：候选进整合 LLM 裁决前先做余弦预筛——与
+         * 既有记忆最高相似 > dedupSkipCosine 直接 NONE（内容几乎相同，省
+         * 一次 LLM 调用）。默认开（#48 敏感红线同款默认-on 风格）；无
+         * embedding 时预筛自动旁路（照旧进 LLM）。
+         */
+        public boolean dedupPrefilter = true;
+        /** 预筛的「几乎相同」余弦阈值（bge-m3 经验值；换 embedding 模型须重校）。 */
+        public double dedupSkipCosine = 0.92;
         public double weightVector = 0.40;
         public double weightKeyword = 0.30;
         public double weightRecency = 0.15;
@@ -921,6 +930,16 @@ public final class Settings {
                 throw new SettingsError("MEMORY_RECALL_MIN_SCORE must be in [0, 1), got %s".formatted(value));
             }
             t.recallMinScore = value;
+        }
+        if (v.containsKey("dedup_prefilter")) {
+            t.dedupPrefilter = requireBool("dedup_prefilter", v.get("dedup_prefilter"));
+        }
+        if (v.containsKey("dedup_skip_cosine")) {
+            double value = requireFloat("dedup_skip_cosine", v.get("dedup_skip_cosine"));
+            if (!(value >= 0.0 && value < 1.0)) {
+                throw new SettingsError("MEMORY_DEDUP_SKIP_COSINE must be in [0, 1), got %s".formatted(value));
+            }
+            t.dedupSkipCosine = value;
         }
         if (v.containsKey("salience_exempt_threshold")) {
             double value = requireFloat("salience_exempt_threshold", v.get("salience_exempt_threshold"));

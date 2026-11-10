@@ -990,5 +990,10 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
                              long durationMs) {
             MemoryService.this.recordOp(op, userId, agentId, threadId, detail, status, errorText, durationMs);
         }
+
+        @Override
+        public List<Float> embedCandidate(String content) {
+            return MemoryService.this.embedOne(content);
+        }
     }
 }

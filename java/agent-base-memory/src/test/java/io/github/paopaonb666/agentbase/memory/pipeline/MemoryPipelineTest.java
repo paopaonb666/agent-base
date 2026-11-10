@@ -91,12 +91,20 @@ class MemoryPipelineTest {
         Models.SessionSummary summaryToReturn = null;
         boolean updateResult = true;
         boolean deleteResult = true;
+        // #38 预筛测试注入口（默认值 = 旧行为：空结果、无候选向量）。
+        List<Retrieval.ScoredMemory> searchResults = List.of();
+        List<Float> candidateVector = null;
 
         @Override
         public List<Retrieval.ScoredMemory> search(String userId, String agentId,
                                                    String query, Integer topK) {
             calls.add("search");
-            return List.of();
+            return searchResults;
+        }
+
+        @Override
+        public List<Float> embedCandidate(String content) {
+            return candidateVector;
         }
 
         @Override
@@ -284,6 +292,73 @@ class MemoryPipelineTest {
     }
 
     // ── consolidate ──────────────────────────────────────────────────────
+
+    @Test
+    void consolidateDedupPrefilterSkipsLlmAboveThreshold() {
+        // #38：候选与既有记忆最高余弦 > 0.92 → 直接 NONE，LLM 不被调用；
+        // 审计 detail 带 prefilter=dedup_skip + max_sim 数值（不落原文）。
+        ScriptedMain main = new ScriptedMain();
+        RecordingOps ops = new RecordingOps();
+        // 同向单位向量 → cosine = 1.0 > 0.92。
+        ops.searchResults = List.of(new Retrieval.ScoredMemory(
+                new Models.MemoryRecord("m1", "u1", "chat", "semantic", "几乎相同的内容",
+                        List.of(), Models.encodeEmbedding(List.of(0.6f, 0.8f)), 2,
+                        0.5, "active", "", List.of(), 1000.0, 1000.0, null, 0),
+                0.9, Map.of("keyword", 0.9)));
+        ops.candidateVector = List.of(0.6f, 0.8f);
+        MemoryPipeline pipeline = pipelineWith(main, new ScriptedFast(), ops);
+
+        assertEquals("NONE", pipeline.consolidate(
+                new MemoryPipeline.Candidate("几乎相同的内容", "semantic", 0.5, List.of()),
+                "u1", "chat", "chat:tt"));
+        assertTrue(main.prompts.isEmpty(), "预筛命中不得进 LLM：" + main.prompts);
+        Map<String, Object> detail = ops.opDetails.get("consolidate|ok");
+        assertEquals("dedup_skip", detail.get("prefilter"));
+        assertEquals("m1", detail.get("matched_memory_id"));
+        // max_sim 是数值字符串（审计可读、不落原文）。
+        assertTrue(String.valueOf(detail.get("max_sim")).startsWith("1.0"),
+                String.valueOf(detail.get("max_sim")));
+    }
+
+    @Test
+    void consolidateDedupPrefilterPassesMidBandToLlm() {
+        // 余弦低于阈值（0.707 < 0.92）→ 照旧进 LLM 裁决（中间带与低带同路）。
+        ScriptedMain main = new ScriptedMain();
+        main.responses.add("{\"op\": \"ADD\", \"content\": \"新事实\"}");
+        RecordingOps ops = new RecordingOps();
+        ops.searchResults = List.of(new Retrieval.ScoredMemory(
+                new Models.MemoryRecord("m1", "u1", "chat", "semantic", "相关但不同",
+                        List.of(), Models.encodeEmbedding(List.of(0.5f, 0.5f)), 2,
+                        0.5, "active", "", List.of(), 1000.0, 1000.0, null, 0),
+                0.9, Map.of("keyword", 0.9)));
+        ops.candidateVector = List.of(1.0f, 0.0f);
+        MemoryPipeline pipeline = pipelineWith(main, new ScriptedFast(), ops);
+
+        assertEquals("ADD", pipeline.consolidate(
+                new MemoryPipeline.Candidate("候选内容", "semantic", 0.5, List.of()),
+                "u1", "chat", "chat:tt"));
+        assertEquals(1, main.prompts.size(), "中间带应照旧进 LLM");
+    }
+
+    @Test
+    void consolidateDedupPrefilterSkippedWithoutEmbedding() {
+        // 降级路径：候选无向量（embedCandidate null）→ 预筛旁路、行为与旧一致。
+        ScriptedMain main = new ScriptedMain();
+        main.responses.add("{\"op\": \"NONE\"}");
+        RecordingOps ops = new RecordingOps();
+        ops.searchResults = List.of(new Retrieval.ScoredMemory(
+                new Models.MemoryRecord("m1", "u1", "chat", "semantic", "同文本",
+                        List.of(), null, null, 0.5, "active", "", List.of(),
+                        1000.0, 1000.0, null, 0),
+                0.9, Map.of("keyword", 0.9)));
+        // candidateVector 保持 null。
+        MemoryPipeline pipeline = pipelineWith(main, new ScriptedFast(), ops);
+
+        assertEquals("NONE", pipeline.consolidate(
+                new MemoryPipeline.Candidate("同文本", "semantic", 0.5, List.of()),
+                "u1", "chat", "chat:tt"));
+        assertEquals(1, main.prompts.size(), "无向量应跳过预筛照旧进 LLM");
+    }
 
     @Test
     void consolidateAddFallsBackToCandidateContent() {

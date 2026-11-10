@@ -158,6 +158,15 @@ public final class MemoryPipeline {
 
         void recordOp(String op, String userId, String agentId, String threadId,
                       Map<String, Object> detail, String status, String errorText, long durationMs);
+
+        /**
+         * 候选内容向量（#38 预筛用）：{@code embedder.embed} 的单文本形态，
+         * 降级（无 embedding）返回 null——预筛跳过、照旧进 LLM。default
+         * 实现返回 null，对手写桩向后兼容（预筛自动旁路）。
+         */
+        default List<Float> embedCandidate(String content) {
+            return null;
+        }
     }
 
     public MemoryPipeline(ModelRuntime llm, AgentModule.ChatInvokerPort fastLlm,
@@ -335,6 +344,35 @@ public final class MemoryPipeline {
         }
         List<io.github.paopaonb666.agentbase.memory.retrieval.Retrieval.ScoredMemory> similar =
                 ops.search(userId, agentId, candidate.content(), 3);
+        // 去重硬阈值预筛（#38）：候选与既有记忆最高余弦 > 阈值 → 内容几乎
+        // 相同，直接 NONE 不烧 LLM 裁决；预筛命中落审计（op=consolidate +
+        // detail.prefilter=dedup_skip，写 max_sim 数值不落原文）。降级路径
+        // （任一侧无向量）跳过预筛、照旧进 LLM——行为与旧一致。
+        if (settings.memory.dedupPrefilter && !similar.isEmpty()) {
+            List<Float> candidateVector = ops.embedCandidate(candidate.content());
+            if (candidateVector != null) {
+                double maxSim = -1.0;
+                String matchedId = null;
+                for (var item : similar) {
+                    Double sim = io.github.paopaonb666.agentbase.memory.retrieval.Retrieval
+                            .cosineSimilarity(candidateVector,
+                                    io.github.paopaonb666.agentbase.memory.store.Models
+                                            .decodeEmbedding(item.record().embedding()));
+                    if (sim != null && sim > maxSim) {
+                        maxSim = sim;
+                        matchedId = item.record().memoryId();
+                    }
+                }
+                if (maxSim > settings.memory.dedupSkipCosine) {
+                    ops.recordOp("consolidate", userId, agentId, threadId,
+                            Map.of("op", "NONE", "prefilter", "dedup_skip",
+                                    "max_sim", String.format(java.util.Locale.ROOT, "%.4f", maxSim),
+                                    "matched_memory_id", matchedId == null ? "" : matchedId),
+                            "ok", "", 0);
+                    return "NONE";
+                }
+            }
+        }
         StringBuilder existing = new StringBuilder();
         for (var item : similar) {
             if (existing.length() > 0) {
