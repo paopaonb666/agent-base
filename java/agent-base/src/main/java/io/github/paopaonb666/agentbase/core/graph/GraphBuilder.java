@@ -107,10 +107,21 @@ public final class GraphBuilder {
 
     /**
      * 编译并绑定工具池（#238：池是编译参数，不是编译后覆写）；
-     * {@code pool} 为 null = 本图未接工具。
+     * {@code pool} 为 null = 本图未接工具。压缩终态钩子缺席
+     * （{@code compactionHook=null}，开关关/测试直构的既有形态）。
      */
     public CompiledGraph compile(Checkpointer checkpointer, String name,
                                  io.github.paopaonb666.agentbase.core.tools.ToolPool toolPool) {
+        return compile(checkpointer, name, toolPool, null);
+    }
+
+    /**
+     * 编译并挂压缩终态钩子（#328）：钩子在每次 run 终态（非 CANCELLED）后
+     * 被调用，实现内部异步评估历史压缩。planner 等短生命周期子任务图不挂。
+     */
+    public CompiledGraph compile(Checkpointer checkpointer, String name,
+                                 io.github.paopaonb666.agentbase.core.tools.ToolPool toolPool,
+                                 CompiledGraph.CompactionHook compactionHook) {
         if (entry == null || START.equals(entry) || END.equals(entry)) {
             throw new IllegalStateException("必须设置入口节点（builder.entry(...)）");
         }
@@ -138,7 +149,8 @@ public final class GraphBuilder {
                 throw new IllegalStateException("节点 '%s' 缺少出边".formatted(node));
             }
         }
-        return new CompiledGraph(name, Map.copyOf(nodes), Map.copyOf(edges), entry, checkpointer, toolPool);
+        return new CompiledGraph(name, Map.copyOf(nodes), Map.copyOf(edges), entry, checkpointer,
+                toolPool, compactionHook);
     }
 
     /** 可用目标提示（#202 错误文案）：已注册节点 + END。 */

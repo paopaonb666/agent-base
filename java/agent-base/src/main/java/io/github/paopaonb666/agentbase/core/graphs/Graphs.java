@@ -143,7 +143,9 @@ public final class Graphs {
                                 pool, List.of(),
                                 io.github.paopaonb666.agentbase.core.tools.ToolPool.DEFAULT_TOOL_TIMEOUT_SECONDS,
                                 Map.of(), null);
-        return builder.compile(ctx.checkpointer(), name, toolPool);
+        // 压缩终态钩子（#328）随 ModuleContext 带入（null = 未装配，零行为
+        // 变化）；只动 compile 调用段——tools 节点段归并行批次。
+        return builder.compile(ctx.checkpointer(), name, toolPool, ctx.compactionHook());
     }
 
     private static List<dev.langchain4j.agent.tool.ToolSpecification> specs(List<AgentTool> pool) {

@@ -310,4 +310,52 @@ class ContextEngineTest {
                 "factor=2.0 的保留条数不得多于 factor=1.0：" + conservative.size());
         assertFalse(conservative.isEmpty(), "至少保留最后一条的守卫不因系数失效");
     }
+
+    // ── 历史压缩触发检测（#328 纯函数） ──────────────────────────────────
+
+    @Test
+    void compactionNeededFollowsBudgetRatioMatrix() {
+        useEstimator();
+        // 3 条 × (估算 5 + 开销 4) = 27 token（与 buildModelInput 同口径）。
+        List<ChatMessage> history = List.of(
+                shortHuman("a"), shortHuman("b"), shortHuman("c"));
+        // 27 > 30×0.7=21 → 触发。
+        assertTrue(ContextEngine.compactionNeeded(history, 30, 0.7));
+        // 27 > 27×0.9=24.3 → 触发；27 > 27×1.0=27 不成立（严格大于）→ 不触发。
+        assertTrue(ContextEngine.compactionNeeded(history, 27, 0.9));
+        assertFalse(ContextEngine.compactionNeeded(history, 27, 1.0));
+        // 低于阈值：27 <= 40×0.7=28 → 不触发。
+        assertFalse(ContextEngine.compactionNeeded(history, 40, 0.7));
+    }
+
+    @Test
+    void compactionNeededSkipsEmptyShortHistoryAndBadBudget() {
+        useEstimator();
+        List<ChatMessage> history = List.of(shortHuman("a"), shortHuman("b"));
+        // 空/null 历史与坏预算一律 false（防御）。
+        assertFalse(ContextEngine.compactionNeeded(List.of(), 100, 0.7));
+        assertFalse(ContextEngine.compactionNeeded(null, 100, 0.7));
+        assertFalse(ContextEngine.compactionNeeded(history, 0, 0.7));
+        assertFalse(ContextEngine.compactionNeeded(history, -5, 0.7));
+    }
+
+    @Test
+    void compactionNeededIgnoresToolPairingAndDoesNotMutateMessages() {
+        // 纯函数不裁消息：工具配对、注入去重都是写回侧折叠边界的事，触发
+        // 检测只做计量——含配对序列照常计数，且不修改入参列表。
+        useEstimator();
+        ChatMessage withCall = AiMessage.from("", List.of(
+                dev.langchain4j.agent.tool.ToolExecutionRequest.builder()
+                        .id("c1").name("echo").arguments("{}").build()));
+        List<ChatMessage> history = new java.util.ArrayList<>(List.of(
+                shortHuman("a"),                                  // 9
+                withCall,                                         // 0+4 = 4
+                ToolExecutionResultMessage.from("c1", "echo", "z".repeat(20)), // 5+4 = 9
+                shortHuman("b")));                                // 9
+        int expected = 9 + 4 + 9 + 9;
+        // 31 > 40×0.7=28 → 触发；40×0.8=32 → 不触发。
+        assertTrue(ContextEngine.compactionNeeded(history, 40, 0.7));
+        assertFalse(ContextEngine.compactionNeeded(history, 40, 0.8));
+        assertEquals(4, history.size(), "纯函数不得修改入参");
+    }
 }

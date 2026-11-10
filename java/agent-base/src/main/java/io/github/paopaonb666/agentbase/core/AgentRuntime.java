@@ -5,6 +5,7 @@ import org.slf4j.LoggerFactory;
 
 import io.github.paopaonb666.agentbase.core.config.Settings;
 import io.github.paopaonb666.agentbase.core.graph.Checkpointer;
+import io.github.paopaonb666.agentbase.core.graph.CompactionService;
 import io.github.paopaonb666.agentbase.core.graph.CompiledGraph;
 import io.github.paopaonb666.agentbase.core.llm.LlmFactory;
 import io.github.paopaonb666.agentbase.core.llm.ModelRuntime;
@@ -54,6 +55,12 @@ public final class AgentRuntime {
     private final AgentModule.MemoryServicePort memory;
     private final CoreStore threadIndex;
     private final AgentModule.PlanStorePort planStore;
+    /**
+     * 会话历史压缩任务（#328）：null = 未装配（开关关/记忆端口缺席，全链路
+     * 零行为变化）。钩子经 ModuleContext 进图编译，写回走
+     * {@link CompiledGraph#compactThread}（#330 方案 B）。
+     */
+    private final CompactionService compaction;
     /** MCP 装配句柄（#29 健康可见）：null 或空 servers = MCP 未启用。 */
     private final io.github.paopaonb666.agentbase.toolkit.mcp.McpSources.McpAssembly mcpAssembly;
     // 惰性缓存被并发 HTTP 请求线程读写（Python dict 有事件循环串行化 +
@@ -76,6 +83,16 @@ public final class AgentRuntime {
                  UploadedFileStore fileStore, AgentModule.MemoryServicePort memory,
                  CoreStore threadIndex, AgentModule.PlanStorePort planStore,
                  io.github.paopaonb666.agentbase.toolkit.mcp.McpSources.McpAssembly mcpAssembly) {
+        this(settings, llm, modules, tools, checkpointer, toolRecorder, fileStore,
+                memory, threadIndex, planStore, mcpAssembly, null);
+    }
+
+    AgentRuntime(Settings settings, ModelRuntime llm, Map<String, AgentModule> modules,
+                 ToolPool tools, Checkpointer checkpointer, ToolCallRecorder toolRecorder,
+                 UploadedFileStore fileStore, AgentModule.MemoryServicePort memory,
+                 CoreStore threadIndex, AgentModule.PlanStorePort planStore,
+                 io.github.paopaonb666.agentbase.toolkit.mcp.McpSources.McpAssembly mcpAssembly,
+                 CompactionService compaction) {
         this.settings = settings;
         this.llm = llm;
         this.modules = modules;
@@ -87,6 +104,7 @@ public final class AgentRuntime {
         this.threadIndex = threadIndex;
         this.planStore = planStore;
         this.mcpAssembly = mcpAssembly;
+        this.compaction = compaction;
     }
 
     /** 请求的模块不在 AGENT_MODULES 清单中（入口层据此给出友好报错）。 */
@@ -162,7 +180,7 @@ public final class AgentRuntime {
                         ? io.github.paopaonb666.agentbase.core.llm.UsageSinks.costMeterSink("fast")
                         : ModelRuntime.noopUsageSink());
         AgentRuntime view = new AgentRuntime(settings, fastLlm, modules, tools, checkpointer,
-                toolRecorder, fileStore, memory, threadIndex, planStore);
+                toolRecorder, fileStore, memory, threadIndex, planStore, null, compaction);
         profileViews.put(profile, view);
         return view;
     }
@@ -170,7 +188,9 @@ public final class AgentRuntime {
     /** 交给每个模块的 {@code buildGraph} 的 {@code ModuleContext}。 */
     public AgentModule.ModuleContext context() {
         return new AgentModule.ModuleContext(settings, llm, checkpointer,
-                tools == null ? java.util.List.of() : moduleToolViews(), memory, planStore, tools);
+                tools == null ? java.util.List.of() : moduleToolViews(), memory, planStore, tools,
+                // 压缩终态钩子（#328）：未装配为 null（图执行零开销）。
+                compaction == null ? null : compaction::onRunTerminated);
     }
 
     /**
@@ -248,6 +268,11 @@ public final class AgentRuntime {
         }
         if (memory != null) {
             memory.close();
+        }
+        if (compaction != null) {
+            // 压缩任务执行器（#328）：在途任务中断、队列丢弃（守护线程，
+            // 不阻塞进程退出；close 前到达的终态不再评估）。
+            compaction.close();
         }
         // 基座存储与记忆存储相互独立（0.3.0）：两个都要关，不能 elif。
         if (threadIndex != null) {
@@ -359,6 +384,17 @@ public final class AgentRuntime {
         io.github.paopaonb666.agentbase.core.memory.MemoryPlugins.MemoryPlugin plugin =
                 io.github.paopaonb666.agentbase.core.memory.MemoryPlugins.build(resolved, llm, fastLlm);
         AgentModule.MemoryServicePort memoryService = plugin == null ? null : plugin.service();
+        // 会话历史压缩（#328/#330）：开关关/记忆端口缺席 = 不装配、零行为
+        // 变化。budget 按主力 runtime 窗口经 resolveInputBudget 同口径推导；
+        // 摘要走记忆端口的 compaction 通道（快档，未配 LLM 时端口返回 null
+        // → 放弃本轮）；写回经 CompiledGraph.compactThread 持锁互斥。
+        CompactionService compaction = null;
+        if (resolved.memory.compactionEnabled && memoryService != null) {
+            compaction = new CompactionService(checkpointer, resolved.memory,
+                    io.github.paopaonb666.agentbase.core.context.ContextEngine
+                            .resolveInputBudget(resolved, llm),
+                    memoryService::compactTranscript);
+        }
         // 工具库的内置工具按 TOOLKIT_ENABLED 装配后并入共享池（模块工具在
         // 前，工具库在后）；重名在任何一侧发生都会快速失败。
         ToolCallRecorder recorder = ToolCallLoggers.build(resolved);
@@ -380,7 +416,7 @@ public final class AgentRuntime {
         return new AgentRuntime(resolved, llm, modules, pool, checkpointer, recorder,
                 fileStore, memoryService, coreStore,
                 coreStore == null ? null : new io.github.paopaonb666.agentbase.core.storage.PlanStoreAdapter(coreStore),
-                mcp);
+                mcp, compaction);
     }
 
     private static java.util.List<AgentTool> moduleTools(Map<String, AgentModule> modules) {

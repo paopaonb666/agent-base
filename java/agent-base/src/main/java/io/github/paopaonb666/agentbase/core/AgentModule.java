@@ -49,12 +49,14 @@ public interface AgentModule {
      * 基座交给每个模块的运行时服务（对应 Python 侧 {@code ModuleContext}
      * dataclass）。
      *
-     * @param settings     已校验的配置
-     * @param llm          装配好的对话模型（openai 兼容；流式/非流式统一面）
-     * @param checkpointer 对话状态存储器；仅手动构造 context（测试）时为 null
-     * @param tools        共享工具池：各模块 getTools() 的贡献 + 超时包装
-     * @param memory       记忆服务端口；null = 未启用
-     * @param planStore    计划快照端口；null = 存储不可用
+     * @param settings       已校验的配置
+     * @param llm            装配好的对话模型（openai 兼容；流式/非流式统一面）
+     * @param checkpointer   对话状态存储器；仅手动构造 context（测试）时为 null
+     * @param tools          共享工具池：各模块 getTools() 的贡献 + 超时包装
+     * @param memory         记忆服务端口；null = 未启用
+     * @param planStore      计划快照端口；null = 存储不可用
+     * @param compactionHook 压缩终态钩子（#328）；null = 未装配（开关关/记忆
+     *                       端口缺席，零行为变化）
      */
     record ModuleContext(
             io.github.paopaonb666.agentbase.core.config.Settings settings,
@@ -63,10 +65,20 @@ public interface AgentModule {
             List<AgentTool> tools,
             MemoryPort memory,
             PlanStorePort planStore,
-            io.github.paopaonb666.agentbase.core.tools.ToolPool toolPool) {
+            io.github.paopaonb666.agentbase.core.tools.ToolPool toolPool,
+            CompiledGraph.CompactionHook compactionHook) {
 
         public ModuleContext {
             tools = tools == null ? List.of() : List.copyOf(tools);
+        }
+
+        /** 七参便利构造（compactionHook=null：既有装配/测试直构零破坏）。 */
+        public ModuleContext(io.github.paopaonb666.agentbase.core.config.Settings settings,
+                             ModelRuntime llm,
+                             io.github.paopaonb666.agentbase.core.graph.Checkpointer checkpointer,
+                             List<AgentTool> tools, MemoryPort memory, PlanStorePort planStore,
+                             io.github.paopaonb666.agentbase.core.tools.ToolPool toolPool) {
+            this(settings, llm, checkpointer, tools, memory, planStore, toolPool, null);
         }
 
         /** 六参便利构造（toolPool=null：测试直构/未接池的模块）。 */
@@ -74,7 +86,7 @@ public interface AgentModule {
                              ModelRuntime llm,
                              io.github.paopaonb666.agentbase.core.graph.Checkpointer checkpointer,
                              List<AgentTool> tools, MemoryPort memory, PlanStorePort planStore) {
-            this(settings, llm, checkpointer, tools, memory, planStore, null);
+            this(settings, llm, checkpointer, tools, memory, planStore, null, null);
         }
     }
 

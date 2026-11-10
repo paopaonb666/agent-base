@@ -45,21 +45,40 @@ public final class CompiledGraph {
         }
     }
 
+    /**
+     * 运行终态钩子（#328）：图运行结束（per-thread 锁已释放）后对快照做
+     * 异步评估的挂点——覆盖 invoke 与 stream 两条路径（CLI 与 SSE 共用）。
+     *
+     * <p>契约：实现内部必须自转线程/池（如 {@code CompactionService} 的
+     * 单守护线程执行器），<b>绝不阻塞运行线程</b>；仅 CANCELLED 终态不调用
+     * （done/failed/partial 都触发——失败轮的快照同样会无界增长）；失败/
+     * 触顶轮的 {@code finalState} 可能为 null（快照以 checkpointer 为准）。
+     * 钩子自身的异常被吞掉记 WARN——绝不能反过来影响运行结果。
+     */
+    @FunctionalInterface
+    public interface CompactionHook {
+        void onRunTerminated(RunConfig config, GraphState finalState);
+    }
+
     private final String name;
     private final Map<String, GraphBuilder.Node> nodes;
     private final Map<String, GraphBuilder.Edge> edges;
     private final String entry;
     private final Checkpointer checkpointer;
+    /** 运行终态钩子（#328）：null = 未挂（开关关/端口缺席，零行为变化）。 */
+    private final CompactionHook compactionHook;
 
     CompiledGraph(String name, Map<String, GraphBuilder.Node> nodes,
                   Map<String, GraphBuilder.Edge> edges, String entry, Checkpointer checkpointer,
-                  io.github.paopaonb666.agentbase.core.tools.ToolPool toolPool) {
+                  io.github.paopaonb666.agentbase.core.tools.ToolPool toolPool,
+                  CompactionHook compactionHook) {
         this.name = name;
         this.nodes = nodes;
         this.edges = edges;
         this.entry = entry;
         this.checkpointer = checkpointer;
         this.toolPoolRef = toolPool;
+        this.compactionHook = compactionHook;
     }
 
     public String name() {
@@ -143,16 +162,47 @@ public final class CompiledGraph {
     /** 运行出口（#9）：终止标注在本层判定——正常走到 END → DONE、断连 break → CANCELLED。 */
     private RunOutcome runExit(GraphState input, RunConfig config, EventSink sink) {
         // per-thread 互斥（#197）：拿不到锁说明同 thread 已有 run 在途——
-        // 快速失败（last-writer-wins 的快照互踩从根上消除）。
+        // 快速失败（last-writer-wins 的快照互踩从根上消除）。THREAD_BUSY
+        // 的 run 根本没执行，不触发终态钩子。
         java.util.concurrent.locks.ReentrantLock lock =
                 THREAD_LOCKS.computeIfAbsent(config.threadId(), k -> new java.util.concurrent.locks.ReentrantLock());
         if (!lock.tryLock()) {
             throw new ThreadBusyError(config.threadId());
         }
+        RunOutcome outcome = null;
+        RuntimeException failure = null;
         try {
-            return runLocked(input, config, sink);
+            outcome = runLocked(input, config, sink);
+        } catch (RuntimeException e) {
+            failure = e;
         } finally {
             lock.unlock();
+        }
+        // 压缩触发挂点（#328）：锁释放之后调用（hook 实现内部异步，绝不阻塞
+        // 运行线程）。仅 CANCELLED 跳过——done/failed/partial 都触发；节点
+        // 异常路径的终态按 sink 取消态归类（与 streamWithTermination 同口径）。
+        boolean cancelled = failure != null
+                ? sink != null && sink.cancelled()
+                : outcome.termination() == Events.RunTermination.CANCELLED;
+        if (!cancelled) {
+            notifyCompactionHook(config, outcome == null ? null : outcome.state());
+        }
+        if (failure != null) {
+            throw failure;
+        }
+        return outcome;
+    }
+
+    /** 终态钩子调用（#328）：钩子缺席零开销；钩子异常吞掉记 WARN。 */
+    private void notifyCompactionHook(RunConfig config, GraphState finalState) {
+        if (compactionHook == null) {
+            return;
+        }
+        try {
+            compactionHook.onRunTerminated(config, finalState);
+        } catch (RuntimeException e) {
+            LOG.warn("graph: 压缩终态钩子失败（不影响运行结果）：thread={}，{}",
+                    config.threadId(), e.toString());
         }
     }
 
@@ -329,19 +379,29 @@ public final class CompiledGraph {
     }
 
     private void persistState(RunConfig config, GraphState state) {
+        persistSnapshot(checkpointer, config.threadId(), state);
+    }
+
+    /**
+     * 快照落盘的共享路径（#330 从 persistState 提取）：run 每步与压缩写回
+     * 同一套 put+重试欠账语义（序列化在各后端 put 内部）。put 失败重试
+     * 1 次（#198），仍失败记欠账——调用方内存续跑，绝不因快照欠账报废
+     * 已产出内容。
+     */
+    private static void persistSnapshot(Checkpointer checkpointer, String threadId, GraphState state) {
         if (checkpointer == null) {
             return;
         }
         try {
-            checkpointer.put(config.threadId(), state.copy());
+            checkpointer.put(threadId, state.copy());
             recoverPersistDebt();
             return;
         } catch (RuntimeException first) {
             // put 失败重试 1 次（#198）：连接抖动/锁竞争多为一过性。
             try {
-                checkpointer.put(config.threadId(), state.copy());
+                checkpointer.put(threadId, state.copy());
                 recoverPersistDebt();
-                LOG.warn("graph: 快照落盘重试成功：thread={}", config.threadId());
+                LOG.warn("graph: 快照落盘重试成功：thread={}", threadId);
                 return;
             } catch (RuntimeException second) {
                 second.addSuppressed(first);
@@ -350,6 +410,57 @@ public final class CompiledGraph {
         }
         // 内存续跑：run 循环里的 state 本就是内存对象，这里只跳过持久化
         // ——绝不因快照欠账把整轮已产出的 token 报废（#198）。
+    }
+
+    /**
+     * 压缩写回互斥入口（#330 方案 B）：tryLock {@link #THREAD_LOCKS}——
+     * 失败快速返回 false（与 run 同语义：不排队，忙 = 放弃本轮写回）；
+     * 持锁内 re-read checkpointer 最新状态交给 {@code rewriter}——返回
+     * empty = 基准不一致/放弃（不产生半写），有值 = 持久化（复用 run 的
+     * put+重试欠账路径）后返回 true。
+     *
+     * <p>「进程内所有写者被同一把锁串行后重读校验实际恒过，是防御性双保险」
+     * （#330 方案 B 原文）：单进程里 run 与压缩写回被 {@link #THREAD_LOCKS}
+     * 串行，重读校验兜底的是锁外的第三类写者（如运维脚本直写 checkpointer）。
+     *
+     * <p>{@code rewrite} 在锁内执行——必须快（纯内存变换），绝不做 IO/LLM
+     * 调用；摘要已在 {@link CompactionService} 的任务体里完成。
+     */
+    public boolean compactThread(String threadId,
+                                 java.util.function.Function<GraphState, java.util.Optional<GraphState>> rewrite) {
+        return compactThread(checkpointer, threadId, rewrite);
+    }
+
+    /**
+     * 静态形态（#330）：{@code CompactionService} 装配面只有 checkpointer
+     * 没有图实例——THREAD_LOCKS 是进程级静态锁，同 threadId 与所有图的
+     * run/写回天然互斥。图实例方法委托到这里。
+     */
+    public static boolean compactThread(Checkpointer checkpointer, String threadId,
+                                        java.util.function.Function<GraphState, java.util.Optional<GraphState>> rewrite) {
+        if (checkpointer == null) {
+            return false;
+        }
+        java.util.concurrent.locks.ReentrantLock lock =
+                THREAD_LOCKS.computeIfAbsent(threadId, k -> new java.util.concurrent.locks.ReentrantLock());
+        if (!lock.tryLock()) {
+            return false;
+        }
+        try {
+            GraphState fresh = checkpointer.get(threadId);
+            if (fresh == null) {
+                fresh = new GraphState();
+            }
+            java.util.Optional<GraphState> rewritten = rewrite.apply(fresh);
+            if (rewritten.isEmpty()) {
+                // 基准不一致/放弃：不动快照（不产生半写）。
+                return false;
+            }
+            persistSnapshot(checkpointer, threadId, rewritten.get());
+            return true;
+        } finally {
+            lock.unlock();
+        }
     }
 
     /** 快照欠账（#198）：进程级计数——/health 据此报告快照积压。 */

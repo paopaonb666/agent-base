@@ -183,7 +183,8 @@ public final class SupervisorGraphs {
                     return update;
                 })
                 .addEdge("handoffs", "supervisor")
-                .compile(ctx.checkpointer(), MODULE_NAME, ctx.toolPool());
+                // 压缩终态钩子（#328）随 ModuleContext 带入（#330 写回互斥）。
+                .compile(ctx.checkpointer(), MODULE_NAME, ctx.toolPool(), ctx.compactionHook());
     }
 
     /**

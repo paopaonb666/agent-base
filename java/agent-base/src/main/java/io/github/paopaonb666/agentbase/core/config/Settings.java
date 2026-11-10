@@ -331,6 +331,24 @@ public final class Settings {
          * Java 先行单边增强（Python 侧无此层）。
          */
         public boolean sensitiveContentFilter = true;
+        /**
+         * 会话历史压缩（#328）：buildModelInput 修剪不收缩 checkpointer 里的
+         * 历史本体——开启后轮次终态异步评估，超预算即把历史折叠为「压缩摘要
+         * + 近 N 轮原文」写回（快照整行覆盖）。默认关（比照 vectorPushdown
+         * 先例）：关闭时不装配压缩任务，全链路零行为变化。
+         */
+        public boolean compactionEnabled = false;
+        /**
+         * 压缩触发阈值（#328）：历史 token 估算 &gt; 输入预算 × ratio 即触发
+         * （(0,1) 开区间——1.0 永不触发、0 必触发均非法）。
+         */
+        public double compactionRatio = 0.7;
+        /**
+         * 压缩写回保留的近 N 轮原文（#328）：「轮」= 从一条 UserMessage 到
+         * 下一条 UserMessage 之前；窗口锚定在 UserMessage 起点、工具配对
+         * 不拆散。其余历史折叠进摘要。
+         */
+        public int compactionKeepRecentTurns = 3;
     }
 
     /** planner 模块的预算与防护（M9）：env 前缀 {@code PLANNER_}。 */
@@ -482,7 +500,6 @@ public final class Settings {
         // 根级字段的 env/dotenv 键可能全大写（AGENT_MODULES）：归一小写。
         for (String key : List.of("agent_modules", "agent_module_packages", "cors_origins", "env",
                 "agent_recursion_limit", "agent_handoff_max_per_run", "rate_limit_per_minute",
-                "agent_run_concurrency")) {
             String up = key.toUpperCase(Locale.ROOT);
             if (out.containsKey(up) && !out.containsKey(key)) {
                 out.put(key, out.remove(up));
@@ -1117,6 +1134,23 @@ public final class Settings {
         }
         if (v.containsKey("sensitive_content_filter")) {
             t.sensitiveContentFilter = requireBool("sensitive_content_filter", v.get("sensitive_content_filter"));
+        }
+        if (v.containsKey("compaction_enabled")) {
+            t.compactionEnabled = requireBool("compaction_enabled", v.get("compaction_enabled"));
+        }
+        if (v.containsKey("compaction_ratio")) {
+            double value = requireFloat("compaction_ratio", v.get("compaction_ratio"));
+            if (!(value > 0.0 && value < 1.0)) {
+                throw new SettingsError("MEMORY_COMPACTION_RATIO must be in (0, 1), got %s".formatted(value));
+            }
+            t.compactionRatio = value;
+        }
+        if (v.containsKey("compaction_keep_recent_turns")) {
+            int value = requireInt("compaction_keep_recent_turns", v.get("compaction_keep_recent_turns"));
+            if (value < 1) {
+                throw new SettingsError("MEMORY_COMPACTION_KEEP_RECENT_TURNS must be >= 1, got %d".formatted(value));
+            }
+            t.compactionKeepRecentTurns = value;
         }
     }
 

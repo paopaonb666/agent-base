@@ -192,6 +192,28 @@ public final class ContextEngine {
         return Math.min(memoryBudget, Math.max(MIN_INPUT_BUDGET, window - OUTPUT_RESERVE_TOKENS));
     }
 
+    /**
+     * 历史压缩触发检测（#328 纯函数）：与 buildModelInput 同预算口径
+     * （countMessageTokens + 每条 +4 固定开销）累计全量历史，估算超过
+     * {@code budget * ratio} 即需要压缩。只读不改消息列表——修剪/折叠是
+     * 异步压缩任务的事，本函数只回答「超没超」；图执行线程不做内联触发
+     * （阻塞用户轮次不可接受），调用点在轮次终态后的异步评估侧。
+     *
+     * <p>纯函数不裁消息：工具配对、注入去重都是写回侧（折叠边界）的事，
+     * 与触发检测无关。{@code messages} 为空或 {@code budget <= 0}（防御，
+     * 预算推导缺席）一律 false。
+     */
+    public static boolean compactionNeeded(List<ChatMessage> messages, int budget, double ratio) {
+        if (messages == null || messages.isEmpty() || budget <= 0) {
+            return false;
+        }
+        int total = 0;
+        for (ChatMessage message : messages) {
+            total += countMessageTokens(message) + 4;
+        }
+        return total > budget * ratio;
+    }
+
     /** 返回消息的注入类型（匹配的标记前缀）；非注入消息返回 null。 */
     public static String injectedKind(ChatMessage message) {
         if (!(message instanceof SystemMessage system)) {

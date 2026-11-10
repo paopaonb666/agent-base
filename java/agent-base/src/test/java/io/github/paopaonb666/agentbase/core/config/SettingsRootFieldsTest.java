@@ -162,6 +162,44 @@ class SettingsRootFieldsTest {
     }
 
     @Test
+    void memoryCompactionKeysParseWithDefaultsAndValidation() {
+        // #328 三键：默认关（vectorPushdown 先例）、ratio (0,1) 开区间、
+        // keepRecentTurns >= 1。
+        Settings defaults = Settings.load(Map.of("ENV", "development"), null);
+        assertFalse(defaults.memory.compactionEnabled);
+        assertEquals(0.7, defaults.memory.compactionRatio, 1e-9);
+        assertEquals(3, defaults.memory.compactionKeepRecentTurns);
+
+        Settings tuned = Settings.load(Map.of(
+                "ENV", "development",
+                "MEMORY_COMPACTION_ENABLED", "true",
+                "MEMORY_COMPACTION_RATIO", "0.8",
+                "MEMORY_COMPACTION_KEEP_RECENT_TURNS", "5"), null);
+        assertTrue(tuned.memory.compactionEnabled);
+        assertEquals(0.8, tuned.memory.compactionRatio, 1e-9);
+        assertEquals(5, tuned.memory.compactionKeepRecentTurns);
+
+        // ratio 开区间：两端点（0 = 必触发、1 = 永不触发）与越界值拒绝。
+        for (String bad : new String[]{"0", "1.0", "1", "-0.5", "1.5"}) {
+            Settings.SettingsError ratioError = assertThrows(Settings.SettingsError.class,
+                    () -> Settings.load(Map.of(
+                            "ENV", "development",
+                            "MEMORY_COMPACTION_RATIO", bad), null),
+                    "ratio=" + bad + " 应拒绝");
+            assertTrue(ratioError.getMessage().contains("MEMORY_COMPACTION_RATIO"),
+                    ratioError.getMessage());
+        }
+        // keepRecentTurns 下限：0 = 保留窗为空，全部历史折叠（违背「近 N 轮
+        // 原文」契约）→ 拒绝。
+        Settings.SettingsError turnsError = assertThrows(Settings.SettingsError.class,
+                () -> Settings.load(Map.of(
+                        "ENV", "development",
+                        "MEMORY_COMPACTION_KEEP_RECENT_TURNS", "0"), null));
+        assertTrue(turnsError.getMessage().contains("MEMORY_COMPACTION_KEEP_RECENT_TURNS"),
+                turnsError.getMessage());
+    }
+
+    @Test
     void perModelContextWindowsParseIndependently() {
         // #4：主/快档窗口独立解析；0 = 未配置（预算沿用现状）；负数拒绝。
         Settings s = Settings.load(Map.of(
@@ -248,4 +286,4 @@ class SettingsRootFieldsTest {
                 () -> Settings.load(Map.of(
                         "ENV", "development", "LLM_FALLBACKS", "not-json"), null));
     }
-}
+
