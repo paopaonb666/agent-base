@@ -75,6 +75,11 @@ public final class Graphs {
         // 零开销零日志；>0 只告警不截断——外置由条目 6 承接）。
         int toolResultCapTokens = ctx.settings() == null
                 ? 0 : ctx.settings().memory.contextBudgetToolResultTokens;
+        // 条目 6：外置接线在构建期固化——fileStore 与溢出阈值进闭包（store
+        // 缺席或阈值 0 = 外置停用，decorateOutput 原样返回，行为退回条目 15）。
+        io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStore fileStore = ctx.fileStore();
+        int spillThresholdChars = ctx.settings() == null
+                ? 0 : ctx.settings().toolkit.toolResultSpillThreshold;
 
         GraphBuilder builder = GraphBuilder.begin();
         builder.addNode("agent", (GraphState state, NodeContext nodeCtx) -> {
@@ -165,7 +170,8 @@ public final class Graphs {
                     String toolName = request.name() == null ? "" : request.name();
                     String output = loopIntercepted[index]
                             ? outputs.get(index) // 提示文本不包不可信标记（系统引导，非外部数据）
-                            : decorateOutput(toolName, outputs.get(index), untrustedMarker, toolResultCapTokens);
+                            : decorateOutput(toolName, outputs.get(index), untrustedMarker,
+                                    toolResultCapTokens, fileStore, spillThresholdChars, nodeCtx);
                     results.add(ToolExecutionResultMessage.from(
                             request.id() == null ? "" : request.id(),
                             toolName,
@@ -224,19 +230,33 @@ public final class Graphs {
     }
 
     /**
-     * 单请求输出 → ToolMessage 文本的装饰（条目 6 外置改造预留的函数级
-     * 接缝）：#84① 开关开时外部数据结果包标记进上下文；ToolCallEvent/
-     * 审计日志在池内用原文（事件与上下文分离）。行为与抽方法前逐字节一致。
+     * 单请求输出 → ToolMessage 文本的装饰（条目 6 外置落点）：叠加顺序
+     * <b>先 spill 后 wrap 后 warn</b>——超阈值结果经
+     * {@link ContextEngine#spillIfNeeded} 外置成摘要块（摘要块是上下文文本
+     * 基座），#84① 开关开时外部数据结果在其上包标记（标记仍是第一行；外置
+     * 行存原文不带标记）；ToolCallEvent/审计日志在池内用原文（事件与上下文
+     * 分离）。
+     *
+     * <p>MCP 归属（条目 6 / 汇总 5 顺修）：wrap 判定经
+     * {@code nodeCtx.tools().isMcpTool(name)} 传入 2 参判据——MCP 工具命名
+     * 是 "{server}_{tool}"，非 mcp_ 前缀；池未接判 false（1 参旧口径）。
      *
      * <p>条目 15 TOOL_RESULTS 域：{@code toolResultCapTokens > 0} 时对装饰后
      * 的最终文本（含不可信标记行）做超限观测告警（helper 单源
-     * ContextEngine.warnIfToolResultOverCap；不截断不外置）。
+     * ContextEngine.warnIfToolResultOverCap；外置生效时最终文本=摘要块，天然小）。
      */
     private static String decorateOutput(String toolName, String output, boolean untrustedMarker,
-                                         int toolResultCapTokens) {
-        String decorated = untrustedMarker
-                ? ContextEngine.wrapUntrusted(toolName, output)
-                : output;
+                                         int toolResultCapTokens,
+                                         io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStore fileStore,
+                                         int spillThresholdChars, NodeContext nodeCtx) {
+        String threadId = nodeCtx.config() == null ? "" : nodeCtx.config().threadId();
+        String userId = nodeCtx.config() == null ? "" : nodeCtx.config().userId();
+        String decorated = ContextEngine.spillIfNeeded(toolName, output, fileStore,
+                threadId, userId, spillThresholdChars);
+        boolean mcpTool = nodeCtx.tools() != null && nodeCtx.tools().isMcpTool(toolName);
+        if (untrustedMarker) {
+            decorated = ContextEngine.wrapUntrusted(toolName, decorated, mcpTool);
+        }
         ContextEngine.warnIfToolResultOverCap(toolName, decorated, toolResultCapTokens);
         return decorated;
     }

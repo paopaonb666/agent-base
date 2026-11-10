@@ -32,6 +32,19 @@ public interface AgentTool {
      * 非空且 ≥ 30 字符（ToolDescriptionContractTest 锁定）。两个已声明
      * 的豁免：web_search 与 Python docstring 逐字一致（一致性锁定，
      * 不升级为三段式）；MCP 工具透传 server 侧描述（内容不可控）。
+     *
+     * <p><b>分页约定（条目 23）</b>：新增<b>列表类</b>工具的参数统一用
+     * {@code limit}/{@code offset} 整数对——默认 {@code limit=5}（对齐
+     * memory_search/knowledge_search 既有默认）、上限 20、越界<b>报错不
+     * 钳制</b>（"limit 必须在 1..20 之间" 文案先例）、offset 从 0 起；
+     * 参数要点段须写明这组边界。约束对象是<b>基座自有工具</b>：存量相关度
+     * topK 检索型工具（memory_search/knowledge_search）的 wire 已合规不动；
+     * web_search 的 {@code max_results} 受 Python 双端一致性锁定豁免（不改名）；
+     * MCP 透传工具由 server 侧 schema 决定，基座不可控。分页的游标形态示范
+     * 见 {@code toolkit.ReadToolResultTool}（offset/limit 整数页参 + 元信息
+     * 首行 + next_offset/已到底）。约定落在描述规范层——<b>不做运行时统一
+     * 校验器</b>（ToolArgsValidator 只按 schema 校验类型/必填，区间校验留在
+     * 各工具内是存量形态）。
      */
     String description();
 

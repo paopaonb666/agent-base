@@ -237,6 +237,16 @@ public final class Settings {
          * 标记文本会进 prompt，开启前需灰度确认无行为回归。
          */
         public boolean toolResultUntrustedMarker = false;
+        /**
+         * 工具结果外置阈值（条目 6，码点）：单次工具结果超过该长度时全文
+         * 外置进附件存储（module="tool_result" 哨兵行），ToolMessage 只留
+         * 摘要块（首屏 + file_id 引用 + read_tool_result 分页指引，格式契约
+         * 见 ContextEngine.SPILL_SUMMARY_PREFIX）。0 = 关闭（单键双义，
+         * streamIdleSeconds/salienceExemptThreshold 先例）；存储未装配
+         * （未知 checkpointer 后端）时外置自动停用。常量矩阵见
+         * {@code toolkit.ToolResultLimits}。
+         */
+        public int toolResultSpillThreshold = 4000;
     }
 
     /** 网络搜索（tools/search）配置节：env 前缀 {@code SEARCH_} / {@code TAVILY_}。 */
@@ -489,6 +499,7 @@ public final class Settings {
                 Map.entry("tool_timeout_seconds", "toolkit"),
                 Map.entry("tool_call_log_enabled", "toolkit"),
                 Map.entry("tool_result_untrusted_marker", "toolkit"),
+                Map.entry("tool_result_spill_threshold", "toolkit"),
                 Map.entry("search_", "search"),
                 Map.entry("tavily_api_key", "search"),
                 Map.entry("doc_parse_", "doc_parse"),
@@ -501,6 +512,7 @@ public final class Settings {
                 "tool_timeout_seconds", "timeout_seconds",
                 "tool_call_log_enabled", "call_log_enabled",
                 "tool_result_untrusted_marker", "tool_result_untrusted_marker",
+                "tool_result_spill_threshold", "tool_result_spill_threshold",
                 "log_json", "log_json",
                 "health_probe_model", "health_probe_model",
                 "tavily_api_key", "tavily_api_key");
@@ -931,6 +943,14 @@ public final class Settings {
         if (v.containsKey("tool_result_untrusted_marker")) {
             t.toolResultUntrustedMarker = requireBool("tool_result_untrusted_marker",
                     v.get("tool_result_untrusted_marker"));
+        }
+        if (v.containsKey("tool_result_spill_threshold")) {
+            int value = requireInt("tool_result_spill_threshold", v.get("tool_result_spill_threshold"));
+            if (value < 0) {
+                throw new SettingsError("TOOL_RESULT_SPILL_THRESHOLD must be >= 0 (0 = disabled), got %d"
+                        .formatted(value));
+            }
+            t.toolResultSpillThreshold = value;
         }
     }
 
@@ -1370,6 +1390,10 @@ public final class Settings {
                 throw new SettingsError("unknown TOOLKIT_ENABLED entry '" + name + "'; known toolkit tools: "
                         + KNOWN_TOOLKIT_NAMES);
             }
+        }
+        if (toolkit.toolResultSpillThreshold < 0) {
+            throw new SettingsError("TOOL_RESULT_SPILL_THRESHOLD must be >= 0 (0 = disabled), got %d"
+                    .formatted(toolkit.toolResultSpillThreshold));
         }
     }
 

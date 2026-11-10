@@ -190,7 +190,10 @@ public final class AgentRuntime {
         return new AgentModule.ModuleContext(settings, llm, checkpointer,
                 tools == null ? java.util.List.of() : moduleToolViews(), memory, planStore, tools,
                 // 压缩终态钩子（#328）：未装配为 null（图执行零开销）。
-                compaction == null ? null : compaction::onRunTerminated);
+                compaction == null ? null : compaction::onRunTerminated,
+                // 工具结果外置通道（条目 6）：store 未装配（未知 checkpointer
+                // 后端）为 null——外置停用，行为退回原样。
+                fileStore);
     }
 
     /**
@@ -406,6 +409,12 @@ public final class AgentRuntime {
             extraTools.addAll(plugin.tools());
         }
         extraTools.addAll(mcp.tools());
+        // 条目 6：read_tool_result 直装（不进 TOOLKIT_ENABLED 注册表——它随
+        // 外置机制存在，无独立启用语义；KNOWN_TOOLKIT_NAMES 不动）。store
+        // 缺席或阈值 0（外置停用）时不装：工具不存在，行为退回原样。
+        if (fileStore != null && resolved.toolkit.toolResultSpillThreshold > 0) {
+            extraTools.add(new io.github.paopaonb666.agentbase.toolkit.ReadToolResultTool(fileStore));
+        }
         // MCP per-server 超时并入池的超时表（键 = 前缀化工具名）。
         java.util.Map<String, Double> timeouts =
                 new java.util.LinkedHashMap<>(

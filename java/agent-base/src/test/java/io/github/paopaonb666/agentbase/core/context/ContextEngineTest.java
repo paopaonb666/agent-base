@@ -9,8 +9,13 @@ import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.ToolExecutionResultMessage;
 import dev.langchain4j.data.message.UserMessage;
+import io.github.paopaonb666.agentbase.core.text.CharMetrics;
 import io.github.paopaonb666.agentbase.core.text.EstimatingTokenCounter;
 import io.github.paopaonb666.agentbase.core.text.ImageTokenPolicy;
+import io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileInfo;
+import io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStore;
+import io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStores;
+import io.github.paopaonb666.agentbase.toolkit.ToolResultLimits;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
@@ -493,5 +498,107 @@ class ContextEngineTest {
     /** ContextEngine 日志的 WARN 计数（MetricsRenderTest 同款模式）。 */
     private static long warnCount(ListAppender<ILoggingEvent> appender) {
         return appender.list.stream().filter(e -> e.getLevel() == Level.WARN).count();
+    }
+
+    // ── 工具结果外置（条目 6） ──────────────────────────────────────────────
+
+    /** 外置 save 必抛的坏 store 桩（接口全量实现——MemoryUploadedFileStore 是 final）。 */
+    private static UploadedFileStore brokenStore() {
+        return new UploadedFileStore() {
+            @Override public void save(UploadedFileInfo info) { throw new IllegalStateException("disk full"); }
+            @Override public List<UploadedFileInfo> getMany(List<String> fileIds) { return List.of(); }
+            @Override public List<UploadedFileInfo> listForUser(String userId, String module, int limit) { return List.of(); }
+            @Override public void bindThread(List<String> fileIds, String threadId) { }
+            @Override public void deleteForThread(String threadId) { }
+            @Override public boolean deleteFile(String fileId) { return false; }
+            @Override public int purgeOrphans(int maxAgeHours) { return 0; }
+        };
+    }
+
+    @Test
+    void spillIfNeededKeepsRawOutputAtOrBelowThreshold() {
+        // 阈值恰等与低于阈值：原样返回、零落库（≤阈值不外置）。
+        var store = new UploadedFileStores.MemoryUploadedFileStore();
+        String raw = "x".repeat(100);
+        assertEquals(raw, ContextEngine.spillIfNeeded("web_search", raw, store, "chat:t1", "u1", 100));
+        assertEquals(raw, ContextEngine.spillIfNeeded("web_search", raw, store, "chat:t1", "u1", 101));
+        assertEquals(0, store.listForUser("u1").size());
+    }
+
+    @Test
+    void spillIfNeededDisabledWithoutStoreOrNonPositiveThreshold() {
+        var store = new UploadedFileStores.MemoryUploadedFileStore();
+        String raw = "x".repeat(500);
+        assertEquals(raw, ContextEngine.spillIfNeeded("web_search", raw, null, "chat:t2", "u1", 100));
+        assertEquals(raw, ContextEngine.spillIfNeeded("web_search", raw, store, "chat:t2", "u1", 0));
+        assertEquals(raw, ContextEngine.spillIfNeeded("web_search", raw, store, "chat:t2", "u1", -1));
+        // null/空输出不外置（包裹后空串会产生孤儿标记行——同 wrapUntrusted 守卫）。
+        assertNull(ContextEngine.spillIfNeeded("web_search", null, store, "chat:t2", "u1", 100));
+        assertEquals("", ContextEngine.spillIfNeeded("web_search", "", store, "chat:t2", "u1", 100));
+    }
+
+    @Test
+    void spillIfNeededSummarizesAndStoresFullTextWithReadbackConsistency() {
+        var store = new UploadedFileStores.MemoryUploadedFileStore();
+        String raw = "y".repeat(2000);
+        String summary = ContextEngine.spillIfNeeded("web_search", raw, store, "chat:t3", "u1", 100);
+        // 摘要块格式（一次性定稿契约）：前缀 + 元信息 + 首屏 + 分页指引。
+        assertTrue(summary.startsWith(ContextEngine.SPILL_SUMMARY_PREFIX), summary);
+        assertTrue(summary.contains("工具 web_search 返回共 2000 字符（超过阈值 100）"), summary);
+        assertTrue(summary.contains("首屏前 1200 字符："), summary);
+        assertTrue(summary.contains("y".repeat(1200)), "摘要块携带首屏");
+        assertFalse(summary.contains("（全文超上限已截断存储）"));
+        int start = summary.indexOf("file_id=") + "file_id=".length();
+        int end = summary.indexOf("。首屏前");
+        String fileId = summary.substring(start, end);
+        assertTrue(summary.contains("……更多内容用 read_tool_result(file_id=\"" + fileId
+                + "\", offset=1200, limit=…) 分页读取。"), summary);
+        // 外置行回读一致：全文在 extractedText，module="tool_result" 哨兵 +
+        // threadId/userId 直接绑定（级联删除白得）+ filename=工具名。
+        List<UploadedFileInfo> rows = store.getMany(List.of(fileId));
+        assertEquals(1, rows.size());
+        UploadedFileInfo row = rows.get(0);
+        assertEquals("y".repeat(2000), row.extractedText());
+        assertEquals("tool_result", row.module());
+        assertEquals("chat:t3", row.threadId());
+        assertEquals("u1", row.userId());
+        assertEquals("web_search", row.filename());
+        assertEquals("txt", row.format());
+        assertFalse(row.truncated());
+        assertEquals(2000, row.textLen());
+    }
+
+    @Test
+    void spillIfNeededTruncatesOversizedStoredTextWithNote() {
+        var store = new UploadedFileStores.MemoryUploadedFileStore();
+        String raw = "z".repeat(ToolResultLimits.MAX_STORED_CHARS + 500);
+        String summary = ContextEngine.spillIfNeeded("knowledge_search", raw, store, "chat:t4", "u1", 100);
+        assertTrue(summary.endsWith("（全文超上限已截断存储）"), "截断存入时末尾注记");
+        assertTrue(summary.contains("z".repeat(1200)), "首屏不受存储截断影响");
+        List<UploadedFileInfo> rows = store.listForUser("u1");
+        assertEquals(1, rows.size());
+        // 存储上限 + textLen = 截断后长度。
+        assertEquals(ToolResultLimits.MAX_STORED_CHARS, CharMetrics.len(rows.get(0).extractedText()));
+        assertEquals(ToolResultLimits.MAX_STORED_CHARS, rows.get(0).textLen());
+    }
+
+    @Test
+    void spillIfNeededSaveFailureFallsBackToRawOutput() {
+        String raw = "x".repeat(500);
+        // save 抛异常 → WARN → 原文直回：绝不因外置失败打断图。
+        assertEquals(raw, ContextEngine.spillIfNeeded("web_search", raw, brokenStore(), "chat:t5", "u1", 100));
+    }
+
+    @Test
+    void isExternalDataToolCoversReadToolResultAndMcpFlag() {
+        // read_tool_result 回读的正是外部内容 → 进封闭集合。
+        assertTrue(ContextEngine.isExternalDataTool("read_tool_result"));
+        // 2 参判据：MCP 名单显式归属——非 mcp_ 前缀的真实 MCP 命名也判外部。
+        assertTrue(ContextEngine.isExternalDataTool("github_search", true));
+        assertFalse(ContextEngine.isExternalDataTool("github_search", false));
+        // 1 参旧口径保持兼容（MCP 判 false，与顺修前逐字节一致）。
+        assertFalse(ContextEngine.isExternalDataTool("github_search"));
+        // mcp_ 前缀判据仍在（2 参口径下同样生效）。
+        assertTrue(ContextEngine.isExternalDataTool("mcp_fs_read", false));
     }
 }

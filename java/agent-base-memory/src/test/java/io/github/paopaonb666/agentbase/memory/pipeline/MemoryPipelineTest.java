@@ -231,6 +231,28 @@ class MemoryPipelineTest {
         assertEquals("……（前文截断）\n前前前" + emoji, tail);
     }
 
+    @Test
+    void renderTranscriptTruncatesSpillSummaryToolLinesAt300CodePoints() {
+        // 条目 6：外置摘要块输入——摘要块约 1300 字符，超过 300 码点截断线，
+        // 首屏被截住正是期望行为（抽取转写不携带全文，摘要块给记忆管线的
+        // 信息量与普通工具行同量级；全文本体在附件存储，不进转写）。
+        String summary = io.github.paopaonb666.agentbase.core.context.ContextEngine
+                .SPILL_SUMMARY_PREFIX
+                + "工具 web_search 返回共 5000 字符（超过阈值 4000），已存为引用 file_id=abc123def456。"
+                + "首屏前 1200 字符：" + "y".repeat(1200)
+                + "……更多内容用 read_tool_result(file_id=\"abc123def456\", offset=1200, limit=…) 分页读取。";
+        String transcript = MemoryPipeline.renderTranscript(List.of(
+                UserMessage.from("查一下"),
+                ToolExecutionResultMessage.from("c1", "web_search", summary)),
+                10_000);
+        List<String> lines = List.of(transcript.split("\n"));
+        assertEquals(2, lines.size());
+        // 工具行按 300 码点截断（前缀与首屏头部保留，其余不进转写）。
+        assertEquals("工具[web_search]：" + summary.substring(0, 300), lines.get(1));
+        assertEquals(300, lines.get(1).codePointCount(0, lines.get(1).length())
+                - "工具[web_search]：".length());
+    }
+
     // ── extractCandidates ────────────────────────────────────────────────
 
     private static MemoryPipeline pipelineWith(ScriptedMain main, ScriptedFast fast,

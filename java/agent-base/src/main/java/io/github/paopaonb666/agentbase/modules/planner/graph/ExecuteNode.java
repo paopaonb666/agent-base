@@ -56,6 +56,11 @@ public final class ExecuteNode {
         // 构造期不存在——与 Graphs 的静态 prompt 形态不同）。
         int toolResultCapTokens = ctx.settings() == null
                 ? 0 : ctx.settings().memory.contextBudgetToolResultTokens;
+        // 条目 6：外置接线在构造期固化——fileStore 与溢出阈值（store 缺席或
+        // 阈值 0 = 外置停用，executeToolCalls 原样返回，行为退回条目 15）。
+        io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStore fileStore = ctx.fileStore();
+        int spillThresholdChars = ctx.settings() == null
+                ? 0 : ctx.settings().toolkit.toolResultSpillThreshold;
 
         return (GraphState state, NodeContext nodeCtx) -> {
             int subtaskToolRounds = ctx.settings().planner.subtaskToolRounds;
@@ -123,10 +128,12 @@ public final class ExecuteNode {
                         }
                     }
                     produced.addAll(executeToolCallsWithLoopBreaks(toolCalls, loopRepeats,
-                            loopThreshold, nodeCtx, untrustedMarker, toolResultCapTokens));
+                            loopThreshold, nodeCtx, untrustedMarker, toolResultCapTokens,
+                            fileStore, spillThresholdChars));
                     break;
                 }
-                produced.addAll(executeToolCalls(toolCalls, nodeCtx, untrustedMarker, toolResultCapTokens));
+                produced.addAll(executeToolCalls(toolCalls, nodeCtx, untrustedMarker,
+                        toolResultCapTokens, fileStore, spillThresholdChars));
             }
             String status = exhausted || loopBrokenTool != null
                     ? PlannerState.FAILED : PlannerState.DONE;
@@ -148,15 +155,24 @@ public final class ExecuteNode {
      * Python {@code _execute_tool_calls}）。未知工具与执行失败都由共享池
      * 归一成模型可读文本（坏掉的工具绝不打断对话）。
      *
+     * <p>条目 6 外置落点：叠加顺序与 Graphs.decorateOutput 同规则——
+     * <b>先 spill 后 wrap 后 warn</b>：超阈值结果经
+     * {@link ContextEngine#spillIfNeeded} 外置成摘要块（外置行存原文不带
+     * 标记），#84① 开关开时外部数据结果在摘要块上包标记（标记仍是第一行）。
+     * MCP 归属经 {@code nodeCtx.tools().isMcpTool(name)} 传入 2 参判据
+     * （MCP 工具命名是 "{server}_{tool}"，非 mcp_ 前缀；池未接判 false）。
+     *
      * <p>条目 15 TOOL_RESULTS 域：{@code toolResultCapTokens > 0} 时对最终
      * 进上下文的文本（含 #84 不可信标记行）做超限观测告警（helper 单源
      * ContextEngine.warnIfToolResultOverCap，与 Graphs.decorateOutput 同规则；
-     * 不截断不外置）。
+     * 外置生效时最终文本=摘要块，天然小）。
      */
     private static List<ChatMessage> executeToolCalls(List<ToolExecutionRequest> toolCalls,
                                                       NodeContext nodeCtx,
                                                       boolean untrustedMarker,
-                                                      int toolResultCapTokens) {
+                                                      int toolResultCapTokens,
+                                                      io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStore fileStore,
+                                                      int spillThresholdChars) {
         List<ChatMessage> results = new ArrayList<>(toolCalls.size());
         // #337：只读工具并发、有副作用串行，结果按请求序（池内通道保归一）；
         // 池未接（测试直构）退化为串行 callTool。
@@ -171,13 +187,17 @@ public final class ExecuteNode {
         for (ToolExecutionRequest call : toolCalls) {
             String name = call.name() == null ? "" : call.name();
             String output = outputs.get(index);
+            // 条目 6：先 spill（外置摘要块是上下文文本基座）后 wrap 后 warn。
+            String threadId = nodeCtx.config() == null ? "" : nodeCtx.config().threadId();
+            String userId = nodeCtx.config() == null ? "" : nodeCtx.config().userId();
+            output = ContextEngine.spillIfNeeded(name, output, fileStore,
+                    threadId, userId, spillThresholdChars);
             if (untrustedMarker) {
                 // #84①：与 Graphs 同规则（判据单源在 ContextEngine）。
-                output = io.github.paopaonb666.agentbase.core.context.ContextEngine
-                        .wrapUntrusted(name, output);
+                boolean mcpTool = nodeCtx.tools() != null && nodeCtx.tools().isMcpTool(name);
+                output = ContextEngine.wrapUntrusted(name, output, mcpTool);
             }
-            io.github.paopaonb666.agentbase.core.context.ContextEngine
-                    .warnIfToolResultOverCap(name, output, toolResultCapTokens);
+            ContextEngine.warnIfToolResultOverCap(name, output, toolResultCapTokens);
             results.add(ToolExecutionResultMessage.from(
                     call.id() == null ? "" : call.id(), name, output));
             index++;
@@ -188,15 +208,17 @@ public final class ExecuteNode {
     /**
      * 一轮 tool_calls 的循环中断执行（条目 5）：被拦截的请求不执行、回喂
      * 提示 ToolMessage（配对完整，#68 先例形态——提示文本不包不可信标记、
-     * 不做 TOOL_RESULTS 域计量，系统引导非外部数据）；其余照常执行，结果按
-     * 请求序（与 Graphs tools 节点同规则，判据单源 ToolLoopDetector）。
+     * 不做 TOOL_RESULTS 域计量、不外置，系统引导非外部数据）；其余照常执行，
+     * 结果按请求序（与 Graphs tools 节点同规则，判据单源 ToolLoopDetector）。
      */
     private static List<ChatMessage> executeToolCallsWithLoopBreaks(List<ToolExecutionRequest> toolCalls,
                                                                     int[] loopRepeats,
                                                                     int loopThreshold,
                                                                     NodeContext nodeCtx,
                                                                     boolean untrustedMarker,
-                                                                    int toolResultCapTokens) {
+                                                                    int toolResultCapTokens,
+                                                                    io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStore fileStore,
+                                                                    int spillThresholdChars) {
         List<ChatMessage> results = new ArrayList<>(toolCalls.size());
         List<ToolExecutionRequest> executable = new ArrayList<>();
         List<Integer> executableSlots = new ArrayList<>();
@@ -212,7 +234,8 @@ public final class ExecuteNode {
                 executableSlots.add(i);
             }
         }
-        List<ChatMessage> executed = executeToolCalls(executable, nodeCtx, untrustedMarker, toolResultCapTokens);
+        List<ChatMessage> executed = executeToolCalls(executable, nodeCtx, untrustedMarker,
+                toolResultCapTokens, fileStore, spillThresholdChars);
         for (int k = 0; k < executed.size(); k++) {
             results.add(executableSlots.get(k), executed.get(k));
         }

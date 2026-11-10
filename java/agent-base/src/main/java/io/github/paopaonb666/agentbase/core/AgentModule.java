@@ -57,6 +57,9 @@ public interface AgentModule {
      * @param planStore      计划快照端口；null = 存储不可用
      * @param compactionHook 压缩终态钩子（#328）；null = 未装配（开关关/记忆
      *                       端口缺席，零行为变化）
+     * @param fileStore      附件存储（条目 6 外置通道）；null = 外置停用
+     *                       （未配 checkpointer 后端时 UploadedFileStores.build
+     *                       返回 null 的既有语义一致，行为退回原样）
      */
     record ModuleContext(
             io.github.paopaonb666.agentbase.core.config.Settings settings,
@@ -66,10 +69,21 @@ public interface AgentModule {
             MemoryPort memory,
             PlanStorePort planStore,
             io.github.paopaonb666.agentbase.core.tools.ToolPool toolPool,
-            CompiledGraph.CompactionHook compactionHook) {
+            CompiledGraph.CompactionHook compactionHook,
+            io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStore fileStore) {
 
         public ModuleContext {
             tools = tools == null ? List.of() : List.copyOf(tools);
+        }
+
+        /** 八参便利构造（fileStore=null：#328 形态的既有装配/测试直构零破坏）。 */
+        public ModuleContext(io.github.paopaonb666.agentbase.core.config.Settings settings,
+                             ModelRuntime llm,
+                             io.github.paopaonb666.agentbase.core.graph.Checkpointer checkpointer,
+                             List<AgentTool> tools, MemoryPort memory, PlanStorePort planStore,
+                             io.github.paopaonb666.agentbase.core.tools.ToolPool toolPool,
+                             CompiledGraph.CompactionHook compactionHook) {
+            this(settings, llm, checkpointer, tools, memory, planStore, toolPool, compactionHook, null);
         }
 
         /** 七参便利构造（compactionHook=null：既有装配/测试直构零破坏）。 */
@@ -78,7 +92,7 @@ public interface AgentModule {
                              io.github.paopaonb666.agentbase.core.graph.Checkpointer checkpointer,
                              List<AgentTool> tools, MemoryPort memory, PlanStorePort planStore,
                              io.github.paopaonb666.agentbase.core.tools.ToolPool toolPool) {
-            this(settings, llm, checkpointer, tools, memory, planStore, toolPool, null);
+            this(settings, llm, checkpointer, tools, memory, planStore, toolPool, null, null);
         }
 
         /** 六参便利构造（toolPool=null：测试直构/未接池的模块）。 */
@@ -86,7 +100,7 @@ public interface AgentModule {
                              ModelRuntime llm,
                              io.github.paopaonb666.agentbase.core.graph.Checkpointer checkpointer,
                              List<AgentTool> tools, MemoryPort memory, PlanStorePort planStore) {
-            this(settings, llm, checkpointer, tools, memory, planStore, null, null);
+            this(settings, llm, checkpointer, tools, memory, planStore, null, null, null);
         }
     }
 

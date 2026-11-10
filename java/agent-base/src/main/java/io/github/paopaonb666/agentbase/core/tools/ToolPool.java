@@ -112,12 +112,18 @@ public final class ToolPool {
 
     private final Map<String, Entry> tools;
     private final ToolCallRecorder recorder;
+    // 条目 6 / 汇总 5 顺修：MCP 工具名的装配期名单——MCP 工具实际命名是
+    // "{server}_{tool}"（非 mcp_ 前缀），不可信标记/外置判据需要显式归属
+    // 而非前缀猜测。判据消费在 ContextEngine.isExternalDataTool(name, isMcpTool)。
+    private final java.util.Set<String> mcpToolNames;
 
     private record Entry(AgentTool inner, ToolSpecification spec, double timeout) {}
 
-    private ToolPool(Map<String, Entry> tools, ToolCallRecorder recorder) {
+    private ToolPool(Map<String, Entry> tools, ToolCallRecorder recorder,
+                     java.util.Set<String> mcpToolNames) {
         this.tools = tools;
         this.recorder = recorder;
+        this.mcpToolNames = mcpToolNames;
     }
 
     /**
@@ -129,15 +135,24 @@ public final class ToolPool {
                                  double defaultTimeout, Map<String, Double> timeouts,
                                  ToolCallRecorder recorder) {
         Map<String, Entry> pool = new LinkedHashMap<>();
+        java.util.Set<String> mcpNames = new java.util.LinkedHashSet<>();
         for (AgentTool tool : moduleTools) {
             put(pool, tool, "module", defaultTimeout, timeouts);
         }
         for (AgentTool tool : extraTools) {
             put(pool, tool, "toolkit", defaultTimeout, timeouts);
         }
+        // 条目 6：装配期收集 MCP 工具名（McpTool 适配器实例；判据消费在
+        // ContextEngine.isExternalDataTool(name, isMcpTool)，Graphs/ExecuteNode
+        // 两个接线点经 nodeCtx.tools().isMcpTool(name) 传入）。
+        for (Entry entry : pool.values()) {
+            if (entry.inner() instanceof io.github.paopaonb666.agentbase.toolkit.mcp.McpTool) {
+                mcpNames.add(entry.inner().name());
+            }
+        }
         // #33：装配期把工具名闭集显式交给指标层（基数防漂移；未注册名照常计数并 WARN 一次）。
         Metrics.tool().registerNames(pool.keySet());
-        return new ToolPool(Map.copyOf(pool), recorder);
+        return new ToolPool(Map.copyOf(pool), recorder, java.util.Set.copyOf(mcpNames));
     }
 
     private static void put(Map<String, Entry> pool, AgentTool tool, String sourceKind,
@@ -178,6 +193,17 @@ public final class ToolPool {
     /** 池是否为空。 */
     public boolean isEmpty() {
         return tools.isEmpty();
+    }
+
+    /**
+     * 该名字是否是池内登记的 MCP 工具（条目 6）：名单在装配期从 McpTool
+     * 实例收集。池未接（NodeContext.tools() 为 null）由调用方短路为 false；
+     * 空池/未登记名一律 false——判据只认装配期名单，不做前缀猜测
+     * （MCP 工具命名是 "{server}_{tool}"，与 "mcp_" 前缀判据脱节，见
+     * ContextEngine.isExternalDataTool 2 参重载）。
+     */
+    public boolean isMcpTool(String name) {
+        return name != null && mcpToolNames.contains(name);
     }
 
     /**

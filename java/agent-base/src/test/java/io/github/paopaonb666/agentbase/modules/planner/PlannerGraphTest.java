@@ -14,14 +14,20 @@ import dev.langchain4j.model.chat.response.ChatResponse;
 import io.github.paopaonb666.agentbase.core.AgentModule;
 import io.github.paopaonb666.agentbase.core.config.Settings;
 import io.github.paopaonb666.agentbase.core.graph.CompiledGraph;
+import io.github.paopaonb666.agentbase.core.graph.GraphBuilder;
 import io.github.paopaonb666.agentbase.core.graph.GraphState;
 import io.github.paopaonb666.agentbase.core.graph.InMemoryCheckpointer;
+import io.github.paopaonb666.agentbase.core.graph.NodeContext;
 import io.github.paopaonb666.agentbase.core.graph.RunConfig;
 import io.github.paopaonb666.agentbase.core.context.ContextEngine;
 import io.github.paopaonb666.agentbase.core.graphs.ToolLoopDetector;
 import io.github.paopaonb666.agentbase.core.llm.ModelRuntime;
 import io.github.paopaonb666.agentbase.core.tools.AgentTool;
+import io.github.paopaonb666.agentbase.core.tools.ToolPool;
 import io.github.paopaonb666.agentbase.extensions.events.Events;
+import io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileInfo;
+import io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStores;
+import io.github.paopaonb666.agentbase.modules.planner.graph.ExecuteNode;
 import io.github.paopaonb666.agentbase.modules.planner.graph.PlannerGraphs;
 import io.github.paopaonb666.agentbase.modules.planner.graph.PlannerState;
 import org.junit.jupiter.api.Test;
@@ -413,5 +419,83 @@ class PlannerGraphTest {
         // 图收尾：synthesize 的综合答复是最后一条消息。
         assertEquals("收尾答复",
                 ContextEngine.contentText(result.messages().get(result.messages().size() - 1)).strip());
+    }
+
+    /** 条目 6：planner 路径（ExecuteNode.executeToolCalls）超阈值结果外置。 */
+    @Test
+    void plannerExecuteNodeSpillsOversizeToolResult() throws Exception {
+        String big = "x".repeat(300);
+        AgentTool bigTool = new AgentTool() {
+            @Override public String name() { return "probe"; }
+            @Override public String description() { return "外置测试桩：返回超大固定文本。"; }
+            @Override public ToolSpecification specification() {
+                return ToolSpecification.builder().name(name()).description(description())
+                        .parameters(JsonObjectSchema.builder().build()).build();
+            }
+            @Override public String call(String argsJson, ToolContext ctx) {
+                return big;
+            }
+        };
+        ToolPool pool = ToolPool.build(List.of(bigTool), List.of(), 30.0, Map.of(), null);
+        ScriptedModel model = new ScriptedModel(
+                aiWithCall("c1", "probe", "{}"),               // execute 轮 1：tool_calls
+                AiMessage.from("基于结果的足够长的最终产出摘要")); // execute 轮 2：收尾
+        Settings settings = new Settings();
+        settings.toolkit.toolResultSpillThreshold = 100;
+        var store = new UploadedFileStores.MemoryUploadedFileStore();
+        AgentModule.ModuleContext ctx = new AgentModule.ModuleContext(
+                settings, model, new InMemoryCheckpointer(), List.of(bigTool), null, null, pool, null, store);
+        // planner 图 compile 不接池（PlannerGraphs 二参 compile），execute 节点
+        // 的工具通道经 NodeContext 注入——直驱节点 + 带池 NodeContext 桩，
+        // 走的是与生产一致的 executeToolCalls 路径。
+        GraphBuilder.Node execute = ExecuteNode.make(ctx);
+        GraphState seed = new GraphState(List.of(UserMessage.from("做 A")),
+                Map.of(PlannerState.TASKS,
+                        List.of(Map.of(PlannerState.ID, 1, PlannerState.GOAL, "A"))));
+        List<Object> events = new ArrayList<>();
+        NodeContext nodeCtx = new NodeContext() {
+            private final RunConfig config = new RunConfig("planner:t-spill", "u1", 25);
+            @Override public RunConfig config() { return config; }
+            @Override public void emit(Object event) { events.add(event); }
+            @Override public String callTool(String name, String argsJson) {
+                return pool.call(name, argsJson, config, this);
+            }
+            @Override public ToolPool tools() { return pool; }
+            @Override public boolean cancelled() { return false; }
+        };
+        Map<String, Object> update = execute.apply(seed, nodeCtx);
+
+        // ToolMessage 是摘要块（untrustedMarker 默认关 → 纯摘要，无标记）。
+        @SuppressWarnings("unchecked")
+        List<ChatMessage> produced = (List<ChatMessage>) update.get(GraphState.MESSAGES);
+        List<ToolExecutionResultMessage> toolMessages = produced.stream()
+                .filter(m -> m instanceof ToolExecutionResultMessage)
+                .map(m -> (ToolExecutionResultMessage) m)
+                .toList();
+        assertEquals(1, toolMessages.size());
+        String text = toolMessages.get(0).text();
+        assertTrue(text.startsWith(ContextEngine.SPILL_SUMMARY_PREFIX), text);
+        assertTrue(text.contains("工具 probe 返回共 300 字符（超过阈值 100）"), text);
+        int start = text.indexOf("file_id=") + "file_id=".length();
+        int end = text.indexOf("。首屏前");
+        String fileId = text.substring(start, end);
+        // store.extractedText = 全文，threadId/userId 直接绑定（级联删除白得）。
+        List<UploadedFileInfo> rows = store.getMany(List.of(fileId));
+        assertEquals(1, rows.size());
+        assertEquals(big, rows.get(0).extractedText());
+        assertEquals("tool_result", rows.get(0).module());
+        assertEquals("planner:t-spill", rows.get(0).threadId());
+        assertEquals("u1", rows.get(0).userId());
+        // 事件/审计原文分离：池内 ToolCallEvent 仍是原文。
+        String eventResult = events.stream()
+                .filter(e -> e instanceof Events.ToolCallEvent call
+                        && "end".equals(call.phase()) && "probe".equals(call.name()))
+                .map(e -> ((Events.ToolCallEvent) e).result())
+                .findFirst().orElseThrow();
+        assertEquals(big, eventResult);
+        // 子任务正常收尾（摘要块不影响 check 的空输出门语义）。
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> tasks = (List<Map<String, Object>>) update.get(PlannerState.TASKS);
+        assertEquals("done", tasks.get(0).get(PlannerState.STATUS));
     }
 }
