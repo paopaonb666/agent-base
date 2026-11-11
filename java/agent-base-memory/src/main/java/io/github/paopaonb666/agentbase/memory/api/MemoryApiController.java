@@ -1,5 +1,6 @@
 package io.github.paopaonb666.agentbase.memory.api;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -330,15 +331,18 @@ public class MemoryApiController {
 
     /**
      * #160/#176：可选 {@code thread}（thread_id 精确匹配）、{@code since}
-     * （epoch 秒，含边界）与 {@code before}（翻页游标，epoch 秒——取上一页
-     * 响应的 next_before，语义是严格早于该时刻）。取满 limit 时响应追加
-     * {@code next_before}（末行的 created_at 秒值）；不足 limit 不带。
+     * （epoch 秒，含边界）与 {@code before}（翻页游标——取上一页响应的
+     * next_before，形态「秒:op_id」，语义是严格早于该 (时刻, op_id) 复合
+     * 位；同刻并列的余量按 op_id 前移续页，不漏行）。旧客户端的纯 epoch
+     * 秒形态仍接受（op_id 缺省，同刻并列的余量按既有语义可被跳过，见
+     * {@link MemoryStore.OpsCursor}）。取满 limit 时响应追加
+     * {@code next_before}（末行的「秒:op_id」）；不足 limit 不带。
      */
     @GetMapping("/audit")
     public Map<String, Object> audit(@RequestParam(value = "limit", defaultValue = "50") int limit,
                                      @RequestParam(value = "thread", required = false) String thread,
                                      @RequestParam(value = "since", required = false) Double since,
-                                     @RequestParam(value = "before", required = false) Double before,
+                                     @RequestParam(value = "before", required = false) String before,
                                      @RequestHeader(value = "X-User-Id", required = false) String userIdHeader,
                                      @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
                                      @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,
@@ -346,10 +350,7 @@ public class MemoryApiController {
         MemoryService memory = service();
         String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
         int effectiveLimit = Math.min(Math.max(limit, 1), 200);
-        // 游标只有秒值（API 契约），同刻并列的余量由 store 层的时间戳截断
-        // 兜底（见 MemoryStore.OpsCursor）。
-        MemoryStore.OpsCursor cursor = before == null ? null
-                : new MemoryStore.OpsCursor(before, null);
+        MemoryStore.OpsCursor cursor = parseCursor(before);
         List<io.github.paopaonb666.agentbase.memory.store.Models.MemoryOp> ops =
                 memory.listOps(userId, thread, since, cursor, effectiveLimit);
         List<Map<String, Object>> items = ops.stream()
@@ -358,9 +359,39 @@ public class MemoryApiController {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("ops", items);
         if (ops.size() >= effectiveLimit) {
-            out.put("next_before", ops.get(ops.size() - 1).createdAt());
+            var last = ops.get(ops.size() - 1);
+            // 复合游标（R3 收口）：MySQL created_at 是秒精度，同刻并列组的
+            // 页界即 createdAt 相同——只回秒值时下一页「严格早于该时刻」会把
+            // 同秒余量整组跳掉，必须带上末行 op_id 做 tiebreak。秒值用
+            // toPlainString 编码（Double.toString 对 1.8E9 量级会出科学计数
+            // 法，客户端无法回传）；op_id 是 uuid hex（Models.newMemoryId），
+            // 不含冒号，「秒:op_id」切分无歧义。
+            out.put("next_before", BigDecimal.valueOf(last.createdAt()).toPlainString()
+                    + ":" + last.opId());
         }
         return out;
+    }
+
+    /**
+     * 解析 before 游标：「秒:op_id」复合形态 → 带边界行 op_id 的 OpsCursor
+     * （同刻并列稳定前移）；纯秒旧形态 → op_id 缺省（兼容旧客户端，语义 =
+     * 既有同刻截断）。秒值非法 → 422（与其他参数校验同形态）。
+     */
+    private static MemoryStore.OpsCursor parseCursor(String before) {
+        if (before == null || before.isBlank()) {
+            return null;
+        }
+        int sep = before.indexOf(':');
+        try {
+            if (sep < 0) {
+                return new MemoryStore.OpsCursor(Double.parseDouble(before.trim()), null);
+            }
+            return new MemoryStore.OpsCursor(
+                    Double.parseDouble(before.substring(0, sep).trim()),
+                    before.substring(sep + 1));
+        } catch (NumberFormatException e) {
+            throw new HttpError(422, "before 游标非法：应为 '秒:op_id' 或纯 epoch 秒");
+        }
     }
 
     // ── 向量回填（#164：换 embedding 模型后的迁移入口） ─────────────────
