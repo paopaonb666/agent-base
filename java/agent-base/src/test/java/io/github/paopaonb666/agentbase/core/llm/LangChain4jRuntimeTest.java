@@ -402,4 +402,62 @@ class LangChain4jRuntimeTest {
                         .contains(estimatedInputLine(model, "fast", 9)),
                 "非流式回退路径应发射 {model, profile=fast, estimated_input}=9");
     }
+
+    // ── 缓做池 #19：上下文窗口压力观测（est / contextWindowTokens） ────────
+
+    @Test
+    void invokeObservesContextPressureWhenWindowConfigured() {
+        // 窗口已配置（>0）：invoke 一次后 last = est/window——两条 metered
+        // 消息 est=18（9/条），window=100 → 0.1800；首次观测 high==last。
+        // Metrics.context() 是进程级单例：独特 model 名隔离（#340 同款约定）。
+        useEstimator();
+        ScriptedModels.ScriptedChatModel chat =
+                new ScriptedModels.ScriptedChatModel(List.of(ScriptedModels.ScriptedResponse.of("ok")));
+        String model = "ctx-win-" + System.nanoTime();
+        LangChain4jRuntime runtime = new LangChain4jRuntime(
+                chat, null, model, false, 100, 0, 1.0, null, "main");
+        runtime.invoke(List.of(meteredHuman(), meteredHuman()));
+        String body = Metrics.context().renderContextMetrics();
+        assertTrue(body.contains("llm_context_pressure{model=\"" + model
+                        + "\",profile=\"main\",stat=\"last\"} 0.1800"),
+                "last 应等于 est/window = 18/100");
+        assertTrue(body.contains("llm_context_pressure{model=\"" + model
+                        + "\",profile=\"main\",stat=\"high\"} 0.1800"),
+                "首次观测 high==last");
+    }
+
+    @Test
+    void contextPressureMayExceedOneWhenWindowTiny() {
+        // 占用比 > 1 合法（估算输入超窗口——压力大正是要观测的信号），
+        // 不做钳制：window=10 < est=18 → 1.8000。
+        useEstimator();
+        ScriptedModels.ScriptedChatModel chat =
+                new ScriptedModels.ScriptedChatModel(List.of(ScriptedModels.ScriptedResponse.of("ok")));
+        String model = "ctx-over-" + System.nanoTime();
+        LangChain4jRuntime runtime = new LangChain4jRuntime(
+                chat, null, model, false, 10, 0, 1.0, null, "main");
+        runtime.invoke(List.of(meteredHuman(), meteredHuman()));
+        assertTrue(Metrics.context().renderContextMetrics()
+                        .contains("llm_context_pressure{model=\"" + model
+                                + "\",profile=\"main\",stat=\"last\"} 1.8000"),
+                "超窗压力应原样发射（18/10=1.8），不钳制到 1");
+    }
+
+    @Test
+    void zeroWindowRuntimeEmitsNoPressureKey() {
+        // 窗口未配置（=0）的运行时不产生键——分母缺失，NaN 无意义。
+        useEstimator();
+        ScriptedModels.ScriptedChatModel chat =
+                new ScriptedModels.ScriptedChatModel(List.of(ScriptedModels.ScriptedResponse.of("ok")));
+        String model = "ctx-zero-" + System.nanoTime();
+        LangChain4jRuntime runtime = new LangChain4jRuntime(
+                chat, null, model, false, 0, 0, 1.0, null, "main");
+        runtime.invoke(List.of(meteredHuman(), meteredHuman()));
+        // estimated_input 照常发射（对账不依赖窗口），压力键缺席。
+        assertTrue(Metrics.cost().renderCostMetrics()
+                        .contains(estimatedInputLine(model, "main", 18)),
+                "estimated_input 与窗口配置无关，照常发射");
+        assertFalse(Metrics.context().renderContextMetrics().contains("model=\"" + model + "\""),
+                "window=0 不应产生压力键");
+    }
 }

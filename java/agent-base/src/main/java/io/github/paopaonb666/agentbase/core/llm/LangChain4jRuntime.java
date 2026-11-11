@@ -194,10 +194,16 @@ public final class LangChain4jRuntime implements ModelRuntime {
         // 装饰器/上下文对象承载——构造参数已到边界，最小的 profile 承载
         // = 尾参 + 旧重载保留（profile() 经 ModelRuntime 透传）。messages
         // 形参就是最终发给模型的输入列表（调用方已过上下文引擎修剪）。
+        int estimatedInput = io.github.paopaonb666.agentbase.core.context.ContextEngine
+                .estimateInputTokens(messages, tokenFactor);
         io.github.paopaonb666.agentbase.extensions.Metrics.cost().observeTokens(
-                modelName, profile, "estimated_input",
-                io.github.paopaonb666.agentbase.core.context.ContextEngine
-                        .estimateInputTokens(messages, tokenFactor));
+                modelName, profile, "estimated_input", estimatedInput);
+        // 缓做池 #19 窗口压力：同一估算值换算 est/window 观测（纯观测面，
+        // 不碰预算逻辑）；窗口未配置（=0）不发射——分母缺失，比例无意义。
+        if (contextWindowTokens > 0) {
+            io.github.paopaonb666.agentbase.extensions.Metrics.context().observePressure(
+                    modelName, profile, estimatedInput / (double) contextWindowTokens);
+        }
         AiMessage message = response.aiMessage();
         return message == null ? null : withAuditMetadata(message, response.finishReason());
     }
@@ -265,10 +271,16 @@ public final class LangChain4jRuntime implements ModelRuntime {
         // #340 对账观测：与 usage 记账同时刻发射（口径与 core/llm →
         // core/context 软引用说明见 invoke 内注释）；messages 形参就是
         // 最终输入列表（调用方已过上下文引擎修剪）。
+        int estimatedInput = io.github.paopaonb666.agentbase.core.context.ContextEngine
+                .estimateInputTokens(messages, tokenFactor);
         io.github.paopaonb666.agentbase.extensions.Metrics.cost().observeTokens(
-                modelName, profile, "estimated_input",
-                io.github.paopaonb666.agentbase.core.context.ContextEngine
-                        .estimateInputTokens(messages, tokenFactor));
+                modelName, profile, "estimated_input", estimatedInput);
+        // 缓做池 #19 窗口压力：同一估算值换算 est/window（观测口径说明见
+        // invoke 内注释）；窗口未配置（=0）不发射。
+        if (contextWindowTokens > 0) {
+            io.github.paopaonb666.agentbase.extensions.Metrics.context().observePressure(
+                    modelName, profile, estimatedInput / (double) contextWindowTokens);
+        }
         // R2-F6 收口：聚合产物的 attributes / thinking 随重造并入——文本仍以
         // 回调累计为权威（显式重造契约不变），langchain4j 1.4 OpenAI 聚合产物
         // 的 attributes 实际为空（≈零影响），并入是防患于 provider 行为变化
@@ -333,10 +345,16 @@ public final class LangChain4jRuntime implements ModelRuntime {
         // #340 对账观测：非流式回退同样是真实调用（cost_usage 行在此产出），
         // 同时刻发射保持 attempt 级 1:1——缺了这里，快档工具轮（回退的
         // 高频形态）将永久缺失对账分母。
+        int estimatedInput = io.github.paopaonb666.agentbase.core.context.ContextEngine
+                .estimateInputTokens(messages, tokenFactor);
         io.github.paopaonb666.agentbase.extensions.Metrics.cost().observeTokens(
-                modelName, profile, "estimated_input",
-                io.github.paopaonb666.agentbase.core.context.ContextEngine
-                        .estimateInputTokens(messages, tokenFactor));
+                modelName, profile, "estimated_input", estimatedInput);
+        // 缓做池 #19 窗口压力：同一估算值换算 est/window（观测口径说明见
+        // invoke 内注释）；窗口未配置（=0）不发射。
+        if (contextWindowTokens > 0) {
+            io.github.paopaonb666.agentbase.extensions.Metrics.context().observePressure(
+                    modelName, profile, estimatedInput / (double) contextWindowTokens);
+        }
         return withAuditMetadata(message, response.finishReason());
     }
 

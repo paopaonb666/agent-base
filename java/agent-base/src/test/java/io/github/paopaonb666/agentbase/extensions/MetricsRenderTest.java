@@ -258,6 +258,62 @@ class MetricsRenderTest {
                 "KEY_ORDER 逐元素字典序：estimated_input 行在前");
     }
 
+    // ── 缓做池 #19：上下文窗口压力仪表（llm_context_pressure） ─────────────
+
+    @Test
+    void contextPressureRendersLastAndHighPerKeyInKeyOrder() {
+        // 行形状：每键两行（stat="last"/"high"），%.4f（Locale.ROOT），
+        // KEY_ORDER 字典序；空 map 渲染 ""（与 tool/memory 空段同形）。
+        // 新建实例隔离断言（类注释约定）。
+        assertEquals("", new Metrics.ContextMetrics().renderContextMetrics());
+        Metrics.ContextMetrics context = new Metrics.ContextMetrics();
+        context.observePressure("gpt-ctx-b", "main", 0.5);
+        context.observePressure("gpt-ctx-a", "fast", 0.25);
+        context.observePressure("gpt-ctx-a", "fast", 0.75);
+        String body = context.renderContextMetrics();
+        assertTrue(body.contains(
+                "llm_context_pressure{model=\"gpt-ctx-a\",profile=\"fast\",stat=\"last\"} 0.7500"));
+        assertTrue(body.contains(
+                "llm_context_pressure{model=\"gpt-ctx-a\",profile=\"fast\",stat=\"high\"} 0.7500"));
+        assertTrue(body.contains(
+                "llm_context_pressure{model=\"gpt-ctx-b\",profile=\"main\",stat=\"last\"} 0.5000"));
+        assertTrue(body.contains(
+                "llm_context_pressure{model=\"gpt-ctx-b\",profile=\"main\",stat=\"high\"} 0.5000"));
+        // 字典序：gpt-ctx-a 键整体排在 gpt-ctx-b 前。
+        assertTrue(body.indexOf("model=\"gpt-ctx-a\"") < body.indexOf("model=\"gpt-ctx-b\""),
+                "KEY_ORDER 逐元素字典序：a 键在前");
+        // 4 位小数口径锁定（任意行都形如 x.xxxx）。
+        assertTrue(Pattern.compile(
+                        "llm_context_pressure\\{model=\"[^\"]+\",profile=\"[^\"]+\",stat=\"(last|high)\"} \\d+\\.\\d{4}")
+                        .matcher(body).find());
+        assertTrue(body.endsWith("\n"));
+    }
+
+    @Test
+    void contextPressureHighWatermarkNeverFalls() {
+        // high 水位只升不降：observe 0.5 再 0.3 → last=0.3、high=0.5。
+        Metrics.ContextMetrics context = new Metrics.ContextMetrics();
+        context.observePressure("gpt-wm", "main", 0.5);
+        context.observePressure("gpt-wm", "main", 0.3);
+        String body = context.renderContextMetrics();
+        assertTrue(body.contains(
+                "llm_context_pressure{model=\"gpt-wm\",profile=\"main\",stat=\"last\"} 0.3000"));
+        assertTrue(body.contains(
+                "llm_context_pressure{model=\"gpt-wm\",profile=\"main\",stat=\"high\"} 0.5000"),
+                "high 水位不随后续低观测回落");
+    }
+
+    @Test
+    void contextPressureIgnoresNegativeAndNonFiniteRatios() {
+        // 无意义观测不建键：ratio<0 / NaN / ±Inf 全忽略。
+        Metrics.ContextMetrics context = new Metrics.ContextMetrics();
+        context.observePressure("gpt-bad", "main", -0.1);
+        context.observePressure("gpt-bad", "main", Double.NaN);
+        context.observePressure("gpt-bad", "main", Double.POSITIVE_INFINITY);
+        context.observePressure("gpt-bad", "main", Double.NEGATIVE_INFINITY);
+        assertEquals("", context.renderContextMetrics(), "负值/非有限值不应建键");
+    }
+
     @Test
     void metricsEndpointConcatenatesAllFourSections() {
         String route = uniq("/v1/concat/");

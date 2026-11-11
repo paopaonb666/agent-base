@@ -301,6 +301,58 @@ public final class Metrics {
         }
     }
 
+    /**
+     * 进程内的上下文窗口压力仪表（缓做池 #19）。
+     *
+     * <p>观测<b>观测输入</b> token 用量占上下文窗口的比例（窗口压力），
+     * 供容量排障——纯观测面，不碰预算逻辑。发射点在 LangChain4jRuntime
+     * 三条真实调用路径的 estimated_input 记账处（est / contextWindowTokens）；
+     * 分面 {model, profile} 与 llm_tokens_total 同构，值 = [last, high]：
+     * last 是最近一次占用比，high 是进程内峰值水位（只升不降）。
+     * 占用比 &gt; 1 合法（估算输入超窗口——排障正是要看这个），不做钳制。
+     */
+    public static final class ContextMetrics {
+        /** {model, profile} → [last, high]（更新走 synchronized，观测面无锁读）。 */
+        private final Map<List<String>, double[]> pressure = new ConcurrentHashMap<>();
+
+        /**
+         * 记录一次窗口占用比。ratio &lt; 0 或非有限值（NaN/Inf）忽略——无意义
+         * 的观测不建键；high 水位只升不降（max）。
+         */
+        public synchronized void observePressure(String model, String profile, double ratio) {
+            if (ratio < 0 || !Double.isFinite(ratio)) {
+                return;
+            }
+            double[] cell = pressure.computeIfAbsent(List.of(model, profile), k -> new double[2]);
+            cell[0] = ratio;
+            cell[1] = Math.max(cell[1], ratio);
+        }
+
+        /**
+         * 渲染窗口压力的 Prometheus 文本展示格式：每键两行（stat="last" 与
+         * stat="high"，%.4f，KEY_ORDER 字典序）。空 map 返回 ""（与
+         * tool/memory 空段同形）。窗口未配置（=0）的运行时不发射——分母
+         * 缺失，NaN 无意义。
+         */
+        public String renderContextMetrics() {
+            if (pressure.isEmpty()) {
+                return "";
+            }
+            List<String> lines = new ArrayList<>();
+            for (Map.Entry<List<String>, double[]> e : pressure.entrySet().stream()
+                    .sorted(Map.Entry.comparingByKey(KEY_ORDER))
+                    .collect(java.util.stream.Collectors.toList())) {
+                lines.add(String.format(java.util.Locale.ROOT,
+                        "llm_context_pressure{model=\"%s\",profile=\"%s\",stat=\"last\"} %.4f",
+                        e.getKey().get(0), e.getKey().get(1), e.getValue()[0]));
+                lines.add(String.format(java.util.Locale.ROOT,
+                        "llm_context_pressure{model=\"%s\",profile=\"%s\",stat=\"high\"} %.4f",
+                        e.getKey().get(0), e.getKey().get(1), e.getValue()[1]));
+            }
+            return String.join("\n", lines) + "\n";
+        }
+    }
+
     // ── 进程级单例（对应 Python 的 TOOL_METRICS / MEMORY_METRICS / COST_METRICS） ──
 
     private static final HttpMetrics HTTP = new HttpMetrics();
@@ -308,6 +360,7 @@ public final class Metrics {
     private static final MemoryMetricsImpl MEMORY = new MemoryMetricsImpl();
     private static final CostMetrics COST = new CostMetrics();
     private static final EventDropMetrics EVENTS = new EventDropMetrics();
+    private static final ContextMetrics CONTEXT = new ContextMetrics();
 
     public static HttpMetrics http() { return HTTP; }
 
@@ -318,4 +371,6 @@ public final class Metrics {
     public static CostMetrics cost() { return COST; }
 
     public static EventDropMetrics events() { return EVENTS; }
+
+    public static ContextMetrics context() { return CONTEXT; }
 }

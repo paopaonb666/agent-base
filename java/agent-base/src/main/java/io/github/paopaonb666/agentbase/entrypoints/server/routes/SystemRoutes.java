@@ -226,7 +226,8 @@ public class SystemRoutes {
                 + Metrics.tool().renderToolMetrics()
                 + Metrics.memory().renderMemoryMetrics()
                 + Metrics.cost().renderCostMetrics()
-                + Metrics.events().renderEventDropMetrics();
+                + Metrics.events().renderEventDropMetrics()
+                + Metrics.context().renderContextMetrics();
         return ResponseEntity.ok().contentType(MediaType.parseMediaType(
                 "text/plain; version=0.0.4; charset=utf-8")).body(body);
     }
