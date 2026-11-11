@@ -79,6 +79,39 @@ storage_unavailable/llm_unavailable/recursion_limit/internal_error` 等）——
 前端只认 code 不认文案；缺省场景省键（旧 wire 逐字节不变），Python 版无
 此字段。
 
+## toolSafeStreaming：快档绑工具轮走非流式（#157）
+
+快档（`profile="fast"`）运行时恒以工具安全形态装配（`toolSafeStreaming=true`）：
+**绑定工具的图执行轮退回非流式**（`LangChain4jRuntime.stream` 的判定
+`toolSafeStreaming && bindTools → nonStreamFallback`），让服务端聚合出合法
+tool_calls；不绑工具的调用（纯对话、记忆形成管线）不受影响，仍走流式。
+主档恒原生流式（`toolSafeStreaming=false`，无配置开关）。
+
+**触发面**（哪些路径会观察到工具轮无 delta）：
+
+| 路径 | 行为 |
+| --- | --- |
+| `profile=fast` 的图执行请求（Tier 1 单 agent / planner，均 bind_tools） | 工具轮非流式；工具轮之间的纯文本轮仍流式 |
+| 快档未配置时的回落形态（#128：回落主力配置但保持 toolSafe） | 同上——回落流量不重新暴露在流式 tool_calls 协议缺陷下 |
+| 记忆形成管线的快档 LLM 调用（抽取/画像/摘要，不绑工具） | 不触发，正常调用 |
+| 主档（main） | 永不触发，原生流式 |
+
+**实证触发端点/模型**：SiliconFlow 的 GLM-4-9B——流式模式下把工具名拆进
+`arguments` delta（`function.name` 为空、id 为 null），违反 OpenAI 流式
+协议：langchain4j 聚合不出合法 tool_calls，图执行静默拿到空工具调用与空
+回答（同一请求非流式则完全正常）。其余 provider 未观测到同形缺陷；此清单
+只登记实证事实，不臆测未测端点。
+
+**部署指引**：
+
+- 选型自查：候选模型在「流式 + 绑工具」下若出现空工具调用 + 空回答、而
+  非流式同请求正常，即为同形协议违例——它作为快档时本机制已自动兜住
+  （工具轮无 delta、首 token 延迟略增，属预期代价）；作为主档使用则无
+  保护，请更换模型。
+- 已实证违例的模型不要配为主档带工具使用；快档选型可接受非流式工具轮
+  语义（成本敏感场景的常规取舍）。
+- 该缺陷是服务端聚合行为，网关/代理侧无法修复。
+
 ## 与 Python 版的已知差异
 
 以下为核心差异摘要（均为**内部实现口径**，不影响 HTTP 行为与配置契约）。
