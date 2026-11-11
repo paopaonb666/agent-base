@@ -21,7 +21,8 @@ import java.util.Map;
  * 图状态的 JSON 编解码（checkpointer 持久化的存储格式）。
  *
  * <p>消息形态与 OpenAI/LangChain 语义对齐：type ∈ {system, human, ai,
- * tool}；AiMessage 附 tool_calls（[{id,name,args}]）；ToolMessage 附
+ * tool}；AiMessage 附 tool_calls（[{id,name,args}]）与可选 thinking
+ * （R2-F3 往返对称，有才写键）；ToolMessage 附
  * tool_call_id/name；UserMessage 可能带多段 content（文本 + 图片块）。
  * extra 通道（tasks/cursor/replans 等）原样 JSON 保存。
  */
@@ -164,6 +165,14 @@ public final class GraphStateJson {
             if (finishReason != null) {
                 node.put("finish_reason", finishReason);
             }
+            // R2-F3 收口：thinking 往返对称——写侧有才写键（空串视同无），
+            // reasoning 模型接入后推理轨迹不再静默丢失。兼容读先例同 #123
+            // （message_id/finish_reason）：旧快照无键容忍、不 bump VERSION，
+            // 写侧新增键对旧读侧透明。
+            String thinking = ai.thinking();
+            if (thinking != null && !thinking.isEmpty()) {
+                node.put("thinking", thinking);
+            }
             if (ai.hasToolExecutionRequests()) {
                 ArrayNode calls = node.putArray("tool_calls");
                 for (dev.langchain4j.agent.tool.ToolExecutionRequest request : ai.toolExecutionRequests()) {
@@ -218,15 +227,25 @@ public final class GraphStateJson {
                 if (!node.path("finish_reason").asText("").isEmpty()) {
                     attrs.put("finish_reason", node.path("finish_reason").asText());
                 }
-                if (attrs.isEmpty()) {
+                // R2-F3 收口：thinking 往返对称（写侧有才写键，读侧有才
+                // 还原）——reasoning 模型接入时推理轨迹不再静默丢失。
+                // MissingNode/JSON null → null，空串视作无；旧快照无该键
+                // → thinking 为 null（兼容读，#123 先例，语义不变）。
+                String thinking = node.path("thinking").asText(null);
+                if (thinking != null && thinking.isEmpty()) {
+                    thinking = null;
+                }
+                if (attrs.isEmpty() && thinking == null) {
                     return rebuilt;
                 }
-                return AiMessage.builder()
+                AiMessage.Builder builder = AiMessage.builder()
                         .text(rebuilt.text())
-                        .thinking(rebuilt.thinking())
-                        .toolExecutionRequests(rebuilt.toolExecutionRequests())
-                        .attributes(attrs)
-                        .build();
+                        .thinking(thinking != null ? thinking : rebuilt.thinking())
+                        .toolExecutionRequests(rebuilt.toolExecutionRequests());
+                if (!attrs.isEmpty()) {
+                    builder.attributes(attrs);
+                }
+                return builder.build();
             }
             case "tool" -> {
                 return ToolExecutionResultMessage.from(
@@ -249,7 +268,7 @@ public final class GraphStateJson {
         }
     }
 
-    /** ai 节点 → AiMessage 的基础重建（#123 前的形态；attributes 由调用方按需挂）。 */
+    /** ai 节点 → AiMessage 的基础重建（#123 前的形态；attributes/thinking 由调用方按需挂）。 */
     private static AiMessage aiFromJson(JsonNode node) {
         if (node.has("tool_calls") && node.get("tool_calls").isArray()
                 && !node.get("tool_calls").isEmpty()) {

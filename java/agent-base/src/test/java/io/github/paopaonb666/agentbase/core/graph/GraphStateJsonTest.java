@@ -297,4 +297,96 @@ class GraphStateJsonTest {
         assertNull(legacyRestored.attribute("id", String.class));
         assertEquals("旧快照消息", legacyRestored.text());
     }
+
+    @Test
+    void aiThinkingRoundTripsIncludingToolCallVariant() {
+        // R2-F3 收口：带 thinking 的 AiMessage 往返——推理轨迹不再静默
+        // 丢失；text + thinking + tool_calls 同体的复合形态同样无损。
+        AiMessage thinking = AiMessage.builder()
+                .text("答")
+                .thinking("推理过程")
+                .build();
+        AiMessage restored = (AiMessage) roundTrip(new GraphState(List.of(thinking), Map.of()))
+                .messages().get(0);
+        assertEquals("推理过程", restored.thinking());
+        assertEquals("答", restored.text());
+        assertNull(restored.attribute("id", String.class));
+
+        AiMessage composite = AiMessage.builder()
+                .text("先查再答")
+                .thinking("需要先检索")
+                .toolExecutionRequests(List.of(dev.langchain4j.agent.tool.ToolExecutionRequest.builder()
+                        .id("call_7")
+                        .name("web_search")
+                        .arguments("{\"query\":\"x\"}")
+                        .build()))
+                .build();
+        AiMessage compositeRestored = (AiMessage) roundTrip(new GraphState(List.of(composite), Map.of()))
+                .messages().get(0);
+        assertEquals("需要先检索", compositeRestored.thinking());
+        assertEquals("先查再答", compositeRestored.text());
+        assertTrue(compositeRestored.hasToolExecutionRequests());
+        assertEquals("call_7", compositeRestored.toolExecutionRequests().get(0).id());
+        assertEquals("web_search", compositeRestored.toolExecutionRequests().get(0).name());
+    }
+
+    @Test
+    void aiSnapshotWithoutThinkingKeyStaysCompatible() {
+        // R2-F3 兼容读（#123 先例）：旧快照 ai 节点无 thinking 键 →
+        // thinking() 为 null，其余字段照常还原；不 bump VERSION。
+        GraphState legacy = GraphStateJson.fromJson("""
+                {"v":1,"messages":[
+                  {"type":"ai","content":"旧快照消息"}
+                ],"extra":{}}
+                """);
+        AiMessage old = (AiMessage) legacy.messages().get(0);
+        assertNull(old.thinking());
+        assertEquals("旧快照消息", old.text());
+        assertNull(old.attribute("id", String.class));
+
+        // 带 message_id/finish_reason 但无 thinking 的组合同样容忍。
+        GraphState audited = GraphStateJson.fromJson("""
+                {"v":1,"messages":[
+                  {"type":"ai","content":"回答","message_id":"msg-old","finish_reason":"stop"}
+                ],"extra":{}}
+                """);
+        AiMessage auditedRestored = (AiMessage) audited.messages().get(0);
+        assertNull(auditedRestored.thinking());
+        assertEquals("msg-old", auditedRestored.attribute("id", String.class));
+        assertEquals("stop", auditedRestored.attribute("finish_reason", String.class));
+        assertEquals("回答", auditedRestored.text());
+
+        // thinking 键为 JSON null / 空串均视作无（读侧容忍，不炸不误挂）。
+        GraphState nullThinking = GraphStateJson.fromJson("""
+                {"v":1,"messages":[
+                  {"type":"ai","content":"空推理","thinking":null}
+                ],"extra":{}}
+                """);
+        assertNull(((AiMessage) nullThinking.messages().get(0)).thinking());
+        GraphState emptyThinking = GraphStateJson.fromJson("""
+                {"v":1,"messages":[
+                  {"type":"ai","content":"空推理","thinking":""}
+                ],"extra":{}}
+                """);
+        assertNull(((AiMessage) emptyThinking.messages().get(0)).thinking());
+    }
+
+    @Test
+    void aiThinkingKeyWrittenOnlyWhenPresent() throws Exception {
+        // wire 形态锁定：无 thinking 的 AiMessage 不写 thinking 键（旧行为
+        // 逐字节不变，空串同样不写）；有 thinking 才写键且值原样。
+        String bare = GraphStateJson.toJson(new GraphState(
+                List.of(AiMessage.from("无推理")), Map.of()));
+        assertFalse(MAPPER.readTree(bare).get("messages").get(0).has("thinking"));
+
+        String empty = GraphStateJson.toJson(new GraphState(
+                List.of(AiMessage.builder().text("空推理").thinking("").build()), Map.of()));
+        assertFalse(MAPPER.readTree(empty).get("messages").get(0).has("thinking"));
+
+        String withThinking = GraphStateJson.toJson(new GraphState(
+                List.of(AiMessage.builder().text("答").thinking("推理过程").build()), Map.of()));
+        JsonNode node = MAPPER.readTree(withThinking).get("messages").get(0);
+        assertTrue(node.has("thinking"));
+        assertEquals("推理过程", node.get("thinking").asText());
+    }
 }
