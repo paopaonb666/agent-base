@@ -24,6 +24,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -244,6 +245,33 @@ class ContextEngineTest {
         // 纯文本口径回归：单文本块求和 = 全文计数（旧口径逐字节等价）。
         assertEquals(EstimatingTokenCounter.INSTANCE.countTokens("abcd"),
                 ContextEngine.countMessageTokens(UserMessage.from("abcd")));
+    }
+
+    @Test
+    void multiTextBlockUserMessageCountsJoinedOnce() {
+        // R2-F7：多文本块逐块求和存在 BPE 边界差（块边界把本属同一 token
+        // 的片段劈开）——以 '\n' 拼接后一次计数，与全文一次计数同口径。
+        // 切分点选 tokenizer 有边界差的位置："hello wor"+"ld"。
+        useEstimator();
+        var counter = EstimatingTokenCounter.INSTANCE;
+        UserMessage split = UserMessage.from(List.of(
+                dev.langchain4j.data.message.TextContent.from("hello wor"),
+                dev.langchain4j.data.message.TextContent.from("ld")));
+        // 拼接口径：count("hello wor\nld") = 3。
+        assertEquals(counter.countTokens("hello wor\nld"),
+                ContextEngine.countMessageTokens(split));
+        // 修复前的逐块求和口径（2+0=2）确实不同——锁定边界差真实存在。
+        assertNotEquals(counter.countTokens("hello wor") + counter.countTokens("ld"),
+                ContextEngine.countMessageTokens(split));
+        // 单文本块消息计数逐字节不变（拼接单元素=原串）。
+        assertEquals(counter.countTokens("abcd"),
+                ContextEngine.countMessageTokens(UserMessage.from("abcd")));
+        // 图片块照旧走固定估价累加，文本段与图片段并存互不干扰。
+        UserMessage mixed = UserMessage.from(List.of(
+                dev.langchain4j.data.message.TextContent.from("看图"),
+                dev.langchain4j.data.message.ImageContent.from("aGk=", "image/png")));
+        assertEquals(counter.countTokens("看图") + ImageTokenPolicy.TOKENS_PER_IMAGE,
+                ContextEngine.countMessageTokens(mixed));
     }
 
     @Test

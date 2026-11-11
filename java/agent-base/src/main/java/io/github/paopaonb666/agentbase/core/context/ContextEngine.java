@@ -289,21 +289,30 @@ public final class ContextEngine {
      * 单条消息的 token 计量（预算口径，#130）：文本块走 tokenCounter；
      * 多模态 UserMessage 的图片块按 {@link io.github.paopaonb666.agentbase.core.text.ImageTokenPolicy}
      * 固定估价（"[image]" 占位是渲染语义，不用于计费——一张真实图片数千
-     * token，按 2 token 计会让修剪触发点严重失真）。非多模态消息与旧口径
-     * 逐字节等价（单文本块求和 = 全文计数）。
+     * token，按 2 token 计会让修剪触发点严重失真）。
+     *
+     * <p>R2-F7 口径修正：多文本块不再逐块 countTokens 求和——逐块切分处
+     * 各自起止 token，与全文一次计数存在 BPE 边界差（块边界把本属同一
+     * token 的片段劈开）。文本块以 {@code '\n'} 拼接（块间补换行）后
+     * <b>一次</b> countTokens，与全文一次计数同口径；拼接单元素=原串，
+     * 单文本块消息计数逐字节不变。图片块照旧逐块固定估价累加。
      */
     public static int countMessageTokens(ChatMessage message) {
         if (message instanceof UserMessage user) {
             int total = 0;
+            StringBuilder text = new StringBuilder();
             for (dev.langchain4j.data.message.Content content : user.contents()) {
-                if (content instanceof dev.langchain4j.data.message.TextContent text) {
-                    total += tokenCounter.countTokens(text.text());
+                if (content instanceof dev.langchain4j.data.message.TextContent block) {
+                    if (text.length() > 0) {
+                        text.append('\n');
+                    }
+                    text.append(block.text());
                 } else if (content instanceof dev.langchain4j.data.message.ImageContent image) {
                     total += io.github.paopaonb666.agentbase.core.text.ImageTokenPolicy
                             .estimate(image.image().mimeType());
                 }
             }
-            return total;
+            return total + tokenCounter.countTokens(text.toString());
         }
         return tokenCounter.countTokens(contentText(message));
     }
