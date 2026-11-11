@@ -117,6 +117,21 @@ public final class SseStreams {
     }
 
     /**
+     * 超时形态（review R1-F7）：{@code timeoutMillis > 0} 时 emitter 按该
+     * 时长超时（Servlet 容器侧 {@code AsyncContext.setTimeout}），到点触发
+     * onTimeout → shutdown（打断生产者/心跳）→ produce 的 finally 恰好
+     * 一次执行 onTerminate（#79 并发闸门释放）——半开连接（客户端断网无
+     * RST）不再无限占用闸门额度。0 或负 = 不超时（Spring/Servlet 的 0 =
+     * 永不超时；Python 无超时语义，默认行为逐字节不变）。
+     */
+    public static SseEmitter open(CompiledGraph graph, java.util.List<dev.langchain4j.data.message.ChatMessage> messagesInput,
+                                  java.util.Map<String, Object> extra, RunConfig config, String userThreadId,
+                                  Runnable onComplete, Runnable onTerminate, long timeoutMillis) {
+        return open(graph, messagesInput, extra, config, userThreadId, onComplete, onTerminate,
+                timeoutMillis > 0 ? new SseEmitter(timeoutMillis) : new SseEmitter(0L));
+    }
+
+    /**
      * 全参形态（#79）：{@code onTerminate} 是 run 终态钩子——produce 的
      * finally 里恰好执行一次（正常/失败/取消全路径），并发闸门在此退出。
      */

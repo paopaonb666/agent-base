@@ -340,4 +340,21 @@ class SettingsRootFieldsTest {
         assertTrue(error.getMessage().contains("AGENT_TOOL_LOOP_THRESHOLD"),
                 "拒绝文案要点名出错键：" + error.getMessage());
     }
+
+    @Test
+    void agentSseTimeoutSecondsParsesWithZeroMeaningDisabled() {
+        // R1-F7：SSE emitter 超时秒数（Java 侧扩展，Python 无对应键）——
+        // 半开连接在容器兜底前一直占 #79 闸门额度。默认 0 = 关闭（行为
+        // 不变）；0 是合法值（开关语义）；负数解析期 fail-fast。
+        assertEquals(0, Settings.load(Map.of("ENV", "development"), null).agentSseTimeoutSeconds);
+        assertEquals(30, Settings.load(Map.of(
+                "ENV", "development", "AGENT_SSE_TIMEOUT_SECONDS", "30"), null).agentSseTimeoutSeconds);
+        assertEquals(0, Settings.load(Map.of(
+                "ENV", "development", "AGENT_SSE_TIMEOUT_SECONDS", "0"), null).agentSseTimeoutSeconds);
+        Settings.SettingsError error = assertThrows(Settings.SettingsError.class,
+                () -> Settings.load(Map.of(
+                        "ENV", "development", "AGENT_SSE_TIMEOUT_SECONDS", "-1"), null));
+        assertTrue(error.getMessage().contains("AGENT_SSE_TIMEOUT_SECONDS"),
+                "拒绝文案要点名出错键：" + error.getMessage());
+    }
 }

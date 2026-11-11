@@ -452,8 +452,11 @@ public class AgentsRoutes {
                     effectiveExtra.putIfAbsent(e.getKey(), e.getValue());
                 }
             }
+            // R1-F7：SSE emitter 可选超时（0 = 关闭，行为不变）——半开连接
+            // （无 RST）不再无限占 #79 闸门额度。秒 → 毫秒：先升 long 再乘
+            // （int * 1000L，溢出不进门）。
             SseEmitter emitter = SseStreams.open(graph, messagesInput, effectiveExtra, config, userThreadId,
-                    onComplete, runGate::exit);
+                    onComplete, runGate::exit, runtime.settings().agentSseTimeoutSeconds * 1000L);
             opened = true;
             return emitter;
         } finally {

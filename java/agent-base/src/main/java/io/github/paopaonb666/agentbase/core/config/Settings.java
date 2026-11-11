@@ -115,6 +115,14 @@ public final class Settings {
      * 默认 32 对单机部署是保守健康值。
      */
     public int agentRunConcurrency = 32;
+    /**
+     * SSE emitter 超时秒数（review R1-F7）：半开连接（客户端断网无 RST）
+     * 不会触发 onError/onCompletion，在容器兜底前会一直占 #79 并发闸门
+     * 额度——配置后 emitter 到点超时，触发 onTimeout → shutdown（打断
+     * 生产者/心跳）→ produce 的 finally 恰好一次执行 onTerminate 释放
+     * 闸门。0 = 关闭（默认，行为不变）。Python 无对应键，Java 侧扩展。
+     */
+    public int agentSseTimeoutSeconds = 0;
 
     public final LlmSettings llm = new LlmSettings();
     public final LlmFastSettings llmFast = new LlmFastSettings();
@@ -548,7 +556,7 @@ public final class Settings {
         // 根级字段的 env/dotenv 键可能全大写（AGENT_MODULES）：归一小写。
         for (String key : List.of("agent_modules", "agent_module_packages", "cors_origins", "env",
                 "agent_recursion_limit", "agent_handoff_max_per_run", "agent_tool_loop_threshold",
-                "rate_limit_per_minute", "agent_run_concurrency")) {
+                "rate_limit_per_minute", "agent_run_concurrency", "agent_sse_timeout_seconds")) {
             String up = key.toUpperCase(Locale.ROOT);
             if (out.containsKey(up) && !out.containsKey(key)) {
                 out.put(key, out.remove(up));
@@ -609,6 +617,13 @@ public final class Settings {
                     throw new SettingsError("AGENT_RUN_CONCURRENCY must be >= 0 (0 = unlimited), got %d".formatted(value));
                 }
                 s.agentRunConcurrency = value;
+            }
+            if (vals.containsKey("agent_sse_timeout_seconds")) {
+                int value = requireInt("agent_sse_timeout_seconds", vals.get("agent_sse_timeout_seconds"));
+                if (value < 0) {
+                    throw new SettingsError("AGENT_SSE_TIMEOUT_SECONDS must be >= 0 (0 = disabled), got %d".formatted(value));
+                }
+                s.agentSseTimeoutSeconds = value;
             }
             switch (section) {
                 case "llm" -> applyLlm(s, vals);

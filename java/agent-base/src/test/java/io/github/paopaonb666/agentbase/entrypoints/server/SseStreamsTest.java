@@ -24,6 +24,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
@@ -356,5 +357,76 @@ class SseStreamsTest {
         queue.take();
         SseStreams.putUninterruptibly(queue, new Object(), cancelled);
         assertEquals(2, queue.size());
+    }
+
+    @Test
+    void timeoutFormSetsEmitterTimeoutAndDefaultStaysNeverTimeout() {
+        // R1-F7：超时形态把毫秒值原样交给 emitter（容器侧到点触发
+        // onTimeout）；默认 7 参形态维持 0 = 永不超时（Spring/Servlet 语义，
+        // Python 无超时语义）——不配置时行为逐字节不变。
+        CompiledGraph graph = scriptGraph(List.of());
+        SseEmitter withTimeout = SseStreams.open(graph,
+                List.of(new dev.langchain4j.data.message.UserMessage("hi")),
+                Map.of(), new RunConfig("chat:sse-t13", "u1", 25), "sse-t13",
+                null, null, 1234L);
+        assertEquals(1234L, withTimeout.getTimeout().longValue());
+        SseEmitter defaulted = SseStreams.open(graph,
+                List.of(new dev.langchain4j.data.message.UserMessage("hi")),
+                Map.of(), new RunConfig("chat:sse-t14", "u1", 25), "sse-t14",
+                null, (Runnable) null);
+        assertEquals(0L, defaulted.getTimeout().longValue());
+    }
+
+    @Test
+    void emitterTimeoutRunsShutdownAndReleasesRunGateExactlyOnce() throws Exception {
+        // R1-F7（P1）：半开连接（无 RST）占 #79 闸门额度——onTimeout 必须
+        // 挂与 onCompletion 同一个 shutdown（置取消态 + 打断生产者/心跳），
+        // produce 的 finally 恰好一次执行 onTerminate（闸门 exit）。重复触发
+        // shutdown 幂等（重复 interrupt 无害）；若 exit 被重复执行，inFlight
+        // 会被打成负值（RunGate.exit 无守卫递减），下方断言即失败。
+        RunGate gate = new RunGate(1);
+        assertTrue(gate.tryEnter());
+        SseEmitter emitter = Mockito.mock(SseEmitter.class);
+        AtomicReference<Runnable> onCompletionCallback = new AtomicReference<>();
+        AtomicReference<Runnable> onTimeoutCallback = new AtomicReference<>();
+        Mockito.doAnswer(inv -> {
+            onCompletionCallback.set(inv.getArgument(0));
+            return null;
+        }).when(emitter).onCompletion(any(Runnable.class));
+        Mockito.doAnswer(inv -> {
+            onTimeoutCallback.set(inv.getArgument(0));
+            return null;
+        }).when(emitter).onTimeout(any(Runnable.class));
+        AtomicInteger terminates = new AtomicInteger();
+        // 节点自旋到取消（模拟在途 LLM 工作）：shutdown 中断传导后节点退出，
+        // produce 走到 finally 释放闸门。
+        AgentModule.ModuleContext ctx = new AgentModule.ModuleContext(
+                new Settings(), null, new InMemoryCheckpointer(), List.of(), null, null);
+        CompiledGraph spinner = GraphBuilder.begin()
+                .addNode("spin", (GraphState state, NodeContext nodeCtx) -> {
+                    long deadline = System.currentTimeMillis() + 8000;
+                    while (!nodeCtx.cancelled() && System.currentTimeMillis() < deadline) {
+                        Thread.sleep(20);
+                    }
+                    return Map.of();
+                })
+                .entry("spin")
+                .addEdge("spin", GraphBuilder.END)
+                .compile(ctx.checkpointer(), "chat");
+        SseStreams.open(spinner, List.of(new dev.langchain4j.data.message.UserMessage("hi")),
+                Map.of(), config(), "sse-t15", null, () -> {
+                    terminates.incrementAndGet();
+                    gate.exit();
+                }, emitter);
+
+        assertNotNull(onTimeoutCallback.get(), "onTimeout 回调应已注册");
+        assertSame(onCompletionCallback.get(), onTimeoutCallback.get(),
+                "onTimeout 必须挂同一个 shutdown（与 onCompletion 同引用）");
+        onTimeoutCallback.get().run(); // 模拟容器超时触发
+        onTimeoutCallback.get().run(); // 重复触发：shutdown 幂等，闸门不得重复释放
+        assertTrue(await(() -> gate.inFlight() == 0),
+                "超时 → shutdown → produce finally → onTerminate 应释放闸门");
+        assertEquals(0, gate.inFlight(), "重复触发不得把闸门打到负值（exit 未重复执行）");
+        assertEquals(1, terminates.get(), "onTerminate 应恰好执行一次");
     }
 }
