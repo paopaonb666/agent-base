@@ -163,13 +163,14 @@
               <goal>check</goal>
             </goals>
             <configuration>
-              <!-- 覆盖率门演进（#310→#93）：52%（起步）→ 75%（2026-11-11，
-                   #93 收紧——两 bundle 实测达标）。80% 余量 ≈650 行，最大
-                   缺口：Settings 224、MemoryApiController 143、MemoryOpsCli
-                   107、AgentsRoutes 54、Observability 53、JsonQueryTool 49
-                   ——可测目标；MysqlCheckpointer/MysqlCoreStore/
-                   MysqlMemoryStore/MySqlUploadedFileStore（~350 行）需活体
-                   MySQL 服务器，暂不可测。收紧时只需改本行。 -->
+              <!-- 覆盖率门演进（#310→#93→下一周期批6）：52%（起步）→
+                   75%（2026-11-11）→ 78%（2026-11-12，批1-5 测试落齐后
+                   实测 0.7859/0.7915 达标）。80% 余量 ≈90 行，最大缺口：
+                   Settings 剩余（applyMcp/applySearch 错误分支）、
+                   CliMain 68、AgentsRoutes 65、Observability 53、
+                   JsonQueryTool 49——可测目标；MysqlCheckpointer/
+                   MysqlCoreStore/MysqlMemoryStore/MySqlUploadedFileStore
+                   （~350 行）需活体 MySQL 服务器，暂不可测。收紧只需改本行。 -->
               <rules>
                 <rule>
                   <element>BUNDLE</element>
@@ -177,7 +178,7 @@
                     <limit>
                       <counter>LINE</counter>
                       <value>COVEREDRATIO</value>
-                      <minimum>0.75</minimum>
+                      <minimum>0.78</minimum>
                     </limit>
                   </limits>
                 </rule>
