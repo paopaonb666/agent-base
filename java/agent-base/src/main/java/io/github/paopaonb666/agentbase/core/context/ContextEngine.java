@@ -154,7 +154,6 @@ public final class ContextEngine {
      *
      * <p>事件/审计分离不变式天然保持：spill 发生在池外组装点，池内的
      * resultText/ToolCallEvent/审计记录仍是原文。
-     *
      * @param toolName       工具名（外置行的 filename）
      * @param output         工具原始输出
      * @param fileStore      附件存储；null = 外置停用（原样返回）
@@ -321,6 +320,13 @@ public final class ContextEngine {
      * 超窗请求会被 provider 直接拒绝；未配置窗口（0）沿用
      * {@code memory.contextMaxTokens} 现状，行为逐字节不变。
      *
+     * <p>R2-F1 极小窗口钳制：floor 恒不高于窗口本身（钳制
+     * {@code min(下限, window)}）——window &lt; 1024 时旧 floor
+     * {@code max(1024, 窗口 - 输出预留)} 会把预算抬过窗口（超窗请求被
+     * provider 直接拒绝）；钳制后极小窗口预算=窗口，不再超窗。窗口 ≥ 下限
+     * 时行为不变（{@code min(1024, window)=1024}，与旧 floor 同值）。
+     * {@link #budgetAfterSystem} 委托本方法，自动跟随。
+     *
      * <p>条目 15 HISTORY 域：{@code memory.contextBudgetHistoryTokens > 0}
      * 时在结果上追加一段 min 封顶——历史体（尾部预算段）的<b>独立上限</b>，
      * 与窗口无关（window=0 路径同样生效）；预算退化到极小时由
@@ -332,7 +338,8 @@ public final class ContextEngine {
         int window = llm == null ? 0 : llm.contextWindowTokens();
         int budget = window <= 0
                 ? memoryBudget
-                : Math.min(memoryBudget, Math.max(MIN_INPUT_BUDGET, window - OUTPUT_RESERVE_TOKENS));
+                : Math.min(memoryBudget, Math.max(Math.min(MIN_INPUT_BUDGET, window),
+                        window - OUTPUT_RESERVE_TOKENS));
         if (settings.memory.contextBudgetHistoryTokens > 0) {
             budget = Math.min(budget, settings.memory.contextBudgetHistoryTokens);
         }

@@ -208,6 +208,23 @@ class ContextEngineTest {
     }
 
     @Test
+    void resolveInputBudgetClampsFloorToTinyWindow() {
+        // R2-F1 极小窗口：window < 下限(1024) 时旧 floor
+        // max(1024, 窗口-输出预留) 会把预算抬过窗口——超窗请求被 provider
+        // 直接拒绝。钳制后 floor 恒不高于窗口本身：极小窗口预算=窗口。
+        var settings = new io.github.paopaonb666.agentbase.core.config.Settings();
+        // window=800 < 下限：预算=800（修复前被 floor 抬到 1024）。
+        assertEquals(800, ContextEngine.resolveInputBudget(settings, stubRuntime(800)));
+        // window=5000：窗口-预留=904 < 下限 → 下限 1024 兜底（既有形态不回归）。
+        assertEquals(1024, ContextEngine.resolveInputBudget(settings, stubRuntime(5000)));
+        // window=32000：窗口-预留=27904 > 下限 → floor 不介入（既有形态不回归）。
+        // 抬高 memoryBudget 让窗口推导值可见——默认 12000 会先被 memoryBudget 封顶。
+        settings.memory.contextMaxTokens = 40_000;
+        assertEquals(32000 - ContextEngine.OUTPUT_RESERVE_TOKENS,
+                ContextEngine.resolveInputBudget(settings, stubRuntime(32000)));
+    }
+
+    @Test
     void imageContentCountsFixedEstimateInBudget() {
         // #130：图片块按固定估价（1500）计入预算——"[image]" 占位只是渲染
         // 语义，按 2 token 计会让多模态轮次的修剪触发点严重失真。
