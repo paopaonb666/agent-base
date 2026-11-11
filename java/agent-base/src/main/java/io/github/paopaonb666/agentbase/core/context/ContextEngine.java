@@ -84,7 +84,7 @@ public final class ContextEngine {
      * 内容，#84 标记随内容叠加）。
      */
     private static final java.util.Set<String> EXTERNAL_DATA_TOOLS =
-            java.util.Set.of("web_search", "knowledge_search", "read_tool_result");
+            java.util.Set.of("web_search", "knowledge_search", ToolResultLimits.READ_TOOL_NAME);
     /** MCP 工具前缀：server 行为不可知，默认视为外部数据（最不可信面）。 */
     private static final String MCP_TOOL_PREFIX = "mcp_";
 
@@ -154,6 +154,17 @@ public final class ContextEngine {
      *
      * <p>事件/审计分离不变式天然保持：spill 发生在池外组装点，池内的
      * resultText/ToolCallEvent/审计记录仍是原文。
+     *
+     * <p>R4-b 回读豁免：{@code read_tool_result} 的返回<b>原样放行、绝不
+     * 外置</b>——回读页长已由
+     * {@link io.github.paopaonb666.agentbase.toolkit.ToolResultLimits#READ_PAGE_MAX}
+     * （8000）自限，再对它外置 = 自引用放大（摘要块指引模型回读，回读页
+     * 又被外置成新摘要块——模型永远拿不到全文）+ 同一内容重复落库。豁免
+     * 做在本方法内部（工具名判据，常量单源
+     * {@link io.github.paopaonb666.agentbase.toolkit.ToolResultLimits#READ_TOOL_NAME}），
+     * Graphs / ExecuteNode 两个接线点同时生效；方向安全：放行的页仍受
+     * 页长上限约束，不会无限撑大上下文。
+     *
      * @param toolName       工具名（外置行的 filename）
      * @param output         工具原始输出
      * @param fileStore      附件存储；null = 外置停用（原样返回）
@@ -164,6 +175,11 @@ public final class ContextEngine {
     public static String spillIfNeeded(String toolName, String output,
                                        UploadedFileStore fileStore,
                                        String threadId, String userId, int thresholdChars) {
+        // R4-b 回读豁免（缘由见方法 javadoc）：回读页自限于 READ_PAGE_MAX，
+        // 再外置 = 自引用放大 + 重复落库。
+        if (ToolResultLimits.READ_TOOL_NAME.equals(toolName)) {
+            return output;
+        }
         if (output == null || output.isEmpty() || thresholdChars <= 0
                 || fileStore == null
                 || CharMetrics.len(output) <= thresholdChars) {

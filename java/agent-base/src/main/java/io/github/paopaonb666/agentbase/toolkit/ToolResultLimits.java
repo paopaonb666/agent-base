@@ -46,6 +46,15 @@ public final class ToolResultLimits {
     /** read_tool_result 单屏上限（码点；越界报错不钳制）。 */
     public static final int READ_PAGE_MAX = 8000;
 
+    /**
+     * read_tool_result 的工具名<b>单源</b>（R4-b）：{@link ReadToolResultTool#NAME}
+     * 回引本常量（反向形态会让常量落进工具类、而 ContextEngine 引用工具类
+     * 引入 core→toolkit 反向依赖，故常量收口在本文件）——ContextEngine
+     * spillIfNeeded 的回读豁免、EXTERNAL_DATA_TOOLS 封闭集合与本类共用
+     * 同一份名字，改名只动这一处。
+     */
+    public static final String READ_TOOL_NAME = "read_tool_result";
+
     /** 外置行存储上限（码点）：全文超限头部截断存入并在摘要块注记。 */
     public static final int MAX_STORED_CHARS = 200_000;
 }

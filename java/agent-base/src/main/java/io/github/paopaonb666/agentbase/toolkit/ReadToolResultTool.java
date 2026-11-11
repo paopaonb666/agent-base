@@ -35,7 +35,8 @@ import io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStore;
  */
 public final class ReadToolResultTool implements AgentTool {
 
-    public static final String NAME = "read_tool_result";
+    /** 与 {@link ToolResultLimits#READ_TOOL_NAME} 单源（改名只动常量一处）。 */
+    public static final String NAME = ToolResultLimits.READ_TOOL_NAME;
 
     /** 不存在/非属主的统一掩蔽文案（404 掩蔽风格）。 */
     static final String DENIED_TEXT = "引用不存在或无权访问";

@@ -635,6 +635,23 @@ class ContextEngineTest {
     }
 
     @Test
+    void spillIfNeededExemptsReadToolResultReadback() {
+        // R4-b：read_tool_result 的回读页长由 READ_PAGE_MAX(8000) 自限，再
+        // 对它外置 = 自引用放大（模型永远拿不到全文）+ 重复落库——豁免后
+        // 原样返回、零落库。（字面量锁定契约名，常量漂移即红。）
+        var store = new UploadedFileStores.MemoryUploadedFileStore();
+        String page = "r".repeat(5000); // 超外置阈值 4000
+        assertEquals(page, ContextEngine.spillIfNeeded(
+                "read_tool_result", page, store, "chat:t6", "u1", 4000));
+        assertEquals(0, store.listForUser("u1").size());
+        // 对照：同体量的普通工具结果仍外置（摘要块 + 落库 1 行）。
+        String summary = ContextEngine.spillIfNeeded(
+                "other_tool", page, store, "chat:t6", "u1", 4000);
+        assertTrue(summary.startsWith(ContextEngine.SPILL_SUMMARY_PREFIX), summary);
+        assertEquals(1, store.listForUser("u1").size());
+    }
+
+    @Test
     void isExternalDataToolCoversReadToolResultAndMcpFlag() {
         // read_tool_result 回读的正是外部内容 → 进封闭集合。
         assertTrue(ContextEngine.isExternalDataTool("read_tool_result"));
