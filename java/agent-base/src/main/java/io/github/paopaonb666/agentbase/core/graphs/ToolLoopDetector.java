@@ -1,6 +1,5 @@
 package io.github.paopaonb666.agentbase.core.graphs;
 
-import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.data.message.AiMessage;
@@ -11,6 +10,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.TreeMap;
 
 /**
@@ -30,7 +30,8 @@ import java.util.TreeMap;
  *       免 reset（对比 supervisor #68 的 HANDOFF_COUNT extra 通道需要每轮
  *       init 清零）；反向扫描窗口封顶 {@link #MAX_SCAN_ROUNDS} 防长历史 O(N)。</li>
  *   <li><b>key 归一</b>——{@code request.arguments()} 是 JSON 串，模型可能
- *       重排序键/变空白：Jackson parse → TreeMap → 规范串再比较
+ *       重排序键/变空白/换数字写法：Jackson parse → 递归归一（全深度键序
+ *       TreeMap + 数字形态 BigDecimal，L93）→ 规范串再比较
  *       （{@code ToolPool.jsonSafe} 先例；比较规范串即可，不做 hash 摘要，
  *       避免碰撞讨论）。解析失败（非法 JSON）退回原串比较。</li>
  *   <li><b>拦截形态</b>——被拦截的请求不执行（在 callAll 之前分桶，省成本
@@ -67,16 +68,49 @@ public final class ToolLoopDetector {
         return name + " " + canonicalArgs(argumentsJson);
     }
 
-    /** 参数的规范化串：parse → TreeMap → 序列化；失败退回原串（null 视作 "{}"）。 */
+    /**
+     * 参数的规范化串：parse → 递归归一 → 序列化；失败退回原串（null 视作
+     * "{}"）。归一是全深度的（L93/R4-b 收口）：旧实现的
+     * {@code TypeReference<TreeMap>} 只排序顶层键，嵌套对象保持原序
+     * （LinkedHashMap）、数字形态（1 vs 1.0）原样——两类同参请求可绕过
+     * 检测；现改为 {@link #normalize 递归归一} 后不再可绕（只会更严，
+     * 方向安全不误拦——值确实不同的请求归一后仍不同）。
+     */
     private static String canonicalArgs(String argumentsJson) {
         String raw = argumentsJson == null ? "{}" : argumentsJson;
         try {
-            TreeMap<String, Object> sorted = MAPPER.readValue(raw,
-                    new TypeReference<TreeMap<String, Object>>() {});
-            return MAPPER.writeValueAsString(sorted);
+            Object parsed = MAPPER.readValue(raw, Object.class);
+            return MAPPER.writeValueAsString(normalize(parsed));
         } catch (Exception e) {
             return raw;
         }
+    }
+
+    /**
+     * 递归归一：Map → 键 String 化的 TreeMap（键序全深度稳定）；List →
+     * 逐元素归一（元素序保留——数组位置有语义，不排序）；数字统一走
+     * {@code BigDecimal.stripTrailingZeros}（1 / 1.0 / 1.00 归一同形）。
+     * 其余标量（字符串/布尔/null）原样。
+     */
+    private static Object normalize(Object value) {
+        if (value instanceof Map<?, ?> map) {
+            TreeMap<String, Object> out = new TreeMap<>();
+            for (Map.Entry<?, ?> e : map.entrySet()) {
+                out.put(String.valueOf(e.getKey()), normalize(e.getValue()));
+            }
+            return out;
+        }
+        if (value instanceof List<?> list) {
+            List<Object> out = new ArrayList<>(list.size());
+            for (Object item : list) {
+                out.add(normalize(item));
+            }
+            return out;
+        }
+        if (value instanceof Number n) {
+            return new java.math.BigDecimal(n.toString()).stripTrailingZeros();
+        }
+        return value;
     }
 
     /** 一批请求的 key 列表（按请求序，与逐位比对配套）。 */

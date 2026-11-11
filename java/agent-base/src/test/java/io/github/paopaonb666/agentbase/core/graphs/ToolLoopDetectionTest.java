@@ -320,4 +320,63 @@ class ToolLoopDetectionTest {
         assertTrue(!ToolLoopDetector.allInterceptedAfterRound(partial, threshold),
                 "同批混入新请求（未被拦截）→ 路由回 agent");
     }
+
+    /** 5e. L93/R4-b 归一收口：嵌套键序与数字形态归一同 key；值不同仍不同。 */
+    @Test
+    void canonicalKeyTreatsNestedKeyOrderAndNumericFormAsSame() {
+        // 嵌套对象键序：旧实现只排顶层、嵌套保持原序——现全深度归一。
+        assertEquals(ToolLoopDetector.canonicalKey("probe", "{\"a\":{\"x\":1,\"y\":2}}"),
+                ToolLoopDetector.canonicalKey("probe", "{\"a\":{\"y\":2,\"x\":1}}"),
+                "嵌套对象键序不同应归一为同 key");
+        // 数字形态：1 / 1.0 / 1.00 同 key（1e0 亦然）。
+        assertEquals(ToolLoopDetector.canonicalKey("probe", "{\"n\":1}"),
+                ToolLoopDetector.canonicalKey("probe", "{\"n\":1.0}"),
+                "数字 1 vs 1.0 应归一为同 key");
+        assertEquals(ToolLoopDetector.canonicalKey("probe", "{\"n\":1.0}"),
+                ToolLoopDetector.canonicalKey("probe", "{\"n\":1.00}"),
+                "数字 1.0 vs 1.00 应归一为同 key");
+        assertEquals(ToolLoopDetector.canonicalKey("probe", "{\"n\":1}"),
+                ToolLoopDetector.canonicalKey("probe", "{\"n\":1e0}"),
+                "数字 1 vs 1e0 应归一为同 key");
+        // 归一递归穿 List：数组内对象的键序同样归一（元素序本身保留）。
+        assertEquals(ToolLoopDetector.canonicalKey("probe", "{\"l\":[{\"b\":1,\"a\":2}]}"),
+                ToolLoopDetector.canonicalKey("probe", "{\"l\":[{\"a\":2,\"b\":1}]}"),
+                "数组内嵌套对象键序不同应归一为同 key");
+        // 方向安全：值确实不同 → 归一后仍不同（不误拦）。
+        assertNotEquals(ToolLoopDetector.canonicalKey("probe", "{\"a\":{\"x\":1}}"),
+                ToolLoopDetector.canonicalKey("probe", "{\"a\":{\"x\":2}}"),
+                "嵌套值不同必须仍是不同 key");
+        assertNotEquals(ToolLoopDetector.canonicalKey("probe", "{\"n\":1}"),
+                ToolLoopDetector.canonicalKey("probe", "{\"n\":2}"),
+                "数值不同必须仍是不同 key");
+        assertNotEquals(ToolLoopDetector.canonicalKey("probe", "{\"l\":[1,2]}"),
+                ToolLoopDetector.canonicalKey("probe", "{\"l\":[2,1]}"),
+                "数组元素序有语义：换序是不同参数");
+    }
+
+    /** 5f. L93 端到端：跨轮换数字写法（1 → 1.0 → 1.00）的同参请求仍被拦截。 */
+    @Test
+    void numericFormVariationStillInterceptedEndToEnd() {
+        CountingTool probe = new CountingTool("probe");
+        List<AiMessage> script = List.of(
+                aiWithCalls(call("c1", "probe", "{\"q\":{\"a\":1}}")),
+                aiWithCalls(call("c2", "probe", "{\"q\":{\"a\":1.0}}")),
+                aiWithCalls(call("c3", "probe", "{\"q\":{\"a\":1.00}}")));
+        CompiledGraph graph = Graphs.buildSingleAgentGraph(
+                ctx(settings(null), scriptedLlm(script).get(), List.of(probe)),
+                "chat", null, null);
+        CompiledGraph.RunOutcome outcome = graph.streamWithTermination(
+                new GraphState(List.of(UserMessage.from("开始")), Map.of()),
+                RunConfig.of("chat:t55", "u1"), null);
+        assertEquals(io.github.paopaonb666.agentbase.extensions.events.Events.RunTermination.DONE,
+                outcome.termination(), "全拦截 → 条件边 END");
+        GraphState out = outcome.state();
+
+        assertEquals(2, probe.calls.get(), "数字写法换形态不重置连续计数：第 3 次被拦截");
+        List<ToolExecutionResultMessage> toolMessages = toolMessages(out);
+        assertEquals(3, toolMessages.size());
+        assertEquals(ToolLoopDetector.loopHintText("probe", 2), toolMessages.get(2).text(),
+                "第 3 条 ToolMessage 是结构化收敛提示");
+        assertAllToolCallsPaired(out);
+    }
 }
