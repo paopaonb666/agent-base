@@ -29,6 +29,7 @@ import java.util.concurrent.CountDownLatch;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -384,6 +385,88 @@ class AgentsRoutesTest {
             }
         }
         assertTrue(last == null, "run 完成后闸门应已释放" + (last == null ? "" : "：" + last.getMessage()));
+    }
+
+    @Test
+    void runGateRejectionDoesNotClaimThreadIndex() throws Exception {
+        // review R1-F6：闸门判定提前到线程索引 claim 之前——饱和 429 的请求
+        // 不认领/不刷新线程索引（幽灵活跃痕迹消失）；释放后恢复且认领照常。
+        // 形态同上一条闸门测试（AGENT_RUN_CONCURRENCY=1 + 阻塞节点占满），
+        // 另传线程索引（buildRuntime 第 3 参）：MemoryCoreStore 为 final 不可
+        // 子类化，计数桩用 CoreStore 动态代理委托真实 MemoryCoreStore 并统计
+        // claimThreadIndex 调用（与文件内既有 CoreStore 桩同形态）。
+        java.util.concurrent.CountDownLatch entered = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        AgentModule blocking = new AgentModule() {
+            @Override public String name() { return "chat"; }
+            @Override public String description() { return "blocking stub for gate claim ordering"; }
+            @Override public CompiledGraph buildGraph(ModuleContext ctx) {
+                return GraphBuilder.singleNode("chat", (state, nodeCtx) -> {
+                    entered.countDown();
+                    release.await(10, java.util.concurrent.TimeUnit.SECONDS);
+                    return Map.of();
+                }, ctx.checkpointer());
+            }
+            @Override public List<io.github.paopaonb666.agentbase.core.tools.AgentTool> getTools() {
+                return List.of();
+            }
+        };
+        var backing = new io.github.paopaonb666.agentbase.core.storage.MemoryCoreStore();
+        java.util.concurrent.atomic.AtomicInteger claimCalls = new java.util.concurrent.atomic.AtomicInteger();
+        Object threadIndex = Proxy.newProxyInstance(
+                io.github.paopaonb666.agentbase.core.storage.CoreStore.class.getClassLoader(),
+                new Class<?>[]{io.github.paopaonb666.agentbase.core.storage.CoreStore.class},
+                (proxy, method, args) -> {
+                    if ("claimThreadIndex".equals(method.getName())) {
+                        claimCalls.incrementAndGet();
+                    }
+                    try {
+                        return method.invoke(backing, args);
+                    } catch (java.lang.reflect.InvocationTargetException e) {
+                        throw e.getCause();
+                    }
+                });
+        AgentRuntime runtime = buildRuntime(Settings.load(Map.of(
+                "ENV", "development", "AGENT_RUN_CONCURRENCY", "1")),
+                Map.of("chat", blocking), new InMemoryCheckpointer(),
+                threadIndex, null, null, null, null);
+        AgentsRoutes routes = route(runtime);
+
+        assertNotNull(invoke(routes, "chat", invokeBody("hi", "r1", null, null, null), "u1"));
+        assertTrue(entered.await(5, java.util.concurrent.TimeUnit.SECONDS), "阻塞节点应已进入");
+        // 首轮已恰一次认领 r1（invoke 返回前 claim 同步完成）。
+        assertEquals(1, claimCalls.get(), "首轮应恰一次认领：" + claimCalls.get());
+        assertNotNull(backing.getThreadIndex(
+                new io.github.paopaonb666.agentbase.core.ThreadId("chat", "r1").toString()));
+        // 在途 run 占满唯一额度：第二发 429 + Retry-After。
+        var second = new org.springframework.mock.web.MockHttpServletResponse();
+        HttpError error = httpErrorOf(() ->
+                invoke(routes, "chat", invokeBody("hi", "r2", null, null, null), "u1", second));
+        assertEquals(429, error.status());
+        assertEquals("5", second.getHeader("Retry-After"));
+        // R1-F6 核心断言：429 拒绝未认领——claim 计数不增，索引里没有 r2 的行
+        //（幽灵活跃痕迹消失；修复前该请求会先 claim 出 r2 行再撞闸门）。
+        assertEquals(1, claimCalls.get(), "闸门 429 不得认领线程索引：" + claimCalls.get());
+        assertNull(backing.getThreadIndex(
+                new io.github.paopaonb666.agentbase.core.ThreadId("chat", "r2").toString()));
+
+        // 释放阻塞节点 → run 完成 → 终态钩子退出闸门 → r3 正常恢复且认领照常。
+        release.countDown();
+        HttpError last = null;
+        for (int i = 0; i < 200; i++) {
+            try {
+                invoke(routes, "chat", invokeBody("hi", "r3", null, null, null), "u1");
+                last = null;
+                break;
+            } catch (HttpError e) {
+                last = e; // 释放传播有延迟：429 期让位重试
+                Thread.sleep(25);
+            }
+        }
+        assertTrue(last == null, "run 完成后闸门应已释放" + (last == null ? "" : "：" + last.getMessage()));
+        assertEquals(2, claimCalls.get(), "恢复后的 r3 应认领一次：" + claimCalls.get());
+        assertNotNull(backing.getThreadIndex(
+                new io.github.paopaonb666.agentbase.core.ThreadId("chat", "r3").toString()));
     }
 
     @Test

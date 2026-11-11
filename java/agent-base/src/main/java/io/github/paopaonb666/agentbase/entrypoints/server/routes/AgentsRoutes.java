@@ -381,71 +381,86 @@ public class AgentsRoutes {
         // proxy_buffering——缺了它 delta 会被缓冲到流结束才一次性下发。
         response.setHeader("Cache-Control", "no-cache");
         response.setHeader("X-Accel-Buffering", "no");
-        // 会话索引原子认领（S1）：标题取首条 human 消息前 60 字符。缺席则
-        // 按本用户插入，在席且属主一致则仅刷新 updated_at，属主不符则不
-        // 改动并以 404 拒绝——invoke 开头的预检与这里的认领之间属主被
-        // 并发改变（删除后被他人首发）由权威行兜底，属主永不翻转。
-        if (runtime.threadIndex() != null) {
-            String title = messagesInput.stream()
-                    .filter(m -> m instanceof UserMessage)
-                    .map(m -> MessageSerializers.extractText(m))
-                    .filter(t -> !t.isEmpty())
-                    .findFirst()
-                    .map(t -> t.substring(0, Math.min(60, t.length())))
-                    .orElse(userThreadId);
-            var claimed = runtime.threadIndex().claimThreadIndex(
-                    io.github.paopaonb666.agentbase.core.storage.ThreadIndexRecord.create(
-                            config.threadId(), userId, module, title));
-            if (!claimed.userId().equals(userId)) {
-                throw new HttpError(404, ErrorCode.NOT_FOUND, "线程不存在：" + userThreadId);
-            }
-        }
-        // 记忆形成（M6c）：轮次正常完成后在后台跑抽取/整合/画像/摘要。
-        Runnable onComplete = buildCaptureHook(module, userThreadId, graph, config);
-        // 附件元数据并入状态 extras（对应 Python 把 meta 挂在
-        // HumanMessage.additional_kwargs 随 checkpoint 持久化；langchain4j
-        // 消息对象无元数据承载，改由 extras 承载）。键用“绝对消息下标”
-        // （历史消息数 + 本轮输入下标）——按本轮下标键控会在第二轮起错位；
-        // attachments 键整表替换（extras 通道语义），所以先并入历史表。
-        Map<String, Object> attachmentsByIndex = new LinkedHashMap<>();
-        GraphState prior = graph.getState(config);
-        int base = prior == null ? 0 : prior.messages().size();
-        if (prior != null && prior.extra().get("attachments") instanceof Map<?, ?> priorAtt) {
-            for (Map.Entry<?, ?> e : priorAtt.entrySet()) {
-                attachmentsByIndex.put(String.valueOf(e.getKey()), e.getValue());
-            }
-        }
-        if (extra.get("attachments") instanceof Map<?, ?> newAtt) {
-            for (Map.Entry<?, ?> e : newAtt.entrySet()) {
-                int inputIdx;
-                try {
-                    inputIdx = Integer.parseInt(String.valueOf(e.getKey()));
-                } catch (NumberFormatException nfe) {
-                    continue;
-                }
-                attachmentsByIndex.put(String.valueOf(base + inputIdx), e.getValue());
-            }
-        }
-        Map<String, Object> effectiveExtra = new LinkedHashMap<>();
-        if (!attachmentsByIndex.isEmpty()) {
-            effectiveExtra.put("attachments", attachmentsByIndex);
-        }
-        // 非附件的种子键（#66 的 planner 延续）原样透传进图状态
-        for (Map.Entry<String, Object> e : extra.entrySet()) {
-            if (!"attachments".equals(e.getKey())) {
-                effectiveExtra.putIfAbsent(e.getKey(), e.getValue());
-            }
-        }
-        // 全局 run 并发闸门（#79）：开流前一刻才占额度——startStream 此后
-        // 无抛出路径，退出挂在 SSE 终态钩子上（produce 的 finally，全路径
-        // 恰好一次）。饱和快速失败（429+Retry-After），不排队。
+        // 全局 run 并发闸门（#79，review R1-F6）：判定提前到线程索引 claim
+        // 之前——429 拒绝的请求不再认领/刷新线程索引（幽灵活跃痕迹消失）。
+        // 限流令牌豁免不做（裁决）：#78 限流仍在流式入口先行，被闸门 429
+        // 的请求令牌已消耗，计数按「请求发出」口径语义保持。饱和快速失败
+        // （429+Retry-After），不排队。
         if (!runGate.tryEnter()) {
             response.setHeader("Retry-After", "5");
             throw new HttpError(429, ErrorCode.RUN_GATE_SATURATED, "服务并发已达上限（AGENT_RUN_CONCURRENCY="
                     + runGate.maxConcurrent() + "），请稍后重试");
         }
-        return SseStreams.open(graph, messagesInput, effectiveExtra, config, userThreadId,
-                onComplete, runGate::exit);
+        // tryEnter 成功后到开流之间仍有唯一常规抛出路径（下方 claim 属主
+        // 不符 404）：opened 标志保配对——开流成功前抛出在 finally 还回许可；
+        // 开流成功后退出权移交 SSE 终态钩子（produce 的 finally，正常/失败/
+        // 取消全路径恰好一次）。
+        boolean opened = false;
+        try {
+            // 会话索引原子认领（S1）：标题取首条 human 消息前 60 字符。缺席则
+            // 按本用户插入，在席且属主一致则仅刷新 updated_at，属主不符则不
+            // 改动并以 404 拒绝——invoke 开头的预检与这里的认领之间属主被
+            // 并发改变（删除后被他人首发）由权威行兜底，属主永不翻转。
+            if (runtime.threadIndex() != null) {
+                String title = messagesInput.stream()
+                        .filter(m -> m instanceof UserMessage)
+                        .map(m -> MessageSerializers.extractText(m))
+                        .filter(t -> !t.isEmpty())
+                        .findFirst()
+                        .map(t -> t.substring(0, Math.min(60, t.length())))
+                        .orElse(userThreadId);
+                var claimed = runtime.threadIndex().claimThreadIndex(
+                        io.github.paopaonb666.agentbase.core.storage.ThreadIndexRecord.create(
+                                config.threadId(), userId, module, title));
+                if (!claimed.userId().equals(userId)) {
+                    throw new HttpError(404, ErrorCode.NOT_FOUND, "线程不存在：" + userThreadId);
+                }
+            }
+            // 记忆形成（M6c）：轮次正常完成后在后台跑抽取/整合/画像/摘要。
+            Runnable onComplete = buildCaptureHook(module, userThreadId, graph, config);
+            // 附件元数据并入状态 extras（对应 Python 把 meta 挂在
+            // HumanMessage.additional_kwargs 随 checkpoint 持久化；langchain4j
+            // 消息对象无元数据承载，改由 extras 承载）。键用“绝对消息下标”
+            // （历史消息数 + 本轮输入下标）——按本轮下标键控会在第二轮起错位；
+            // attachments 键整表替换（extras 通道语义），所以先并入历史表。
+            Map<String, Object> attachmentsByIndex = new LinkedHashMap<>();
+            GraphState prior = graph.getState(config);
+            int base = prior == null ? 0 : prior.messages().size();
+            if (prior != null && prior.extra().get("attachments") instanceof Map<?, ?> priorAtt) {
+                for (Map.Entry<?, ?> e : priorAtt.entrySet()) {
+                    attachmentsByIndex.put(String.valueOf(e.getKey()), e.getValue());
+                }
+            }
+            if (extra.get("attachments") instanceof Map<?, ?> newAtt) {
+                for (Map.Entry<?, ?> e : newAtt.entrySet()) {
+                    int inputIdx;
+                    try {
+                        inputIdx = Integer.parseInt(String.valueOf(e.getKey()));
+                    } catch (NumberFormatException nfe) {
+                        continue;
+                    }
+                    attachmentsByIndex.put(String.valueOf(base + inputIdx), e.getValue());
+                }
+            }
+            Map<String, Object> effectiveExtra = new LinkedHashMap<>();
+            if (!attachmentsByIndex.isEmpty()) {
+                effectiveExtra.put("attachments", attachmentsByIndex);
+            }
+            // 非附件的种子键（#66 的 planner 延续）原样透传进图状态
+            for (Map.Entry<String, Object> e : extra.entrySet()) {
+                if (!"attachments".equals(e.getKey())) {
+                    effectiveExtra.putIfAbsent(e.getKey(), e.getValue());
+                }
+            }
+            SseEmitter emitter = SseStreams.open(graph, messagesInput, effectiveExtra, config, userThreadId,
+                    onComplete, runGate::exit);
+            opened = true;
+            return emitter;
+        } finally {
+            if (!opened) {
+                runGate.exit();
+            }
+        }
     }
 
     /** 构造轮次完成后的记忆形成回调（M6c）；管线不可用时返回 null。 */
