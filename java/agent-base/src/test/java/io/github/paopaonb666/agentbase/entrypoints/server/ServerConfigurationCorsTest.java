@@ -28,6 +28,9 @@ class ServerConfigurationCorsTest {
         new ServerConfiguration().corsConfigurer(new Settings()).addCorsMappings(registry);
 
         verify(registration).allowedMethods("GET", "POST", "DELETE", "HEAD", "OPTIONS");
+        // #227：暴露给前端消费面的响应头（限流/闸门 429 与忙 409 都带
+        // Retry-After；X-Request-ID 用于排障关联）。
+        verify(registration).exposedHeaders("X-Request-ID", "Retry-After");
         verify(registration).allowCredentials(false);
     }
 }
