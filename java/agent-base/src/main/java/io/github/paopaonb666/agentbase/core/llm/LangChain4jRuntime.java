@@ -215,7 +215,18 @@ public final class LangChain4jRuntime implements ModelRuntime {
                 ? List.of()
                 : aggregated.toolExecutionRequests();
         usageSink.accept(modelName, response.tokenUsage());
-        AiMessage rebuilt = new AiMessage(deltas.toString(), List.copyOf(toolRequests));
+        // R2-F6 收口：聚合产物的 attributes / thinking 随重造并入——文本仍以
+        // 回调累计为权威（显式重造契约不变），langchain4j 1.4 OpenAI 聚合产物
+        // 的 attributes 实际为空（≈零影响），并入是防患于 provider 行为变化
+        // （invoke/fallback 路径本就保留既有 attributes，流式重造不再丢弃）。
+        AiMessage rebuilt = aggregated == null
+                ? new AiMessage(deltas.toString(), List.copyOf(toolRequests))
+                : AiMessage.builder()
+                        .text(deltas.toString())
+                        .thinking(aggregated.thinking())
+                        .toolExecutionRequests(List.copyOf(toolRequests))
+                        .attributes(aggregated.attributes())
+                        .build();
         return withAuditMetadata(rebuilt, response.finishReason());
     }
 

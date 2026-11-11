@@ -102,6 +102,31 @@ class LangChain4jRuntimeTest {
     }
 
     @Test
+    void streamNativePreservesAggregatedAttributesAndThinking() {
+        // R2-F6：流式重造不再丢弃聚合产物的 attributes / thinking——invoke/
+        // fallback 路径本就保留，三条路径对称；文本仍以回调累计为权威。
+        AiMessage aggregated = AiMessage.builder()
+                .text("聚合文本")
+                .thinking("思考链")
+                .attributes(java.util.Map.of("provider_key", "pv"))
+                .build();
+        ScriptedModels.ScriptedStreamingModel streaming =
+                new ScriptedModels.ScriptedStreamingModel(List.of(
+                        ScriptedModels.ScriptedResponse.of(aggregated)));
+        LangChain4jRuntime runtime = new LangChain4jRuntime(
+                new ScriptedModels.ScriptedChatModel(List.of()), streaming, "scripted-main", false, null);
+        DeltaCapture capture = new DeltaCapture();
+        AiMessage result = runtime.stream(MESSAGES, List.of(), capture);
+
+        assertEquals("聚合文本", result.text(), "文本 = 回调累计（与聚合产物一致）");
+        assertEquals("思考链", result.thinking(), "thinking 随重造保留");
+        assertEquals("pv", result.attribute("provider_key", String.class),
+                "provider attributes 穿透（修复前被丢弃）");
+        assertTrue(result.attribute("id", String.class) != null,
+                "withAuditMetadata 的稳定 id 照常追加");
+    }
+
+    @Test
     void stalledStreamFailsFastWithIdleWatchdog() {
         // #74：provider 半途停止发 delta 且不结束——idle 看门狗让它快速
         // 失败（StreamStalledException），不再等 600s HTTP 总超时。
