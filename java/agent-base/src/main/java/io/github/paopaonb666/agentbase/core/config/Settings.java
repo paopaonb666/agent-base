@@ -300,6 +300,19 @@ public final class Settings {
          */
         public double salienceExemptThreshold = 0.9;
         /**
+         * 记忆检索两段式精排（#37，默认关）：recallMemories 在 minScore
+         * 双门槛之后、topK 截断之前，对过门槛的有证据候选做短名单内
+         * min-max 归一 + 权重重排（#181 豁免条目不参与精排、按原序排尾，
+         * 「仍保留」语义不变）。关闭时全链路零行为变化；Python 侧无此层。
+         */
+        public boolean rerankEnabled = false;
+        /**
+         * 精排短名单上限（#37）：Stage-1 排序后的前 N 条有证据候选进入
+         * 精排；实际池不小于 {@link #recallTopK}（池 &lt; k 时全量精排，
+         * 见 {@code Retrieval.rerankShortlist}）。必须 &gt; 0。
+         */
+        public int rerankPool = 24;
+        /**
          * 去重硬阈值预筛（#38）：候选进整合 LLM 裁决前先做余弦预筛——与
          * 既有记忆最高相似 > dedupSkipCosine 直接 NONE（内容几乎相同，省
          * 一次 LLM 调用）。默认开（#48 敏感红线同款默认-on 风格）；无
@@ -1082,6 +1095,16 @@ public final class Settings {
                 throw new SettingsError("MEMORY_SALIENCE_EXEMPT_THRESHOLD must be in [0, 1), got %s".formatted(value));
             }
             t.salienceExemptThreshold = value;
+        }
+        if (v.containsKey("rerank_enabled")) {
+            t.rerankEnabled = requireBool("rerank_enabled", v.get("rerank_enabled"));
+        }
+        if (v.containsKey("rerank_pool")) {
+            int value = requireInt("rerank_pool", v.get("rerank_pool"));
+            if (value <= 0) {
+                throw new SettingsError("MEMORY_RERANK_POOL must be > 0, got %d".formatted(value));
+            }
+            t.rerankPool = value;
         }
         if (v.containsKey("weight_vector")) {
             double value = requireFloat("weight_vector", v.get("weight_vector"));

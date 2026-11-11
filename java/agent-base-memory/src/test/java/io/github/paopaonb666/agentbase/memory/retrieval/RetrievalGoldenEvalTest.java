@@ -163,4 +163,62 @@ class RetrievalGoldenEvalTest {
                     entry[0] + " 的 golden 查询不应与内容逐字相同");
         }
     }
+
+    @Test
+    void goldenSetWithStageTwoRerankStaysAboveGate() {
+        // #37 Stage-2 精排：同 GOLDEN 语料走 scoreMemories → rerankShortlist
+        // （开关开，MEMORY_RERANK_ENABLED=true；pool 默认 24），度量循环与
+        // 上方基线用例同口径（top-5 内找 golden 目标）。
+        //
+        // 实测（2026-11-12，pool=24，RERANK_SPREAD_EPS=0.05）：
+        // recall@5 = 0.9167，MRR = 0.8658 —— **与基线逐值相等**（门限
+        // 0.90/0.75 全过）。信息门折叠的维度：recency（语料 updated_at
+        // 梯度仅 19 小时，14 天半衰期下原值 spread≈0.038 < 0.05）与
+        // salience（全员 0.5，spread=0）；keyword 维度按查询证据数分化——
+        // 证据 ≥5 条的查询 rrf spread ≥ 1-61/65 ≈ 0.0615 存活（精排序 =
+        // 纯 kw 通道序），证据 ≤4 条的查询 spread < 0.05 同被折叠成全并列
+        // （保持 Stage-1 原序）。修复前（无信息门，min-max 无条件拉满）
+        // 曾实测 0.8833/0.7708：recency 噪音被放大成 0.15 权重主导因子，
+        // 把 m12/m18 两条 Stage-1 边缘命中挤出 top-5——信息门即为此而设。
+        Settings settings = Settings.load(java.util.Map.of(
+                "ENV", "development",
+                "MEMORY_RERANK_ENABLED", "true"), null);
+        double now = 1_800_000_000.0;
+        List<MemoryRecord> corpus = new ArrayList<>(GOLDEN.length);
+        for (int i = 0; i < GOLDEN.length; i++) {
+            corpus.add(record(GOLDEN[i][0], GOLDEN[i][1], now - (i % 20) * 3600.0));
+        }
+
+        int hits = 0;
+        double reciprocalSum = 0.0;
+        List<String> misses = new ArrayList<>();
+        for (String[] entry : GOLDEN) {
+            String expectedId = entry[0];
+            String query = entry[2];
+            List<ScoredMemory> base = Retrieval.scoreMemories(corpus, query, null, now,
+                    settings.memory.timeDecayHalfLifeDays, Retrieval.Weights.DEFAULT);
+            List<ScoredMemory> ranked = Retrieval.rerankShortlist(base, settings);
+            int rank = -1;
+            for (int k = 0; k < Math.min(5, ranked.size()); k++) {
+                if (ranked.get(k).record().memoryId().equals(expectedId)) {
+                    rank = k + 1;
+                    break;
+                }
+            }
+            if (rank > 0) {
+                hits++;
+                reciprocalSum += 1.0 / rank;
+            } else {
+                misses.add(expectedId + " ← 「" + query + "」");
+            }
+        }
+        double recallAt5 = hits / (double) GOLDEN.length;
+        double mrr = reciprocalSum / GOLDEN.length;
+        assertTrue(recallAt5 >= RECALL_AT_5_GATE,
+                "rerank recall@5 = %.3f < 门限 %.2f；未命中：%s".formatted(
+                        recallAt5, RECALL_AT_5_GATE, misses));
+        assertTrue(mrr >= MRR_GATE,
+                "rerank MRR = %.3f < 门限 %.2f；未命中：%s".formatted(
+                        mrr, MRR_GATE, misses));
+    }
 }

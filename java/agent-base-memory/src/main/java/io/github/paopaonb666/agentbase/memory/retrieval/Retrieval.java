@@ -522,6 +522,128 @@ public final class Retrieval {
                 config.memory.timeDecayHalfLifeDays, Weights.fromSettings(config));
     }
 
+    // ── Stage-2 精排（#37）──────────────────────────────────────────
+
+    /**
+     * 精排参与归一的四个分量（求和顺序固定，浮点确定性同
+     * {@code hybridScores} 的分量装配序）。
+     */
+    private static final List<String> RERANK_DIMS = List.of("keyword", "recency", "salience", "vector");
+
+    /**
+     * 显著性信息门（#37）：分量天然值域 [0,1]，spread 不足全量程 5%
+     * 视为<b>无信息维度</b>，归一值恒 0.5——与「全等 → 0.5」退化规则
+     * 的连续化；防「近全等」噪音被 min-max 放大成主导因子（golden 语料
+     * 19 小时 recency 梯度 spread≈0.038 曾把 0.15 权重拉满，实测教训）。
+     */
+    private static final double RERANK_SPREAD_EPS = 0.05;
+
+    /**
+     * Stage-2 精排（#37，{@code MEMORY_RERANK_ENABLED} 默认关）：插在
+     * {@link #recallMemories} 的「minScore 双门槛列表 → topK 截断」之间，
+     * 对过门槛候选做可选精排。
+     *
+     * <p>行为（k = {@code config.memory.recallTopK}；开关关或
+     * {@code gated.size() <= k} 时<b>原样返回</b>，零行为变化）：
+     *
+     * <ol>
+     * <li>按 Stage-1 顺序分离<b>有证据候选</b>（keyword&gt;0 或 vector&gt;0）
+     *     与<b>豁免候选</b>（无证据但过门槛的 #181 条目）；</li>
+     * <li>有证据候选取前 {@code max(rerankPool, k)} 条构成短名单（池下限
+     *     = k：pool &lt; k 时全量精排，top-k 名额不因池配置丢候选）；</li>
+     * <li>短名单内对 keyword/recency/salience/vector 四分量各做 min-max
+     *     归一（分量天然值域 [0,1]，spread 不足全量程 5%
+     *     （{@code RERANK_SPREAD_EPS}）视为<b>无信息维度</b>——单候选、
+     *     全等与近全等一样归一值恒 0.5，防「近全等」噪音被 min-max 放大
+     *     成主导因子；分量缺失 = 不参与该维度——归一统计与加权和都
+     *     跳过），按 {@link Weights#fromSettings} 加权和重排（并列保持
+     *     Stage-1 原序）；</li>
+     * <li>池外有证据候选按原序拼接在精排短名单之后（独立调用本方法时的
+     *     信息保真；k 截断后不可见），豁免候选按原序排尾——#181
+     *     「仍保留（排尾）」语义不变；</li>
+     * <li>截 k 返回。</li>
+     * </ol>
+     *
+     * <p>与 Stage-1 的分工：{@link #hybridScores} 的 RRF 分数是通道内
+     * <b>排名</b>的相对值（同一条记忆的分数随候选集增删浮动），适合做
+     * 门槛；精排在短名单内把四分量拉回可比量纲（min-max 归一），让
+     * recency/salience 先验与证据通道在候选间<b>相对</b>强弱上重新仲裁。
+     * 质量由 #44 golden 门（recall@5/MRR 不降）守护。注意精排截断口径是
+     * {@code recallTopK}：显式 topK 大于它的 {@code recallMemories} 调用
+     * 在开启精排时至多得到 {@code recallTopK} 条。
+     */
+    public static List<ScoredMemory> rerankShortlist(List<ScoredMemory> gated, Settings config) {
+        int k = Math.max(1, config.memory.recallTopK);
+        if (!config.memory.rerankEnabled || gated.size() <= k) {
+            return gated;
+        }
+        List<ScoredMemory> evidence = new ArrayList<>(gated.size());
+        List<ScoredMemory> exempt = new ArrayList<>();
+        for (ScoredMemory item : gated) {
+            if (item.keywordScore() > 0 || item.vectorScore() > 0) {
+                evidence.add(item);
+            } else {
+                exempt.add(item);
+            }
+        }
+        int poolSize = Math.min(Math.max(config.memory.rerankPool, k), evidence.size());
+        List<ScoredMemory> shortlist = new ArrayList<>(evidence.subList(0, poolSize));
+        List<ScoredMemory> beyondPool = evidence.subList(poolSize, evidence.size());
+        // 每维度 min/max：统计只含短名单内持有该分量的候选（全员缺席 →
+        // 维度整体跳过）。
+        Map<String, Double> lo = new HashMap<>();
+        Map<String, Double> hi = new HashMap<>();
+        for (String dim : RERANK_DIMS) {
+            double min = Double.POSITIVE_INFINITY;
+            double max = Double.NEGATIVE_INFINITY;
+            for (ScoredMemory item : shortlist) {
+                Double value = item.components().get(dim);
+                if (value == null) {
+                    continue;
+                }
+                min = Math.min(min, value);
+                max = Math.max(max, value);
+            }
+            if (min != Double.POSITIVE_INFINITY) {
+                lo.put(dim, min);
+                hi.put(dim, max);
+            }
+        }
+        Weights weights = Weights.fromSettings(config);
+        double[] rerankScore = new double[shortlist.size()];
+        for (int i = 0; i < shortlist.size(); i++) {
+            ScoredMemory item = shortlist.get(i);
+            double sum = 0.0;
+            for (String dim : RERANK_DIMS) {
+                Double value = item.components().get(dim);
+                if (value == null) {
+                    continue; // 分量缺失 = 不参与该维度
+                }
+                double spread = hi.get(dim) - lo.get(dim);
+                double norm = spread >= RERANK_SPREAD_EPS
+                        ? (value - lo.get(dim)) / spread
+                        : 0.5; // 显著性信息门：近全等 = 无信息维度（见 RERANK_SPREAD_EPS）
+                sum += weights.forName(dim) * norm;
+            }
+            rerankScore[i] = sum;
+        }
+        Integer[] order = new Integer[shortlist.size()];
+        for (int i = 0; i < order.length; i++) {
+            order[i] = i;
+        }
+        java.util.Arrays.sort(order, (a, b) -> {
+            int byScore = Double.compare(rerankScore[b], rerankScore[a]);
+            return byScore != 0 ? byScore : Integer.compare(a, b); // 并列保持原序
+        });
+        List<ScoredMemory> out = new ArrayList<>(gated.size());
+        for (int idx : order) {
+            out.add(shortlist.get(idx));
+        }
+        out.addAll(beyondPool);
+        out.addAll(exempt);
+        return out.size() > k ? new ArrayList<>(out.subList(0, k)) : out;
+    }
+
     // ── 一次完整召回 ─────────────────────────────────────────────────
 
     /**
@@ -659,7 +781,12 @@ public final class Retrieval {
             }
             scored = gated;
         }
+        // Stage-2 精排（#37）：插在门槛与 topK 截断之间；开关关（默认）时
+        // rerankShortlist 原样返回，零行为变化。k 计算提前——精排池与截断
+        // 的口径都是 recallTopK（显式 topK 由下方截断兜底：精排开启时至多
+        // 返回 recallTopK 条）。
         int k = topK != null ? topK : config.memory.recallTopK;
+        scored = rerankShortlist(scored, config);
         List<ScoredMemory> top = new ArrayList<>(
                 scored.subList(0, Math.min(Math.max(1, k), scored.size())));
         // 访问记账（被召回本身是记忆"还活着"的证据）：失败只记日志。
