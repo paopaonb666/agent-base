@@ -114,6 +114,13 @@ public final class ResilientModelRuntime implements ModelRuntime {
     }
 
     @Override
+    public String profile() {
+        // 透明层同口径（tokenFactor/contextWindowTokens 同款）：#340 对账
+        // 分面由内层运行时携带——快档被本层包装时不得静默变 main。
+        return delegate.profile();
+    }
+
+    @Override
     public int contextWindowTokens() {
         // 弹性包装是透明层：窗口由内层运行时携带（#4）。
         return delegate.contextWindowTokens();

@@ -6,6 +6,10 @@ import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.output.TokenUsage;
+import io.github.paopaonb666.agentbase.core.context.ContextEngine;
+import io.github.paopaonb666.agentbase.core.text.EstimatingTokenCounter;
+import io.github.paopaonb666.agentbase.extensions.Metrics;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -27,6 +31,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *   <li>tool-safe 快档：绑工具退非流式（对应 _ToolSafeStreamChatOpenAI），
  *       纯聊天仍流式。</li>
  *   <li>usage 钩子：每次调用结束投递 (model, usage)。</li>
+ *   <li>#340 对账观测：invoke / 原生流式 / 非流式回退三条真实调用路径都在
+ *       usage 记账时刻发射 estimated_input（与 buildModelInput 逐条计量
+ *       同源，乘 tokenFactor），按 {model, profile} 分面可断言。</li>
  * </ul>
  */
 class LangChain4jRuntimeTest {
@@ -285,5 +292,114 @@ class LangChain4jRuntimeTest {
                         .messages(MESSAGES)
                         .build()));
         assertEquals("ScriptedChatModel: no more responses", exc.getMessage());
+    }
+
+    // ── #340 对账观测：estimated_input 发射 ────────────────────────────────
+
+    @AfterEach
+    void restoreDefaultCounter() {
+        // estimated_input 口径经 ContextEngine 的全局计量器：用后恢复默认
+        //（JTokkit cl100k），防串扰（ContextEngineTest 同款约定）。
+        ContextEngine.setTokenCounter(null);
+    }
+
+    /** 预算边界测试用确定性计量器（估算口径与手算一致，ContextEngineTest 同款）。 */
+    private static void useEstimator() {
+        ContextEngine.setTokenCounter(EstimatingTokenCounter.INSTANCE);
+    }
+
+    /** 20 个 ASCII 字符：估算器口径 5 token，+4/条 固定开销 → 每条 9（对账公式可手算）。 */
+    private static UserMessage meteredHuman() {
+        return UserMessage.from("x".repeat(20));
+    }
+
+    /** llm_tokens_total{kind="estimated_input"} 的期望行形状（MetricsRenderTest 同款 contains 断言）。 */
+    private static String estimatedInputLine(String model, String profile, long expected) {
+        return "llm_tokens_total{model=\"" + model + "\",profile=\"" + profile
+                + "\",kind=\"estimated_input\"} " + expected;
+    }
+
+    @Test
+    void profileCarriesThroughConstructorWithMainFallback() {
+        // 9 参 canonical：profile 原样承载（对账分面）；null/空白防御回落
+        // "main"；旧 8/5 参重载委托后缺省主档。
+        ScriptedModels.ScriptedChatModel chat = new ScriptedModels.ScriptedChatModel(List.of());
+        assertEquals("fast", new LangChain4jRuntime(chat, null, "p-fast", false, 0, 0, 1.0, null, "fast").profile());
+        assertEquals("main", new LangChain4jRuntime(chat, null, "p-null", false, 0, 0, 1.0, null, null).profile());
+        assertEquals("main", new LangChain4jRuntime(chat, null, "p-blank", false, 0, 0, 1.0, null, "   ").profile());
+        assertEquals("main", new LangChain4jRuntime(chat, null, "p-eight", false, 0, 0, 1.0, null).profile(),
+                "旧 8 参 canonical 委托 main");
+        assertEquals("main", new LangChain4jRuntime(chat, null, "p-legacy", false, null).profile(),
+                "旧 5 参形态缺省主档");
+    }
+
+    @Test
+    void invokeEmitsEstimatedInputToMetrics() {
+        // #340 对账：invoke 在 usageSink 记账同一时刻发射 estimated_input，
+        // 值 = Σ(估算 + 4) × factor（与 buildModelInput 逐条计量单源同式）。
+        // 两条 20-ASCII 消息：(5+4)×1.0 = 9/条 → 18。脚本不投递 usage——
+        // 估算只依赖消息列表，与 provider 是否回报 usage 无关。
+        useEstimator();
+        ScriptedModels.ScriptedChatModel chat =
+                new ScriptedModels.ScriptedChatModel(List.of(ScriptedModels.ScriptedResponse.of("ok")));
+        String model = "est-main-" + System.nanoTime(); // 独特 model 名防进程级单例串扰
+        LangChain4jRuntime runtime = new LangChain4jRuntime(
+                chat, null, model, false, 0, 0, 1.0, null, "main");
+        runtime.invoke(List.of(meteredHuman(), meteredHuman()));
+        assertTrue(Metrics.cost().renderCostMetrics()
+                        .contains(estimatedInputLine(model, "main", 18)),
+                "invoke 应发射 {model, profile=main, estimated_input}=18");
+    }
+
+    @Test
+    void streamNativeEmitsEstimatedInputWithProfileFacet() {
+        // 快档（profile="fast"）纯聊天不绑工具 → 原生流式路径同样发射；
+        // 分面来自构造参数（9 参 canonical 尾参承载）。
+        useEstimator();
+        ScriptedModels.ScriptedStreamingModel streaming = new ScriptedModels.ScriptedStreamingModel(
+                List.of(ScriptedModels.ScriptedResponse.of("hi")));
+        ScriptedModels.ScriptedChatModel chat = new ScriptedModels.ScriptedChatModel(List.of());
+        String model = "est-fast-" + System.nanoTime();
+        LangChain4jRuntime runtime = new LangChain4jRuntime(
+                chat, streaming, model, true, 0, 0, 1.0, null, "fast");
+        runtime.stream(List.of(meteredHuman(), meteredHuman()), List.of(), new DeltaCapture());
+        assertTrue(Metrics.cost().renderCostMetrics()
+                        .contains(estimatedInputLine(model, "fast", 18)),
+                "原生流式应发射 {model, profile=fast, estimated_input}=18");
+    }
+
+    @Test
+    void estimatedInputFollowsTokenFactorScaling() {
+        // 估算乘 tokenFactor（LLM_TOKEN_FACTOR 对齐 provider 分词的口径）：
+        // factor=2.0 → (5+4)×2 = 18/条 → 36。
+        useEstimator();
+        ScriptedModels.ScriptedChatModel chat =
+                new ScriptedModels.ScriptedChatModel(List.of(ScriptedModels.ScriptedResponse.of("ok")));
+        String model = "est-factor-" + System.nanoTime();
+        LangChain4jRuntime runtime = new LangChain4jRuntime(
+                chat, null, model, false, 0, 0, 2.0, null, "main");
+        runtime.invoke(List.of(meteredHuman(), meteredHuman()));
+        assertTrue(Metrics.cost().renderCostMetrics()
+                        .contains(estimatedInputLine(model, "main", 36)),
+                "estimated_input 应随 tokenFactor 缩放（2×9/条）");
+    }
+
+    @Test
+    void nonStreamFallbackEmitsEstimatedInputToo() {
+        // 非流式回退同样是真实调用（cost_usage 行在此产出）：同一时刻发射
+        // 保持 attempt 级 1:1——缺了这里，快档工具轮（回退高频形态）将
+        // 永久缺失对账分母。单条 20-ASCII 消息 → 9。
+        useEstimator();
+        ScriptedModels.ScriptedChatModel chat = new ScriptedModels.ScriptedChatModel(
+                List.of(ScriptedModels.ScriptedResponse.withToolCalls("", List.of(echoCall()))));
+        ScriptedModels.ScriptedStreamingModel streaming =
+                new ScriptedModels.ScriptedStreamingModel(List.of());
+        String model = "est-fallback-" + System.nanoTime();
+        LangChain4jRuntime runtime = new LangChain4jRuntime(
+                chat, streaming, model, true, 0, 0, 1.0, null, "fast");
+        runtime.stream(List.of(meteredHuman()), List.of(echoTool()), new DeltaCapture());
+        assertTrue(Metrics.cost().renderCostMetrics()
+                        .contains(estimatedInputLine(model, "fast", 9)),
+                "非流式回退路径应发射 {model, profile=fast, estimated_input}=9");
     }
 }

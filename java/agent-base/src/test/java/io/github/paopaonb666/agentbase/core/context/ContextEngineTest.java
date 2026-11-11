@@ -367,6 +367,52 @@ class ContextEngineTest {
         assertFalse(conservative.isEmpty(), "至少保留最后一条的守卫不因系数失效");
     }
 
+    // ── estimated_input 对账估算（#340 单源） ─────────────────────────────
+
+    @Test
+    void estimateInputTokensMatchesBuildModelInputMeteringAtUnity() {
+        // #340 对账口径哨兵：estimateInputTokens 与 buildModelInput 的逐条
+        // 预算计量单源同式（估算 + 4/条，factor=1.0 不缩放）——同列表下
+        // 估算值恰等于「剪枝前全量计量」：预算=估算值时全保留（预算循环
+        // 的满额累计），预算=估算值-1 时头部被丢。混合消息形态锁定各类型
+        // 的计量分支（User/Ai/Tool/System 文本路径一致）。
+        useEstimator();
+        List<ChatMessage> history = List.of(
+                shortHuman("a"),                                                // 5+4 = 9
+                AiMessage.from("y".repeat(20)),                                 // 5+4 = 9
+                ToolExecutionResultMessage.from("c1", "echo", "z".repeat(20)),  // 5+4 = 9
+                SystemMessage.from("s".repeat(20)));                            // 5+4 = 9
+        int expected = 0;
+        for (ChatMessage message : history) {
+            expected += ContextEngine.countMessageTokens(message) + 4;
+        }
+        assertEquals(36, expected, "手算锁定：4 条 × (估算 5 + 固定开销 4)");
+        assertEquals(expected, ContextEngine.estimateInputTokens(history, 1.0));
+        // 估算值就是修剪的全量计量满额：预算=估算值 → 全保留；-1 → 头部被丢。
+        assertEquals(history, ContextEngine.buildModelInput(history, expected, 1.0),
+                "预算=估算值：全量保留（估算值=剪枝前全量计量）");
+        assertEquals(history.size() - 1, ContextEngine.buildModelInput(history, expected - 1, 1.0).size(),
+                "预算=估算值-1：头部被修剪");
+        // 防御：null/空列表 → 0（buildModelInput 返回空列表的同形前提）。
+        assertEquals(0, ContextEngine.estimateInputTokens(null, 1.0));
+        assertEquals(0, ContextEngine.estimateInputTokens(List.of(), 1.0));
+    }
+
+    @Test
+    void estimateInputTokensScalesWithTokenFactor() {
+        // #340：factor>1 按条取整后求和——2.0 → (5+4)×2=18/条 → 54；
+        // 非整数倍 1.5 → round(13.5)=14/条 → 42（取整口径与
+        // buildModelInput 的预算循环一致）。
+        useEstimator();
+        List<ChatMessage> history = List.of(shortHuman("a"), shortHuman("b"), shortHuman("c"));
+        assertEquals(27, ContextEngine.estimateInputTokens(history, 1.0), "3 × 9");
+        assertEquals(54, ContextEngine.estimateInputTokens(history, 2.0));
+        assertEquals(42, ContextEngine.estimateInputTokens(history, 1.5));
+        assertTrue(ContextEngine.estimateInputTokens(history, 2.0)
+                > ContextEngine.estimateInputTokens(history, 1.0),
+                "factor>1 的估算严格大于 1.0 口径");
+    }
+
     // ── 历史压缩触发检测（#328 纯函数） ──────────────────────────────────
 
     @Test

@@ -538,11 +538,12 @@ public final class ContextEngine {
 
         // 2) token 预算：从尾部向前累积（每条消息 +4 固定开销）。
         //    #130：图片块按固定估价计入（真实 vision 成本数量级），文本块口径不变。
+        //    逐条计量走 messageCost 单源（与 estimateInputTokens 对账口径同式）。
         int total = 0;
         int cut = 0; // kept_indices 里保留的起点
         for (int run = keptIndices.size() - 1; run >= 0; run--) {
             int index = keptIndices.get(run);
-            total += (int) Math.round((countMessageTokens(messages.get(index)) + 4) * tokenFactor);
+            total += messageCost(messages.get(index), tokenFactor);
             if (total > maxTokens && run < keptIndices.size() - 1) {
                 // 超预算且至少保住最后一条；从这个更早的消息开始丢弃。
                 cut = run + 1;
@@ -567,5 +568,43 @@ public final class ContextEngine {
             body.add(0, frozenMessage);
         }
         return body;
+    }
+
+    /**
+     * 对账口径的输入 token 估算（#340 运维对账指标）：与
+     * {@link #buildModelInput} 的逐条预算计量<b>单源同式</b>（共用私有
+     * {@code messageCost}）——每条消息 {@code countMessageTokens + 4}
+     * 固定开销，乘 {@code tokenFactor} 后四舍五入取整，逐条求和。
+     *
+     * <p>用途：LangChain4jRuntime 在每次真实调用的 usage 记账（usageSink）
+     * 时刻发射 {@code llm_tokens_total{kind="estimated_input"}}，运维把它
+     * 与 cost_usage.prompt_tokens（kind="input"）按 {@code {model, profile}}
+     * 对照，校准 LLM_TOKEN_FACTOR——估算乘 tokenFactor 就是为了对齐
+     * provider 自有分词相对 JTokkit 口径的系统性偏差。1.0 = JTokkit 原始
+     * 口径（与 buildModelInput 逐字节一致）；因子语义与
+     * {@code ModelRuntime.tokenFactor()} 相同（随 profile 走）。
+     *
+     * <p>计量对象是<b>最终发给模型的输入列表</b>（调用方已经过
+     * buildModelInput 修剪/注入去重/冻结置顶的形态）——与 cost_usage 行的
+     * 1:1 对齐建立在这个前提上。{@code messages} 为 null/空返回 0。
+     */
+    public static int estimateInputTokens(List<ChatMessage> messages, double tokenFactor) {
+        if (messages == null || messages.isEmpty()) {
+            return 0;
+        }
+        int total = 0;
+        for (ChatMessage message : messages) {
+            total += messageCost(message, tokenFactor);
+        }
+        return total;
+    }
+
+    /**
+     * 单条消息的对账计量（buildModelInput 预算循环与
+     * {@link #estimateInputTokens} 的共用式）：估算值 + 4/条 固定开销，
+     * 乘 tokenFactor 后四舍五入取整——两处任何一侧口径漂移，对账即失真。
+     */
+    private static int messageCost(ChatMessage message, double tokenFactor) {
+        return (int) Math.round((countMessageTokens(message) + 4) * tokenFactor);
     }
 }

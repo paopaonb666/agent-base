@@ -44,6 +44,12 @@ import java.util.function.Consumer;
  *       cost.enabled 时挂的 {@code CostMeterHandler}；stream_usage 参数的
  *       语义由 usageSink 的消费方承接）。usage 为 null（provider 未回报）
  *       也会投递，由 sink 自行决定是否记零。</li>
+ *   <li><b>对账观测（#340）</b>：每次真实调用在 usage 记账的同一时刻发射
+ *       {@code llm_tokens_total{kind="estimated_input"}}——估算口径
+ *       {@code ContextEngine.estimateInputTokens}（与 buildModelInput 的
+ *       逐条预算计量单源同式，乘 tokenFactor 对齐 provider 分词），运维
+ *       把它与 provider 回报的 prompt_tokens 按 {model, profile} 对照
+ *       （profile 分面见 {@link #profile}），校准 LLM_TOKEN_FACTOR。</li>
  * </ul>
  */
 public final class LangChain4jRuntime implements ModelRuntime {
@@ -59,6 +65,8 @@ public final class LangChain4jRuntime implements ModelRuntime {
     private final BiConsumer<String, TokenUsage> usageSink;
     /** #340：估算 token 修正系数（LLM_TOKEN_FACTOR；默认 1.0）。 */
     private final double tokenFactor;
+    /** #340：档位标识（"main"/"fast"）——estimated_input 对账指标的分面之一。 */
+    private final String profile;
 
     /**
      * @param chatModel         非流式客户端（单次调用 + 流式不可用时的回退）
@@ -97,7 +105,7 @@ public final class LangChain4jRuntime implements ModelRuntime {
                 streamIdleMillis, 1.0, usageSink);
     }
 
-    /** 全参形态（#340）：tokenFactor = 估算修正系数（随 profile 运行时走）。 */
+    /** 8 参形态（#340）：tokenFactor = 估算修正系数；档位缺省主档（委托 canonical，profile="main"）。 */
     public LangChain4jRuntime(ChatModel chatModel,
                               StreamingChatModel streamingModel,
                               String modelName,
@@ -106,6 +114,25 @@ public final class LangChain4jRuntime implements ModelRuntime {
                               long streamIdleMillis,
                               double tokenFactor,
                               BiConsumer<String, TokenUsage> usageSink) {
+        this(chatModel, streamingModel, modelName, toolSafeStreaming, contextWindowTokens,
+                streamIdleMillis, tokenFactor, usageSink, "main");
+    }
+
+    /**
+     * canonical 构造（#340 对账）：{@code profile} = 档位标识
+     * （"main"/"fast"），estimated_input 观测与 usageSink 记账共用它的
+     * 分面；null/空白防御回落 "main"。旧 8/7/6/5 参重载全部委托本形态
+     * （档位缺省主档——装配点 LlmFactory 显式透传）。
+     */
+    public LangChain4jRuntime(ChatModel chatModel,
+                              StreamingChatModel streamingModel,
+                              String modelName,
+                              boolean toolSafeStreaming,
+                              int contextWindowTokens,
+                              long streamIdleMillis,
+                              double tokenFactor,
+                              BiConsumer<String, TokenUsage> usageSink,
+                              String profile) {
         this.chatModel = Objects.requireNonNull(chatModel, "chatModel is required");
         this.streamingModel = streamingModel;
         this.modelName = Objects.requireNonNull(modelName, "modelName is required");
@@ -114,12 +141,19 @@ public final class LangChain4jRuntime implements ModelRuntime {
         this.streamIdleMillis = Math.max(0, streamIdleMillis);
         this.tokenFactor = tokenFactor > 0 ? tokenFactor : 1.0;
         this.usageSink = usageSink == null ? ModelRuntime.noopUsageSink() : usageSink;
+        this.profile = profile == null || profile.isBlank() ? "main" : profile;
     }
 
     /** #340：估算修正系数（透明面，Graphs/ExecuteNode 等取值点经 ctx.llm() 读取）。 */
     @Override
     public double tokenFactor() {
         return tokenFactor;
+    }
+
+    /** 档位标识（#340 对账分面）：null/空白已在构造期回落 "main"。 */
+    @Override
+    public String profile() {
+        return profile;
     }
 
     @Override
@@ -151,6 +185,19 @@ public final class LangChain4jRuntime implements ModelRuntime {
     public AiMessage invoke(List<ChatMessage> messages) {
         ChatResponse response = chatModel.chat(messages);
         usageSink.accept(modelName, response.tokenUsage());
+        // #340 对账观测：与 usage 记账同一时刻发射 estimated_input（attempt
+        // 级 1:1）——llm_tokens_total{kind="estimated_input"} 与 cost_usage
+        // 的 prompt_tokens（kind="input"）按 {model, profile} 对照，校准
+        // LLM_TOKEN_FACTOR。core/llm → core/context 单向软引用在此登记为
+        // 有意（FQN 直引，不 import）：估算口径单源在 ContextEngine
+        // （estimateInputTokens 与 buildModelInput 逐条计量同式）；不用
+        // 装饰器/上下文对象承载——构造参数已到边界，最小的 profile 承载
+        // = 尾参 + 旧重载保留（profile() 经 ModelRuntime 透传）。messages
+        // 形参就是最终发给模型的输入列表（调用方已过上下文引擎修剪）。
+        io.github.paopaonb666.agentbase.extensions.Metrics.cost().observeTokens(
+                modelName, profile, "estimated_input",
+                io.github.paopaonb666.agentbase.core.context.ContextEngine
+                        .estimateInputTokens(messages, tokenFactor));
         AiMessage message = response.aiMessage();
         return message == null ? null : withAuditMetadata(message, response.finishReason());
     }
@@ -215,6 +262,13 @@ public final class LangChain4jRuntime implements ModelRuntime {
                 ? List.of()
                 : aggregated.toolExecutionRequests();
         usageSink.accept(modelName, response.tokenUsage());
+        // #340 对账观测：与 usage 记账同时刻发射（口径与 core/llm →
+        // core/context 软引用说明见 invoke 内注释）；messages 形参就是
+        // 最终输入列表（调用方已过上下文引擎修剪）。
+        io.github.paopaonb666.agentbase.extensions.Metrics.cost().observeTokens(
+                modelName, profile, "estimated_input",
+                io.github.paopaonb666.agentbase.core.context.ContextEngine
+                        .estimateInputTokens(messages, tokenFactor));
         // R2-F6 收口：聚合产物的 attributes / thinking 随重造并入——文本仍以
         // 回调累计为权威（显式重造契约不变），langchain4j 1.4 OpenAI 聚合产物
         // 的 attributes 实际为空（≈零影响），并入是防患于 provider 行为变化
@@ -276,6 +330,13 @@ public final class LangChain4jRuntime implements ModelRuntime {
             onDelta.accept(message.text());
         }
         usageSink.accept(modelName, response.tokenUsage());
+        // #340 对账观测：非流式回退同样是真实调用（cost_usage 行在此产出），
+        // 同时刻发射保持 attempt 级 1:1——缺了这里，快档工具轮（回退的
+        // 高频形态）将永久缺失对账分母。
+        io.github.paopaonb666.agentbase.extensions.Metrics.cost().observeTokens(
+                modelName, profile, "estimated_input",
+                io.github.paopaonb666.agentbase.core.context.ContextEngine
+                        .estimateInputTokens(messages, tokenFactor));
         return withAuditMetadata(message, response.finishReason());
     }
 

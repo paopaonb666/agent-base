@@ -120,9 +120,11 @@ public final class LlmFactory {
             // #340：修正系数随 profile（快档独立配置），经运行时到达取值点。
             double tokenFactor = "fast".equals(profile)
                     ? settings.llmFast.tokenFactor : settings.llm.tokenFactor;
+            // #340 对账分面：profile 原样透传——回落主力配置的形态也是
+            // "fast"（分面跟调用方声明的档位走，不跟实际生效的配置走）。
             return buildOpenAiRuntime(baseUrl, apiKey, model, timeout,
                     toolSafeStreaming, contextWindowTokens,
-                    (long) (settings.llm.streamIdleSeconds * 1000), tokenFactor, usageSink);
+                    (long) (settings.llm.streamIdleSeconds * 1000), tokenFactor, usageSink, profile);
         } catch (RuntimeException exc) {
             // 客户端构造失败（典型：完全没有任何 API key）转成可操作的
             // SettingsError，而不是泄漏 langchain4j 的原始异常——对应 Python
@@ -133,12 +135,16 @@ public final class LlmFactory {
         }
     }
 
-    /** 单个 openai 兼容客户端装配（主档与 #71 fallback 链共用）。 */
+    /**
+     * 单个 openai 兼容客户端装配（主档与 #71 fallback 链共用）；{@code profile}
+     * 原样承载为运行时档位（#340 对账分面，estimated_input 观测按它分面）。
+     */
     private static LangChain4jRuntime buildOpenAiRuntime(String baseUrl, String apiKey, String model,
                                                          java.time.Duration timeout,
                                                          boolean toolSafeStreaming, int contextWindowTokens,
                                                          long streamIdleMillis, double tokenFactor,
-                                                         BiConsumer<String, TokenUsage> usageSink) {
+                                                         BiConsumer<String, TokenUsage> usageSink,
+                                                         String profile) {
         OpenAiChatModel chat = OpenAiChatModel.builder()
                 .baseUrl(baseUrl)
                 .apiKey(apiKey)
@@ -152,7 +158,7 @@ public final class LlmFactory {
                 .timeout(timeout)
                 .build();
         return new LangChain4jRuntime(chat, streaming, model, toolSafeStreaming,
-                contextWindowTokens, streamIdleMillis, tokenFactor, usageSink);
+                contextWindowTokens, streamIdleMillis, tokenFactor, usageSink, profile);
     }
 
     /**
@@ -178,11 +184,13 @@ public final class LlmFactory {
                                 + "set an api_key on the fallback entry or configure LLM_API_KEY".formatted(i));
             }
             try {
+                // fallback 元素由主力配置衍生（tokenFactor 同取 settings.llm）
+                // ——#340 对账分面恒 main（fallback 链是主档的延伸，不是快档）。
                 runtimes.add(buildOpenAiRuntime(spec.baseUrl(), apiKey, spec.model(),
                         java.time.Duration.ofMillis((long) (settings.llm.mainTimeoutSeconds * 1000)),
                         false, spec.maxContextTokens(),
                         (long) (settings.llm.streamIdleSeconds * 1000),
-                        settings.llm.tokenFactor, usageSink));
+                        settings.llm.tokenFactor, usageSink, "main"));
             } catch (RuntimeException exc) {
                 throw new Settings.SettingsError(
                         "LLM_FALLBACKS[%d] client build failed: %s".formatted(i, exc.getMessage()));

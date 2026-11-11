@@ -239,6 +239,26 @@ class MetricsRenderTest {
     }
 
     @Test
+    void estimatedInputKindRendersAsTokenTotalLine() {
+        // #340 对账位：kind 集合开放（KEY_ORDER 是逐元素字典序排序，非封闭
+        // 枚举）——estimated_input 按既有行形状渲染（与 input/output 同
+        // 模板），是 LangChain4jRuntime 发射的运维对账指标（与 kind="input"
+        // 按 {model, profile} 对照校准 LLM_TOKEN_FACTOR）。
+        String model = "gpt-est-" + System.nanoTime();
+        Metrics.CostMetrics cost = new Metrics.CostMetrics();
+        cost.observeTokens(model, "fast", "estimated_input", 42);
+        cost.observeTokens(model, "fast", "input", 100);
+        String body = cost.renderCostMetrics();
+        assertTrue(body.contains(
+                "llm_tokens_total{model=\"" + model + "\",profile=\"fast\",kind=\"estimated_input\"} 42"));
+        assertTrue(body.contains(
+                "llm_tokens_total{model=\"" + model + "\",profile=\"fast\",kind=\"input\"} 100"));
+        // 字典序：estimated_input 排在 input 之前（e < i）。
+        assertTrue(body.indexOf("kind=\"estimated_input\"") < body.indexOf("kind=\"input\"}"),
+                "KEY_ORDER 逐元素字典序：estimated_input 行在前");
+    }
+
+    @Test
     void metricsEndpointConcatenatesAllFourSections() {
         String route = uniq("/v1/concat/");
         Metrics.http().observe("GET", route, 200, 0.01);

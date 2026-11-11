@@ -265,7 +265,17 @@ public final class Metrics {
         }
     }
 
-    /** 进程内的 LLM 用量计数器（T4.1 成本治理）。 */
+    /**
+     * 进程内的 LLM 用量计数器（T4.1 成本治理）。
+     *
+     * <p>kind 集合开放（KEY_ORDER 是逐元素字典序排序，非封闭枚举——任意
+     * kind 均按既有行形状渲染）：{@code "input"} / {@code "output"} 来自
+     * CostMeter.observe（真实 usage 记账）；{@code "estimated_input"} 是
+     * #340 的运维<b>对账</b>位——LangChain4jRuntime 在每次真实调用的 usage
+     * 记账时刻发射（ContextEngine.estimateInputTokens 口径，乘 tokenFactor
+     * 对齐 provider 分词），与 kind="input" 按 {model, profile} 对照校准
+     * LLM_TOKEN_FACTOR。
+     */
     public static final class CostMetrics {
         private final Map<List<String>, Long> tokens = new ConcurrentHashMap<>();
         private volatile double costCnyTotal = 0.0;

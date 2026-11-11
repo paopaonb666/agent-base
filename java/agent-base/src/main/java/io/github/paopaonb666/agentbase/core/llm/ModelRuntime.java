@@ -61,6 +61,17 @@ public interface ModelRuntime {
         return 1.0;
     }
 
+    /**
+     * 档位标识（"main" / "fast"，#340）：LLM_TOKEN_FACTOR 对账指标的
+     * 分面之一——estimated_input 观测（llm_tokens_total{kind=
+     * "estimated_input"}）以它与 cost_usage 的 profile 列对齐，校准结论
+     * 按档位分面成立（主力/快档的 provider 分词偏差各自独立）。透明层
+     * 必须委托（与 tokenFactor / contextWindowTokens 同契约），缺省主档。
+     */
+    default String profile() {
+        return "main";
+    }
+
     default boolean toolSafeStreaming() {
         return false;
     }

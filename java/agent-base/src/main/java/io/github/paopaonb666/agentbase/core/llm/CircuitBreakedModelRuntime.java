@@ -134,6 +134,12 @@ public final class CircuitBreakedModelRuntime implements ModelRuntime {
     }
 
     @Override
+    public String profile() {
+        // 透明层（tokenFactor/contextWindowTokens 同口径）：#340 对账分面穿透。
+        return delegate.profile();
+    }
+
+    @Override
     public int contextWindowTokens() {
         return delegate.contextWindowTokens();
     }
