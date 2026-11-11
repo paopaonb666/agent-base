@@ -337,6 +337,36 @@ class RetrievalTest {
     }
 
     @Test
+    void rrfFusesEvidenceChannelsByRankNotMagnitude() {
+        // #53：keyword/vector 两证据通道按通道内排名计 RRF 归一贡献（top=1.0，
+        // 次名=(k+1)/(k+2)=61/62），不再按 BM25 最大值归一——量纲鲁棒；
+        // 无证据候选贡献为 0（证据门语义同构：入榜 ⟺ 命中）。
+        double now = 1_700_000_000.0;
+        MemoryRecord strong = rec("strong", "semantic", "偏好设置 偏好设置 偏好设置", null, 0.5, now);
+        MemoryRecord weak = rec("weak", "semantic", "偏好设置", null, 0.5, now);
+        MemoryRecord noise = rec("noise", "semantic", "完全无关", null, 0.5, now);
+        List<ScoredMemory> out = Retrieval.scoreMemories(
+                List.of(noise, weak, strong), "偏好设置", null, now, 14.0,
+                Retrieval.Weights.DEFAULT);
+        var byId = new java.util.HashMap<String, ScoredMemory>();
+        for (ScoredMemory item : out) {
+            byId.put(item.record().memoryId(), item);
+        }
+        assertEquals(1.0, byId.get("strong").keywordScore(), 1e-12,
+                "通道 top-rank 贡献恒为 1.0");
+        assertEquals(61.0 / 62.0, byId.get("weak").keywordScore(), 1e-12,
+                "次名贡献 = (k+1)/(k+2)，k=60（RRF_K）——与 BM25 原始分数量纲无关");
+        assertEquals(0.0, byId.get("noise").keywordScore(), 1e-12,
+                "未命中通道 = 无贡献（证据门 >0 语义保持）");
+        // 总分仍是 components 的加权和（权重契约不因融合形态改变）。
+        ScoredMemory strongScored = byId.get("strong");
+        double expected = 0.30 * strongScored.keywordScore()
+                + 0.15 * strongScored.recencyScore()
+                + 0.15 * strongScored.salienceScore();
+        assertEquals(expected, strongScored.score(), 1e-12);
+    }
+
+    @Test
     void scoreMemoriesReturnsScoreDescendingOrder() {
         double now = 1_700_000_000.0;
         MemoryRecord strong = rec("strong", "semantic", "用户偏好设置", null, 0.9, now);

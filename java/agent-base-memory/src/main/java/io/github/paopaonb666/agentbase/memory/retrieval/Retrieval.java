@@ -34,8 +34,10 @@ import io.github.paopaonb666.agentbase.memory.store.Models;
  * <p>遗忘策略：episodic 记忆按 {@code MEMORY_EPISODIC_TTL_DAYS} 过滤（0 表示
  * 不过期）；semantic/procedural 不过期——它们的价值恰恰在长期。
  *
- * <p>对应 Python 侧 {@code agent_base_memory/retrieval.py}，逐算法移植
- * （打分公式、分词与分量装配顺序逐字节对齐）。
+ * <p>对应 Python 侧 {@code agent_base_memory/retrieval.py}：分词、分量装配
+ * 与时间衰减逐算法移植；<b>证据融合有意分歧</b>——Java 用加权 RRF（#53，
+ * keyword/vector 两证据通道按通道内排名贡献融合，对量纲失配鲁棒），
+ * Python 仍线性加权；行为分歧由 #44 golden 门（recall@5/MRR 不降）守护。
  */
 public final class Retrieval {
 
@@ -328,11 +330,19 @@ public final class Retrieval {
     /**
      * 混合打分的公共核心（memories 与 doc_chunks 共用）。
      *
-     * <p>缺失分量按 0 计、总分恒以全部权重为分母。<b>分数不是绝对相关度</b>：
-     * keyword 分量按当前候选集内 BM25 最大值归一化，是候选集相对值——同一
-     * 条记忆的分数会随候选集增删而浮动，固定阈值跨查询不严格稳定。稳定的
-     * 是下限性质：既无关键词命中也无语义证据的候选，天花板只有
-     * recency+salience（≤0.3），检索侧的最低分阈值据此把纯噪音挡在门外。
+     * <p>证据融合用<b>加权 RRF</b>（#53，Java 侧语义——Python 仍线性加权，
+     * 差异登记）：keyword 与 vector 是两个独立的检索证据<b>通道</b>，各按
+     * 通道内排名计贡献 {@link #rrfContribution}（(k+1)/(k+rank)，正证据者
+     * 入榜、top-rank=1.0、未入榜=0）——排名口径对 BM25 分数量纲与余弦
+     * 尺度的失配鲁棒（线性加权把两通道原始分数直接相加，一方分数量级大时
+     * 会淹没另一方）；recency/salience 是元数据先验不是检索证据，仍按原值
+     * 线性进总分。缺失分量按 0 计、总分恒以全部权重为分母。<b>分数不是绝对
+     * 相关度</b>：RRF 贡献是通道内候选集相对值——同一条记忆的分数会随候选
+     * 集增删而浮动，固定阈值跨查询不严格稳定。稳定的下限性质不变：既无
+     * 关键词命中也无语义证据的候选（两通道均未入榜），keyword/vector 贡献
+     * 为 0，天花板只有 recency+salience（≤0.3），检索侧的最低分阈值据此把
+     * 纯噪音挡在门外；证据门（keyword&gt;0 或 vector&gt;0）语义同构——入榜
+     * ⟺ 通道命中。
      *
      * <p>{@code saliences} 的 null 位表示该候选无显著度分量；
      * {@code embeddings} 的 null/空位表示该候选未向量化。
@@ -343,31 +353,42 @@ public final class Retrieval {
                                              double now, double halfLifeDays, Weights weights) {
         Weights w = weights == null ? Weights.DEFAULT : weights;
         double[] bm25Raw = BM25_CACHE.scores(texts, tokenize(query));
-        double bm25Max = 0.0;
-        for (double value : bm25Raw) {
-            if (value > bm25Max) {
-                bm25Max = value;
+        int[] keywordRanks = channelRanks(bm25Raw);
+        // 向量通道第一遍：可 Comparable 候选的余弦（未向量化/维度失配/不可
+        // 比 = NaN）；排名只认正向证据（sim>0，负向/零=有键无贡献，与旧
+        // 「截到 0..1 只保留正向证据」同口径）。
+        double[] sims = new double[texts.size()];
+        java.util.Arrays.fill(sims, Double.NaN);
+        if (queryEmbedding != null) {
+            for (int i = 0; i < texts.size(); i++) {
+                byte[] embedding = embeddings.get(i);
+                if (embedding != null && embedding.length > 0) {
+                    Double sim = cosineSimilarity(queryEmbedding, Models.decodeEmbedding(embedding));
+                    if (sim != null) {
+                        sims[i] = sim;
+                    }
+                }
             }
         }
+        double[] vectorEvidence = new double[texts.size()];
+        for (int i = 0; i < sims.length; i++) {
+            vectorEvidence[i] = Double.isNaN(sims[i]) ? -1.0 : sims[i];
+        }
+        int[] vectorRanks = channelRanks(vectorEvidence);
         List<Hybrid> results = new ArrayList<>(texts.size());
         for (int i = 0; i < texts.size(); i++) {
             // LinkedHashMap 保持 Python dict 的插入序（keyword→recency→
             // salience→vector），加权求和的浮点累加顺序与 Python 一致。
             Map<String, Double> components = new LinkedHashMap<>();
-            components.put("keyword", bm25Max > 0 ? bm25Raw[i] / bm25Max : 0.0);
+            components.put("keyword", keywordRanks[i] > 0 ? rrfContribution(keywordRanks[i]) : 0.0);
             components.put("recency", recencyFactor(timestamps[i], now, halfLifeDays));
             Double salience = saliences[i];
             if (salience != null) {
                 components.put("salience", Math.min(Math.max(salience, 0.0), 1.0));
             }
-            // 向量分量：查询与候选必须同维可比。
-            byte[] embedding = embeddings.get(i);
-            if (queryEmbedding != null && embedding != null && embedding.length > 0) {
-                Double sim = cosineSimilarity(queryEmbedding, Models.decodeEmbedding(embedding));
-                if (sim != null) {
-                    // 余弦可为负（反向语义）：截到 0..1 只保留正向证据。
-                    components.put("vector", Math.min(Math.max(sim, 0.0), 1.0));
-                }
+            // 向量分量：查询与候选必须同维可比（sims[i] 非 NaN 即可比）。
+            if (!Double.isNaN(sims[i])) {
+                components.put("vector", vectorRanks[i] > 0 ? rrfContribution(vectorRanks[i]) : 0.0);
             }
             double score = 0.0;
             for (Map.Entry<String, Double> entry : components.entrySet()) {
@@ -376,6 +397,41 @@ public final class Retrieval {
             results.add(new Hybrid(score, components));
         }
         return results;
+    }
+
+    /**
+     * RRF 融合常量（标准 k=60）：rank 越靠前贡献越大，被 1/(k+rank) 的
+     * 长尾形态压平——头部置信度集中、长尾保留区分度的经典取值。
+     */
+    private static final int RRF_K = 60;
+
+    /** 通道内排名的归一贡献：(k+1)/(k+rank) ∈ (0,1]，top-rank=1.0。 */
+    private static double rrfContribution(int rank) {
+        return (double) (RRF_K + 1) / (RRF_K + rank);
+    }
+
+    /**
+     * 正证据候选的通道排名（1 起；分数降序，并列按候选序稳定——排序确定
+     * 性对 golden 门可复现性至关重要）。0 = 未入榜（无证据或不正分）。
+     */
+    private static int[] channelRanks(double[] evidence) {
+        int[] ranks = new int[evidence.length];
+        Integer[] order = new Integer[evidence.length];
+        for (int i = 0; i < order.length; i++) {
+            order[i] = i;
+        }
+        java.util.Arrays.sort(order, (a, b) -> {
+            int byScore = Double.compare(evidence[b], evidence[a]);
+            return byScore != 0 ? byScore : Integer.compare(a, b);
+        });
+        int rank = 0;
+        for (int idx : order) {
+            if (evidence[idx] <= 0) {
+                break;
+            }
+            ranks[idx] = ++rank;
+        }
+        return ranks;
     }
 
     /** 按分数降序稳定排序（并列保持输入序，与 Python sort(reverse=True) 一致）。 */
