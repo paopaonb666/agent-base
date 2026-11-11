@@ -12,6 +12,7 @@ import io.github.paopaonb666.agentbase.extensions.events.Events;
 import io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileInfo;
 import io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStore;
 import io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStores;
+import io.github.paopaonb666.agentbase.modules.planner.graph.PlannerGraphs;
 import io.github.paopaonb666.agentbase.toolkit.mcp.McpClient;
 import io.github.paopaonb666.agentbase.toolkit.mcp.McpTool;
 import io.github.paopaonb666.agentbase.toolkit.mcp.McpToolDef;
@@ -75,6 +76,26 @@ class ToolPoolBindingTest {
         assertNull(legacy.toolPool());
         org.junit.jupiter.api.Assertions.assertNotSame(shared, fallbackBuilt.toolPool());
         org.junit.jupiter.api.Assertions.assertNotNull(fallbackBuilt.toolPool());
+    }
+
+    @Test
+    void plannerGraphBindsSharedPoolFromModuleContext() {
+        // planner 图（modules/planner/graph）同走 compile 期绑定：编译图绑定
+        // 的池 == ctx 的共享池（同一实例，Graphs 条目同款 assertSame 手段）。
+        ToolPool shared = ToolPool.build(List.of(), List.of(),
+                ToolPool.DEFAULT_TOOL_TIMEOUT_SECONDS, Map.of(), null);
+        AgentModule.ModuleContext ctx = new AgentModule.ModuleContext(
+                Settings.load(Map.of("ENV", "development")), null, new InMemoryCheckpointer(),
+                List.of(), null, null, shared);
+        CompiledGraph graph = PlannerGraphs.buildPlannerGraph(ctx);
+        assertSame(shared, graph.toolPool());
+
+        // 六参便利构造 = 无池：planner 图同样不绑池（execute 调工具回
+        // "工具不可用"文案——直构测试的既有兜底形态）。
+        AgentModule.ModuleContext legacy = new AgentModule.ModuleContext(
+                Settings.load(Map.of("ENV", "development")), null, new InMemoryCheckpointer(),
+                List.of(), null, null);
+        assertNull(PlannerGraphs.buildPlannerGraph(legacy).toolPool());
     }
 
     @Test

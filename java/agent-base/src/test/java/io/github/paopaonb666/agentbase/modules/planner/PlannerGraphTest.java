@@ -41,6 +41,7 @@ import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -445,9 +446,10 @@ class PlannerGraphTest {
         var store = new UploadedFileStores.MemoryUploadedFileStore();
         AgentModule.ModuleContext ctx = new AgentModule.ModuleContext(
                 settings, model, new InMemoryCheckpointer(), List.of(bigTool), null, null, pool, null, store);
-        // planner 图 compile 不接池（PlannerGraphs 二参 compile），execute 节点
-        // 的工具通道经 NodeContext 注入——直驱节点 + 带池 NodeContext 桩，
-        // 走的是与生产一致的 executeToolCalls 路径。
+        // planner 图 compile 已接池（PlannerGraphs 三参 compile 绑定
+        // ctx.toolPool()）；本用例仍直驱 execute 节点 + 带池 NodeContext 桩，
+        // 走的是与生产一致的 executeToolCalls 路径——图级接线由
+        // plannerGraphExecutesToolCallsThroughBoundPool 端到端锁定。
         GraphBuilder.Node execute = ExecuteNode.make(ctx);
         GraphState seed = new GraphState(List.of(UserMessage.from("做 A")),
                 Map.of(PlannerState.TASKS,
@@ -497,5 +499,62 @@ class PlannerGraphTest {
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> tasks = (List<Map<String, Object>>) update.get(PlannerState.TASKS);
         assertEquals("done", tasks.get(0).get(PlannerState.STATUS));
+    }
+
+    /** 端到端：图编译绑定真池后，execute 的 tool_calls 走池执行（而非「工具不可用」兜底）。 */
+    @Test
+    void plannerGraphExecutesToolCallsThroughBoundPool() {
+        AgentTool probeTool = new AgentTool() {
+            @Override public String name() { return "probe"; }
+            @Override public String description() { return "真池接线测试桩：返回固定文本。"; }
+            @Override public ToolSpecification specification() {
+                return ToolSpecification.builder().name(name()).description(description())
+                        .parameters(JsonObjectSchema.builder().build()).build();
+            }
+            @Override public String call(String argsJson, ToolContext ctx) {
+                return "probe 结果";
+            }
+        };
+        // 带池 ModuleContext（池在第 7 组件位，同 plannerExecuteNodeSpillsOversizeToolResult
+        // 的装配形态）→ 三参 compile 把池绑进编译图 → 走完整图执行
+        // （plan → execute → check → synthesize）。
+        ToolPool pool = ToolPool.build(List.of(probeTool), List.of(), 30.0, Map.of(), null);
+        ScriptedModel model = new ScriptedModel(
+                AiMessage.from("[{\"id\": 1, \"goal\": \"A\"}]"), // plan：拆解 1 个子任务
+                aiWithCall("c1", "probe", "{}"),                  // execute 轮 1：tool_calls
+                AiMessage.from("已用工具结果完成 A"),             // execute 轮 2：收尾
+                AiMessage.from("综合答复：子任务 A 完成"));       // synthesize
+        CompiledGraph graph = PlannerGraphs.buildPlannerGraph(new AgentModule.ModuleContext(
+                new Settings(), model, new InMemoryCheckpointer(),
+                List.of(probeTool), null, null, pool));
+        assertSame(pool, graph.toolPool());
+        List<Object> events = new ArrayList<>();
+        GraphState result = graph.stream(
+                new GraphState(List.of(UserMessage.from("做 A")), Map.of()),
+                new RunConfig("planner:t-pool", "u1", 25),
+                events::add);
+
+        // ToolMessage 文本 = 真池工具体产出（不得回喂「工具不可用：工具池未装配」）。
+        List<ToolExecutionResultMessage> toolMessages = result.messages().stream()
+                .filter(m -> m instanceof ToolExecutionResultMessage)
+                .map(m -> (ToolExecutionResultMessage) m)
+                .toList();
+        assertEquals(1, toolMessages.size());
+        assertEquals("probe 结果", toolMessages.get(0).text());
+        assertFalse(toolMessages.get(0).text().contains("工具不可用"));
+        // 池内审计事件到位：end 事件携带原始结果（工具体确实经池触达）。
+        String endResult = events.stream()
+                .filter(e -> e instanceof Events.ToolCallEvent call
+                        && "end".equals(call.phase()) && "probe".equals(call.name()))
+                .map(e -> ((Events.ToolCallEvent) e).result())
+                .findFirst().orElseThrow();
+        assertEquals("probe 结果", endResult);
+        // 子任务按 done 收尾，最后一条消息是 synthesize 的综合答复。
+        List<Map<String, Object>> tasks = result.getOrDefault(PlannerState.TASKS, List.of());
+        assertEquals(1, tasks.size());
+        assertEquals("done", tasks.get(0).get(PlannerState.STATUS));
+        List<ChatMessage> messages = result.messages();
+        assertEquals("综合答复：子任务 A 完成",
+                ContextEngine.contentText(messages.get(messages.size() - 1)).strip());
     }
 }

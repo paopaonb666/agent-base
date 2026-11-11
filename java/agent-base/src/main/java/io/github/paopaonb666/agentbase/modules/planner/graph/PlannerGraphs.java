@@ -21,7 +21,7 @@ public final class PlannerGraphs {
 
     private PlannerGraphs() {}
 
-    /** 构建并编译 planner 图（以 name="planner" 编译）。 */
+    /** 构建并编译 planner 图（以 name="planner" 编译；工具池随 ctx 绑定）。 */
     public static CompiledGraph buildPlannerGraph(AgentModule.ModuleContext ctx) {
         return GraphBuilder.begin()
                 .addNode("plan", PlanNode.make(ctx))
@@ -38,6 +38,10 @@ public final class PlannerGraphs {
                         Set.of("replan", "execute", "synthesize"))
                 .addEdge("replan", "execute")
                 .addEdge("synthesize", GraphBuilder.END)
-                .compile(ctx.checkpointer(), PlannerModule.MODULE_NAME);
+                // #238：池是编译参数——execute 的工具通道（NodeContext.callTool /
+                // tools()）取编译图绑定的池；缺池时子任务调工具只能拿到
+                // 「工具不可用：工具池未装配」兜底文案。planner 子图不挂压缩
+                // 终态钩子，三参 compile 即可。
+                .compile(ctx.checkpointer(), PlannerModule.MODULE_NAME, ctx.toolPool());
     }
 }
