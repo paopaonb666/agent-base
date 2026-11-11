@@ -159,6 +159,25 @@ class AgentRuntimeAssemblyTest {
         runtime(devSettings(), Map.of(), null, null, null, null, null, null).close();
     }
 
+    @Test
+    void closeStopsCompactionBeforeCheckpointer() {
+        // F4（R4-a）：close 顺序——压缩先停、存储后关。在途压缩任务（LLM
+        // 摘要数秒且不响应中断）完成后的写回必须落在仍打开的 checkpointer
+        // 上；顺序反过来，写回会对已关闭的存储 get/put（异常落欠账计数，
+        // /health 快照积压被关停瞬态污染）。
+        var checkpointer = Mockito.mock(io.github.paopaonb666.agentbase.core.graph.Checkpointer.class);
+        var compaction = Mockito.mock(io.github.paopaonb666.agentbase.core.graph.CompactionService.class);
+        AgentRuntime runtime = new AgentRuntime(devSettings(), null, Map.of(), null,
+                checkpointer, null, null, null, null, null, null, compaction);
+        runtime.close();
+        Mockito.verify(compaction).close();
+        Mockito.verify(checkpointer).close();
+        // 顺序断言：单个 InOrder 跨两个桩记录调用序列。
+        org.mockito.InOrder inOrder = Mockito.inOrder(compaction, checkpointer);
+        inOrder.verify(compaction).close();
+        inOrder.verify(checkpointer).close();
+    }
+
     // ── profileView（成本治理 T1.2） ──────────────────────────────────────
 
     @Test

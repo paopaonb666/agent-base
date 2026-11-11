@@ -70,6 +70,12 @@ public final class CompactionService implements AutoCloseable {
     /** 折叠段转写的字符上限（保尾部）：超长历史不把快档 LLM 输入撑爆。 */
     private final int transcriptMaxChars;
     private final int budget;
+    /**
+     * 估算修正系数（R4-a F5，对齐 #340 口径）：主力 runtime 的
+     * {@code llm.tokenFactor()}——触发估算与元数据计量乘在估算侧，
+     * 与 {@code buildModelInput} 的计量出口同系数（&gt;1 = 更早触发）。
+     */
+    private final double tokenFactor;
     private final Summarizer summarizer;
     private final ThreadPoolExecutor executor;
     /** 在途评估守卫：每线程至多 1 个（提交侧判定，热线程不积压队列）。 */
@@ -85,11 +91,30 @@ public final class CompactionService implements AutoCloseable {
      */
     public CompactionService(Checkpointer checkpointer, Settings.MemorySettings settings,
                              int budget, Summarizer summarizer) {
+        this(checkpointer, settings, budget, 1.0, summarizer);
+    }
+
+    /**
+     * 带 tokenFactor 的装配变体（R4-a F5）：生产装配传主力
+     * {@code llm.tokenFactor()}（对齐 #340 的运行期修剪口径）；旧四参构造
+     * 委托 1.0（逐字节等价）。非正系数按 1.0 防御（配置侧已在 (0,10] 校验）。
+     *
+     * <p><b>登记性偏差（只登记不修，R4-a F5 ①③）</b>：① 未计入
+     * {@code ContextEngine.budgetAfterSystem} 的 system prompt 扣减——装配期
+     * 只有 {@code resolveInputBudget} 口径的预算，systemPrompt 到图构建期才
+     * 存在、不可计量；③ fast profile 会话共用主力预算——单 worker 的
+     * CompactionService 全 profile 共享一个实例，per-profile 预算需 hook
+     * 管道改造（review F5 原文「或在 hook 里带上 per-profile 预算」）。
+     * 两处只影响触发时机（偏晚/偏早），不影响写回正确性。
+     */
+    public CompactionService(Checkpointer checkpointer, Settings.MemorySettings settings,
+                             int budget, double tokenFactor, Summarizer summarizer) {
         this.checkpointer = checkpointer;
         this.ratio = settings.compactionRatio;
         this.keepRecentTurns = settings.compactionKeepRecentTurns;
         this.transcriptMaxChars = settings.extractionMaxInputChars;
         this.budget = budget;
+        this.tokenFactor = tokenFactor > 0 ? tokenFactor : 1.0;
         this.summarizer = summarizer;
         // 单守护线程 + 有界队列（#328）：压缩属批量成本型工作，与 Background
         // 捕获池隔离（LLM 耗时长，不挤占 capture）；池满丢弃可观测。
@@ -168,7 +193,11 @@ public final class CompactionService implements AutoCloseable {
             return;
         }
         List<ChatMessage> messages = List.copyOf(snapshot.messages());
-        if (!ContextEngine.compactionNeeded(messages, budget, ratio)) {
+        // 触发估算乘 tokenFactor（R4-a F5，对齐 #340/buildModelInput 口径）：
+        // compactionNeeded 的公式是纯函数估算（countMessageTokens + 每条 +4），
+        // 乘法点放在传入前——预算按系数反比缩放（estimate×f > budget×r ⟺
+        // estimate > (budget/f)×r），factor=1.0 时与旧口径逐字节等价。
+        if (!ContextEngine.compactionNeeded(messages, triggerBudget(), ratio)) {
             return;
         }
         int keepFrom = recentTurnsStart(messages, keepRecentTurns);
@@ -197,13 +226,21 @@ public final class CompactionService implements AutoCloseable {
             return;
         }
         // 新状态 = [压缩摘要（标记前缀 SystemMessage）] + [近 N 轮原文]；
-        // extra 保留并追加压缩元数据（读侧不解析，GraphStateJson.VERSION 不 bump）。
+        // 消息序列在 lambda 外定死（日志还用它），extra 的 prior 在 lambda
+        // 内取锁内重读的 fresh——压缩元数据照旧追加（读侧不解析，
+        // GraphStateJson.VERSION 不 bump）。
         List<ChatMessage> compactedMessages = new ArrayList<>();
         compactedMessages.add(SystemMessage.from(
                 ContextEngine.COMPACTION_SUMMARY_PREFIX + summary.strip()));
         compactedMessages.addAll(messages.subList(keepFrom, messages.size()));
-        GraphState replacement = new GraphState(compactedMessages,
-                compactionExtra(snapshot.extra(), baseCount, tokenEstimate));
+        // 折叠段内的 UserMessage 计数（R4-a F7）：随压缩元数据写回
+        // （folded_turns），capture 侧把它加回滚动摘要门控的人类轮计数——
+        // 压缩先写回时 capture 只见收缩后快照，门控不再停摆。读侧：
+        // AgentsRoutes.buildCaptureHook（"compaction"/"folded_turns" 键
+        // 字面量与写侧互指）。
+        int foldedTurns = (int) messages.subList(0, keepFrom).stream()
+                .filter(message -> message instanceof UserMessage)
+                .count();
 
         boolean written = CompiledGraph.compactThread(checkpointer, threadId, fresh -> {
             List<ChatMessage> current = fresh.messages();
@@ -212,6 +249,13 @@ public final class CompactionService implements AutoCloseable {
                 // 基准不一致 = 有并发写入（#330 方案 B）：放弃，不产生半写。
                 return Optional.empty();
             }
+            // F6（R4-a）：replacement 在基准校验通过后构建——extra 以锁内
+            // 重读的 fresh.extra() 为 prior，不是摘要前的旧 snapshot.extra()。
+            // 基准校验只保证消息序列一致；摘要期间 extra-only 落盘
+            // （attachments/plan 通道更新、#199 cancelled 行标记）不再被
+            // 旧快照整行回退。
+            GraphState replacement = new GraphState(compactedMessages,
+                    compactionExtra(fresh.extra(), baseCount, tokenEstimate, foldedTurns));
             return Optional.of(replacement);
         });
         if (written) {
@@ -255,23 +299,44 @@ public final class CompactionService implements AutoCloseable {
         return Math.max(400, Math.min(2000, budget / 10));
     }
 
-    /** 压缩元数据（#328）：extra "compaction" 键；读侧不解析，VERSION 不 bump。 */
+    /**
+     * 压缩元数据（#328）：extra "compaction" 键；读侧不解析，VERSION 不 bump。
+     * {@code folded_turns}（R4-a F7）= 折叠段内的 UserMessage 数——读侧
+     * {@code AgentsRoutes.buildCaptureHook} 以同字面量取用并加回 capture 的
+     * 滚动摘要门控（两侧键字面量互指）。
+     */
     private static Map<String, Object> compactionExtra(Map<String, Object> prior,
-                                                       int originalCount, int tokenEstimate) {
+                                                       int originalCount, int tokenEstimate,
+                                                       int foldedTurns) {
         Map<String, Object> meta = new LinkedHashMap<>();
         meta.put("original_message_count", originalCount);
         meta.put("original_token_estimate", tokenEstimate);
+        meta.put("folded_turns", foldedTurns);
         meta.put("at", java.time.Instant.now().toString());
         Map<String, Object> extra = new LinkedHashMap<>(prior);
         extra.put("compaction", meta);
         return extra;
     }
 
-    /** 历史估算（#328 口径）：countMessageTokens + 每条 +4，与 compactionNeeded 一致。 */
-    private static int estimateTokens(List<ChatMessage> messages) {
+    /**
+     * 触发线的预算侧换算（R4-a F5）：{@code budget / tokenFactor}——估算侧
+     * 乘系数与预算侧除系数在比较式里等价（见 {@link #compactOnce} 处注释）；
+     * 向下取整只让触发线略偏保守（更早触发），与系数「&gt;1 = 保守修正」的
+     * 方向一致。factor=1.0 时恒等于 budget 本身。
+     */
+    private int triggerBudget() {
+        return (int) (budget / tokenFactor);
+    }
+
+    /**
+     * 历史估算（#328 口径）：countMessageTokens + 每条 +4，每条出口乘
+     * tokenFactor——与 {@code buildModelInput} 的逐条计量乘法点一致
+     * （R4-a F5）；factor=1.0 时与 compactionNeeded 逐字节一致。
+     */
+    private int estimateTokens(List<ChatMessage> messages) {
         int total = 0;
         for (ChatMessage message : messages) {
-            total += ContextEngine.countMessageTokens(message) + 4;
+            total += (int) Math.round((ContextEngine.countMessageTokens(message) + 4) * tokenFactor);
         }
         return total;
     }

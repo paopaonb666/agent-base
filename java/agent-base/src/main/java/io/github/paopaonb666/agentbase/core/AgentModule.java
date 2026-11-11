@@ -156,6 +156,24 @@ public interface AgentModule {
             purgeThread(threadId);
         }
 
+        /**
+         * captureTurn 的折叠轮数变体（R4-a F7）：会话历史压缩写回后，快照
+         * 里的 UserMessage 比真实轮数少 {@code foldedHumanTurns}（被折叠段
+         * 吞掉的人类轮，来自快照 extra 压缩元数据的 {@code folded_turns} 键，
+         * 读法见 {@code AgentsRoutes.buildCaptureHook}）——capture 实现把它
+         * 加回人类轮计数，滚动摘要门控（{@code summaryTriggerMessages}）不因
+         * 压缩停摆。{@code force} 旁路抽取门控的语义与实现方既有口径一致。
+         *
+         * <p>default 忽略两个新参委托旧签名（#172 {@code purgeThread} 端口
+         * default 先例）：装饰器/替身无需逐个跟进；真正实现方（记忆包）
+         * 覆写本重载。
+         */
+        default Map<String, Object> captureTurn(String userId, String agentId, String threadId,
+                                                List<ChatMessage> messages, boolean force,
+                                                int foldedHumanTurns) {
+            return captureTurn(userId, agentId, threadId, messages);
+        }
+
         /** 文档入库：切块 + 向量化；返回写入的分块数。 */
         int ingestDocument(String fileId, String userId, String agentId, String text, String threadId);
 

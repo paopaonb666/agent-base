@@ -181,8 +181,12 @@ public final class CompiledGraph {
         // 压缩触发挂点（#328）：锁释放之后调用（hook 实现内部异步，绝不阻塞
         // 运行线程）。仅 CANCELLED 跳过——done/failed/partial 都触发；节点
         // 异常路径的终态按 sink 取消态归类（与 streamWithTermination 同口径）。
+        // F10①（R4-a）：节点抛 CancellationException 且 sink 未取消时同样
+        // 视为取消——streamWithTermination 已把它归 CANCELLED（#9 既有口径），
+        // 钩子契约「仅 CANCELLED 不调用」在 failure 路径不再有缝。
         boolean cancelled = failure != null
-                ? sink != null && sink.cancelled()
+                ? (sink != null && sink.cancelled())
+                        || failure instanceof java.util.concurrent.CancellationException
                 : outcome.termination() == Events.RunTermination.CANCELLED;
         if (!cancelled) {
             notifyCompactionHook(config, outcome == null ? null : outcome.state());

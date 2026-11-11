@@ -590,14 +590,15 @@ public final class MemoryPipeline {
 
     /**
      * 历史折叠摘要（#328 压缩任务消费，compaction 角色）：把待折叠段转写
-     * 压成 {@code targetChars} 字以内的三键摘要。走快档通道（complete(fast)
-     * ——快档未装配时回落主力，既有逻辑）。返回渲染后的摘要文本；模型输出
-     * 不可用（空）时返回空串，调用方按放弃本轮处理。
+     * 压成 {@code targetChars} 字以内的三键摘要。档位随 pipelineProfile
+     * （{@link #bulkFast} 单源，R4-a F9：all_main=主力），与抽取/画像/滚动
+     * 摘要一致；快档未装配时回落主力（既有逻辑）。返回渲染后的摘要文本；
+     * 模型输出不可用（空）时返回空串，调用方按放弃本轮处理。
      */
     public String compactSummary(String transcript, int targetChars) {
         String raw = complete(COMPACTION_SUMMARY_PROMPT
                 .replace("{target}", String.valueOf(targetChars))
-                .replace("{transcript}", transcript), true);
+                .replace("{transcript}", transcript), bulkFast());
         return structuredSummaryText(raw);
     }
 

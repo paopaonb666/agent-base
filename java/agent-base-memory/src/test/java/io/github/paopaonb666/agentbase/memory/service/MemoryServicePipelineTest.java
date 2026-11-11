@@ -1,6 +1,7 @@
 package io.github.paopaonb666.agentbase.memory.service;
 
 import dev.langchain4j.data.message.AiMessage;
+import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.UserMessage;
 import io.github.paopaonb666.agentbase.core.config.Settings;
 import io.github.paopaonb666.agentbase.memory.embeddings.EmbeddingClient;
@@ -20,6 +21,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -67,6 +69,38 @@ class MemoryServicePipelineTest {
         // 只有无文本的消息（工具消息）→ 转写空 → null。
         assertNull(withPipeline.captureTurn("u", "chat", "chat:t1",
                 List.of(AiMessage.from(""))));
+    }
+
+    /**
+     * 折叠轮数计入人类轮门控（R4-a F7）：压缩先写回时快照只剩
+     * [摘要+近 N 轮]，快照可见的 UserMessage 数从累计值重置——capture 重载
+     * 把压缩元数据的 folded_turns 加回，滚动摘要门控
+     * （summary_trigger_messages=12）不再停摆约 9 轮。门控可见面 = summary
+     * 审计（MemoryPipeline captureTurn 的第 3 步）。
+     */
+    @Test
+    void captureTurnAddsFoldedHumanTurnsToSummaryGate() {
+        // 快照可见 3 条 UserMessage（3 轮原文）+ folded_turns=10 → 按 13 ≥ 12 判定。
+        InMemoryMemoryStore store = new InMemoryMemoryStore();
+        MemoryService memory = scriptedService(store, new ScriptedMain("[]"), false);
+        List<ChatMessage> visibleTurns = List.of(
+                UserMessage.from("一"), AiMessage.from("答一"),
+                UserMessage.from("二"), AiMessage.from("答二"),
+                UserMessage.from("三"), AiMessage.from("答三"));
+        memory.captureTurn("u", "chat", "chat:t1", visibleTurns, false, 10);
+        assertTrue(store.listOps(null, 50).stream().anyMatch(op ->
+                        "summary".equals(op.op()) && "ok".equals(op.status())),
+                "3 条可见 UserMessage + 10 折叠轮 = 13 ≥ 12，滚动摘要应触发");
+        memory.close();
+
+        // 对照：同一快照 folded=0 → 3 < 12，不触发摘要（旧行为）。
+        InMemoryMemoryStore store2 = new InMemoryMemoryStore();
+        MemoryService withoutFolded = scriptedService(store2, new ScriptedMain("[]"), false);
+        withoutFolded.captureTurn("u", "chat", "chat:t1", visibleTurns, false, 0);
+        assertFalse(store2.listOps(null, 50).stream().anyMatch(op ->
+                        "summary".equals(op.op())),
+                "无折叠轮数时门控按可见数判定（3 < 12，不触发）");
+        withoutFolded.close();
     }
 
     // ── capture 失败重试队列（#182） ──────────────────────────────────────

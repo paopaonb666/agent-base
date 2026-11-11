@@ -482,13 +482,34 @@ public class AgentsRoutes {
                 }
                 String userId = config.userId() == null || config.userId().isEmpty()
                         ? "default" : config.userId();
+                // 折叠轮数随快照进 capture（R4-a F7）：压缩先写回时快照只剩
+                // [摘要+近 N 轮]，折叠段的人类轮数在压缩元数据里——不传回的
+                // 话滚动摘要门控（summaryTriggerMessages）停摆约 9 轮。
                 memory.captureTurn(userId, module,
-                        new ThreadId(module, userThreadId).toString(), messages);
+                        new ThreadId(module, userThreadId).toString(), messages,
+                        false, foldedHumanTurns(snapshot));
             } catch (Exception e) {
                 org.slf4j.LoggerFactory.getLogger(AgentsRoutes.class)
                         .warn("memory: 后台记忆形成失败（不影响对话）", e);
             }
         });
+    }
+
+    /**
+     * 从快照 extra 读压缩元数据的折叠轮数（R4-a F7）。键字面量
+     * {@code "compaction"} / {@code "folded_turns"} 与写侧
+     * {@code CompactionService.compactionExtra} 互指（core 契约不 import
+     * 记忆包，元数据是 Map 载荷；JSON 往返后数值可能升宽，按 Number 读）。
+     * 防御：快照缺席 / 键缺失 / 类型不符 / 负值一律按 0。
+     */
+    private static int foldedHumanTurns(GraphState snapshot) {
+        if (snapshot == null || !(snapshot.extra().get("compaction") instanceof Map<?, ?> meta)) {
+            return 0;
+        }
+        if (!(meta.get("folded_turns") instanceof Number folded)) {
+            return 0;
+        }
+        return Math.max(0, folded.intValue());
     }
 
     private static Runnable wrapContext(Runnable body) {

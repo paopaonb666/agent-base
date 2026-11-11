@@ -537,7 +537,7 @@ class MemoryPipelineTest {
 
         String summary = pipeline.compactSummary("用户：你好", 500);
         assertEquals("【任务态】t\n【关键实体】e\n【未决问题】q", summary);
-        // compaction 角色走快档（complete(fast)：快档缺席才回落主力）。
+        // compaction 角色档位随 pipelineProfile（split 默认 → 快档）。
         assertEquals(1, fast.prompts.size());
         assertEquals(0, main.prompts.size(), "compaction 不应消耗主力");
         // 角色差异进 prompt 头部：历史压缩器 + 目标字数参数化 + 转写注入。
@@ -547,6 +547,24 @@ class MemoryPipelineTest {
         assertTrue(prompt.contains("用户：你好"), prompt);
         // 三键体单源：compaction 与 rolling 共享同一输出契约。
         assertTrue(prompt.contains("key_entities"), prompt);
+    }
+
+    @Test
+    void compactSummaryFollowsPipelineProfileAllMain() {
+        // R4-a F9：all_main 档位下 compaction 摘要走主力（bulkFast 单源），
+        // 与抽取/画像/滚动摘要的档位语义一致——不再硬编码快档通道。
+        ScriptedMain main = new ScriptedMain();
+        main.responses.add("{\"task_state\": \"t\", \"key_entities\": \"e\", "
+                + "\"open_questions\": \"q\"}");
+        ScriptedFast fast = new ScriptedFast();
+        RecordingOps ops = new RecordingOps();
+        MemoryPipeline pipeline = new MemoryPipeline(main, fast,
+                Settings.load(Map.of("MEMORY_PIPELINE_PROFILE", "all_main")), ops);
+
+        assertEquals("【任务态】t\n【关键实体】e\n【未决问题】q",
+                pipeline.compactSummary("用户：你好", 500));
+        assertEquals(1, main.prompts.size(), "all_main 下 compaction 走主力");
+        assertEquals(0, fast.prompts.size(), "all_main 下不消耗快档");
     }
 
     @Test

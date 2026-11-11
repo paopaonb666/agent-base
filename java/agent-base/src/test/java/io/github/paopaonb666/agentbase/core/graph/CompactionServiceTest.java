@@ -177,11 +177,14 @@ class CompactionServiceTest {
                 assertEquals(history(8).get(10 + i), compacted.messages().get(1 + i),
                         "近 3 轮原文逐条保留（UserMessage 边界）");
             }
-            // extra 元数据齐全：original_message_count / original_token_estimate / at。
+            // extra 元数据齐全：original_message_count / original_token_estimate /
+            // folded_turns / at。
             Map<String, Object> meta = castMap(compacted.extra().get("compaction"));
             assertEquals(16, ((Number) meta.get("original_message_count")).intValue());
             assertEquals(208, ((Number) meta.get("original_token_estimate")).intValue(),
                     "13/条 × 16（估算器口径锁定）");
+            assertEquals(5, ((Number) meta.get("folded_turns")).intValue(),
+                    "折叠段（前 5 轮）内的 UserMessage 数（F7 读侧加回门控的口径）");
             assertFalse(String.valueOf(meta.get("at")).isBlank());
             // 既有 extra 通道内容保留（本用例无，仅形状核对）。
             assertTrue(compacted.extra().containsKey("compaction"));
@@ -401,6 +404,92 @@ class CompactionServiceTest {
             assertEquals(7, cp.get("chat:t1").messages().size());
             assertEquals(ContextEngine.COMPACTION_SUMMARY_PREFIX + SUMMARY_TEXT,
                     ((SystemMessage) cp.get("chat:t1").messages().get(0)).text());
+        } finally {
+            service.close();
+        }
+    }
+
+    @Test
+    void tokenFactorMovesTriggerLineAndScalesEstimate() {
+        // R4-a F5：估算侧乘 tokenFactor（对齐 #340/buildModelInput 口径）——
+        // 208 token 在 budget=300×0.7=210 下不触发（factor=1.0）；factor=1.3
+        // 时触发线随系数下移（(300/1.3)×0.7≈161）→ 触发。估算侧偏保守的
+        // 修正不再让压缩触发晚于运行期修剪。
+        useEstimator();
+        InMemoryCheckpointer cp = new InMemoryCheckpointer();
+        cp.put("chat:t1", new GraphState(history(8), Map.of()));
+        ScriptedSummarizer idle = new ScriptedSummarizer();
+        // 旧四参构造 = factor 1.0（委托旧口径，行为逐字节不变）。
+        CompactionService unitFactor = new CompactionService(cp, settings(), 300, idle);
+        try {
+            unitFactor.onRunTerminated(RunConfig.of("chat:t1", "u1"), null);
+            settle();
+            assertEquals(0, idle.transcripts.size(), "factor=1.0 不触发（208 ≤ 210）");
+            assertEquals(0, unitFactor.abandonedRounds());
+            assertEquals(0, unitFactor.compactedRounds());
+            assertEquals(16, cp.get("chat:t1").messages().size(), "快照原样");
+        } finally {
+            unitFactor.close();
+        }
+
+        // 同一快照换 factor=1.3：触发线移动 → 压缩发生，元数据估算按系数放大。
+        InMemoryCheckpointer cp2 = new InMemoryCheckpointer();
+        cp2.put("chat:t1", new GraphState(history(8), Map.of()));
+        ScriptedSummarizer summarizer = new ScriptedSummarizer();
+        summarizer.responses.add(SUMMARY_TEXT);
+        CompactionService factored = new CompactionService(cp2, settings(), 300, 1.3, summarizer);
+        try {
+            factored.onRunTerminated(RunConfig.of("chat:t1", "u1"), null);
+            waitFor(() -> factored.compactedRounds() == 1);
+            // targetChars 仍按原始预算裁决（与系数无关）：clamp(300/10,400,2000)=400。
+            assertEquals(List.of(400), summarizer.targets);
+            GraphState compacted = cp2.get("chat:t1");
+            assertEquals(7, compacted.messages().size());
+            // 每条出口乘系数（与 buildModelInput 同乘法点）：round(13×1.3)=17 × 16。
+            Map<String, Object> meta = castMap(compacted.extra().get("compaction"));
+            assertEquals(272, ((Number) meta.get("original_token_estimate")).intValue(),
+                    "13/条 × 1.3 → 17/条 × 16（估算侧乘 factor）");
+            assertEquals(5, ((Number) meta.get("folded_turns")).intValue());
+        } finally {
+            factored.close();
+        }
+    }
+
+    @Test
+    void staleExtraSnapshotIsNotWrittenBackWhenMessagesUnchanged() {
+        // R4-a F6：摘要期间「消息不变」的 extra-only 落盘（attachments 通道
+        // 更新、#199 cancelled 标记等）不被旧快照整行回退——replacement 的
+        // extra 以锁内重读的 fresh.extra() 为 prior，不是摘要前的旧快照。
+        useEstimator();
+        InMemoryCheckpointer cp = new InMemoryCheckpointer();
+        cp.put("chat:t1", new GraphState(history(8),
+                Map.of("attachments", Map.of("0", "首轮附件"))));
+        ScriptedSummarizer summarizer = new ScriptedSummarizer();
+        summarizer.responses.add(SUMMARY_TEXT);
+        summarizer.beforeRespond = () -> {
+            // 摘要期间 extra-only 落盘：消息序列不变（基准校验仍过），
+            // attachments 追加一条（附件元数据整表替换的常规形态）。
+            GraphState mutated = new GraphState(cp.get("chat:t1").messages(),
+                    Map.of("attachments", Map.of("0", "首轮附件", "1", "摘要期间新增附件")));
+            cp.put("chat:t1", mutated);
+        };
+        CompactionService service = new CompactionService(cp, settings(), 250, summarizer);
+        try {
+            service.onRunTerminated(RunConfig.of("chat:t1", "u1"), null);
+            waitFor(() -> service.compactedRounds() == 1);
+            GraphState compacted = cp.get("chat:t1");
+            // 压缩照常发生（消息基准一致）。
+            assertEquals(7, compacted.messages().size());
+            assertTrue(compacted.messages().get(0) instanceof SystemMessage);
+            // 摘要期间的 extra 更新保留（不被旧快照回退）。
+            Map<String, Object> attachments = castMap(compacted.extra().get("attachments"));
+            assertEquals("首轮附件", attachments.get("0"));
+            assertEquals("摘要期间新增附件", attachments.get("1"),
+                    "摘要期间落盘的 extra-only 更新必须保留（F6）");
+            // 压缩元数据仍在（prior 之上单键覆盖）。
+            Map<String, Object> meta = castMap(compacted.extra().get("compaction"));
+            assertEquals(16, ((Number) meta.get("original_message_count")).intValue());
+            assertEquals(5, ((Number) meta.get("folded_turns")).intValue());
         } finally {
             service.close();
         }

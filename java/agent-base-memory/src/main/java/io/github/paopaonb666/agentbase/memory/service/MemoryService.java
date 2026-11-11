@@ -833,9 +833,24 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
     /**
      * 一轮对话结束后的记忆形成（后台调用；绝不抛异常）。消息是该线程的
      * 全部持久化消息（checkpointer 快照）；force 旁路门控（夜间批脚本）。
+     * 折叠轮数缺省 0（快照未被压缩改写）。
      */
     public Map<String, Object> captureTurn(String userId, String agentId, String threadId,
                                            List<ChatMessage> messages, boolean force) {
+        return captureTurn(userId, agentId, threadId, messages, force, 0);
+    }
+
+    /**
+     * 折叠轮数变体（端口通道，R4-a F7）：{@code foldedHumanTurns} = 该线程
+     * 历史里被压缩折叠段吞掉的 UserMessage 数（读侧
+     * {@code AgentsRoutes.buildCaptureHook} 从快照 extra 的 compaction 元数据
+     * 取出）——门控的人类轮计数 = 快照可见数 + 折叠轮数，压缩先写回时滚动
+     * 摘要不再停摆。负值按 0 防御（门控计数只增不减）。
+     */
+    @Override
+    public Map<String, Object> captureTurn(String userId, String agentId, String threadId,
+                                           List<ChatMessage> messages, boolean force,
+                                           int foldedHumanTurns) {
         if (pipeline == null) {
             return null;
         }
@@ -845,6 +860,7 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
                 humanCount++;
             }
         }
+        humanCount += Math.max(0, foldedHumanTurns);
         List<ChatMessage> window = messages.subList(
                 Math.max(0, messages.size() - settings.memory.extractionMaxMessages), messages.size());
         String transcript = MemoryPipeline.renderTranscript(window, settings.memory.extractionMaxInputChars);

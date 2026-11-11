@@ -260,6 +260,15 @@ public final class AgentRuntime {
             }
             tools.close();
         }
+        if (compaction != null) {
+            // 压缩任务执行器（#328）：在途任务中断、队列丢弃（守护线程，
+            // 不阻塞进程退出；close 前到达的终态不再评估）。
+            // F4（R4-a）：先停压缩、后关存储——在途压缩任务（LLM 摘要可跑
+            // 数秒且不响应中断）完成后的写回必须落在仍打开的 checkpointer
+            // 上；顺序反过来，写回会对已关闭的存储 get/put（异常落欠账
+            // 计数，/health 快照积压被关停瞬态污染）。
+            compaction.close();
+        }
         if (checkpointer != null) {
             checkpointer.close();
         }
@@ -271,11 +280,6 @@ public final class AgentRuntime {
         }
         if (memory != null) {
             memory.close();
-        }
-        if (compaction != null) {
-            // 压缩任务执行器（#328）：在途任务中断、队列丢弃（守护线程，
-            // 不阻塞进程退出；close 前到达的终态不再评估）。
-            compaction.close();
         }
         // 基座存储与记忆存储相互独立（0.3.0）：两个都要关，不能 elif。
         if (threadIndex != null) {
@@ -388,14 +392,17 @@ public final class AgentRuntime {
                 io.github.paopaonb666.agentbase.core.memory.MemoryPlugins.build(resolved, llm, fastLlm);
         AgentModule.MemoryServicePort memoryService = plugin == null ? null : plugin.service();
         // 会话历史压缩（#328/#330）：开关关/记忆端口缺席 = 不装配、零行为
-        // 变化。budget 按主力 runtime 窗口经 resolveInputBudget 同口径推导；
-        // 摘要走记忆端口的 compaction 通道（快档，未配 LLM 时端口返回 null
-        // → 放弃本轮）；写回经 CompiledGraph.compactThread 持锁互斥。
+        // 变化。budget 按主力 runtime 窗口经 resolveInputBudget 同口径推导，
+        // 触发估算乘主力 tokenFactor（R4-a F5 对齐 #340 口径；system 扣减与
+        // fast profile 共用主力预算两处偏差在 CompactionService 构造 javadoc
+        // 登记）；摘要走记忆端口的 compaction 通道（快档，未配 LLM 时端口
+        // 返回 null → 放弃本轮）；写回经 CompiledGraph.compactThread 持锁互斥。
         CompactionService compaction = null;
         if (resolved.memory.compactionEnabled && memoryService != null) {
             compaction = new CompactionService(checkpointer, resolved.memory,
                     io.github.paopaonb666.agentbase.core.context.ContextEngine
                             .resolveInputBudget(resolved, llm),
+                    llm.tokenFactor(),
                     memoryService::compactTranscript);
         }
         // 工具库的内置工具按 TOOLKIT_ENABLED 装配后并入共享池（模块工具在

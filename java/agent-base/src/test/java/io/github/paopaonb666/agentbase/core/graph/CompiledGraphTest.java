@@ -878,4 +878,37 @@ class CompiledGraphTest {
         release.countDown();
         a.join(5000);
     }
+
+    @Test
+    void compactionHookSkipsNodeThrownCancellationWithoutSinkCancel() {
+        // R4-a F10①：节点抛 CancellationException 且 sink 未取消——
+        // streamWithTermination 已把它归 CANCELLED（#9 既有口径），runExit 的
+        // failure 路径按同口径归类后，钩子契约「仅 CANCELLED 不调用」不再有缝。
+        List<String> fired = new java.util.concurrent.CopyOnWriteArrayList<>();
+        CompiledGraph.CompactionHook hook = (config, finalState) -> fired.add(config.threadId());
+        CompiledGraph graph = GraphBuilder.begin()
+                .addNode("cancel", (state, ctx) -> {
+                    throw new java.util.concurrent.CancellationException("node cancelled");
+                })
+                .entry("cancel")
+                .addEdge("cancel", GraphBuilder.END)
+                .compile(null, "chat", null, hook);
+        // invoke 的抛出契约不变：CancellationException 原样穿出（RuntimeException
+        // 归一分支不再包装）。
+        assertThrows(java.util.concurrent.CancellationException.class,
+                () -> graph.invoke(new GraphState(), RunConfig.of("chat:t1", "u1")));
+        assertTrue(fired.isEmpty(), "节点抛 CancellationException = CANCELLED 终态，钩子不触发");
+
+        // 对照：同形态的 run 经 streamWithTermination 归 CANCELLED（口径一致）。
+        CompiledGraph annotated = GraphBuilder.begin()
+                .addNode("cancel", (state, ctx) -> {
+                    throw new java.util.concurrent.CancellationException("node cancelled");
+                })
+                .entry("cancel")
+                .addEdge("cancel", GraphBuilder.END)
+                .compile(null, "chat");
+        CompiledGraph.RunOutcome outcome = annotated.streamWithTermination(
+                new GraphState(), RunConfig.of("chat:t2", "u1"), null);
+        assertEquals(Events.RunTermination.CANCELLED, outcome.termination());
+    }
 }
