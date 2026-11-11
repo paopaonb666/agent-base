@@ -255,6 +255,22 @@ public final class UploadedFileStores {
         }
 
         @Override
+        public synchronized List<UploadedFileInfo> listVisibleForUser(String userId) {
+            // 查询级排除（L92）：哨兵行不占 limit 预算；排序/上限语义与
+            // listForUser(userId, null, 200) 完全一致。
+            List<UploadedFileInfo> visible = new ArrayList<>();
+            for (UploadedFileInfo info : files.values()) {
+                if (info.userId().equals(userId)
+                        && !UploadedFileStore.TOOL_RESULT_MODULE.equals(info.module())) {
+                    visible.add(info);
+                }
+            }
+            visible.sort(Comparator.comparingDouble(UploadedFileInfo::createdAt).reversed());
+            int capped = Math.min(visible.size(), 200);
+            return List.copyOf(visible.subList(0, capped));
+        }
+
+        @Override
         public synchronized void deleteForThread(String threadId) {
             files.values().removeIf(info -> info.threadId().equals(threadId));
         }
@@ -497,10 +513,25 @@ public final class UploadedFileStores {
 
         @Override
         public synchronized List<UploadedFileInfo> listForUser(String userId, String module, int limit) {
+            return listForUserInternal(userId, module, null, limit);
+        }
+
+        @Override
+        public synchronized List<UploadedFileInfo> listVisibleForUser(String userId) {
+            // 查询级下推（L92）：AND module != ? 让 LIMIT 预算花在真实文件上。
+            return listForUserInternal(userId, null, UploadedFileStore.TOOL_RESULT_MODULE, 200);
+        }
+
+        /** listForUser 的查询体：module=等值过滤；excludeModule=排除哨兵行（L92）。 */
+        private synchronized List<UploadedFileInfo> listForUserInternal(
+                String userId, String module, String excludeModule, int limit) {
             StringBuilder sql = new StringBuilder("SELECT " + SQLITE_SELECT_COLUMNS
                     + " FROM uploaded_files WHERE user_id = ?");
             if (module != null) {
                 sql.append(" AND module = ?");
+            }
+            if (excludeModule != null) {
+                sql.append(" AND module != ?");
             }
             sql.append(" ORDER BY created_at DESC LIMIT ?");
             try (PreparedStatement ps = conn.prepareStatement(sql.toString())) {
@@ -508,6 +539,9 @@ public final class UploadedFileStores {
                 ps.setString(i++, userId);
                 if (module != null) {
                     ps.setString(i++, module);
+                }
+                if (excludeModule != null) {
+                    ps.setString(i++, excludeModule);
                 }
                 ps.setInt(i++, Math.max(1, limit));
                 List<UploadedFileInfo> out = new ArrayList<>();
@@ -700,10 +734,25 @@ public final class UploadedFileStores {
 
         @Override
         public List<UploadedFileInfo> listForUser(String userId, String module, int limit) {
+            return listForUserInternal(userId, module, null, limit);
+        }
+
+        @Override
+        public List<UploadedFileInfo> listVisibleForUser(String userId) {
+            // 查询级下推（L92）：AND module != ? 让 LIMIT 预算花在真实文件上。
+            return listForUserInternal(userId, null, UploadedFileStore.TOOL_RESULT_MODULE, 200);
+        }
+
+        /** listForUser 的查询体：module=等值过滤；excludeModule=排除哨兵行（L92）。 */
+        private List<UploadedFileInfo> listForUserInternal(
+                String userId, String module, String excludeModule, int limit) {
             StringBuilder sql = new StringBuilder("SELECT " + MYSQL_SELECT_COLUMNS
                     + " FROM uploaded_files WHERE user_id = ?");
             if (module != null) {
                 sql.append(" AND module = ?");
+            }
+            if (excludeModule != null) {
+                sql.append(" AND module != ?");
             }
             sql.append(" ORDER BY created_at DESC LIMIT ?");
             try (Connection conn = connect();
@@ -712,6 +761,9 @@ public final class UploadedFileStores {
                 ps.setString(i++, userId);
                 if (module != null) {
                     ps.setString(i++, module);
+                }
+                if (excludeModule != null) {
+                    ps.setString(i++, excludeModule);
                 }
                 ps.setInt(i++, Math.max(1, limit));
                 List<UploadedFileInfo> out = new ArrayList<>();

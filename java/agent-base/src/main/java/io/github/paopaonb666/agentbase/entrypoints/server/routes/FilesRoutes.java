@@ -358,7 +358,7 @@ public class FilesRoutes {
         if (fileStore == null) {
             throw new HttpError(503, ErrorCode.STORAGE_UNAVAILABLE, "附件存储未启用（存储后端不可用）");
         }
-        List<UploadedFileInfo> files = fileStore.listForUser(userId);
+        List<UploadedFileInfo> files = fileStore.listVisibleForUser(userId);
         Map<String, Integer> counts = Map.of();
         var memory = runtime.memory();
         if (memory != null) {

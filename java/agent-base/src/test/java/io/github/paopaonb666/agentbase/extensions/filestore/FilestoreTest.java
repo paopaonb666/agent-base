@@ -390,4 +390,34 @@ class FilestoreTest {
             assertEquals(1, store.listForUser("u9").size());
         }
     }
+
+    // ── 可见清单（L92/R4-b）：tool_result 哨兵行排除 ─────────────────
+
+    @Test
+    void toolResultSentinelRowsExcludedFromVisibleList() {
+        // 哨兵行（#6 外置）不是知识文件：listVisibleForUser 恒排除；
+        // 三参 listForUser 按模块精确查询仍可见（级联/审计路径不回归）。
+        try (UploadedFileStore store = UploadedFileStores.build(settings("memory", null))) {
+            store.save(info("f-chat", "", "u1", "chat", ""));
+            store.save(info("f-tool", "chat:t1", "u1", UploadedFileStore.TOOL_RESULT_MODULE, ""));
+            store.save(info("f-writer", "", "u1", "writer", ""));
+            List<String> visible = ids(store.listVisibleForUser("u1"));
+            assertTrue(visible.contains("f-chat") && visible.contains("f-writer"),
+                    "真实文件保留：" + visible);
+            assertTrue(!visible.contains("f-tool"), "哨兵行必须被排除：" + visible);
+            assertEquals(List.of("f-tool"),
+                    ids(store.listForUser("u1", UploadedFileStore.TOOL_RESULT_MODULE, 200)),
+                    "按模块查询哨兵行仍可见（删除走线程级联，查询面不回归）");
+        }
+        try (UploadedFileStores.SqliteUploadedFileStore store = sqliteStore("visible.db")) {
+            // SQL 后端走查询级下推（AND module != ?）：LIMIT 预算花在真实文件上。
+            store.save(info("s-chat", "", "u1", "chat", ""));
+            store.save(info("s-tool", "chat:t1", "u1", UploadedFileStore.TOOL_RESULT_MODULE, ""));
+            List<String> visible = ids(store.listVisibleForUser("u1"));
+            assertTrue(visible.contains("s-chat"), "真实文件保留：" + visible);
+            assertTrue(!visible.contains("s-tool"), "哨兵行必须被排除：" + visible);
+            assertEquals(List.of("s-tool"),
+                    ids(store.listForUser("u1", UploadedFileStore.TOOL_RESULT_MODULE, 200)));
+        }
+    }
 }

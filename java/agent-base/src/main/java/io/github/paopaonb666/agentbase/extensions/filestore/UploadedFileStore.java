@@ -26,6 +26,12 @@ public interface UploadedFileStore extends AutoCloseable {
     /** 未绑定线程的孤儿附件保留时长（小时），超过后在上传时机会式清理。 */
     int ORPHAN_MAX_AGE_HOURS = 24;
 
+    /**
+     * 工具结果外置哨兵行的 module 值（#6）：这类行是超大工具结果的全文
+     * 寄存，不是用户上传的知识文件——列表侧必须排除（L92）。
+     */
+    String TOOL_RESULT_MODULE = "tool_result";
+
     /** 保存（或按 file_id 覆写）一条附件。 */
     void save(UploadedFileInfo info);
 
@@ -41,6 +47,26 @@ public interface UploadedFileStore extends AutoCloseable {
     /** 某用户的附件清单（不过滤模块，默认 200 条；对应 Python 的默认参数）。 */
     default List<UploadedFileInfo> listForUser(String userId) {
         return listForUser(userId, null, 200);
+    }
+
+    /**
+     * 某用户的<b>可见</b>附件清单（L92/R4-b 收口）：等价
+     * {@code listForUser(userId, null, 200)} 但恒排除
+     * {@link #TOOL_RESULT_MODULE} 哨兵行——工具结果外置行不是知识文件，
+     * 不得泄入 GET /v1/knowledge/files，也无法经既有 DELETE 路由删除
+     * （requireModule 拒非模块名，哨兵行删除走线程级联）。默认形态取回
+     * 后内存过滤；SQL 后端应覆写为查询级下推（{@code module != ?}），
+     * 让 LIMIT 预算花在真实文件上。
+     */
+    default List<UploadedFileInfo> listVisibleForUser(String userId) {
+        List<UploadedFileInfo> all = listForUser(userId, null, 200);
+        List<UploadedFileInfo> visible = new java.util.ArrayList<>(all.size());
+        for (UploadedFileInfo info : all) {
+            if (!TOOL_RESULT_MODULE.equals(info.module())) {
+                visible.add(info);
+            }
+        }
+        return List.copyOf(visible);
     }
 
     /** 把一批附件回填绑定到对话线程（上传先于线程生成的时序补偿）。 */

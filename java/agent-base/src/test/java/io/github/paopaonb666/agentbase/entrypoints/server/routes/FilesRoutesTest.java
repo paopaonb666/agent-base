@@ -378,4 +378,27 @@ class FilesRoutesTest {
         assertTrue(error.getMessage().contains("PDF 解析失败"), error.getMessage());
         assertTrue(!calls.contains("save"), calls.toString());
     }
+
+    @Test
+    void knowledgeFileListExcludesToolResultSentinelRows() throws Exception {
+        // L92/R4-b：#6 外置哨兵行（module="tool_result"）不是知识文件，
+        // 不得泄入 GET /v1/knowledge/files（且无法经 DELETE 路由删除）。
+        var store = new io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStores
+                .MemoryUploadedFileStore();
+        store.save(new io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileInfo(
+                "f1", "", "chat", "u1", "a.pdf", "pdf", null, null, false, 10, "", "文本", new byte[0]));
+        store.save(new io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileInfo(
+                "f2", "chat:t1",
+                io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStore.TOOL_RESULT_MODULE,
+                "u1", "web_search", "txt", null, null, false, 8000, "", "工具结果全文", new byte[0]));
+        AgentRuntime runtime = buildRuntime(Settings.load(Map.of("ENV", "development")), store);
+        FilesRoutes routes = new FilesRoutes(runtime, PASS_THROUGH_AUTH);
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> files = (List<Map<String, Object>>)
+                routes.knowledgeFiles("u1", null, null, null).get("files");
+        List<String> ids = files.stream().map(f -> String.valueOf(f.get("file_id"))).toList();
+        assertTrue(ids.contains("f1"), "真实上传文件保留：" + ids);
+        assertTrue(!ids.contains("f2"), "哨兵行必须被排除：" + ids);
+    }
 }

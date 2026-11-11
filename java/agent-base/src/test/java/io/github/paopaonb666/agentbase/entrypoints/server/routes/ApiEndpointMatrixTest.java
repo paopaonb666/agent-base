@@ -444,7 +444,9 @@ class ApiEndpointMatrixTest {
     @Test
     void knowledgeFilesMergesChunkCountsAndDegradesWithoutStore() throws Exception {
         var fileStore = Mockito.mock(io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStore.class);
-        when(fileStore.listForUser("alice")).thenReturn(List.of(
+        // L92：路由改走可见清单（listVisibleForUser）——哨兵行在 store 层排除，
+        // mock 按新契约打桩。
+        when(fileStore.listVisibleForUser("alice")).thenReturn(List.of(
                 info("f1", "alice", "a.pdf", "pdf", new byte[1])));
         var memory = Mockito.mock(AgentModule.MemoryServicePort.class);
         when(memory.chunkCountsByFile("alice")).thenReturn(Map.of("f1", 7));

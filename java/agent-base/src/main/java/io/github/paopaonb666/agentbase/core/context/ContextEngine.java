@@ -183,7 +183,7 @@ public final class ContextEngine {
             fileStore.save(new UploadedFileInfo(
                     fileId,
                     threadId == null ? "" : threadId,
-                    "tool_result",
+                    UploadedFileStore.TOOL_RESULT_MODULE,
                     userId == null ? "" : userId,
                     toolName == null ? "" : toolName,
                     "txt",
