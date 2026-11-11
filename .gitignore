@@ -28,6 +28,10 @@ working/
 *.swo
 *~
 
+# Local tool / extraction scratch (never commit)
+.mimosa/
+.qqdoc_extract/
+
 # Python
 __pycache__/
 *.py[cod]
