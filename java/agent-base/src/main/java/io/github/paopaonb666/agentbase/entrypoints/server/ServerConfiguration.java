@@ -21,6 +21,8 @@ import org.springframework.core.Ordered;
 import org.springframework.web.servlet.config.annotation.CorsRegistry;
 import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 
+import jakarta.servlet.DispatcherType;
+
 /**
  * 服务装配（对应 Python 侧 {@code create_app} + lifespan）：
  *
@@ -135,6 +137,9 @@ public class ServerConfiguration {
         FilterRegistrationBean<WebFilters.MetricsFilter> registration = new FilterRegistrationBean<>();
         registration.setFilter(new WebFilters.MetricsFilter());
         registration.addUrlPatterns("/*");
+        // 异步请求（SSE）的收口观测依赖容器在流终态重入 ASYNC dispatch
+        //（review C-P3）——缺省只挂 REQUEST 时 filter 看不到流结束。
+        registration.setDispatcherTypes(DispatcherType.REQUEST, DispatcherType.ASYNC);
         registration.setOrder(Ordered.HIGHEST_PRECEDENCE + 1);
         return registration;
     }

@@ -5,6 +5,7 @@ import java.io.IOException;
 import io.github.paopaonb666.agentbase.extensions.Metrics;
 import io.github.paopaonb666.agentbase.extensions.Observability;
 
+import jakarta.servlet.DispatcherType;
 import jakarta.servlet.Filter;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
@@ -58,19 +59,41 @@ public final class WebFilters {
 
     public static final class MetricsFilter implements Filter {
 
+        /** REQUEST 趟记录的起始时刻（ASYNC dispatch 读回计全生命周期时长）。 */
+        private static final String START_NANO_ATTR = MetricsFilter.class.getName() + ".startNano";
+
         @Override
         public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
                 throws IOException, ServletException {
             HttpServletRequest req = (HttpServletRequest) request;
-            long started = System.nanoTime();
+            // 异步请求（SSE）量全生命周期（review C-P3，对齐 Python 中间件
+            // 量完整流）：REQUEST 趟只记录起始时刻——controller 返回
+            // SseEmitter 后 filter 链即返回，此处观测到的只有数毫秒的装配
+            // 时长；等容器在流终态重入 ASYNC dispatch 时再收口（起始时刻从
+            // request attribute 读回）。流内 error 事件不改变 HTTP status，
+            // metrics status 恒为响应状态码（与 Python 同口径；终态事件到
+            // status 的映射不做——需要 SseStreams 内部终态分类传出，超 S）。
+            boolean initial = req.getDispatcherType() != DispatcherType.ASYNC;
+            long started;
+            if (initial) {
+                started = System.nanoTime();
+                req.setAttribute(START_NANO_ATTR, started);
+            } else {
+                started = req.getAttribute(START_NANO_ATTR) instanceof Long recorded
+                        ? recorded
+                        : System.nanoTime();
+            }
             try {
                 chain.doFilter(request, response);
             } finally {
-                int status = response instanceof HttpServletResponse http
-                        ? http.getStatus()
-                        : 200;
-                Metrics.http().observe(req.getMethod(), routeOf(req), status,
-                        (System.nanoTime() - started) / 1_000_000_000.0);
+                boolean deferToAsyncDispatch = initial && req.isAsyncStarted();
+                if (!deferToAsyncDispatch) {
+                    int status = response instanceof HttpServletResponse http
+                            ? http.getStatus()
+                            : 200;
+                    Metrics.http().observe(req.getMethod(), routeOf(req), status,
+                            (System.nanoTime() - started) / 1_000_000_000.0);
+                }
             }
         }
 
