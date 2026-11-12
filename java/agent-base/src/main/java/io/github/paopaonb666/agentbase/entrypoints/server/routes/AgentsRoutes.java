@@ -283,7 +283,9 @@ public class AgentsRoutes {
                 }
             }
         }
-        // 附件（M4b）：校验属主 → 绑定线程 → 注入。
+        // 附件（M4b）：校验属主 → 注入。绑定线程（bindThread）后置到
+        // startStream 的闸门判定之后（review C-P2）——429/404 等拒绝路径
+        // 不残留 file↔thread 绑定行。
         if (body.attachments() != null && !body.attachments().isEmpty()) {
             UploadedFileStore fileStore = runtime.fileStore();
             if (fileStore == null) {
@@ -307,7 +309,6 @@ public class AgentsRoutes {
                 throw new HttpError(400, ErrorCode.BAD_REQUEST, "附件不存在或无权访问：" + String.join("，", sorted)
                         + "；请重新上传");
             }
-            fileStore.bindThread(body.attachments(), fullThreadId);
             List<String> blocks = attachmentBlocks(attachmentInfos);
             List<UploadedFileInfo> imageParts = new ArrayList<>();
             for (UploadedFileInfo info : attachmentInfos) {
@@ -344,13 +345,14 @@ public class AgentsRoutes {
             Map<String, Object> inputExtra = new LinkedHashMap<>();
             inputExtra.put("attachments", Map.of(String.valueOf(messagesInput.size() - 1), attachmentsMeta));
             inputExtra.putAll(planSeed);
-            return startStream(graph, messagesInput, inputExtra, config, userThreadId, userId, module, response);
+            return startStream(graph, messagesInput, inputExtra, config, userThreadId, userId, module, response,
+                    body.attachments());
         }
         messagesInput.add(UserMessage.from(body.message()));
         // 会话索引 upsert（S1）由 startStream 统一执行（#141：非附件分支
         // 不再先行写一次——双写既放大写入量，两次写之间失败还会留下
         // 不一致标题；Python 侧恰一次）。
-        return startStream(graph, messagesInput, planSeed, config, userThreadId, userId, module, response);
+        return startStream(graph, messagesInput, planSeed, config, userThreadId, userId, module, response, null);
     }
 
     /**
@@ -383,11 +385,16 @@ public class AgentsRoutes {
         return seed;
     }
 
-    /** 打开 SSE 流（挂记忆形成钩子；索引 upsert 的唯一落点，所有分支共用）。 */
+    /**
+     * 打开 SSE 流（挂记忆形成钩子；索引 upsert 的唯一落点，所有分支共用）。
+     * {@code attachmentFileIds} 非空时在开流前绑定附件线程（review C-P2）：
+     * 绑定发生在闸门与认领全部通过之后——拒绝路径不残留 file↔thread 绑定行。
+     */
     private SseEmitter startStream(CompiledGraph graph, List<ChatMessage> messagesInput,
                                    Map<String, Object> extra, RunConfig config,
                                    String userThreadId, String userId, String module,
-                                   jakarta.servlet.http.HttpServletResponse response) {
+                                   jakarta.servlet.http.HttpServletResponse response,
+                                   List<String> attachmentFileIds) {
         // SSE 代理头（对应 Python sse.py _SSE_HEADERS 挂在 StreamingResponse
         // 上）：no-cache 防中间层缓存事件流；X-Accel-Buffering 关掉 nginx 的
         // proxy_buffering——缺了它 delta 会被缓冲到流结束才一次性下发。
@@ -463,6 +470,13 @@ public class AgentsRoutes {
                 if (!"attachments".equals(e.getKey())) {
                     effectiveExtra.putIfAbsent(e.getKey(), e.getValue());
                 }
+            }
+            // 附件绑定（M4b，review C-P2）：后置于闸门/认领/快照读取全部
+            // 通过之后——429、404、getState 失败等拒绝路径不残留 file↔thread
+            // 绑定行（purgeOrphans 只清未绑定孤儿，绑定行会残留到线程删除）。
+            // 绑定本身抛错时 opened 仍为 false，finally 归还闸门许可。
+            if (attachmentFileIds != null) {
+                runtime.fileStore().bindThread(attachmentFileIds, config.threadId());
             }
             // R1-F7：SSE emitter 可选超时（0 = 关闭，行为不变）——半开连接
             // （无 RST）不再无限占 #79 闸门额度。秒 → 毫秒：先升 long 再乘

@@ -470,6 +470,59 @@ class AgentsRoutesTest {
     }
 
     @Test
+    void runGateSaturated429DoesNotBindAttachments() throws Exception {
+        // review C-P2：附件 bindThread 后置于 run gate——闸门 429 的请求不得
+        // 残留 file↔thread 绑定行（purgeOrphans 只清未绑定孤儿，绑定行会留到
+        // 线程删除为止）。修复前绑定发生在 invoke 主体、早于 startStream 的
+        // gate 判定——429 请求已把附件绑上线程（本测试在该序下必红）。
+        java.util.concurrent.CountDownLatch entered = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        AgentModule blocking = new AgentModule() {
+            @Override public String name() { return "chat"; }
+            @Override public String description() { return "blocking stub for attachment gate ordering"; }
+            @Override public CompiledGraph buildGraph(ModuleContext ctx) {
+                return GraphBuilder.singleNode("chat", (state, nodeCtx) -> {
+                    entered.countDown();
+                    release.await(10, java.util.concurrent.TimeUnit.SECONDS);
+                    return Map.of();
+                }, ctx.checkpointer());
+            }
+            @Override public List<io.github.paopaonb666.agentbase.core.tools.AgentTool> getTools() {
+                return List.of();
+            }
+        };
+        List<UploadedFileInfo> store = List.of(new UploadedFileInfo(
+                "f1", "", "", "u1", "a.txt", "txt",
+                null, null, false, 2, null, "hi", new byte[0]));
+        List<String> fileCalls = new ArrayList<>();
+        Object fileStore = Proxy.newProxyInstance(
+                io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStore.class.getClassLoader(),
+                new Class<?>[]{io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStore.class},
+                (proxy, method, args) -> {
+                    if ("getMany".equals(method.getName())) {
+                        return store;
+                    }
+                    fileCalls.add(method.getName());
+                    return defaultValue(method.getReturnType());
+                });
+        AgentRuntime runtime = buildRuntime(Settings.load(Map.of(
+                "ENV", "development", "AGENT_RUN_CONCURRENCY", "1")),
+                Map.of("chat", blocking), new InMemoryCheckpointer(),
+                null, fileStore, null, null, null);
+        AgentsRoutes routes = route(runtime);
+
+        // 首轮占满唯一额度（无附件；阻塞节点进入后在途）。
+        assertNotNull(invoke(routes, "chat", invokeBody("hi", "r1", null, null, null), "u1"));
+        assertTrue(entered.await(5, java.util.concurrent.TimeUnit.SECONDS), "阻塞节点应已进入");
+        // 带附件的第二发撞闸门 429：不得发生任何绑定副作用。
+        HttpError error = httpErrorOf(() ->
+                invoke(routes, "chat", invokeBody("hi", "r2", List.of("f1"), null, null), "u1"));
+        assertEquals(429, error.status());
+        assertFalse(fileCalls.contains("bindThread"), "闸门 429 不得绑定附件：" + fileCalls);
+        release.countDown();
+    }
+
+    @Test
     void continuePlanWithoutSnapshotGives400() throws Exception {
         // #66：显式要求延续而快照缺席 → 400（静默重拆反而误导）。
         AgentRuntime runtime = buildRuntime(Map.of("planner", stubModule("planner")),
