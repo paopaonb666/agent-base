@@ -244,21 +244,34 @@ public final class MemoryOpsCli {
                 System.err.println("回填已在进行中（409 语义）");
                 return 1;
             }
-            while (true) {
-                Map<String, Object> status = service.backfillStatus();
-                System.out.print("\rbackfill: " + status);
-                String state = String.valueOf(status.get("state"));
-                if ("done".equals(state) || "failed".equals(state)
-                        || "not_running".equals(state)) {
-                    System.out.println();
-                    return "done".equals(state) ? 0 : 1;
-                }
-                Thread.sleep(500);
-            }
+            return backfillExitCode(service::backfillStatus);
         } finally {
             if (service != null) {
                 service.close();
             }
+        }
+    }
+
+    /**
+     * 轮询回填状态直至终态，返回退出码（done=0，其余终态=1）。终态词表
+     * （review B-P2）：{@code MemoryService} 的回填状态全集是
+     * idle|running|done|<b>error</b>——回填任务抛异常置 error，此前 CLI
+     * 只认 done/failed/not_running，error 态永不命中 → {@code \r} 刷屏
+     * 无限轮询、退出码协议失效。failed/not_running 为防御性保留（当前
+     * 服务不产出这两个词）。
+     */
+    static int backfillExitCode(java.util.function.Supplier<Map<String, Object>> poll)
+            throws InterruptedException {
+        while (true) {
+            Map<String, Object> status = poll.get();
+            System.out.print("\rbackfill: " + status);
+            String state = String.valueOf(status.get("state"));
+            if ("done".equals(state) || "error".equals(state)
+                    || "failed".equals(state) || "not_running".equals(state)) {
+                System.out.println();
+                return "done".equals(state) ? 0 : 1;
+            }
+            Thread.sleep(500);
         }
     }
 
