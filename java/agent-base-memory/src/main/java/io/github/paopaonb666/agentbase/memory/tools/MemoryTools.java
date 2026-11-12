@@ -281,6 +281,23 @@ public final class MemoryTools {
                             String note = "……（较早内容已截断）\n";
                             merged = note + CharMetrics.tail(merged, charLimit - note.length());
                         }
+                        // 敏感内容红线（#48，审查 B-P1 补口）：update_block 与
+                        // memory_save 同款工具层拦截——直写 store().upsertBlock
+                        // 绕过了 service 层兜底，模型可把密钥写进每轮注入的
+                        // 常驻块（冻结快照缓存放大持久化）。检查对象=本次写入
+                        // 的 content（append 混入的旧内容已在库，只拦新值——
+                        // 与 service 层 updateMemory 只检新 content 同口径；
+                        // replace 时 merged==content 等效全覆盖）。
+                        // 回提示文案不打断对话，与 memory_save 同形态。
+                        if (sensitiveContentFilter) {
+                            List<String> rules =
+                                    io.github.paopaonb666.agentbase.memory.textkit
+                                            .SensitiveContentPolicy.INSTANCE.violations(content);
+                            if (!rules.isEmpty()) {
+                                return "记忆块更新被拒绝：内容命中敏感信息规则（"
+                                        + String.join("、", rules) + "），请移除后重试";
+                            }
+                        }
                         int version = (existing != null ? existing.version() : 0) + 1;
                         memory.store().upsertBlock(new MemoryBlock(scope.userId(), agent, label,
                                 merged, charLimit, version,

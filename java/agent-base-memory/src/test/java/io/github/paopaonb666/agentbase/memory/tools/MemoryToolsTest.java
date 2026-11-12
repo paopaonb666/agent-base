@@ -238,8 +238,49 @@ class MemoryToolsTest {
                         "{\"label\": \"persona\", \"content\": \"" + "字".repeat(4001) + "\"}", null))
                         .getMessage());
         // 中文 label 合法（(?U) unicode \w，与 Python re \w 同语义）。
-        assertTrue(call(tool("memory_update_block"), 
+        assertTrue(call(tool("memory_update_block"),
                 "{\"label\": \"人设\", \"content\": \"简洁\"}", null).contains("已更新"));
+    }
+
+    @Test
+    void memoryUpdateBlockRejectsSensitiveContentAndHonorsToggle() {
+        // 审查 B-P1：update_block 直写 store().upsertBlock 此前绕过红线——
+        // 密钥可经工具写进每轮注入的常驻块（冻结快照缓存放大持久化）。
+        // 与 memory_save 同款工具层拦截（默认开关开）。
+        MemoryScope.set("alice", "chat:t1");
+        String ok = call(tool("memory_update_block"),
+                "{\"label\": \"persona\", \"content\": \"第一行\"}", null);
+        assertTrue(ok.contains("已更新"), ok);
+
+        // append 新值命中 → 拒绝，块内容与版本不动（旧内容不受牵连）。
+        String rejected = call(tool("memory_update_block"),
+                "{\"label\": \"persona\", \"content\": \"密钥 sk-abcdefghijklmnop123456\", "
+                        + "\"operation\": \"append\"}", null);
+        assertEquals("记忆块更新被拒绝：内容命中敏感信息规则（api_key），请移除后重试", rejected);
+        var block = memory.store().getBlock("alice", "chat", "persona");
+        assertEquals("第一行", block.content(), "被拒内容不得混入常驻块");
+        assertEquals(1, block.version());
+
+        // replace 同样拦截（content 即最终内容，全覆盖）。
+        String rejectedReplace = call(tool("memory_update_block"),
+                "{\"label\": \"persona\", \"content\": \"手机 13812345678\", "
+                        + "\"operation\": \"replace\"}", null);
+        assertEquals("记忆块更新被拒绝：内容命中敏感信息规则（phone_number），请移除后重试",
+                rejectedReplace);
+        assertEquals("第一行", memory.store().getBlock("alice", "chat", "persona").content());
+
+        // 关开关（build 二参 false）：同内容照常落库——开关与 service 层共用
+        // MEMORY_SENSITIVE_CONTENT_FILTER（#48 既有口径）。
+        MemoryService unfiltered = new MemoryService(store, neverEmbedder(),
+                Settings.load(Map.of("ENV", "development",
+                        "MEMORY_SENSITIVE_CONTENT_FILTER", "false"), null), null, null);
+        AgentTool update = MemoryTools.build(unfiltered, false).stream()
+                .filter(t -> t.name().equals("memory_update_block")).findFirst().orElseThrow();
+        String saved = call(update,
+                "{\"label\": \"persona\", \"content\": \"第二行\", \"operation\": \"append\"}", null);
+        assertTrue(saved.contains("已更新"), saved);
+        assertEquals("第一行\n第二行",
+                memory.store().getBlock("alice", "chat", "persona").content());
     }
 
     @Test
