@@ -101,6 +101,34 @@ class CircuitBreakedModelRuntimeTest {
     }
 
     @Test
+    void failedProbeReopensAndCanRecoverLater() {
+        // 审查 A-P0：探测失败必须 HALF_OPEN→OPEN 重开（冷却重启）——缺这条
+        // 转移会永久卡在 HALF_OPEN（guard 对半开恒快速失败、无冷却出口），
+        // 一次「冷却到期后探测仍失败」就把该链元素打瘫到重启。修复前的
+        // 既有断言（抛 CircuitOpenException 且 retryAfter>0）区分不了
+        // 「卡死半开（retryAfter 恒 1）」与「真重开」——本用例锁真判据。
+        CountingRuntime flaky = new CountingRuntime(3, new IllegalStateException("down"));
+        AtomicLong clock = new AtomicLong(0);
+        CircuitBreakedModelRuntime breaker =
+                new CircuitBreakedModelRuntime(flaky, 2, 30, clock::get);
+        for (int i = 0; i < 2; i++) {
+            assertThrows(IllegalStateException.class, () -> breaker.invoke(MESSAGES));
+        }
+        assertEquals("open(30s)", breaker.stateDescription());
+        // 冷却到期 → 单发探测（第 3 次失败）→ 必须重开为 OPEN（非卡 half-open）。
+        clock.addAndGet(31_000_000_000L);
+        assertThrows(IllegalStateException.class, () -> breaker.invoke(MESSAGES));
+        assertTrue(breaker.stateDescription().startsWith("open("),
+                "探测失败后应重开为 open（带新冷却）：" + breaker.stateDescription());
+        // 再次冷却到期 → 探测成功 → 闭路直通（卡死状态下这一步永不发生）。
+        clock.addAndGet(31_000_000_000L);
+        assertEquals("ok", breaker.invoke(MESSAGES).text(), "重开冷却后应放行新探测");
+        assertEquals("closed", breaker.stateDescription(), "探测成功应闭路");
+        assertEquals("ok", breaker.invoke(MESSAGES).text(), "闭路后直通");
+        assertEquals(5, flaky.invocations(), "真实调用数：2 开路 + 1 探测败 + 1 探测成 + 1 直通");
+    }
+
+    @Test
     void disabledThresholdPassesThrough() {
         CountingRuntime inner = new CountingRuntime(Integer.MAX_VALUE,
                 new IllegalStateException("down"));

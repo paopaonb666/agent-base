@@ -190,19 +190,29 @@ public final class CircuitBreakedModelRuntime implements ModelRuntime {
         }
         int failures = consecutiveFailures.incrementAndGet();
         if (state.get() == HALF_OPEN) {
-            openCircuit();
+            // 探测失败：HALF_OPEN → OPEN 重开（冷却重启）。缺了这条转移，
+            // 状态会永久卡在 HALF_OPEN——guard 对半开恒快速失败且无冷却
+            // 出口，一次"冷却到期后探测仍失败"就把该链元素打瘫到重启
+            // （全量审查 A-P0）。CAS 失败 = 另一线程已转移，随它。
+            if (state.compareAndSet(HALF_OPEN, OPEN)) {
+                openCircuit(true);
+            }
             return;
         }
         if (failures >= failureThreshold && state.compareAndSet(CLOSED, OPEN)) {
-            openCircuit();
+            openCircuit(false);
         }
     }
 
-    private void openCircuit() {
+    private void openCircuit(boolean probeFailureReopen) {
         openedAt.set(nanoClock.getAsLong());
         openCount.incrementAndGet();
-        LOG.warn("llm: 熔断开启（连续失败 {} 次达到阈值 {}），{}s 后半开探测",
-                consecutiveFailures.get(), failureThreshold, cooldownNanos / 1_000_000_000L);
+        if (probeFailureReopen) {
+            LOG.warn("llm: 熔断探测失败重开，{}s 后再次半开探测", cooldownNanos / 1_000_000_000L);
+        } else {
+            LOG.warn("llm: 熔断开启（连续失败 {} 次达到阈值 {}），{}s 后半开探测",
+                    consecutiveFailures.get(), failureThreshold, cooldownNanos / 1_000_000_000L);
+        }
     }
 
     private long cooldownRemainingNanos(long now) {
