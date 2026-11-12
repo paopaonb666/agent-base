@@ -186,6 +186,36 @@ class MemoryStoreTimestampMatrixTest {
         }
     }
 
+    @Test
+    void listOpsCrossUserThreadFilterMatchesInMemory() {
+        // review B-P5：listOps(userId=null, threadId≠null) 此前生成
+        // `FROM memory_ops AND thread_id = ?` 的非法 SQL（WHERE 只由 userId
+        // 发起）——当前接线不可达（调用方 userId 来自认证非空），纯潜伏；
+        // InMemory 版对同组合语义正常。修复=AND 改按「是否已有 WHERE」拼接。
+        // 真判据：SQL 后端同组合不炸且与 InMemory 视图一致（修复前必红：
+        // SQLException）。
+        InMemoryMemoryStore inMemory = new InMemoryMemoryStore();
+        try (SqliteMemoryStore sqlite = new SqliteMemoryStore(
+                tempDir.resolve("ops-null-user-" + System.nanoTime() + ".db").toString())) {
+            for (MemoryStore store : List.of(inMemory, sqlite)) {
+                store.recordOp(new Models.MemoryOp("o1", "extract", "u1", "chat", "chat:t1",
+                        Map.of(), "ok", "", 1, 5000.0));
+                store.recordOp(new Models.MemoryOp("o2", "extract", "u2", "chat", "chat:t1",
+                        Map.of(), "ok", "", 1, 5000.0));
+                store.recordOp(new Models.MemoryOp("o3", "extract", "u1", "chat", "chat:t2",
+                        Map.of(), "ok", "", 1, 5000.0));
+            }
+            List<String> expected = inMemory.listOps(null, "chat:t1", null, null, 10).stream()
+                    .map(Models.MemoryOp::opId).toList();
+            assertEquals(List.of("o2", "o1"), expected,
+                    "InMemory 基线：跨用户按 thread 过滤（同刻 tiebreak rowid/插入序 DESC）");
+            assertEquals(expected,
+                    sqlite.listOps(null, "chat:t1", null, null, 10).stream()
+                            .map(Models.MemoryOp::opId).toList(),
+                    "SQL 后端同组合不得炸非法 SQL、语义与 InMemory 一致");
+        }
+    }
+
     // ── 跨后端语义矩阵：固定种子 → 相同观察视图 ──────────────────────────
 
     @Test

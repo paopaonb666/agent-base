@@ -805,7 +805,11 @@ abstract class AbstractSqlMemoryStore implements MemoryStore {
             params.add(userId);
         }
         if (threadId != null) {
-            sql.append(" AND thread_id = ?");
+            // WHERE/AND 按「是否已有 WHERE」推进（review B-P5）：userId 缺席
+            // + threadId 在场的组合此前生成 `FROM memory_ops AND thread_id = ?`
+            // 的非法 SQL——当前接线不可达（调用方 userId 来自认证非空），
+            // 纯潜伏；InMemory 版对同组合语义正常（null=跨用户）。
+            sql.append(userId == null ? " WHERE thread_id = ?" : " AND thread_id = ?");
             params.add(threadId);
         }
         if (sinceEpochSeconds != null) {
