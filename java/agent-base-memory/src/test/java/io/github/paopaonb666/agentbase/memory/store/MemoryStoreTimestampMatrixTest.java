@@ -117,6 +117,37 @@ class MemoryStoreTimestampMatrixTest {
         }
     }
 
+    @Test
+    void sameMillisecondMemoryOrderStableAcrossSqliteReplace() {
+        // review B-P3：memories 的 updated_at 同刻并列组必须有确定性次序键
+        // ——sqlite 的 INSERT OR REPLACE 是删旧插新，重写即翻 rowid，修复前
+        // 同刻并列组的返回序在两次查询间互换（RRF 通道排名/top-k 边界随之
+        // 漂移，候选序是排序与并列判定的底序）。修复=ORDER BY 追加
+        // memory_id DESC（与 ops 的 opsTiebreak 同款收口）。
+        double same = 5000.0;
+        Models.MemoryRecord a = new Models.MemoryRecord("m-aaa", "u", "chat", "semantic",
+                "内容甲", List.of(), null, null, 0.5, "active", "", List.of(),
+                same, same, null, 0);
+        Models.MemoryRecord b = new Models.MemoryRecord("m-bbb", "u", "chat", "semantic",
+                "内容乙", List.of(), null, null, 0.5, "active", "", List.of(),
+                same, same, null, 0);
+        try (SqliteMemoryStore sqlite = new SqliteMemoryStore(
+                tempDir.resolve("tie-mem-" + System.nanoTime() + ".db").toString())) {
+            sqlite.upsertMemory(a);
+            sqlite.upsertMemory(b);
+            List<String> before = sqlite.listMemories("u", null, true, null,
+                    List.of("active"), 100, false).stream()
+                    .map(Models.MemoryRecord::memoryId).toList();
+            // 重写 m-aaa（REPLACE 翻 rowid）：返回序必须不变（memory_id tiebreak）。
+            sqlite.upsertMemory(a);
+            List<String> after = sqlite.listMemories("u", null, true, null,
+                    List.of("active"), 100, false).stream()
+                    .map(Models.MemoryRecord::memoryId).toList();
+            assertEquals(before, after, "同刻并列组的返回序在重写后不得翻转");
+            assertEquals(List.of("m-bbb", "m-aaa"), after, "tiebreak=memory_id DESC");
+        }
+    }
+
     // ── 跨后端语义矩阵：固定种子 → 相同观察视图 ──────────────────────────
 
     @Test

@@ -554,7 +554,14 @@ abstract class AbstractSqlMemoryStore implements MemoryStore {
             }
             params.add(agentId);
         }
-        sql.append(" ORDER BY updated_at DESC LIMIT ?");
+        // 同刻并列的确定性次序键（review B-P3）：updated_at 是毫秒粒度
+        // （Models.now()），一轮 capture 写出的多条记忆常同值；MySQL
+        // TIMESTAMP(0) 更把同秒全部压成同值——sqlite 的 INSERT OR REPLACE
+        // 翻 rowid，会让同刻并列组的返回序在两次查询间互换，RRF 通道排名/
+        // top-k 边界随之漂移（候选序是 sortByScoreDescending 与 RRF 并列
+        // 判定的底序）。追加 memory_id 作确定性 tiebreak（与 ops 的
+        // opsTiebreak 同款收口）。
+        sql.append(" ORDER BY updated_at DESC, memory_id DESC LIMIT ?");
         params.add(Math.max(1, limit));
         List<Object[]> rows = fetchAll(sql.toString(), params.toArray());
         List<Models.MemoryRecord> out = new ArrayList<>();
