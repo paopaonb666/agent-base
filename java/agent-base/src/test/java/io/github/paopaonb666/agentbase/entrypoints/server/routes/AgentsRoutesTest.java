@@ -493,6 +493,47 @@ class AgentsRoutesTest {
     }
 
     @Test
+    void fastProfileInvokeExecutesTheViewGraph() throws Exception {
+        // 审查 C-P1：profile=fast 的执行图必须取自快档视图——修复前 view
+        // 只做 400 门、图恒取主 runtime（快档静默走主力模型）。判据：模块
+        // 的 buildGraph 会被主 runtime 与视图各调一次，两次收到的 ctx.llm()
+        // 不同（主档桩为 null、视图为构建出的 fast runtime 非 null）。
+        java.util.Set<Object> llmIdentities = java.util.Collections.newSetFromMap(
+                java.util.Collections.synchronizedMap(new java.util.IdentityHashMap<>()));
+        AgentModule recording = new AgentModule() {
+            @Override public String name() { return "chat"; }
+            @Override public String description() { return "recording stub for profile routing"; }
+            @Override public CompiledGraph buildGraph(ModuleContext ctx) {
+                llmIdentities.add(ctx.llm());
+                return GraphBuilder.singleNode("chat", (state, nodeCtx) -> Map.of(),
+                        ctx.checkpointer());
+            }
+            @Override public List<io.github.paopaonb666.agentbase.core.tools.AgentTool> getTools() {
+                return List.of();
+            }
+        };
+        AgentRuntime runtime = buildRuntime(Settings.load(Map.of(
+                "ENV", "development",
+                "LLM_API_KEY", "sk-test",
+                "LLM_FAST_BASE_URL", "http://fast.example.com/v1",
+                "LLM_FAST_MODEL", "fast-model")),
+                Map.of("chat", recording), new InMemoryCheckpointer(),
+                null, null, null, null, null);
+        AgentsRoutes routes = route(runtime);
+
+        // main：走主 runtime 图（ctx.llm() == 注入的 null）。
+        assertNotNull(invoke(routes, "chat", invokeBody("hi", "t1", null, null, null), "u1"));
+        // fast：走视图图（graphOr404(view, ...) → buildGraph 收到 fast runtime）。
+        assertNotNull(invoke(routes, "chat", invokeBody("hi", "t2", null, "chat", "fast"), "u1"));
+
+        assertEquals(2, llmIdentities.size(), "main 与 fast 各建一图：" + llmIdentities.size());
+        assertTrue(llmIdentities.stream().anyMatch(java.util.Objects::isNull),
+                "主档图 ctx.llm() 为注入桩（null）");
+        assertTrue(llmIdentities.stream().anyMatch(java.util.Objects::nonNull),
+                "fast 视图图的 ctx.llm() 应为构建出的 fast runtime（非 null）");
+    }
+
+    @Test
     void truncatedAttachmentInjectionCarriesGuidance() {        // #250：截断的附件全文注入时，块尾带指路提示（模型不再把半份文档
         // 当全文回答）；未截断的不带。
         List<UploadedFileInfo> infos = List.of(

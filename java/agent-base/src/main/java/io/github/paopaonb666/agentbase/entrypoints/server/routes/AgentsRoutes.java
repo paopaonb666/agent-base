@@ -100,8 +100,19 @@ public class AgentsRoutes {
 
     /** 按模块取图；未知模块给干净的 404。 */
     private CompiledGraph graphOr404(String module) {
+        return graphOr404(runtime, module);
+    }
+
+    /**
+     * 按模块取图（owner 决定档位装配；审查 C-P1）：profile=fast 的图取自
+     * 快档视图——修复前 view 只做 400 门、执行图恒取主 runtime，快档请求
+     * 静默走主力模型（档位语义失效 + fast 成本计量失真）。view 与主
+     * runtime 的模块集/checkpointer/记忆共享，图缓存各自独立（fast 图懒建）；
+     * profile="main" 时 profileView 返回 runtime 自身，行为逐字节不变。
+     */
+    private CompiledGraph graphOr404(AgentRuntime owner, String module) {
         try {
-            return runtime.graph(module);
+            return owner.graph(module);
         } catch (AgentRuntime.UnknownModuleError exc) {
             throw new HttpError(404, ErrorCode.NOT_FOUND, String.valueOf(exc.getMessage()));
         }
@@ -203,11 +214,12 @@ public class AgentsRoutes {
             usePlan = false; // auto：静默降级
         }
         // 模型档位（T1.2）：快档视图共享 checkpointer/memory，未配置显式 400。
+        // 图也取自视图（审查 C-P1）——profile 决定执行档位，不止是 400 门。
         AgentRuntime view = runtime.profileView(profile);
         if (view == null) {
             throw new HttpError(400, ErrorCode.BAD_REQUEST, "LLM_FAST_* 未配置：profile=\"fast\" 不可用（配置快速档或使用默认档）");
         }
-        CompiledGraph graph = graphOr404(usePlan ? "planner" : module);
+        CompiledGraph graph = graphOr404(view, usePlan ? "planner" : module);
         String userThreadId = body.threadId() != null && !body.threadId().isEmpty()
                 ? body.threadId()
                 : io.github.paopaonb666.agentbase.extensions.Observability.newRequestId();
