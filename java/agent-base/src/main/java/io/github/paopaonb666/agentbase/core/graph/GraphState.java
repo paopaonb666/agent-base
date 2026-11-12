@@ -83,7 +83,14 @@ public final class GraphState {
         }
     }
 
-    /** 深拷贝（checkpointer 存快照前用，防止后续节点修改影响已存状态）。 */
+    /**
+     * 容器级浅拷贝（checkpointer 存快照前用）：messages/extra 换新容器，
+     * 消息对象与 extra 值仍共享引用——防「后续节点追加消息 / 整表替换
+     * extra 键」有效，不防「原地修改消息对象或 extra 值」。extra 值按
+     * 不可变约定使用（写入方一律 fresh List/Map，Graphs/planner/supervisor
+     * 各写入点同构；InMemoryCheckpointer 的 javadoc 同口径）。SQL 后端在
+     * put 内即时 toJson，不受共享引用影响。
+     */
     public GraphState copy() {
         GraphState copied = new GraphState(new ArrayList<>(messages), new LinkedHashMap<>(extra));
         copied.cancelledRound = cancelledRound;
