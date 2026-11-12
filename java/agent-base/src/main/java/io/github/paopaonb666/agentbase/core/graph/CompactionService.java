@@ -273,8 +273,10 @@ public final class CompactionService implements AutoCloseable {
     /**
      * 近 N 轮原文的窗口起点（#328）：「轮」= 从一条 UserMessage 到下一条
      * UserMessage 之前。从尾部收集 UserMessage 起点，锚定在第 N 个（从尾数）
-     * UserMessage；起点落上 ToolMessage 时向前扩窗（工具配对不拆散——同
-     * buildModelInput 边界守卫语义，方向相反：扩窗保对而不是丢消息）。
+     * UserMessage——锚定处刚被判定为 UserMessage，起点恒为该 UserMessage
+     * 本身，保留窗恒以 UserMessage 开始（配对安全；review A-P2：曾有的
+     * 「起点落上 ToolMessage 向前扩窗」守卫在此锚定逻辑下恒假，是死代码，
+     * 移除——若未来锚定逻辑变化，扩窗需按新语义重新推导而非复用）。
      * 不足 N 轮返回 0（无可折叠段）。
      */
     static int recentTurnsStart(List<ChatMessage> messages, int keepTurns) {
@@ -283,11 +285,7 @@ public final class CompactionService implements AutoCloseable {
             if (messages.get(i) instanceof UserMessage) {
                 seen++;
                 if (seen == keepTurns) {
-                    int start = i;
-                    while (start > 0 && messages.get(start) instanceof ToolExecutionResultMessage) {
-                        start--;
-                    }
-                    return start;
+                    return i;
                 }
             }
         }
