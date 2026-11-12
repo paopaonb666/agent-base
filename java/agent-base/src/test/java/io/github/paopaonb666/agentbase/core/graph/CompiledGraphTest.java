@@ -212,6 +212,55 @@ class CompiledGraphTest {
     }
 
     @Test
+    void loopTopCancellationHealsDanglingToolCallsPersistedByPreviousStep() {
+        // 审查 A-P1 步间窗：取消落在「上一步完成态（含 tool_calls）已落盘、
+        // tools 节点未执行」的窗口时，loop-top 检查取消返回——修复前快照
+        // 保持悬挂 AiMessage(tool_calls)，该线程下一轮起每轮被 provider 400。
+        // 修复后与节点中途取消同款善后：剥除 + cancelled 标记 + 重落盘。
+        InMemoryCheckpointer cp = new InMemoryCheckpointer();
+        // sink：见到 chat 的 completed 事件即进入取消态（模拟断连落在步间）。
+        EventSink sink = new EventSink() {
+            volatile boolean cancelSeen = false;
+
+            @Override public void accept(Object event) {
+                if (event instanceof Events.StepEvent step
+                        && "completed".equals(step.status()) && "chat".equals(step.name())) {
+                    cancelSeen = true;
+                }
+            }
+
+            @Override public boolean cancelled() {
+                return cancelSeen;
+            }
+        };
+        CompiledGraph graph = GraphBuilder.begin()
+                .addNode("chat", (state, ctx) -> Map.of(GraphState.MESSAGES, List.of(AiMessage.from(
+                        "让我查一下",
+                        List.of(dev.langchain4j.agent.tool.ToolExecutionRequest.builder()
+                                .id("call_1").name("web_search")
+                                .arguments("{\"query\":\"x\"}").build())))))
+                .addNode("tools", (state, ctx) -> {
+                    throw new AssertionError("取消后不应再执行任何节点");
+                })
+                .entry("chat")
+                .addEdge("chat", "tools")
+                .addEdge("tools", GraphBuilder.END)
+                .compile(cp, "chat");
+
+        CompiledGraph.RunOutcome outcome = graph.streamWithTermination(
+                new GraphState(), RunConfig.of("chat:t1", "u1"), sink);
+        assertEquals(Events.RunTermination.CANCELLED, outcome.termination());
+
+        GraphState persisted = cp.get("chat:t1");
+        assertNotNull(persisted);
+        assertTrue(persisted.cancelledRound(), "快照行应携带取消标记");
+        ChatMessage last = persisted.messages().get(persisted.messages().size() - 1);
+        assertTrue(last instanceof AiMessage ai && !ai.hasToolExecutionRequests(),
+                "loop-top 取消必须剥除上步悬挂 tool_calls：" + last);
+        assertEquals("让我查一下", ((AiMessage) last).text());
+    }
+
+    @Test
     void cancelledRoundPersistFailureStillCountsAsDebtAndStaysCancelled() {
         // 取消落盘复用 #198 的重试+欠账语义：put 恒失败时半步留在内存续跑
         // （返回值完整），终态仍是 CANCELLED——不因快照欠账把取消变成异常。

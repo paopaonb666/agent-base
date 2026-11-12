@@ -217,7 +217,17 @@ public final class CompiledGraph {
         int steps = 0;
         while (!GraphBuilder.END.equals(current)) {
             if (sink != null && sink.cancelled()) {
-                LOG.debug("图执行被取消（客户端断开）：thread={}", config.threadId());
+                // 循环顶取消（审查 A-P1 步间窗）：上一步的完成态可能已带着
+                // AiMessage(tool_calls) 落盘（路由指向 tools 节点、工具结果
+                // 还没配对）——快照悬挂调用会让该线程下一轮起每轮被 provider
+                // 400 拒收。与节点中途取消分支同款善后：剥除悬挂调用 +
+                // cancelled 标记 + 重落盘（残余窗口收窄为「上一步 persist
+                // 之后到本检查之前」的进程死亡，与一切落盘窗口同级）。
+                stripDanglingToolCalls(state);
+                state.cancelledRound(true);
+                persistState(config, state);
+                LOG.debug("图执行被取消（客户端断开）：thread={}，上步悬挂调用已剥除并带标记落盘",
+                        config.threadId());
                 return new RunOutcome(state, Events.RunTermination.CANCELLED, null);
             }
             if (steps >= config.recursionLimit()) {
