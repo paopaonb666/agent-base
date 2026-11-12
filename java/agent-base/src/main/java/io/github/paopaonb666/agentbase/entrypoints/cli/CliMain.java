@@ -85,6 +85,11 @@ public final class CliMain {
                             [--thread-id ID] [--version]""");
                     return 0;
                 }
+                // 值型参数（--module/--message/-m/--thread-id）：parseArgs 已取
+                // 值，这里连同其值一起跳过。审查 C-P0 回归锁：#295 重构曾在
+                // 本 switch 丢失这些 case——文档化主用法（--message 单轮）落
+                // default「未知参数」退 2，测试盲区（只测缺值路径）未抓到。
+                case "--module", "--message", "-m", "--thread-id" -> i++;
                 default -> {
                     System.err.println("error: 未知参数 " + argv[i]);
                     return 2;

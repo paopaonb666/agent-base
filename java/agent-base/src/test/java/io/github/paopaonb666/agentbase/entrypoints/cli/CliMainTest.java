@@ -12,6 +12,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -60,6 +61,22 @@ class CliMainTest {
         String[] r = runCaptured("--nope");
         assertEquals("2", r[0]);
         assertTrue(r[2].contains("未知参数 --nope"));
+    }
+
+    @Test
+    void valueFlagsAreNotRejectedAsUnknown() {
+        // 审查 C-P0 回归锁：#295 重构在 runCli 第二遍 switch 丢失
+        // --module/--message/-m/--thread-id 的 case——文档化主用法
+        // （--message 单轮）落 default「未知参数」退 2，既有测试只测缺值
+        // 路径故全绿未抓。判据：值型组合不得再报「未知参数」（解析通过后
+        // 进入 run()，本测试环境无 LLM 配置/记忆包 → 以其他错误收场）。
+        String[] r = runCaptured("--message", "hi");
+        assertFalse(r[2].contains("未知参数"), "stderr=" + r[2]);
+        r = runCaptured("--module", "chat", "-m", "hi", "--thread-id", "t1");
+        assertFalse(r[2].contains("未知参数"), "stderr=" + r[2]);
+        // 对照：真未知参数仍然退 2。
+        r = runCaptured("--nope");
+        assertTrue(r[2].contains("未知参数"));
     }
 
     @Test
