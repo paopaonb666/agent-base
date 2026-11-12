@@ -148,6 +148,44 @@ class MemoryStoreTimestampMatrixTest {
         }
     }
 
+    @Test
+    void inMemoryTtlFilterRunsBeforeLimitLikeSql() {
+        // review B-P2：InMemory 的 8 参 listMemories 此前先按 limit 截断再
+        // 做 episodic TTL 过滤——过期行占满名额后被滤掉，同调用 SQL 后端
+        // 满额活候选、InMemory 短额（实现与自身 javadoc/#168 登记相反）。
+        // 修复=TTL 判定移入扫描内、先于截断（对齐 SQL 下推）。真判据：
+        // 2 条最新但过期的 episodic + 3 条活行、limit=3 → 满额活候选
+        //（修复前 InMemory 只返回 1 条，本测试必红）。
+        InMemoryMemoryStore inMemory = new InMemoryMemoryStore();
+        try (SqliteMemoryStore sqlite = new SqliteMemoryStore(
+                tempDir.resolve("ttl-limit-" + System.nanoTime() + ".db").toString())) {
+            for (MemoryStore store : List.of(inMemory, sqlite)) {
+                store.upsertMemory(new Models.MemoryRecord("stale-1", "u", "chat", "episodic",
+                        "过期一", List.of(), null, null, 0.5, "active", "", List.of(),
+                        4900.0, 4900.0, null, 0));
+                store.upsertMemory(new Models.MemoryRecord("stale-2", "u", "chat", "episodic",
+                        "过期二", List.of(), null, null, 0.5, "active", "", List.of(),
+                        4800.0, 4800.0, null, 0));
+                store.upsertMemory(new Models.MemoryRecord("live-1", "u", "chat", "semantic",
+                        "活一", List.of(), null, null, 0.5, "active", "", List.of(),
+                        3000.0, 3000.0, null, 0));
+                store.upsertMemory(new Models.MemoryRecord("live-2", "u", "chat", "semantic",
+                        "活二", List.of(), null, null, 0.5, "active", "", List.of(),
+                        2000.0, 2000.0, null, 0));
+                store.upsertMemory(new Models.MemoryRecord("live-3", "u", "chat", "semantic",
+                        "活三", List.of(), null, null, 0.5, "active", "", List.of(),
+                        1000.0, 1000.0, null, 0));
+            }
+            for (MemoryStore store : List.of(inMemory, sqlite)) {
+                List<Models.MemoryRecord> view = store.listMemories("u", null, true, null,
+                        List.of("active"), 3, false, 5000.0);
+                assertEquals(List.of("live-1", "live-2", "live-3"),
+                        view.stream().map(Models.MemoryRecord::memoryId).toList(),
+                        store.getClass().getSimpleName() + "：过期行不占名额（limit=3 满额活候选）");
+            }
+        }
+    }
+
     // ── 跨后端语义矩阵：固定种子 → 相同观察视图 ──────────────────────────
 
     @Test

@@ -73,6 +73,24 @@ public final class InMemoryMemoryStore implements MemoryStore {
                                                   boolean includeGlobal, List<String> kinds,
                                                   List<String> statuses, int limit,
                                                   boolean excludeProfile) {
+        return listMemories(userId, agentId, includeGlobal, kinds, statuses, limit,
+                excludeProfile, null);
+    }
+
+    /**
+     * episodic TTL 下推（#168 对齐 #180 SQL 语义）：过期 episodic 行在扫描
+     * 内被排除、<b>先于 LIMIT</b>，不挤占候选名额（review B-P2：此前先按
+     * limit 截断再过滤，过期行占满名额后被滤掉——同调用 SQL 后端满额活
+     * 候选、InMemory 短额，两后端检索面不一致且与原 javadoc 声明相反）。
+     * Retrieval.filterExpired 内存兜底保留为幂等二次过滤。边界与 SQL 的
+     * {@code updated_at >= ?} 对齐：恰等于截止线的行保留。
+     */
+    @Override
+    public List<Models.MemoryRecord> listMemories(String userId, String agentId,
+                                                  boolean includeGlobal, List<String> kinds,
+                                                  List<String> statuses, int limit,
+                                                  boolean excludeProfile,
+                                                  Double episodicCutoffBefore) {
         List<String> kindList = kinds == null ? null : List.copyOf(kinds);
         List<String> statusList = statuses == null ? List.of() : List.copyOf(statuses);
         synchronized (lock) {
@@ -96,38 +114,17 @@ public final class InMemoryMemoryStore implements MemoryStore {
                         && !(includeGlobal && record.agentId().equals("*"))) {
                     continue;
                 }
+                // TTL 在截断前判（对齐 SQL 下推语义：过期行不占名额）。
+                if (episodicCutoffBefore != null
+                        && "episodic".equals(record.kind())
+                        && record.updatedAt() < episodicCutoffBefore) {
+                    continue;
+                }
                 matched.add(record);
             }
             matched.sort(Comparator.comparingDouble(Models.MemoryRecord::updatedAt).reversed());
             return new ArrayList<>(matched.subList(0, Math.min(matched.size(), Math.max(1, limit))));
         }
-    }
-
-    /**
-     * episodic TTL 下推（#168 对齐 #180 SQL 语义）：过期 episodic 行在此
-     * 被排除，不再挤占候选名额（此前靠 Retrieval.filterExpired 内存兜底，
-     * 该兜底保留为幂等二次过滤）。边界与 SQL 的 {@code updated_at >= ?}
-     * 对齐：恰等于截止线的行保留。
-     */
-    @Override
-    public List<Models.MemoryRecord> listMemories(String userId, String agentId,
-                                                  boolean includeGlobal, List<String> kinds,
-                                                  List<String> statuses, int limit,
-                                                  boolean excludeProfile,
-                                                  Double episodicCutoffBefore) {
-        List<Models.MemoryRecord> matched = listMemories(userId, agentId, includeGlobal,
-                kinds, statuses, limit, excludeProfile);
-        if (episodicCutoffBefore == null) {
-            return matched;
-        }
-        List<Models.MemoryRecord> filtered = new ArrayList<>(matched.size());
-        for (Models.MemoryRecord record : matched) {
-            if ("episodic".equals(record.kind()) && record.updatedAt() < episodicCutoffBefore) {
-                continue;
-            }
-            filtered.add(record);
-        }
-        return filtered;
     }
 
     /**
