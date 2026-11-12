@@ -311,6 +311,33 @@ class ResilientModelRuntimeTest {
     }
 
     @Test
+    void streamFallbackEmittingDeltaThenFailingDoesNotSwitchToNextFallback() {
+        // 审查 A-P1：delta 纪律在链内同受约束——fallback#0 发出半截流后
+        // 中断，继续切 fallback#1 = 半截输出重放；应原样上抛且 #1 不被调用
+        // （修复前链内 catch 不查 deltaEmitted，会继续点燃后续候选）。
+        CountingRuntime emittingThenFailing = new CountingRuntime(null, null) {
+            @Override public AiMessage stream(List<ChatMessage> messages,
+                    List<dev.langchain4j.agent.tool.ToolSpecification> tools,
+                    java.util.function.Consumer<String> onDelta) {
+                calls.incrementAndGet();
+                onDelta.accept("f0-半截");
+                throw new IllegalStateException("f0 stalled after delta");
+            }
+        };
+        CountingRuntime backup2 = new CountingRuntime(AiMessage.from("ok"), null);
+        CountingRuntime silentPrimary = new CountingRuntime(null, new IllegalStateException("primary down"));
+        ResilientModelRuntime chain = new ResilientModelRuntime(silentPrimary,
+                List.of(emittingThenFailing, backup2), 0, 4, 0.0, 60, 20);
+        StringBuilder deltas = new StringBuilder();
+        IllegalStateException error = assertThrows(IllegalStateException.class,
+                () -> chain.stream(oneMessage(), List.of(), deltas::append));
+        assertEquals("f0 stalled after delta", error.getMessage(), "链内半截流失败应原样上抛");
+        assertEquals("f0-半截", deltas.toString(), "客户端只见到一份半截 delta（无重放）");
+        assertEquals(1, emittingThenFailing.invocations());
+        assertEquals(0, backup2.invocations(), "候选发过 delta 后不得切下一个 fallback");
+    }
+
+    @Test
     void tokenFactorDelegatesThroughTransparencyContract() {
         // #340：ResilientModelRuntime/CircuitBreakedModelRuntime 是透明层
         // ——tokenFactor 必须委托内层（R2-F5 同款教训：漏委托=静默回 1.0）。

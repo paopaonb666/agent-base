@@ -175,15 +175,23 @@ public final class ResilientModelRuntime implements ModelRuntime {
                 sleepBeforeRetry(attempt, exc);
             }
         }
-        return streamFallbacks(messages, tools, guarded, lastError);
+        return streamFallbacks(messages, tools, guarded, deltaEmitted, lastError);
     }
 
-    /** #71：按序尝试备用模型（各一次真实调用，不进重试预算——预算管同目标重试）。 */
+    /**
+     * #71：按序尝试备用模型（各一次真实调用，不进重试预算——预算管同目标
+     * 重试）。delta 纪律在链内同受约束（审查 A-P1）：候选发过 delta 后中途
+     * 失败，继续切下一个候选 = 半截输出重放——原样上抛（与主→备边界同款）；
+     * 候选<b>之间</b>切换仍允许（前一个候选零 delta 时客户端一无所见）。
+     */
     private AiMessage streamFallbacks(List<ChatMessage> messages, List<ToolSpecification> tools,
-                                      Consumer<String> onDelta, RuntimeException primaryFailure) {
+                                      Consumer<String> onDelta,
+                                      java.util.concurrent.atomic.AtomicBoolean deltaEmitted,
+                                      RuntimeException primaryFailure) {
         RuntimeException lastError = primaryFailure;
         for (int i = 0; i < fallbacks.size(); i++) {
             ModelRuntime candidate = fallbacks.get(i);
+            deltaEmitted.set(false);
             try {
                 AiMessage message = callWithLimit(() -> candidate.stream(messages, tools, onDelta),
                         "stream-fallback#" + i, 0);
@@ -192,6 +200,9 @@ public final class ResilientModelRuntime implements ModelRuntime {
                 return message;
             } catch (RuntimeException exc) {
                 lastError = exc;
+                if (deltaEmitted.get()) {
+                    throw exc; // 候选已下发半截输出：不切下一个（重放=重复输出）
+                }
             }
         }
         if (lastError != primaryFailure && lastError != null) {
