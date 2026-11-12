@@ -22,8 +22,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  * 需要这三个方法（裁决范围）。
  *
  * <p>响应由后台读线程分发给 pending 表（按 id 关联）；来自 server 的通知
- * 与对客户端的请求被忽略（本客户端不提供 sampling/roots 能力，工具调用
- * 期间 server 也不应反向请求）。线程安全：写线程串行化，读线程独立。
+ * 与对客户端的请求（带 id 带 method）一律忽略——本客户端不提供
+ * sampling/roots 能力，工具调用期间 server 也不应反向请求；反向请求即使
+ * 撞上在途 pending id 也不会被当成响应（review C-P2）。线程安全：写线程
+ * 串行化（各 transport 自持写锁），读线程独立。
  */
 public final class McpClient implements AutoCloseable {
 
@@ -38,7 +40,6 @@ public final class McpClient implements AutoCloseable {
     private final String serverName;
     private final AtomicInteger nextId = new AtomicInteger();
     private final Map<Integer, CompletableFuture<ObjectNode>> pending = new ConcurrentHashMap<>();
-    private final Object writeLock = new Object();
     // transport 可替换（#29 重连）：重连时由工厂产出新通道并整体换芯。
     private volatile McpTransport transport;
     private volatile Thread readerThread;
@@ -403,9 +404,20 @@ public final class McpClient implements AutoCloseable {
                     line.length() > 120 ? line.substring(0, 120) : line);
             return;
         }
+        if (node.has("method")) {
+            // server → client 的请求（带 id 带 method）或通知（无 id）：
+            // 本客户端不提供 sampling/roots 能力，一律忽略——绝不落响应
+            // 分派（review C-P2：撞上在途 pending id 的反向请求此前会被
+            // 当成空 result 伪成功）。
+            if (node.has("id")) {
+                LOG.info("MCP server {}: 忽略 server→client 请求 method={}", serverName,
+                        node.path("method").asText());
+            }
+            return;
+        }
         JsonNode id = node.get("id");
         if (id == null || !id.canConvertToInt()) {
-            // 通知或 server → client 的请求：本客户端没有对应能力，忽略。
+            // 无 id 且无 method 的畸形帧：忽略。
             return;
         }
         CompletableFuture<ObjectNode> future = pending.get(id.asInt());

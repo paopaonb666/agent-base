@@ -8,6 +8,8 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -190,6 +192,37 @@ class McpClientTest {
         client.close();
     }
 
+    @Test
+    @SuppressWarnings("unchecked")
+    void serverToClientRequestWithCollidingIdDoesNotCompletePending() throws Exception {
+        // review C-P2：server→client 请求（带 id 带 method）撞在途 pending
+        // id 时不得被当成响应——此前 handleLine 只判 id 不判 method，反向
+        // 请求会把在途调用以「空 result」伪成功完成（合规 server 不发反向
+        // 请求，非合规 server 下是静默错误数据）。真判据：撞号帧后 future
+        // 仍未完成，真实响应到达才完成。
+        FakeTransport transport = new FakeTransport();
+        transport.results.add("{\"protocolVersion\":\"" + McpClient.PROTOCOL_VERSION + "\"}");
+        McpClient client = new McpClient("fake", transport);
+        client.connect("agent-base-test", "1", 5.0);
+        // 模拟「请求已发出、响应未到」窗口：直接登记在途 pending
+        //（真实 request() 会被 FakeTransport 的回显立即完成，造不出窗口）。
+        Map<Integer, CompletableFuture<ObjectNode>> pending =
+                (Map<Integer, CompletableFuture<ObjectNode>>) pendingOf(client);
+        CompletableFuture<ObjectNode> inflight = new CompletableFuture<>();
+        pending.put(7, inflight);
+        // 撞号反向请求：显式忽略。
+        transport.incoming.add(
+                "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"sampling/createMessage\",\"params\":{}}");
+        assertThrows(java.util.concurrent.TimeoutException.class,
+                () -> inflight.get(300, TimeUnit.MILLISECONDS),
+                "撞号 server→client 请求不得伪成功完成在途调用");
+        // 真正的响应照常完成 pending。
+        transport.incoming.add("{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}");
+        ObjectNode result = inflight.get(2, TimeUnit.SECONDS);
+        assertEquals(true, result.path("ok").asBoolean());
+        client.close();
+    }
+
     // ── 反射观察面 ────────────────────────────────────────────────────────
 
     private static McpTransport clientTransport(McpClient client) throws Exception {
@@ -202,5 +235,11 @@ class McpClientTest {
         var field = McpClient.class.getDeclaredField("closed");
         field.setAccessible(true);
         return field.getBoolean(client);
+    }
+
+    private static Object pendingOf(McpClient client) throws Exception {
+        var field = McpClient.class.getDeclaredField("pending");
+        field.setAccessible(true);
+        return field.get(client);
     }
 }
