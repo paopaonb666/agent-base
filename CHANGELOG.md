@@ -3,6 +3,44 @@
 本文件格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased] — Java 重写（feat/java-rewrite 分支）
+
+同仓并行 Java 实现：双 Maven 模块 `agent-base`（基座）与
+`agent-base-memory`（记忆子系统，对应 Python 独立包），特性面与
+Python 0.3.0 对齐，HTTP wire 契约逐字节兼容（业务表 DDL 一致，
+可与 Python 版共用同一 MySQL 库；对话状态快照表两侧各自管理）。
+权威清单：`java/README.md`（模块/配置/边界）与
+`docs/java-differences.md`（有意差异、Java 扩展、逐条锚点）。
+
+### Added（Java 侧扩展，择要）
+
+- 检索质量：keyword/vector 证据通道加权 RRF 融合（#53，golden 门
+  recall@5 0.9167 / MRR 0.8658）、两段式召回精排（#37，默认关，
+  短名单 min-max 归一 + spread 信息门）、高显著度召回豁免（#181）、
+  去重余弦预筛（#38）、关键词/向量下推（#326/#327/#324）。
+- LLM 弹性：回落链（#71）、自研熔断器（#72）、流式 idle 看门狗、
+  per-model 窗口（#4）、token 修正系数与 estimated_input 对账指标
+  （#340/L88）、上下文窗口压力仪表（#19）。
+- 治理与护栏：per-user 限流（#78）、全局 run 并发闸门（#79）、
+  SSE 可选超时（L82）、工具循环检测（#5）、工具结果外置 + 分页回读
+  （#6/#23）、不可信结果标记（#84）、四域上下文预算（#15）、
+  会话历史压缩（#328/#330）、敏感内容红线（#48）。
+- 服务面：结构化错误码（#91）、审计过滤与复合游标（#160/#176/L89）、
+  /health 组件化（MCP 可见 #29、pools 观测段 #81）、CORS 暴露
+  X-Request-ID / Retry-After（#227）。
+
+### Changed
+
+- 质量基线：全量测试 752 → 806 全绿；JaCoCo 行覆盖门 0.78
+  （双 bundle 实测 0.7859 / 0.7915）；`Version.VERSION` 与
+  pyproject 双源一致性由测试守护（#115）。
+
+### 显式未迁移（启动期专项报错，非静默缺席）
+
+- `python_repl` 工具（exec 级隔离语义未承诺）、DuckDuckGo 搜索引擎
+  （走 Tavily）、MCP websocket transport（stdio / streamable HTTP /
+  SSE 可用）。
+
 ## [0.3.0] - 2026-10-22
 
 记忆子系统拆为独立发行包。基座只保留契约与装配点；不改任何业务语义
