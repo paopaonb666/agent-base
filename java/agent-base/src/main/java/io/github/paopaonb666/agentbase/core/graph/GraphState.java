@@ -13,6 +13,22 @@ import java.util.Map;
  * <p>对应 Python 侧 {@code MessagesState}（messages）与 {@code PlanState}
  * （messages + tasks/cursor/replans）的统一载体：messages 由图运行时做
  * 追加合并，其余键由节点整表替换（语义与 LangGraph 的通道 reducer 一致）。
+ *
+ * <p><b>不可变契约（#203/A-8）</b>：
+ * <ul>
+ *   <li><b>messages append-only</b>——节点只经 {@code apply(Map)} 追加；
+ *       图执行层是唯一允许原地修改的角色（stripDanglingToolCalls 的取消
+ *       善后），业务节点绝不改写历史消息；</li>
+ *   <li><b>extra 键整表替换、extra 值不可变</b>——节点对某个 extra 键的
+ *       修改 = 在返回的 update 里放一个全新值（fresh List/Map，A-8 的
+ *       replacement-in-lambda 约定），绝不原地改写共享容器内的元素；
+ *       SQL 后端在 put 内即时 toJson（写线程串行化），InMemory 后端存
+ *       {@code copy()}（容器新、元素引用共享）——两者的安全前提都是
+ *       本约定；</li>
+ *   <li><b>cancelled 标记生命周期</b>——根级快照行元数据（#199），写侧
+ *       在取消善后时置位、读侧刻意不解析、新 round 加载自动复位、正常
+ *       落盘整行覆盖消失。</li>
+ * </ul>
  */
 public final class GraphState {
 
