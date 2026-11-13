@@ -67,6 +67,8 @@ public final class ExecuteNode {
                 .parseDangerous(ctx.settings() == null ? "off" : ctx.settings().toolkit.toolApprovalMode);
         long approvalTtl = ctx.settings() == null
                 ? 600 : ctx.settings().toolkit.toolApprovalTimeoutSeconds;
+        // A-#62：计划审批开关在构造期固化（off=默认，运行期零开销）。
+        boolean planApproval = ctx.settings().planner.planApproval;
 
         return (GraphState state, NodeContext nodeCtx) -> {
             int subtaskToolRounds = ctx.settings().planner.subtaskToolRounds;
@@ -81,6 +83,26 @@ public final class ExecuteNode {
             task.put(PlannerState.ATTEMPTS,
                     PlannerState.intOf(tasks.get(cursor), PlannerState.ATTEMPTS) + 1);
             tasks.set(cursor, task);
+            // A-#62 计划被拒绝：消费账本决定，未完成任务全部终止（FAILED，
+            // summary=计划被用户拒绝）——正常路由接管（replan 预算有界，修订
+            // 版计划会再次暂停等批准）。决定消费即清。
+            if (planApproval
+                    && io.github.paopaonb666.agentbase.core.tools.ApprovalLedger.status(
+                            nodeCtx.config().threadId(), PlanNode.PLAN_CALL_ID, 0)
+                            == io.github.paopaonb666.agentbase.core.tools.ApprovalLedger.Status.REJECTED) {
+                io.github.paopaonb666.agentbase.core.tools.ApprovalLedger.clear(
+                        nodeCtx.config().threadId(), PlanNode.PLAN_CALL_ID);
+                for (int i = cursor; i < tasks.size(); i++) {
+                    Map<String, Object> rejected = PlannerState.copyTask(tasks.get(i));
+                    rejected.put(PlannerState.STATUS, PlannerState.FAILED);
+                    rejected.put(PlannerState.SUMMARY, "计划被用户拒绝");
+                    tasks.set(i, rejected);
+                }
+                PlanStreaming.emitPlan(nodeCtx, tasks, "progress", "计划被用户拒绝，子任务全部终止");
+                return Map.of(
+                        GraphState.MESSAGES, List.of(),
+                        PlannerState.TASKS, tasks);
+            }
             PlanStreaming.emitPlan(nodeCtx, tasks, "progress",
                     "子任务 " + (cursor + 1) + "/" + tasks.size() + " 执行中");
 

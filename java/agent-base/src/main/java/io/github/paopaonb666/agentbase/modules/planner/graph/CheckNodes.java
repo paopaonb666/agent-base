@@ -149,6 +149,9 @@ public final class CheckNodes {
     /** replan 节点：LLM 重新拆解未完成项（保留已完成结果）。 */
     public static GraphBuilder.Node makeReplan(AgentModule.ModuleContext ctx) {
         int maxSubtasks = ctx.settings().planner.maxSubtasks;
+        // A-#62：计划审批开关在构造期固化——修订版计划同样要过审批
+        // （replan 节点自带规划，不走 PlanNode 的标记路径）。
+        boolean planApproval = ctx.settings().planner.planApproval;
         return (GraphState state, NodeContext nodeCtx) -> {
             List<Map<String, Object>> tasks = PlannerState.tasks(state);
             List<Map<String, Object>> done = new ArrayList<>();
@@ -193,10 +196,24 @@ public final class CheckNodes {
             }
             PlanStreaming.emitPlan(nodeCtx, merged, "replanned", detail);
             PlanPersist.persistPlan(ctx, nodeCtx, merged, done.size(), PlannerState.replans(state) + 1);
-            return Map.of(
-                    PlannerState.TASKS, merged,
-                    PlannerState.CURSOR, done.size(),
-                    PlannerState.REPLANS, PlannerState.replans(state) + 1);
+            Map<String, Object> update = new java.util.LinkedHashMap<>();
+            update.put(PlannerState.TASKS, merged);
+            update.put(PlannerState.CURSOR, done.size());
+            update.put(PlannerState.REPLANS, PlannerState.replans(state) + 1);
+            if (planApproval) {
+                // A-#62：修订版计划同样暂停等批准（已有批准决定 → 消费清账本
+                // 照常执行）。拒绝决定由 execute 节点消费。
+                if (io.github.paopaonb666.agentbase.core.tools.ApprovalLedger
+                        .status(nodeCtx.config().threadId(), PlanNode.PLAN_CALL_ID, 0)
+                        == io.github.paopaonb666.agentbase.core.tools.ApprovalLedger.Status.APPROVED) {
+                    io.github.paopaonb666.agentbase.core.tools.ApprovalLedger
+                            .clear(nodeCtx.config().threadId(), PlanNode.PLAN_CALL_ID);
+                } else {
+                    update.put("pending_approval",
+                            Map.of("resume_node", "execute", "detail", "plan"));
+                }
+            }
+            return update;
         };
     }
 

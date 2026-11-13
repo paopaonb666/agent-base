@@ -557,4 +557,71 @@ class PlannerGraphTest {
         assertEquals("综合答复：子任务 A 完成",
                 ContextEngine.contentText(messages.get(messages.size() - 1)).strip());
     }
+
+    /** A-#62：计划审批——plan 产出即暂停，批准后 resume（entryOverride=execute）续跑。 */
+    @Test
+    void planApprovalPausesThenApprovedResumeExecutes() {
+        ScriptedModel model = new ScriptedModel(
+                AiMessage.from("[{\"id\": 1, \"goal\": \"A\"}]"),
+                AiMessage.from("A 的结果"),
+                AiMessage.from("综合答复：A 完成"));
+        Settings settings = new Settings();
+        settings.planner.planApproval = true;
+        CompiledGraph graph = PlannerGraphs.buildPlannerGraph(new AgentModule.ModuleContext(
+                settings, model, new InMemoryCheckpointer(), List.of(), null,
+                new RecordingPlanStore()));
+        String threadId = "planner:t1";
+        CompiledGraph.RunOutcome first = graph.streamWithTermination(
+                new GraphState(List.of(UserMessage.from("做 A")), Map.of()),
+                new RunConfig(threadId, "u1", 25), null);
+        assertEquals(Events.RunTermination.PAUSED, first.termination(), "计划产出即暂停");
+        GraphState snapshot = graph.getState(new RunConfig(threadId, "u1", 25));
+        assertTrue(snapshot.extra().containsKey("pending_approval"), "pending_approval 标记在场");
+        assertEquals(1, io.github.paopaonb666.agentbase.modules.planner.graph.PlannerState
+                .tasks(snapshot).size(), "tasks 已随暂停快照落盘");
+        assertEquals(1, model.received.size(), "未批准前 execute 不跑");
+        io.github.paopaonb666.agentbase.core.tools.ApprovalLedger.record(
+                threadId, io.github.paopaonb666.agentbase.modules.planner.graph.PlanNode.PLAN_CALL_ID,
+                true);
+        CompiledGraph.RunOutcome resumed = graph.streamWithTermination(
+                new GraphState(), new RunConfig(threadId, "u1", 25, "execute"), null);
+        assertEquals(Events.RunTermination.DONE, resumed.termination());
+        assertEquals("done", io.github.paopaonb666.agentbase.modules.planner.graph.PlannerState
+                .tasks(resumed.state()).get(0).get(PlannerState.STATUS));
+        assertFalse(graph.getState(new RunConfig(threadId, "u1", 25))
+                .extra().containsKey("pending_approval"), "标记退场");
+    }
+
+    /** A-#62：拒绝→任务终止→replan 有界路由→修订版计划再次暂停→批准完成。 */
+    @Test
+    void planRejectionTerminatesTasksThenReplansWithBoundedPause() {
+        ScriptedModel model = new ScriptedModel(
+                AiMessage.from("[{\"id\": 1, \"goal\": \"A\"}]"),
+                AiMessage.from("[{\"id\": 1, \"goal\": \"修订 A\"}]"),
+                AiMessage.from("修订结果"),
+                AiMessage.from("最终答复"));
+        Settings settings = new Settings();
+        settings.planner.planApproval = true;
+        CompiledGraph graph = PlannerGraphs.buildPlannerGraph(new AgentModule.ModuleContext(
+                settings, model, new InMemoryCheckpointer(), List.of(), null,
+                new RecordingPlanStore()));
+        String threadId = "planner:t2";
+        graph.streamWithTermination(new GraphState(List.of(UserMessage.from("做 A")), Map.of()),
+                new RunConfig(threadId, "u1", 25), null);
+        io.github.paopaonb666.agentbase.core.tools.ApprovalLedger.record(
+                threadId, io.github.paopaonb666.agentbase.modules.planner.graph.PlanNode.PLAN_CALL_ID,
+                false);
+        CompiledGraph.RunOutcome afterReject = graph.streamWithTermination(
+                new GraphState(), new RunConfig(threadId, "u1", 25, "execute"), null);
+        assertEquals(Events.RunTermination.PAUSED, afterReject.termination(),
+                "拒绝→replan 路由→修订版计划再次暂停（预算有界，未批准绝不执行）");
+        io.github.paopaonb666.agentbase.core.tools.ApprovalLedger.record(
+                threadId, io.github.paopaonb666.agentbase.modules.planner.graph.PlanNode.PLAN_CALL_ID,
+                true);
+        CompiledGraph.RunOutcome finalOutcome = graph.streamWithTermination(
+                new GraphState(), new RunConfig(threadId, "u1", 25, "execute"), null);
+        assertEquals(Events.RunTermination.DONE, finalOutcome.termination());
+        assertEquals("done", io.github.paopaonb666.agentbase.modules.planner.graph.PlannerState
+                .tasks(finalOutcome.state()).get(0).get(PlannerState.STATUS));
+    }
 }

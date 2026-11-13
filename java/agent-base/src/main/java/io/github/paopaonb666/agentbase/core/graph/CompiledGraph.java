@@ -363,7 +363,24 @@ public final class CompiledGraph {
             state.apply(update);
             // A-#26：续跑的审批节点完成——待审批调用已全部消费（执行或回喂
             // 拒绝文本），pending_approval 标记退场（此后取消路径照常剥除）。
-            state.extra().remove("pending_approval");
+            // A-#62 marker 型暂停：resume_node 之外节点产出的标记（如 plan
+            // 节点产 tasks）保留并在下方触发暂停；resume_node 自身完成则清。
+            if (state.extra().get("pending_approval") instanceof Map<?, ?> pending
+                    && current.equals(String.valueOf(pending.get("resume_node")))) {
+                state.extra().remove("pending_approval");
+            } else if (state.extra().containsKey("pending_approval")) {
+                // A-#62：计划产出后暂停（tasks 已随 update 进状态并落盘），
+                // 等审批端点决定后以 entryOverride=resume_node 续跑。
+                persistState(config, state);
+                if (sink != null) {
+                    sink.accept(new Events.StepEvent("approval", "running",
+                            String.valueOf(((Map<?, ?>) state.extra().get("pending_approval"))
+                                    .get("detail"))));
+                }
+                LOG.info("graph: 审批暂停（thread={}，等待 {} 批准）", config.threadId(),
+                        state.extra().get("pending_approval"));
+                return new RunOutcome(state, Events.RunTermination.PAUSED, null);
+            }
             if (sink != null) {
                 sink.accept(Events.StepEvent.completed(current));
             }

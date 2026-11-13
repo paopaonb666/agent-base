@@ -860,9 +860,16 @@ public class AgentsRoutes {
         CompiledGraph graph = graphOr404(module);
         GraphState snapshot = graph.getState(new RunConfig(fullThreadId, userId,
                 runtime.settings().agentRecursionLimit));
-        // call_id 校验：必须在暂停快照的悬挂 tool_calls 里（不给枚举通道）。
+        // call_id 校验：工具审批须在暂停快照的悬挂 tool_calls 里；计划审批
+        // （A-#62）用保留键 "plan"（pending detail=plan）。两者都走 404
+        // 掩蔽（不给枚举通道）。
         boolean known = false;
-        if (snapshot != null && !snapshot.messages().isEmpty()) {
+        Object pendingRaw = snapshot == null ? null : snapshot.extra().get("pending_approval");
+        boolean planPending = pendingRaw instanceof Map<?, ?> pending
+                && "plan".equals(String.valueOf(pending.get("detail")));
+        if ("plan".equals(callId)) {
+            known = planPending;
+        } else if (snapshot != null && !snapshot.messages().isEmpty()) {
             ChatMessage tail = snapshot.messages().get(snapshot.messages().size() - 1);
             if (tail instanceof dev.langchain4j.data.message.AiMessage ai
                     && ai.hasToolExecutionRequests()) {

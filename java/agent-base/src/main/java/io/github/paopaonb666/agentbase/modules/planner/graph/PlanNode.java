@@ -41,6 +41,8 @@ public final class PlanNode {
     /** 构造 plan 节点（LangGraph 节点的统一签名：状态进、状态更新字典出）。 */
     public static GraphBuilder.Node make(AgentModule.ModuleContext ctx) {
         int maxSubtasks = ctx.settings().planner.maxSubtasks;
+        // A-#62：计划审批开关在构造期固化（off=默认，运行期零开销）。
+        boolean planApproval = ctx.settings().planner.planApproval;
         return (GraphState state, NodeContext nodeCtx) -> {
             // #66 跨轮延续：快照已注入 tasks（continue_plan=true）→ 跳过
             // 重拆，从注入的 cursor 续跑；plan 事件 status=progress。
@@ -70,10 +72,26 @@ public final class PlanNode {
             }
             PlanStreaming.emitPlan(nodeCtx, tasks, "created", "拆解出 " + tasks.size() + " 个子任务");
             PlanPersist.persistPlan(ctx, nodeCtx, tasks, 0, 0);
-            return Map.of(
-                    PlannerState.TASKS, tasks,
-                    PlannerState.CURSOR, 0,
-                    PlannerState.REPLANS, 0);
+            Map<String, Object> update = new java.util.LinkedHashMap<>();
+            update.put(PlannerState.TASKS, tasks);
+            update.put(PlannerState.CURSOR, 0);
+            update.put(PlannerState.REPLANS, 0);
+            if (planApproval) {
+                // A-#62 marker 型暂停：tasks 已在 update 里（图层 apply 后
+                // 落盘 PAUSED）——审批端点 POST .../approvals/plan 决定，
+                // resume 以 entryOverride=execute 续跑。已有批准决定 → 消费
+                // 清账本照常执行（拒绝决定在 execute 节点消费）。
+                if (io.github.paopaonb666.agentbase.core.tools.ApprovalLedger
+                        .status(nodeCtx.config().threadId(), PLAN_CALL_ID, 0)
+                        == io.github.paopaonb666.agentbase.core.tools.ApprovalLedger.Status.APPROVED) {
+                    io.github.paopaonb666.agentbase.core.tools.ApprovalLedger
+                            .clear(nodeCtx.config().threadId(), PLAN_CALL_ID);
+                } else {
+                    update.put("pending_approval",
+                            Map.of("resume_node", "execute", "detail", "plan"));
+                }
+            }
+            return update;
         };
     }
 
@@ -83,6 +101,9 @@ public final class PlanNode {
         String text = reply == null ? null : reply.text();
         return text == null ? "" : text;
     }
+
+    /** A-#62：计划审批决定在账本里的键（与工具 call_id 命名空间隔离）。 */
+    public static final String PLAN_CALL_ID = "plan";
 
     /**
      * 模型输出 → 规范化 Task 列表；任何解析失败都降级为单任务。

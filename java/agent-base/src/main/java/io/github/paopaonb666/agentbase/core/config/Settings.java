@@ -484,6 +484,15 @@ public final class Settings {
         /** 空输出门的最小摘要长度门槛；0 = 只拦空白输出。 */
         public int minSummaryChars = 0;
         /**
+         * 计划审批门（A-#62）：开启后 plan 节点拆解出任务即暂停
+         * （termination=paused，pending_approval 标记 resume_node=execute），
+         * 审批端点 POST .../approvals/plan {decision} 决定后续跑——批准
+         * 照常执行子任务；拒绝把未完成任务标记 FAILED（summary=计划被用户
+         * 拒绝），正常 replan 路由接管（修订版计划再次暂停等批准，预算
+         * 有界）。默认关（零行为变化）。
+         */
+        public boolean planApproval = false;
+        /**
          * 语义判分（#63）：空=关（默认，只跑字数门）；"llm" = check 节点
          * 对通过字数门的输出做一次 LLM 判分（done/failed/partial 三态；
          * partial 定向补做一轮）。判分调用走模块主档模型（ModuleContext
@@ -1397,6 +1406,9 @@ public final class Settings {
 
     private static void applyPlanner(Settings s, Map<String, String> v) {
         PlannerSettings t = s.planner;
+        if (v.containsKey("approval")) {
+            t.planApproval = requireBool("approval", v.get("approval"));
+        }
         if (v.containsKey("max_subtasks")) {
             int value = requireInt("max_subtasks", v.get("max_subtasks"));
             if (value < 1) throw new SettingsError("max_subtasks must be >= 1, got %d".formatted(value));
