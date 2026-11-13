@@ -276,6 +276,15 @@ public final class Settings {
          */
         public String lowQualityUrlPatterns;
         public String lowQualityTitlePatterns;
+        /**
+         * 搜索结果语义 rerank（A-31）：相关性打分后对短名单做 embedding
+         * 余弦重排（复用记忆包 Embeddings，零新增 LLM 成本）。默认关——
+         * 增一批嵌入调用（1+pool 条），量化随 #96 场景 eval；embedding
+         * 未配置/嵌入失败时整体降级原序（不做部分重排）。
+         */
+        public boolean rerankEnabled = false;
+        /** rerank 短名单池：对打分后前 pool 条重排（池外原序接尾）。 */
+        public int rerankPool = 20;
     }
 
     /** 文档解析（tools/parsing）配置节：env 前缀 {@code DOC_PARSE_}。 */
@@ -1034,6 +1043,16 @@ public final class Settings {
         }
         if (v.containsKey("low_quality_title_patterns")) {
             t.lowQualityTitlePatterns = v.get("low_quality_title_patterns");
+        }
+        if (v.containsKey("rerank_enabled")) {
+            t.rerankEnabled = requireBool("rerank_enabled", v.get("rerank_enabled"));
+        }
+        if (v.containsKey("rerank_pool")) {
+            int value = requireInt("rerank_pool", v.get("rerank_pool"));
+            if (value < 2) {
+                throw new SettingsError("SEARCH_RERANK_POOL must be >= 2, got %d".formatted(value));
+            }
+            t.rerankPool = value;
         }
         if (v.containsKey("timeout_seconds")) {
             double value = requireFloat("timeout_seconds", v.get("timeout_seconds"));

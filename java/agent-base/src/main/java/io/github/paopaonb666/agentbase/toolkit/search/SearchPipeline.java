@@ -140,6 +140,100 @@ public final class SearchPipeline {
         return out;
     }
 
+    /**
+     * A-31 搜索结果语义 rerank（{@code SEARCH_RERANK_ENABLED} 默认关）：
+     * 相关性打分之后的 embedding 余弦重排——短名单（前 {@code pool} 条）
+     * 内把「查询↔候选(标题+摘要)」的语义相似度作为唯一排序键重新仲裁
+     * （词面/引擎序让位语义序），池外候选按原序接尾并顺延编号。
+     *
+     * <p>降级语义：embedder 为 null（记忆插件/embedding 未配置）、批量嵌入
+     * 返回 null（端点失败/冷却/维度失配——MemoryService.embedBatch 的整体
+     * 降级口径）或向量数与文本数不对齐时，<b>原序原样返回</b>（不做部分
+     * 重排——部分重排会引入序不一致）；候选数 &lt; 2 无可重排。平局保持
+     * 原序（与 filterAndRank 的稳定排序一致）。
+     *
+     * <p>量化随 #96 场景 eval（RAG 线）——默认关时的行为逐字节不变。
+     */
+    public static List<SearchResult> rerankByEmbedding(List<SearchResult> ranked, String query,
+                                                       java.util.function.Function<List<String>, List<List<Float>>> embedBatch,
+                                                       int pool) {
+        if (embedBatch == null || ranked == null || ranked.size() < 2 || pool < 2) {
+            return ranked;
+        }
+        int shortlistSize = Math.min(pool, ranked.size());
+        List<String> texts = new ArrayList<>(shortlistSize + 1);
+        texts.add(query);
+        for (int i = 0; i < shortlistSize; i++) {
+            texts.add(ranked.get(i).title() + "\n" + ranked.get(i).snippet());
+        }
+        List<List<Float>> vectors;
+        try {
+            vectors = embedBatch.apply(texts);
+        } catch (Exception e) {
+            return ranked;
+        }
+        if (vectors == null || vectors.size() != texts.size()) {
+            return ranked;
+        }
+        List<Float> queryVector = vectors.get(0);
+        if (queryVector == null || queryVector.isEmpty()) {
+            return ranked;
+        }
+        record Scored(SearchResult result, double similarity, int index) {
+        }
+        List<Scored> scored = new ArrayList<>(shortlistSize);
+        for (int i = 0; i < shortlistSize; i++) {
+            List<Float> vector = vectors.get(i + 1);
+            if (vector == null || vector.isEmpty()) {
+                return ranked;
+            }
+            Double similarity = cosineSimilarity(queryVector, vector);
+            if (similarity == null) {
+                return ranked;
+            }
+            scored.add(new Scored(ranked.get(i), similarity, i));
+        }
+        scored.sort((a, b) -> {
+            int bySim = Double.compare(b.similarity(), a.similarity());
+            return bySim != 0 ? bySim : Integer.compare(a.index(), b.index());
+        });
+        List<SearchResult> out = new ArrayList<>(ranked.size());
+        for (int i = 0; i < scored.size(); i++) {
+            SearchResult r = scored.get(i).result();
+            out.add(new SearchResult(r.title(), r.url(), r.snippet(), i + 1, r.engine()));
+        }
+        for (int i = shortlistSize; i < ranked.size(); i++) {
+            SearchResult r = ranked.get(i);
+            out.add(new SearchResult(r.title(), r.url(), r.snippet(), i + 1, r.engine()));
+        }
+        return out;
+    }
+
+    /**
+     * 余弦相似度；任一向量零范数或维度不齐返回 null（调用方降级）。
+     * 与记忆侧 Retrieval.cosineSimilarity 同公式（core 不依赖 memory 包，
+     * 此处独立实现——float 求和口径一致性对该用途无影响）。
+     */
+    static Double cosineSimilarity(List<Float> a, List<Float> b) {
+        if (a.size() != b.size() || a.isEmpty()) {
+            return null;
+        }
+        double dot = 0.0;
+        double normA = 0.0;
+        double normB = 0.0;
+        for (int i = 0; i < a.size(); i++) {
+            double x = a.get(i);
+            double y = b.get(i);
+            dot += x * y;
+            normA += x * x;
+            normB += y * y;
+        }
+        if (normA == 0.0 || normB == 0.0) {
+            return null;
+        }
+        return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+    }
+
     /** 把结果渲染为带编号的引用上下文（编号供模型在回复中标注来源）。 */
     public static String formatWebContext(List<SearchResult> results) {
         if (results.isEmpty()) {

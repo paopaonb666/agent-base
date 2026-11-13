@@ -582,6 +582,91 @@ class SearchToolTest {
         assertNull(defaults.search.lowQualityTitlePatterns);
     }
 
+    // ── A-31 语义 rerank ─────────────────────────────────────────────────
+
+    /** 桩嵌入：按文本前缀给固定向量（"q:"=查询轴，"a:"=A 轴，"b:"=B 轴）。 */
+    private static final java.util.function.Function<List<String>, List<List<Float>>>
+            PREFIX_EMBEDDER = texts -> {
+        List<List<Float>> out = new java.util.ArrayList<>();
+        for (String text : texts) {
+            if (text.startsWith("q:")) {
+                out.add(List.of(1.0f, 0.0f));
+            } else if (text.startsWith("a:")) {
+                out.add(List.of(0.9f, 0.1f)); // 与查询余弦≈0.994
+            } else {
+                out.add(List.of(0.0f, 1.0f)); // 与查询余弦=0
+            }
+        }
+        return out;
+    };
+
+    @Test
+    void rerankByEmbeddingReordersShortlistAndRenumbers() {
+        // 打分后序 = A,B,C；查询与 A 语义近 → rerank 后 A 第一（位置重编），
+        // C 池外原序接尾并顺延编号。
+        SearchResult a = new SearchResult("a:标题A", "u1", "a:摘要", 1, "fake");
+        SearchResult b = new SearchResult("b:标题B", "u2", "b:摘要", 2, "fake");
+        SearchResult c = new SearchResult("c:标题C", "u3", "c:摘要", 3, "fake");
+        List<SearchResult> out = SearchPipeline.rerankByEmbedding(
+                List.of(b, a, c), "q:查询", PREFIX_EMBEDDER, 2);
+        assertEquals(List.of("a:标题A", "b:标题B", "c:标题C"),
+                out.stream().map(SearchResult::title).toList());
+        assertEquals(List.of(1, 2, 3), out.stream().map(SearchResult::position).toList(),
+                "重排后重新编号；池外接尾顺延");
+    }
+
+    @Test
+    void rerankByEmbeddingDegradesToOriginalOnAnyEmbeddingFailure() {
+        SearchResult a = new SearchResult("a:标题A", "u1", "a:摘要", 1, "fake");
+        SearchResult b = new SearchResult("b:标题B", "u2", "b:摘要", 2, "fake");
+        // embedBatch 返回 null（端点失败/未配置的 MemoryService 口径）→ 原序。
+        assertEquals(List.of(a, b), SearchPipeline.rerankByEmbedding(
+                List.of(a, b), "q:查询", texts -> null, 20));
+        // 数量不齐 → 原序。
+        assertEquals(List.of(a, b), SearchPipeline.rerankByEmbedding(
+                List.of(a, b), "q:查询", texts -> List.of(List.of(1.0f, 0.0f)), 20));
+        // 零向量 → 原序。
+        assertEquals(List.of(a, b), SearchPipeline.rerankByEmbedding(
+                List.of(a, b), "q:查询", texts -> List.of(
+                        List.of(1.0f, 0.0f), List.of(0.0f, 0.0f), List.of(1.0f, 0.0f)), 20));
+        // embedder 本身缺席 → 原序。
+        assertEquals(List.of(a, b), SearchPipeline.rerankByEmbedding(
+                List.of(a, b), "q:查询", null, 20));
+        // 嵌入调用抛异常 → 原序（整体降级口径对异常同样成立）。
+        assertEquals(List.of(a, b), SearchPipeline.rerankByEmbedding(
+                List.of(a, b), "q:查询", texts -> {
+                    throw new IllegalStateException("endpoint down");
+                }, 20));
+    }
+
+    @Test
+    void rerankByEmbeddingKeepsOriginalOrderForTiesAndSmallInputs() {
+        SearchResult a = new SearchResult("a:标题A", "u1", "a:摘要", 1, "fake");
+        SearchResult b = new SearchResult("a:标题A2", "u2", "a:摘要2", 2, "fake");
+        // 同前缀=同向量=平局 → 保持原序（稳定排序）。
+        List<SearchResult> out = SearchPipeline.rerankByEmbedding(
+                List.of(a, b), "q:查询", PREFIX_EMBEDDER, 20);
+        assertEquals(List.of("a:标题A", "a:标题A2"), out.stream().map(SearchResult::title).toList());
+        // 单候选无可重排。
+        assertEquals(1, SearchPipeline.rerankByEmbedding(
+                List.of(a), "q:查询", PREFIX_EMBEDDER, 20).size());
+    }
+
+    @Test
+    void settingsCarriesSearchRerankKeys() {
+        var configured = Settings.load(Map.of("ENV", "development",
+                "SEARCH_RERANK_ENABLED", "true",
+                "SEARCH_RERANK_POOL", "8"), null);
+        assertTrue(configured.search.rerankEnabled);
+        assertEquals(8, configured.search.rerankPool);
+        var defaults = Settings.load(Map.of("ENV", "development"), null);
+        assertFalse(defaults.search.rerankEnabled, "默认关（关闭态零行为变化）");
+        assertEquals(20, defaults.search.rerankPool);
+        assertThrows(Settings.SettingsError.class,
+                () -> Settings.load(Map.of("ENV", "development", "SEARCH_RERANK_POOL", "1"), null),
+                "池下限 2（单候选无可重排）");
+    }
+
     private static int cacheSize(SearchCache cache) {
         try {
             var field = SearchCache.class.getDeclaredField("entries");

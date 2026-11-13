@@ -526,4 +526,31 @@ class MemoryServicePipelineTest {
             service.recordOp(op, userId, agentId, threadId, detail, status, errorText, durationMs);
         }
     }
+
+    // ── A-31 搜索 rerank 注入缝 ──────────────────────────────────────────
+
+    @Test
+    void embedBatchPortPassesThroughVectorsAndDegradesWhenUnavailable() {
+        // 有 embedder：批量接口透传（rerank 侧消费）。
+        EmbeddingClient scripted = new EmbeddingClient() {
+            @Override public Integer dims() { return 2; }
+            @Override public List<List<Float>> embed(List<String> texts) {
+                List<List<Float>> out = new java.util.ArrayList<>();
+                for (String ignored : texts) {
+                    out.add(List.of(1.0f, 0.0f));
+                }
+                return out;
+            }
+            @Override public boolean probe() { return true; }
+        };
+        MemoryService configured = new MemoryService(new InMemoryMemoryStore(), scripted,
+                settings(), null, null);
+        assertEquals(List.of(List.of(1.0f, 0.0f), List.of(1.0f, 0.0f)),
+                configured.embedBatch().apply(List.of("q", "d")));
+
+        // embedding 未配置（never 桩 embed→null）：端口函数整体返回 null
+        // （调用方降级原序），绝不抛。
+        MemoryService unavailable = service(new InMemoryMemoryStore(), settings());
+        assertNull(unavailable.embedBatch().apply(List.of("查询", "候选")));
+    }
 }

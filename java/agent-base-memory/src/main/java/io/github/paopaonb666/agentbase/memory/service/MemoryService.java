@@ -579,6 +579,26 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
         return pipeline != null;
     }
 
+    /**
+     * A-31 搜索 rerank 注入缝：把 Embeddings 客户端的批量接口暴露给
+     * toolkit 层（core 端口 default null——本实现有 embedder 才非 null）。
+     * embedding 未配置（NullEmbedding）或批内任一失败 → 返回 null，调用方
+     * 整体降级原序（不做部分重排）；维度失配（#165 故意穿透冷却的配置
+     * 错误）同样按不可用降级。
+     */
+    @Override
+    public java.util.function.Function<java.util.List<String>, java.util.List<java.util.List<Float>>> embedBatch() {
+        return texts -> {
+            try {
+                List<List<Float>> vectors = embedder.embed(texts);
+                return vectors == null ? null : vectors;
+            } catch (Exception e) {
+                LOG.warn("memory: rerank 嵌入失败，调用方降级原序", e);
+                return null;
+            }
+        };
+    }
+
     @Override
     public String healthProbe() {
         try {

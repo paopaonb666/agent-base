@@ -423,8 +423,12 @@ public final class AgentRuntime {
         // 工具库的内置工具按 TOOLKIT_ENABLED 装配后并入共享池（模块工具在
         // 前，工具库在后）；重名在任何一侧发生都会快速失败。
         ToolCallRecorder recorder = ToolCallLoggers.build(resolved);
+        // A-31：记忆插件的批量嵌入函数注入 web_search（语义 rerank 用）——
+        // 端口 default null（未配 memory/embedding 时 web_search rerank
+        // 恒降级原序，零成本）。
         java.util.List<AgentTool> extraTools = new java.util.ArrayList<>(
-                io.github.paopaonb666.agentbase.toolkit.Toolkits.buildToolkitTools(resolved));
+                io.github.paopaonb666.agentbase.toolkit.Toolkits.buildToolkitTools(resolved,
+                        memoryService == null ? null : memoryService.embedBatch()));
         if (plugin != null) {
             // 记忆工具（M6e）由插件随服务一起返回；与模块/工具库工具同样受
             // 超时包装与审计收口。

@@ -210,6 +210,18 @@ public interface AgentModule {
             return null;
         }
 
+        /**
+         * 批量嵌入函数（A-31 搜索 rerank 注入缝）：输入文本批，返回对齐的
+         * 嵌入批（复用记忆包的 Embeddings 客户端，零新增 LLM 成本）。返回
+         * null = embedding 未配置/内存插件缺席（调用方降级跳过 rerank）；
+         * 批内失败也整体返回 null（调用方按不可用降级，不做部分重排——
+         * 部分重排会引入序不一致）。default 返回 null 对既有实现零破坏
+         * （#172/#184/#328 default 先例：core 不依赖记忆包）。
+         */
+        default java.util.function.Function<java.util.List<String>, java.util.List<java.util.List<Float>>> embedBatch() {
+            return null;
+        }
+
         /** 健康探针：store 可读 + embedding 探活；返回 ok/degraded。 */
         String healthProbe();
     }

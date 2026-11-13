@@ -80,9 +80,19 @@ public final class WebSearchTool implements AgentTool {
     /** A-32：低质模式表（Settings 覆写口径；测试构造回落基座默认）。 */
     private final List<String> lowQualityUrlPatterns;
     private final List<String> lowQualityTitlePatterns;
+    /** A-31：语义 rerank 开关/池/批量嵌入函数（null=不可用，恒降级原序）。 */
+    private final boolean rerankEnabled;
+    private final int rerankPool;
+    private final java.util.function.Function<List<String>, List<List<Float>>> embedBatch;
 
     /** 生产装配：按 settings 组装引擎与缓存（注册表工厂调用）。 */
     public static WebSearchTool build(Settings settings) {
+        return build(settings, null);
+    }
+
+    /** 全参装配（A-31）：embedBatch 由记忆插件端口注入（null=不可用）。 */
+    public static WebSearchTool build(Settings settings,
+                                      java.util.function.Function<List<String>, List<List<Float>>> embedBatch) {
         return new WebSearchTool(
                 new FallbackSearchManager(Engines.buildEngines(
                         Engines.parsePriority(settings.search.enginePriority),
@@ -93,7 +103,10 @@ public final class WebSearchTool implements AgentTool {
                 SearchPipeline.parsePatterns(settings.search.lowQualityUrlPatterns,
                         SearchPipeline.BASE_LOW_QUALITY_URL_PATTERNS),
                 SearchPipeline.parsePatterns(settings.search.lowQualityTitlePatterns,
-                        SearchPipeline.BASE_LOW_QUALITY_TITLE_PATTERNS));
+                        SearchPipeline.BASE_LOW_QUALITY_TITLE_PATTERNS),
+                settings.search.rerankEnabled,
+                settings.search.rerankPool,
+                embedBatch);
     }
 
     /**
@@ -110,17 +123,23 @@ public final class WebSearchTool implements AgentTool {
     public WebSearchTool(FallbackSearchManager manager, SearchCache cache, double timeoutSeconds) {
         this(manager, cache, timeoutSeconds,
                 SearchPipeline.BASE_LOW_QUALITY_URL_PATTERNS,
-                SearchPipeline.BASE_LOW_QUALITY_TITLE_PATTERNS);
+                SearchPipeline.BASE_LOW_QUALITY_TITLE_PATTERNS,
+                false, 20, null);
     }
 
-    /** 全参形态（A-32）：低质模式表由 Settings 装配传入。 */
+    /** 全参形态（A-32/A-31）：模式表与 rerank 配置由 Settings 装配传入。 */
     public WebSearchTool(FallbackSearchManager manager, SearchCache cache, double timeoutSeconds,
-                         List<String> lowQualityUrlPatterns, List<String> lowQualityTitlePatterns) {
+                         List<String> lowQualityUrlPatterns, List<String> lowQualityTitlePatterns,
+                         boolean rerankEnabled, int rerankPool,
+                         java.util.function.Function<List<String>, List<List<Float>>> embedBatch) {
         this.manager = manager;
         this.cache = cache;
         this.timeoutSeconds = timeoutSeconds;
         this.lowQualityUrlPatterns = List.copyOf(lowQualityUrlPatterns);
         this.lowQualityTitlePatterns = List.copyOf(lowQualityTitlePatterns);
+        this.rerankEnabled = rerankEnabled;
+        this.rerankPool = rerankPool;
+        this.embedBatch = embedBatch;
     }
 
     @Override
@@ -219,6 +238,11 @@ public final class WebSearchTool implements AgentTool {
         List<SearchResult> raw = manager.search(query, maxResults * 2, timeoutSeconds);
         List<SearchResult> ranked = SearchPipeline.filterAndRank(raw, query, maxResults,
                 lowQualityUrlPatterns, lowQualityTitlePatterns);
+        // A-31 语义 rerank（默认关）：打分后按 embedding 余弦重排短名单；
+        // 不可用（embedder 缺席/嵌入失败）整体降级原序。
+        if (rerankEnabled) {
+            ranked = SearchPipeline.rerankByEmbedding(ranked, query, embedBatch, rerankPool);
+        }
         if (!ranked.isEmpty()) {
             cache.put(query, ranked);
         }
