@@ -144,4 +144,54 @@ class SteeringTest {
             RunRegistry.unregister("chat:t3", handle);
         }
     }
+
+    @Test
+    void lastRunRecordedAtTerminalWithWireLabel() {
+        // 正常完成 → done；取消 → cancelled；记录带 runId（run- 前缀）与属主。
+        RecordingSink sink = new RecordingSink();
+        CompiledGraph graph = twoStepGraph(null);
+        graph.stream(new GraphState(), RunConfig.of("chat:t6", "u1"), sink);
+        RunRegistry.LastRun last = RunRegistry.lastRun("chat:t6");
+        assertEquals("done", last.termination());
+        assertEquals("u1", last.userId());
+        assertTrue(last.runId().startsWith("run-"), last.runId());
+        assertTrue(last.endedAtMillis() > 0);
+
+        RecordingSink cancelSink = new RecordingSink();
+        CompiledGraph cancelGraph = twoStepGraph(() -> cancelSink.cancelled = true);
+        cancelGraph.streamWithTermination(new GraphState(), RunConfig.of("chat:t7", "u1"), cancelSink);
+        assertEquals("cancelled", RunRegistry.lastRun("chat:t7").termination(),
+                "取消路径的终态标注与 streamWithTermination 同口径");
+    }
+
+    @Test
+    void cancelledRunResumesFromSnapshotAndCompletes() {
+        // #8 e2e：第一轮取消（a 的半步产出带标记落盘）→ 空输入重入（resume
+        // 语义）从入口续跑 → done；快照完整性=先前消息保留、终态记录翻 done。
+        io.github.paopaonb666.agentbase.core.graph.InMemoryCheckpointer checkpointer =
+                new io.github.paopaonb666.agentbase.core.graph.InMemoryCheckpointer();
+        RecordingSink cancelSink = new RecordingSink();
+        CompiledGraph graph = GraphBuilder.begin()
+                .addNode("a", (state, ctx) -> {
+                    cancelSink.cancelled = true;
+                    return Map.of(GraphState.MESSAGES, List.of(AiMessage.from("a输出")));
+                })
+                .addNode("b", (state, ctx) ->
+                        Map.of(GraphState.MESSAGES, List.of(AiMessage.from("b输出"))))
+                .entry("a")
+                .addEdge("a", "b")
+                .addEdge("b", GraphBuilder.END)
+                .compile(checkpointer, "resumable");
+        graph.streamWithTermination(new GraphState(), RunConfig.of("chat:t8", "u1"), cancelSink);
+        assertEquals("cancelled", RunRegistry.lastRun("chat:t8").termination());
+
+        GraphState resumed = graph.stream(new GraphState(), RunConfig.of("chat:t8", "u1"),
+                new RecordingSink());
+        assertEquals("done", RunRegistry.lastRun("chat:t8").termination(), "续跑翻 done");
+        // 快照完整性：取消轮的 a输出 保留，重入按入口再跑 a、b。
+        assertEquals(3, resumed.messages().size());
+        assertEquals("a输出", ((AiMessage) resumed.messages().get(0)).text());
+        assertEquals("a输出", ((AiMessage) resumed.messages().get(1)).text());
+        assertEquals("b输出", ((AiMessage) resumed.messages().get(2)).text());
+    }
 }

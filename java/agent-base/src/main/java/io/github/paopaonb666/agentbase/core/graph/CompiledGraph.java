@@ -182,6 +182,10 @@ public final class CompiledGraph {
         } finally {
             if (handle != null) {
                 RunRegistry.unregister(config.threadId(), handle);
+                // #8 生命周期记录：末次终态进 RunRegistry（resume 端点的
+                // 可恢复性判定依据；wire 小写形态与 #9 终态枚举一致）。
+                RunRegistry.recordLastRun(config.threadId(), handle.userId(), handle.runId(),
+                        terminationLabel(outcome, failure, sink));
             }
             lock.unlock();
         }
@@ -215,6 +219,31 @@ public final class CompiledGraph {
             LOG.warn("graph: 压缩终态钩子失败（不影响运行结果）：thread={}，{}",
                     config.threadId(), e.toString());
         }
+    }
+
+    /**
+     * 生命周期记录的终态标注（#8）：与 {@link #streamWithTermination} 的
+     * 归类同口径——failure 按 sink 取消态区分 cancelled/internal_error，
+     * 递归触顶记 recursion_limit，正常出口用终态枚举的 wire 小写形态。
+     */
+    private static String terminationLabel(RunOutcome outcome, RuntimeException failure,
+                                           EventSink sink) {
+        if (failure != null) {
+            if ((sink != null && sink.cancelled())
+                    || failure instanceof java.util.concurrent.CancellationException) {
+                return Events.RunTermination.CANCELLED.name()
+                        .toLowerCase(java.util.Locale.ROOT);
+            }
+            if (failure instanceof GraphRecursionError) {
+                return Events.RunTermination.RECURSION_LIMIT.name()
+                        .toLowerCase(java.util.Locale.ROOT);
+            }
+            return Events.RunTermination.INTERNAL_ERROR.name()
+                    .toLowerCase(java.util.Locale.ROOT);
+        }
+        return outcome == null
+                ? Events.RunTermination.INTERNAL_ERROR.name().toLowerCase(java.util.Locale.ROOT)
+                : outcome.termination().name().toLowerCase(java.util.Locale.ROOT);
     }
 
     /**

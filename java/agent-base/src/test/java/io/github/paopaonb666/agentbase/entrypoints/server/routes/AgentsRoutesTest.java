@@ -789,6 +789,95 @@ class AgentsRoutesTest {
     }
 
     @Test
+    void resumeEndpointMatrix() throws Exception {
+        // #8 中断恢复端点：无记录/非属主 404 掩蔽、done 400、在途 409、
+        // 可恢复 → SSE emitter（空输入重入图）。线程 id 独立（t10）——
+        // 其他测试的真实运行会把同 id 的生命周期记录翻 done（跨测试污染）。
+        AgentRuntime runtime = buildRuntime(Map.of("chat", stubModule("chat")),
+                new InMemoryCheckpointer(), null, null, null, null, null);
+        AgentsRoutes routes = route(runtime);
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        HttpError none = httpErrorOf(() -> routes.resumeThread("chat", "t10", response,
+                "u1", null, null, null));
+        assertEquals(404, none.status(), "无生命周期记录掩蔽 404");
+
+        HttpError unknownModule = httpErrorOf(() -> routes.resumeThread("nope", "t10", response,
+                "u1", null, null, null));
+        assertEquals(404, unknownModule.status());
+
+        io.github.paopaonb666.agentbase.core.graph.RunRegistry.recordLastRun(
+                "chat:t10", "owner-a", "run-x", "cancelled");
+        HttpError foreign = httpErrorOf(() -> routes.resumeThread("chat", "t10", response,
+                "u1", null, null, null));
+        assertEquals(404, foreign.status(), "非属主掩蔽 404");
+
+        io.github.paopaonb666.agentbase.core.graph.RunRegistry.recordLastRun(
+                "chat:t10", "u1", "run-x", "done");
+        HttpError done = httpErrorOf(() -> routes.resumeThread("chat", "t10", response,
+                "u1", null, null, null));
+        assertEquals(400, done.status(), "已完成的运行没有「继续」语义");
+
+        // 可恢复 → emitter 非空（stub 图真实跑到终态）。
+        io.github.paopaonb666.agentbase.core.graph.RunRegistry.recordLastRun(
+                "chat:t10", "u1", "run-x", "cancelled");
+        SseEmitter emitter = routes.resumeThread("chat", "t10", response, "u1", null, null, null);
+        assertNotNull(emitter);
+    }
+
+    @Test
+    void resumeBusyThreadReturns409() throws Exception {
+        // 在途 run 持锁：resume 探针 409（与 invoke 同码同文案，权威判定在
+        // 图执行 tryLock）。线程 id 独立（t11）。
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch entered = new CountDownLatch(1);
+        AgentModule slow = new AgentModule() {
+            @Override public String name() { return "chat"; }
+            @Override public String description() { return "slow stub"; }
+            @Override public CompiledGraph buildGraph(ModuleContext ctx) {
+                return GraphBuilder.begin()
+                        .addNode("slow", (state, nodeCtx) -> {
+                            entered.countDown();
+                            try {
+                                release.await(5, java.util.concurrent.TimeUnit.SECONDS);
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                            }
+                            return Map.of();
+                        })
+                        .entry("slow")
+                        .addEdge("slow", GraphBuilder.END)
+                        .compile(ctx.checkpointer(), "chat");
+            }
+            @Override public List<io.github.paopaonb666.agentbase.core.tools.AgentTool> getTools() {
+                return List.of();
+            }
+        };
+        AgentRuntime runtime = buildRuntime(Map.of("chat", slow),
+                new InMemoryCheckpointer(), null, null, null, null, null);
+        AgentsRoutes routes = route(runtime);
+        io.github.paopaonb666.agentbase.core.graph.RunRegistry.recordLastRun(
+                "chat:t11", "u1", "run-x", "cancelled");
+
+        java.util.concurrent.ExecutorService pool =
+                java.util.concurrent.Executors.newSingleThreadExecutor();
+        try {
+            var running = pool.submit(() -> routes.resumeThread("chat", "t11",
+                    new MockHttpServletResponse(), "u1", null, null, null));
+            assertTrue(entered.await(5, java.util.concurrent.TimeUnit.SECONDS),
+                    "resume run 应已进入慢节点（持线程锁）");
+            MockHttpServletResponse second = new MockHttpServletResponse();
+            HttpError busy = httpErrorOf(() -> routes.resumeThread("chat", "t11", second,
+                    "u1", null, null, null));
+            assertEquals(409, busy.status());
+            assertNotNull(running.get(5, java.util.concurrent.TimeUnit.SECONDS));
+        } finally {
+            release.countDown();
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
     void chineseThreadIdRoundTripsThroughPathEndpoints() throws Exception {
         // #121 回归：中文 thread id 在 invoke 创建后在历史端点仍可读
         // （路径校验 (?U) 与请求体侧同 unicode 语义，对齐 Python \w）。

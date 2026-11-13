@@ -23,19 +23,27 @@ public final class RunRegistry {
     /** steering 队列上限：超过即满（端点 429）—— runaway 插话防线。 */
     public static final int STEER_QUEUE_CAPACITY = 16;
 
-    /** 单个在途 run 的句柄：steering 通道 + 属主。 */
+    /** 单个在途 run 的句柄：run id + 属主 + steering 通道。 */
     public static final class RunHandle {
+        private final String runId;
         private final String userId;
         private final LinkedBlockingQueue<UserMessage> steering =
                 new LinkedBlockingQueue<>(STEER_QUEUE_CAPACITY);
 
         RunHandle(String userId) {
+            this.runId = "run-"
+                    + io.github.paopaonb666.agentbase.extensions.Observability.newRequestId();
             this.userId = userId;
         }
 
         /** 属主（端点掩蔽校验：非属主 404）。 */
         public String userId() {
             return userId;
+        }
+
+        /** run 标识（生命周期记录/对账锚点）。 */
+        public String runId() {
+            return runId;
         }
 
         /** 尽力投递一条插话；队列满返回 false（端点转 429）。 */
@@ -61,6 +69,16 @@ public final class RunRegistry {
 
     private static final ConcurrentHashMap<String, RunHandle> ACTIVE = new ConcurrentHashMap<>();
 
+    /**
+     * 末次终态记录（#8 resume）：threadId → 最近一次 run 的生命周期快照。
+     * 与 THREAD_LOCKS 同款「每线程一条、常驻不回收」取舍（进程级线程数即
+     * 上界，javadoc 登记）；resume 端点据此判定「有无可恢复的运行」与属主。
+     */
+    public record LastRun(String runId, String userId, String termination, long endedAtMillis) {
+    }
+
+    private static final ConcurrentHashMap<String, LastRun> LAST = new ConcurrentHashMap<>();
+
     private RunRegistry() {
     }
 
@@ -85,5 +103,19 @@ public final class RunRegistry {
     /** 查在途 run 句柄；线程空闲返回 null。 */
     public static RunHandle lookup(String threadId) {
         return ACTIVE.get(threadId);
+    }
+
+    /**
+     * 记录末次终态（#8：图执行线程在注销句柄后调用——termination 用
+     * {@link Events.RunTermination} 的 wire 小写形态）。
+     */
+    public static void recordLastRun(String threadId, String userId, String runId,
+                                     String termination) {
+        LAST.put(threadId, new LastRun(runId, userId, termination, System.currentTimeMillis()));
+    }
+
+    /** 查末次终态记录；该线程从未运行过返回 null。 */
+    public static LastRun lastRun(String threadId) {
+        return LAST.get(threadId);
     }
 }

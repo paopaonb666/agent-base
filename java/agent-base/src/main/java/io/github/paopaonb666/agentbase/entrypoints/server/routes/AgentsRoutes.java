@@ -761,6 +761,54 @@ public class AgentsRoutes {
         return out;
     }
 
+    // ── POST /{module}/threads/{thread_id}/resume：中断恢复续跑（#8）────
+
+    /**
+     * 中断恢复（A-#8）：从该线程最近一次终态运行的生命周期记录判定可恢复
+     * 性，复用 {@code startStream} 全套机制（闸门/认领/记忆钩子/SSE 生产
+     * 者）以<b>空输入</b>重入图——快照即全部上下文，从入口节点续跑。可恢复
+     * 终态 = 非 done（cancelled/failed/recursion_limit/internal_error 等
+     * ——已完成的运行没有「继续」语义，400 拒绝）；在途 run → 409（与
+     * invoke 探针同文案同码）；无记录/非属主 → 404 掩蔽。Python 无此面
+     * （Java 单边扩展）。
+     */
+    @org.springframework.web.bind.annotation.PostMapping("/{module}/threads/{thread_id}/resume")
+    public SseEmitter resumeThread(@PathVariable("module") String module,
+                                   @PathVariable("thread_id") String threadId,
+                                   jakarta.servlet.http.HttpServletResponse response,
+                                   @RequestHeader(value = "X-User-Id", required = false) String userIdHeader,
+                                   @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
+                                   @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,
+                                   @RequestHeader(value = "X-User-Nonce", required = false) String nonceHeader) {
+        String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
+        validateThreadId(threadId);
+        if (!knownModule(module)) {
+            throw new HttpError(404, ErrorCode.NOT_FOUND, "unknown module '" + module + "'");
+        }
+        String fullThreadId = new ThreadId(module, threadId).toString();
+        RunRegistry.LastRun last = RunRegistry.lastRun(fullThreadId);
+        if (last == null || !userId.equals(last.userId())) {
+            throw new HttpError(404, ErrorCode.NOT_FOUND, "thread 不存在或没有可恢复的运行");
+        }
+        if ("done".equals(last.termination())) {
+            throw new HttpError(400, ErrorCode.BAD_REQUEST,
+                    "该运行已正常完成，无需恢复；请发起新一轮对话");
+        }
+        CompiledGraph graph = graphOr404(module);
+        // 在途 run → 409（权威判定在图执行的 tryLock，探针提前报错——与
+        // invoke 同哲学：SSE 开始后只能以 error 事件收口）。
+        if (graph.isThreadBusy(fullThreadId)) {
+            response.setHeader("Retry-After", "5");
+            throw new HttpError(409, ErrorCode.THREAD_BUSY, "线程忙：该 thread 已有进行中的对话（" + threadId
+                    + "），请等待当前轮完成或稍后重试");
+        }
+        RunConfig config = new RunConfig(fullThreadId, userId,
+                runtime.settings().agentRecursionLimit);
+        // 空输入续跑：快照即全部上下文（startStream 的空标题回退 userThreadId）。
+        return startStream(graph, List.of(), java.util.Map.of(), config, threadId, userId,
+                module, response, null);
+    }
+
     // ── GET /{module}/threads/{thread_id}/tool-calls：审计记录 ───────────
     @GetMapping("/{module}/threads/{thread_id}/tool-calls")
     public Map<String, Object> toolCalls(@PathVariable("module") String module,
