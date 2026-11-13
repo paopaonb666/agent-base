@@ -24,6 +24,23 @@ import java.util.regex.Pattern;
  *
  * <p>任何失败都会中止启动——有问题的模块永远不会被静默跳过。
  *
+ * <p><b>失败矩阵（#319/#113，行为由 {@code ModuleRegistryTest} 锁定）</b>：
+ * <ul>
+ *   <li><b>重复名字</b>（AGENT_MODULES 含重复条目）→ RegistryError；</li>
+ *   <li><b>非法名字</b>（不过标识符模式：路径遍历/任意类加载面）→
+ *       RegistryError；</li>
+ *   <li><b>非法包名</b> / <b>空清单</b> / <b>未知模块</b>（包里找不到类）→
+ *       RegistryError 带可用清单文案；</li>
+ *   <li><b>类名/声明名不一致</b>（实例化成功但 {@code name()} 与请求名
+ *       不同）→ RegistryError；</li>
+ *   <li><b>未实现 AgentModule 接口</b> / <b>抽象类</b>（无法实例化）→
+ *       RegistryError；</li>
+ *   <li><b>构造期异常 / LinkageError</b>（类初始化失败、依赖缺失）→
+ *       RegistryError 原因链保留。</li>
+ * </ul>
+ * 兼容垫片：配置出现 Python 默认包名时自动映射（见下）——映射后的包
+ * 同样参与上述失败矩阵。
+ *
  * <p>对应 Python 侧 {@code core/registry.py}；兼容垫片：配置里出现
  * Python 侧的默认包名 {@code agent_base.modules} 时自动映射到 Java 包
  * （同名配置文件无需迁移）。
