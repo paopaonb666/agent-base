@@ -15,6 +15,8 @@ package io.github.paopaonb666.agentbase.extensions.costmeter;
  * @param completionTokens 输出 token 数
  * @param cacheReadTokens  命中缓存的输入 token 数（未上报按 0）
  * @param costCny          本次调用计价（元）
+ * @param attempt          弹性包尝试位次（A-L79+#76；无弹性包装/旧行 NULL）
+ * @param fallback         备用候选标记（"fallback#序号"；主档尝试 NULL）
  */
 public record UsageRecord(
         double ts,
@@ -24,5 +26,7 @@ public record UsageRecord(
         long promptTokens,
         long completionTokens,
         long cacheReadTokens,
-        double costCny) {
+        double costCny,
+        Integer attempt,
+        String fallback) {
 }

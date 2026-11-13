@@ -262,12 +262,24 @@ public final class ResilientModelRuntime implements ModelRuntime {
             throw new IllegalStateException("llm 并发等待被中断", interrupted);
         }
         try {
+            // A-L79+#76 写账上下文：attempt 位次 + fallback 候选序号（kind
+            // 形态 "…-fallback#i"；主档尝试 fallback=-1 → 账本列 NULL）。
+            // body 在同线程执行（usage sink 在 body 内触发），ThreadLocal
+            // 可见；exit 必 clear（线程池复用不串账）。
+            int fallbackIndex = -1;
+            int fallbackMarker = kind.indexOf("fallback#");
+            if (fallbackMarker >= 0) {
+                fallbackIndex = Integer.parseInt(
+                        kind.substring(fallbackMarker + "fallback#".length()));
+            }
+            UsageSinks.setAttemptContext(new UsageSinks.AttemptContext(attempt, fallbackIndex));
             if (attempt > 0) {
                 LOG.warn("llm: {} 第 {}/{} 次重试（真实调用，usage 由内层 sink 记账）",
                         kind, attempt + 1, maxRetries + 1);
             }
             return body.get();
         } finally {
+            UsageSinks.clearAttemptContext();
             semaphore.release();
         }
     }

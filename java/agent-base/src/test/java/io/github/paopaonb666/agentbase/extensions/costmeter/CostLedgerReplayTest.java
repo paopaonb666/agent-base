@@ -41,7 +41,7 @@ class CostLedgerReplayTest {
     }
 
     private static UsageRecord row(String model) {
-        return new UsageRecord(1000.0, "req-1", model, "main", 10, 5, 0, 0.01);
+        return new UsageRecord(1000.0, "req-1", model, "main", 10, 5, 0, 0.01, null, null);
     }
 
     @Test

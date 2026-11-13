@@ -20,6 +20,34 @@ public final class UsageSinks {
     private UsageSinks() {
     }
 
+    // ── A-L79+#76：attempt/fallback 写账上下文 ───────────────────────────
+
+    /**
+     * 一次真实调用所在的尝试位次（弹性包写账上下文）：ResilientModelRuntime
+     * 在每次 {@code callWithLimit} 前后 set/clear——同线程可见（invoke 与
+     * 流式回调同线程），costMeterSink 在记账时刻读取。fallback 序号仅在
+     * 备用候选调用时非负（主档尝试恒 -1）。
+     */
+    public record AttemptContext(int attempt, int fallbackIndex) {
+    }
+
+    private static final ThreadLocal<AttemptContext> ATTEMPT = new ThreadLocal<>();
+
+    /** 弹性包进入一次真实调用前设置（调用结束必须 clear）。 */
+    public static void setAttemptContext(AttemptContext context) {
+        ATTEMPT.set(context);
+    }
+
+    /** 弹性包退出真实调用后清除。 */
+    public static void clearAttemptContext() {
+        ATTEMPT.remove();
+    }
+
+    /** 记账时刻读取；无弹性包装（直连运行时/测试）返回 null（账本列写 NULL）。 */
+    public static AttemptContext currentAttemptContext() {
+        return ATTEMPT.get();
+    }
+
     /**
      * 成本计量 sink：投递给成本计量单例
      * {@code CostMeters.cost().recordUsage(model, profile, input, output, cacheRead)}。
@@ -60,7 +88,8 @@ public final class UsageSinks {
                     }
                 }
             }
-            CostMeters.cost().recordUsage(model, safeProfile, input, output, cacheRead);
+            CostMeters.cost().recordUsage(model, safeProfile, input, output, cacheRead,
+                    currentAttemptContext());
         };
     }
 }

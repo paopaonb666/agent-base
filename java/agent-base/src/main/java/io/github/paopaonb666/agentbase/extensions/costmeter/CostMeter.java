@@ -91,7 +91,16 @@ public final class CostMeter {
     /** 记录一次模型调用（指定档位与缓存命中数）。 */
     public void recordUsage(String model, String profile, long inputTokens, long outputTokens,
             long cacheReadTokens) {
-        observe(model, profile, inputTokens, outputTokens, cacheReadTokens);
+        recordUsage(model, profile, inputTokens, outputTokens, cacheReadTokens, null);
+    }
+
+    /**
+     * 记录一次模型调用（A-L79+#76 弹性上下文形态）：{@code context} 非空时
+     * attempt/fallback 候选序号随行落账（主档尝试 fallback 列 NULL）。
+     */
+    public void recordUsage(String model, String profile, long inputTokens, long outputTokens,
+            long cacheReadTokens, io.github.paopaonb666.agentbase.core.llm.UsageSinks.AttemptContext context) {
+        observe(model, profile, inputTokens, outputTokens, cacheReadTokens, context);
     }
 
     /**
@@ -102,6 +111,12 @@ public final class CostMeter {
      * completion/1e6*output}，其中 {@code hit = min(cache_read, prompt)}。
      */
     public void observe(String model, String profile, long prompt, long completion, long cacheRead) {
+        observe(model, profile, prompt, completion, cacheRead, null);
+    }
+
+    /** 同上（A-L79+#76 上下文形态：attempt/fallback 随行入账本队列）。 */
+    public void observe(String model, String profile, long prompt, long completion,
+            long cacheRead, io.github.paopaonb666.agentbase.core.llm.UsageSinks.AttemptContext context) {
         double cost;
         synchronized (lock) {
             if (!prices.containsKey(model) && !warnedModels.contains(model)) {
@@ -128,7 +143,10 @@ public final class CostMeter {
             }
             pending.add(new UsageRecord(
                     now, Observability.requestId(), model, profile,
-                    prompt, completion, cacheRead, cost));
+                    prompt, completion, cacheRead, cost,
+                    context == null ? null : context.attempt(),
+                    context == null || context.fallbackIndex() < 0
+                            ? null : "fallback#" + context.fallbackIndex()));
         }
         Metrics.cost().observeTokens(model, profile, "input", prompt);
         Metrics.cost().observeTokens(model, profile, "output", completion);
@@ -165,6 +183,11 @@ public final class CostMeter {
     /** 累计因 pending 队列满被丢弃的最老行数（#263 丢账方向：少记 → 可能少熔断）。 */
     public long droppedRecordCount() {
         return droppedCount.get();
+    }
+
+    /** 待落库行数（观测面；A-L79+#76 弹性上下文链路的测试与运维口径）。 */
+    public synchronized int pendingRows() {
+        return pending.size();
     }
 
     /** 当日累计（元）。 */

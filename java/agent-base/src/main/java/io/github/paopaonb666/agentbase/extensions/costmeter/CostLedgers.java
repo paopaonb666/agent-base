@@ -83,8 +83,21 @@ public final class CostLedgers {
 
     private static final String INSERT_SQL =
             "INSERT INTO cost_usage (ts, request_id, model, profile, prompt_tokens,"
-                    + " completion_tokens, cache_read_tokens, cost_cny)"
-                    + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+                    + " completion_tokens, cache_read_tokens, cost_cny, attempt, fallback)"
+                    + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+    /**
+     * A-L79+#76 账本列迁移（SchemaMigrations 清单追加）：attempt/fallback
+     * 两列——DDL 保守保持原 8 列（新库也走迁移补列，单一路径），版本表
+     * {@code cost_schema_versions} 保证只应用一次（MySQL 无需 information_schema
+     * 守卫——迁移 id 即幂等护栏）。
+     */
+    private static final List<io.github.paopaonb666.agentbase.core.storage.SchemaMigrations.Migration>
+            COST_MIGRATIONS = List.of(new io.github.paopaonb666.agentbase.core.storage.SchemaMigrations.Migration(
+            "001_cost_attempt_fallback",
+            "attempt/fallback ledger columns (L79+#76)",
+            List.of("ALTER TABLE cost_usage ADD COLUMN attempt INTEGER",
+                    "ALTER TABLE cost_usage ADD COLUMN fallback VARCHAR(64)")));
 
     private static final String TOTALS_SINCE_SQL =
             "SELECT COALESCE(SUM(cost_cny), 0) FROM cost_usage WHERE ts >= ?";
@@ -205,8 +218,53 @@ public final class CostLedgers {
                     st.execute(SQLITE_INDEX_DDL);
                 }
                 conn.commit(); // 对应 Python aiosqlite 的显式 commit
+                applyMigrations();
             } catch (SQLException e) {
                 throw new IllegalStateException("cost: sqlite 账本初始化失败: " + e.getMessage(), e);
+            }
+        }
+
+        /** A-L79+#76：SchemaMigrations 接线（同连接 Executor；版本表自举）。 */
+        private void applyMigrations() {
+            try {
+                io.github.paopaonb666.agentbase.core.storage.SchemaMigrations.apply(
+                        "cost", new io.github.paopaonb666.agentbase.core.storage.SchemaMigrations.Executor() {
+                            @Override public void ensureVersionsTable(String table) throws SQLException {
+                                try (Statement st = conn.createStatement()) {
+                                    st.execute("CREATE TABLE IF NOT EXISTS " + table
+                                            + " (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)");
+                                }
+                            }
+
+                            @Override public void recordVersion(String table, String id) throws SQLException {
+                                try (PreparedStatement ps = conn.prepareStatement(
+                                        "INSERT INTO " + table + " (id, applied_at) VALUES (?, ?)")) {
+                                    ps.setString(1, id);
+                                    ps.setString(2, java.time.Instant.now().toString());
+                                    ps.executeUpdate();
+                                }
+                            }
+
+                            @Override public List<String> appliedVersions(String table) throws SQLException {
+                                List<String> ids = new ArrayList<>();
+                                try (Statement st = conn.createStatement();
+                                     var rs = st.executeQuery("SELECT id FROM " + table)) {
+                                    while (rs.next()) {
+                                        ids.add(rs.getString(1));
+                                    }
+                                }
+                                return ids;
+                            }
+
+                            @Override public void execute(String sql) throws SQLException {
+                                try (Statement st = conn.createStatement()) {
+                                    st.execute(sql);
+                                }
+                            }
+                        }, COST_MIGRATIONS, LOG);
+                conn.commit();
+            } catch (Exception e) {
+                throw new IllegalStateException("cost: sqlite 账本迁移失败: " + e.getMessage(), e);
             }
         }
 
@@ -298,6 +356,42 @@ public final class CostLedgers {
                 try (Statement st = conn.createStatement()) {
                     st.execute(MYSQL_DDL);
                 }
+                // A-L79+#76：SchemaMigrations 接线（每次连接首操作执行；
+                // 版本表保证迁移幂等——与 sqlite 侧同一清单）。
+                io.github.paopaonb666.agentbase.core.storage.SchemaMigrations.apply(
+                        "cost", new io.github.paopaonb666.agentbase.core.storage.SchemaMigrations.Executor() {
+                            @Override public void ensureVersionsTable(String table) throws SQLException {
+                                try (Statement st = conn.createStatement()) {
+                                    st.execute("CREATE TABLE IF NOT EXISTS " + table
+                                            + " (id VARCHAR(128) PRIMARY KEY, applied_at DATETIME NOT NULL)");
+                                }
+                            }
+
+                            @Override public void recordVersion(String table, String id) throws SQLException {
+                                try (PreparedStatement ps = conn.prepareStatement(
+                                        "INSERT INTO " + table + " (id, applied_at) VALUES (?, NOW())")) {
+                                    ps.setString(1, id);
+                                    ps.executeUpdate();
+                                }
+                            }
+
+                            @Override public List<String> appliedVersions(String table) throws SQLException {
+                                List<String> ids = new ArrayList<>();
+                                try (Statement st = conn.createStatement();
+                                     var rs = st.executeQuery("SELECT id FROM " + table)) {
+                                    while (rs.next()) {
+                                        ids.add(rs.getString(1));
+                                    }
+                                }
+                                return ids;
+                            }
+
+                            @Override public void execute(String sql) throws SQLException {
+                                try (Statement st = conn.createStatement()) {
+                                    st.execute(sql);
+                                }
+                            }
+                        }, COST_MIGRATIONS, LOG);
                 tableReady = true;
             }
         }
@@ -364,5 +458,17 @@ public final class CostLedgers {
         ps.setLong(6, r.completionTokens());
         ps.setLong(7, r.cacheReadTokens());
         ps.setDouble(8, r.costCny());
+        // A-L79+#76：attempt/fallback 可空列（旧行 NULL 兼容——无弹性包装
+        // 的直连调用与迁移前的存量行都是 NULL）。
+        if (r.attempt() == null) {
+            ps.setNull(9, java.sql.Types.INTEGER);
+        } else {
+            ps.setInt(9, r.attempt());
+        }
+        if (r.fallback() == null) {
+            ps.setNull(10, java.sql.Types.VARCHAR);
+        } else {
+            ps.setString(10, r.fallback());
+        }
     }
 }

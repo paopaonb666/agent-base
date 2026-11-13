@@ -206,7 +206,8 @@ class CostMeterTest {
     void memoryLedgerRoundtrip() {
         CostLedgers.MemoryCostLedger ledger = new CostLedgers.MemoryCostLedger();
         UsageRecord row = new UsageRecord(
-                System.currentTimeMillis() / 1000.0, "", "m", "main", 10, 5, 0, 1.25);
+                System.currentTimeMillis() / 1000.0, "", "m", "main", 10, 5, 0, 1.25,
+                null, null);
         ledger.append(row);
         assertTrue(ledger.totalsByDay().isEmpty(), "flush 前不落账");
         ledger.flush();
