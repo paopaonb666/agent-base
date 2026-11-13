@@ -318,9 +318,11 @@ public final class ToolCallLoggers {
         private Connection connect() throws SQLException {
             var s = settings.checkpointer;
             // #161：短连接换共享 HikariCP 池（与 checkpointer/core store/
-            // 记忆 store 同批合并）。
+            // 记忆 store 同批合并）；A-5：URL 规范串单源 MySqlPools.jdbcUrl
+            // ——此前拼裸 URL（无 query 参数），同库同账号也 split 第二池。
             return io.github.paopaonb666.agentbase.core.storage.MySqlPools.pool(
-                    "jdbc:mysql://%s:%d/%s".formatted(s.mysqlHost, s.mysqlPort, s.mysqlDatabase),
+                    io.github.paopaonb666.agentbase.core.storage.MySqlPools.jdbcUrl(
+                            s.mysqlHost, s.mysqlPort, s.mysqlDatabase),
                     s.mysqlUser, s.mysqlPassword.value()).getConnection();
         }
 

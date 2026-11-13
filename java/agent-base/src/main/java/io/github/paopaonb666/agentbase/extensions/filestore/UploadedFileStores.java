@@ -43,8 +43,8 @@ import io.github.paopaonb666.agentbase.core.config.Settings;
  * </ul>
  *
  * <p>memory → 进程内字典；sqlite → 单连接 + 方法级 synchronized（对应
- * Python aiosqlite 持久连接 + 事件循环串行化）；mysql → DriverManager
- * 短连接（对应 aiomysql 按操作连接，写入频率低，无需连接池）。
+ * Python aiosqlite 持久连接 + 事件循环串行化）；mysql → 共享 HikariCP 池
+ * （A-5 前为 DriverManager 短连接，对应 aiomysql 按操作连接）。
  * 后端未知时工厂返回 null（附件功能停用）。
  */
 public final class UploadedFileStores {
@@ -592,9 +592,9 @@ public final class UploadedFileStores {
     }
 
     /**
-     * MySQL 附件表：DriverManager 短连接（对应 aiomysql 按操作连接——
-     * 附件写入频率低，无需连接池）。建表 DDL 首写时执行（幂等，alembic
-     * 0003 + 0006 的合并形态）。
+     * MySQL 附件表：共享 HikariCP 池（A-5 前为 DriverManager 短连接——#161
+     * 漏改点，审查只点了 toollog 本处同病；对应 aiomysql 按操作连接）。
+     * 建表 DDL 首写时执行（幂等，alembic 0003 + 0006 的合并形态）。
      */
     public static final class MySqlUploadedFileStore implements UploadedFileStore {
 
@@ -607,9 +607,13 @@ public final class UploadedFileStores {
 
         private Connection connect() throws SQLException {
             var s = settings.checkpointer;
-            return DriverManager.getConnection(
-                    "jdbc:mysql://%s:%d/%s".formatted(s.mysqlHost, s.mysqlPort, s.mysqlDatabase),
-                    s.mysqlUser, s.mysqlPassword.value());
+            // A-5：DriverManager 裸短连接迁入共享池；URL 规范串单源
+            // MySqlPools.jdbcUrl（裸 URL 缺 query 参数——MySQL 8 默认认证下
+            // 缺 allowPublicKeyRetrieval 可能直接建连失败）。
+            return io.github.paopaonb666.agentbase.core.storage.MySqlPools.pool(
+                    io.github.paopaonb666.agentbase.core.storage.MySqlPools.jdbcUrl(
+                            s.mysqlHost, s.mysqlPort, s.mysqlDatabase),
+                    s.mysqlUser, s.mysqlPassword.value()).getConnection();
         }
 
         @Override

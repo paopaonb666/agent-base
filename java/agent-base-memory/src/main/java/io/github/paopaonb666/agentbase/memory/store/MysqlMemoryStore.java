@@ -43,9 +43,9 @@ public final class MysqlMemoryStore extends AbstractSqlMemoryStore {
     public MysqlMemoryStore(Settings settings) {
         super("REPLACE");
         Settings.CheckpointerSettings s = settings.checkpointer;
-        this.url = ("jdbc:mysql://%s:%d/%s?useUnicode=true&characterEncoding=utf8"
-                + "&allowPublicKeyRetrieval=true&useSSL=false")
-                .formatted(s.mysqlHost, s.mysqlPort, s.mysqlDatabase);
+        // A-5：URL 规范串单源 MySqlPools.jdbcUrl（此前内联同参串，杜绝漂移）。
+        this.url = io.github.paopaonb666.agentbase.core.storage.MySqlPools
+                .jdbcUrl(s.mysqlHost, s.mysqlPort, s.mysqlDatabase);
         this.user = s.mysqlUser;
         this.password = s.mysqlPassword.value();
     }

@@ -31,9 +31,9 @@ import io.github.paopaonb666.agentbase.core.config.Settings;
  *   <li><b>sqlite</b>：JDBC 常驻连接，{@code cost_usage} 表与对话状态
  *       同一文件（路径来自 {@code CHECKPOINTER_SQLITE_PATH}），DDL 与
  *       Python 侧 {@code _COST_USAGE_DDL} 逐条一致（幂等自举）；</li>
- *   <li><b>mysql</b>：DriverManager 短连接（账本是低频批量写，参数来自
- *       checkpointer 节），{@code _COST_USAGE_MYSQL_DDL} 幂等建表
- *       （5.7 没有 CREATE INDEX IF NOT EXISTS，索引进 CREATE TABLE）。</li>
+ *   <li><b>mysql</b>：共享 HikariCP 池（A-5 前为 DriverManager 短连接；
+ *       账本是低频批量写，参数来自 checkpointer 节），{@code _COST_USAGE_MYSQL_DDL}
+ *       幂等建表（5.7 没有 CREATE INDEX IF NOT EXISTS，索引进 CREATE TABLE）。</li>
  * </ul>
  * 后端未知时 {@link #build} 返回 null（成本治理不启用）。
  */
@@ -271,7 +271,7 @@ public final class CostLedgers {
         }
     }
 
-    /** MySQL 账本：DriverManager 短连接（账本是低频批量写，无跨语句事务需求）。 */
+    /** MySQL 账本：共享 HikariCP 池（A-5 前为 DriverManager 短连接——#161 漏改点）。 */
     public static final class MySqlCostLedger extends BufferedCostLedger {
         private final Settings settings;
         private volatile boolean tableReady = false;
@@ -282,9 +282,14 @@ public final class CostLedgers {
 
         private Connection connect() throws SQLException {
             var s = settings.checkpointer;
-            return DriverManager.getConnection(
-                    "jdbc:mysql://%s:%d/%s".formatted(s.mysqlHost, s.mysqlPort, s.mysqlDatabase),
-                    s.mysqlUser, s.mysqlPassword.value());
+            // A-5（审查 P2-5 范围扩展）：DriverManager 裸短连接迁入共享池
+            // （审查只点了 toollog，本处与 UploadedFileStores 同病）；URL
+            // 规范串单源 MySqlPools.jdbcUrl——裸 URL 缺 query 参数，MySQL 8
+            // 默认认证下缺 allowPublicKeyRetrieval 可能直接建连失败。
+            return io.github.paopaonb666.agentbase.core.storage.MySqlPools.pool(
+                    io.github.paopaonb666.agentbase.core.storage.MySqlPools.jdbcUrl(
+                            s.mysqlHost, s.mysqlPort, s.mysqlDatabase),
+                    s.mysqlUser, s.mysqlPassword.value()).getConnection();
         }
 
         /** 幂等建表（每连接首次操作时执行一次；对应 Python _ensure_table）。 */
