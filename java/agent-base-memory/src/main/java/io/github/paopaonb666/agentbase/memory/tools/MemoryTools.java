@@ -27,9 +27,15 @@ import io.github.paopaonb666.agentbase.memory.store.Models.MemoryRecord;
  * 到工具线程，#162 起）——CLI 等未设置的场景优雅回退到 default /
  * 全局作用域。
  *
+ * <p><b>agentId=null 的作用域口径（#190）</b>：线程级记忆检索（memory_recall
+ * 注入与工具级召回）的 agent_id 取自 thread_id 所属模块；无 thread 上下文
+ * （CLI 直调、后台管线）时 agent_id=null → 查询落 <b>"*"</b> 全模块共享层
+ * ——写入侧（memory_save/常驻块）的 agent_id=null 同样落 "*"，两侧对齐：
+ * null 作用域 = 跨模块公共记忆，从不落任何具体模块名。</p>
+ *
  * <p><b>检索作用域</b>：memory_search / knowledge_search 是<b>用户级</b>
  * （跨模块可见，user 隔离是唯一边界）；memory_save / 常驻块写入继续带
- * 模块归属（agent_id），供管理端按模块溯源与过滤。
+ * 模块归属（agent_id），供管理端按模块溯源与过滤。</p>
  *
  * <p>对应 Python 侧 {@code agent_base_memory/tools.py}；工具结果文案
  * 逐字节对齐。<b>两处已声明的 Java 先行差异</b>（Python 侧无对应物）：
