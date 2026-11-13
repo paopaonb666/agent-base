@@ -1,5 +1,6 @@
 package io.github.paopaonb666.agentbase.toolkit.search;
 
+import java.util.ArrayList;
 import java.util.List;
 
 import org.slf4j.Logger;
@@ -55,6 +56,20 @@ public final class WebSearchTool implements AgentTool {
             "没有任何可用的搜索引擎：Java 侧只实现 tavily 引擎，"
                     + "需要配置 TAVILY_API_KEY（duckduckgo 等 ddgs 引擎仅 Python 侧可用）";
 
+    /**
+     * 查询改写提示（A-52 多查询扩展）：LLM 把原查询改写成指定数量的检索
+     * 变体（JSON 字符串数组）；变体与原查询各自检索后按 URL 去重合并。
+     * 占位符 {@code {variants}} / {@code {query}} 调用时替换。
+     */
+    static final String QUERY_REWRITE_PROMPT = """
+            你是检索查询改写器。把下面的查询改写成 {variants} 个不同的检索变体，用于提升召回覆盖面：
+            - 保留专有名词完整（不拆词），换用同义词、上下位词、不同表述角度；
+            - 语言与原查询保持一致；
+            - 每个变体都是可直接使用的独立检索词。
+            只输出 JSON 字符串数组（如 ["变体一","变体二"]），不要输出其他内容。
+
+            原查询：{query}""";
+
     /** 给模型看的说明书（逐字复制 Python 版 docstring）。 */
     private static final String DESCRIPTION = """
             搜索互联网获取最新信息。当需要了解实时新闻、当前事件、
@@ -84,15 +99,20 @@ public final class WebSearchTool implements AgentTool {
     private final boolean rerankEnabled;
     private final int rerankPool;
     private final java.util.function.Function<List<String>, List<List<Float>>> embedBatch;
+    /** A-52：查询改写开关/变体数/改写函数（null=不可用，恒单查询）。 */
+    private final boolean queryRewriteEnabled;
+    private final int queryRewriteVariants;
+    private final java.util.function.Function<String, List<String>> queryRewriter;
 
     /** 生产装配：按 settings 组装引擎与缓存（注册表工厂调用）。 */
     public static WebSearchTool build(Settings settings) {
-        return build(settings, null);
+        return build(settings, null, null);
     }
 
-    /** 全参装配（A-31）：embedBatch 由记忆插件端口注入（null=不可用）。 */
+    /** 全参装配（A-31/A-52）：嵌入与改写函数由 AgentRuntime 注入（null=不可用）。 */
     public static WebSearchTool build(Settings settings,
-                                      java.util.function.Function<List<String>, List<List<Float>>> embedBatch) {
+                                      java.util.function.Function<List<String>, List<List<Float>>> embedBatch,
+                                      java.util.function.Function<String, List<String>> queryRewriter) {
         return new WebSearchTool(
                 new FallbackSearchManager(Engines.buildEngines(
                         Engines.parsePriority(settings.search.enginePriority),
@@ -106,7 +126,10 @@ public final class WebSearchTool implements AgentTool {
                         SearchPipeline.BASE_LOW_QUALITY_TITLE_PATTERNS),
                 settings.search.rerankEnabled,
                 settings.search.rerankPool,
-                embedBatch);
+                embedBatch,
+                settings.search.queryRewriteEnabled,
+                settings.search.queryRewriteVariants,
+                queryRewriter);
     }
 
     /**
@@ -124,14 +147,16 @@ public final class WebSearchTool implements AgentTool {
         this(manager, cache, timeoutSeconds,
                 SearchPipeline.BASE_LOW_QUALITY_URL_PATTERNS,
                 SearchPipeline.BASE_LOW_QUALITY_TITLE_PATTERNS,
-                false, 20, null);
+                false, 20, null, false, 2, null);
     }
 
-    /** 全参形态（A-32/A-31）：模式表与 rerank 配置由 Settings 装配传入。 */
+    /** 全参形态（A-32/A-31/A-52）：模式表与 rerank/改写配置由装配传入。 */
     public WebSearchTool(FallbackSearchManager manager, SearchCache cache, double timeoutSeconds,
                          List<String> lowQualityUrlPatterns, List<String> lowQualityTitlePatterns,
                          boolean rerankEnabled, int rerankPool,
-                         java.util.function.Function<List<String>, List<List<Float>>> embedBatch) {
+                         java.util.function.Function<List<String>, List<List<Float>>> embedBatch,
+                         boolean queryRewriteEnabled, int queryRewriteVariants,
+                         java.util.function.Function<String, List<String>> queryRewriter) {
         this.manager = manager;
         this.cache = cache;
         this.timeoutSeconds = timeoutSeconds;
@@ -140,6 +165,9 @@ public final class WebSearchTool implements AgentTool {
         this.rerankEnabled = rerankEnabled;
         this.rerankPool = rerankPool;
         this.embedBatch = embedBatch;
+        this.queryRewriteEnabled = queryRewriteEnabled;
+        this.queryRewriteVariants = queryRewriteVariants;
+        this.queryRewriter = queryRewriter;
     }
 
     @Override
@@ -225,18 +253,92 @@ public final class WebSearchTool implements AgentTool {
         }
     }
 
+    /**
+     * LLM 查询改写函数（A-52 注入缝）：AgentRuntime 用快档（缺省主力）
+     * 构建——输入原查询，输出 ≤variants 个改写变体（JSON 数组解析，条目
+     * trim/去空/去重/剔除与原查询相同的条目）。任何失败（LLM 异常/输出
+     * 不可解析）返回空表——调用方回退仅原查询（与关闭态同结果，绝不阻断
+     * 搜索）。
+     */
+    public static java.util.function.Function<String, List<String>> llmRewriter(
+            io.github.paopaonb666.agentbase.core.llm.ModelRuntime llm,
+            io.github.paopaonb666.agentbase.core.AgentModule.ChatInvokerPort fast,
+            int variants) {
+        return query -> {
+            try {
+                String prompt = QUERY_REWRITE_PROMPT
+                        .replace("{variants}", String.valueOf(variants))
+                        .replace("{query}", query);
+                String raw = fast != null
+                        ? fast.invoke(List.of(dev.langchain4j.data.message.UserMessage.from(prompt)))
+                        : llm.invoke(List.of(dev.langchain4j.data.message.UserMessage.from(prompt)))
+                                .text();
+                String arrayJson = io.github.paopaonb666.agentbase.core.text.JsonBlocks
+                        .firstBalancedArray(raw);
+                com.fasterxml.jackson.databind.JsonNode node = MAPPER.readTree(arrayJson);
+                List<String> out = new ArrayList<>();
+                if (node.isArray()) {
+                    for (com.fasterxml.jackson.databind.JsonNode item : node) {
+                        if (!item.isTextual()) {
+                            continue;
+                        }
+                        String variant = item.asText().strip();
+                        if (!variant.isEmpty() && !variant.equalsIgnoreCase(query.strip())
+                                && !out.contains(variant)) {
+                            out.add(variant);
+                        }
+                        if (out.size() >= variants) {
+                            break;
+                        }
+                    }
+                }
+                return out;
+            } catch (Exception e) {
+                LOG.warn("web_search: 查询改写 LLM 失败，回退仅原查询", e);
+                return List.of();
+            }
+        };
+    }
+
     /** 缓存优先的搜索执行；引擎全失败时返回空列表（管理器已记日志）。 */
     private List<SearchResult> runSearch(String query, int maxResults) {
         List<SearchResult> cached = cache.get(query);
         if (cached != null) {
             return cached;
         }
-        // 管线总预算（#242，对应 Python asyncio.wait_for）：SEARCH_TIMEOUT_
-        // SECONDS 是整条 fallback 管线的 deadline，逐引擎传剩余部分——多引擎
-        // 时最坏等待不再无界放大（引擎线程被池掐断后继续跑完的泄漏，从源头
-        // 收口）。
-        List<SearchResult> raw = manager.search(query, maxResults * 2, timeoutSeconds);
-        List<SearchResult> ranked = SearchPipeline.filterAndRank(raw, query, maxResults,
+        // A-52 多查询扩展（默认关）：改写 LLM 产出变体 → 原查询 + 变体各自
+        // 检索，按 URL 去重合并（先见优先——原查询结果排前）后统一打分/
+        // rerank；改写失败/空表回退仅原查询（queries 单元素 = 与关闭态同
+        // 路径）。预算口径：#242 整条管线 deadline 不因变体数放大——各查询
+        // 均摊（下限 2s）。
+        List<String> queries = List.of(query);
+        if (queryRewriteEnabled && queryRewriter != null) {
+            List<String> variants = queryRewriter.apply(query);
+            if (!variants.isEmpty()) {
+                java.util.List<String> expanded = new ArrayList<>(variants.size() + 1);
+                expanded.add(query);
+                expanded.addAll(variants);
+                queries = List.copyOf(expanded);
+            }
+        }
+        double share = queries.size() == 1
+                ? timeoutSeconds
+                : Math.max(2.0, timeoutSeconds / queries.size());
+        boolean multiQuery = queries.size() > 1;
+        List<SearchResult> merged = new ArrayList<>();
+        java.util.Set<String> seenUrls = new java.util.LinkedHashSet<>();
+        for (String q : queries) {
+            for (SearchResult result : manager.search(q, maxResults * 2, share)) {
+                String url = result.url();
+                // 去重只发生在多查询合并（URL 先见优先）；单查询路径逐条
+                // 原样进打分——关闭态行为逐字节不变。
+                if (multiQuery && url != null && !url.isEmpty() && !seenUrls.add(url)) {
+                    continue;
+                }
+                merged.add(result);
+            }
+        }
+        List<SearchResult> ranked = SearchPipeline.filterAndRank(merged, query, maxResults,
                 lowQualityUrlPatterns, lowQualityTitlePatterns);
         // A-31 语义 rerank（默认关）：打分后按 embedding 余弦重排短名单；
         // 不可用（embedder 缺席/嵌入失败）整体降级原序。

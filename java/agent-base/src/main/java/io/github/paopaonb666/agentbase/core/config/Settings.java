@@ -285,6 +285,16 @@ public final class Settings {
         public boolean rerankEnabled = false;
         /** rerank 短名单池：对打分后前 pool 条重排（池外原序接尾）。 */
         public int rerankPool = 20;
+        /**
+         * 查询改写（A-52 多查询扩展）：开启后搜索前先让 LLM 把原查询改写成
+         * {@link #queryRewriteVariants} 个变体，原查询 + 变体各自检索后按
+         * URL 去重合并再打分/rerank。默认关——每轮多一次快档 LLM 调用 +
+         * 多次引擎检索（延迟显著增加），量化随 #96 场景 eval；改写失败/
+         * 不可解析回退仅原查询（与关闭态同结果）。
+         */
+        public boolean queryRewriteEnabled = false;
+        /** 改写变体数上限（1..4；原查询恒在）。 */
+        public int queryRewriteVariants = 2;
     }
 
     /** 文档解析（tools/parsing）配置节：env 前缀 {@code DOC_PARSE_}。 */
@@ -1053,6 +1063,16 @@ public final class Settings {
                 throw new SettingsError("SEARCH_RERANK_POOL must be >= 2, got %d".formatted(value));
             }
             t.rerankPool = value;
+        }
+        if (v.containsKey("query_rewrite_enabled")) {
+            t.queryRewriteEnabled = requireBool("query_rewrite_enabled", v.get("query_rewrite_enabled"));
+        }
+        if (v.containsKey("query_rewrite_variants")) {
+            int value = requireInt("query_rewrite_variants", v.get("query_rewrite_variants"));
+            if (value < 1 || value > 4) {
+                throw new SettingsError("SEARCH_QUERY_REWRITE_VARIANTS must be in [1, 4], got %d".formatted(value));
+            }
+            t.queryRewriteVariants = value;
         }
         if (v.containsKey("timeout_seconds")) {
             double value = requireFloat("timeout_seconds", v.get("timeout_seconds"));

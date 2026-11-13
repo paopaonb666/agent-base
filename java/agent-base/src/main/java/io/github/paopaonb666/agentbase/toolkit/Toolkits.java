@@ -49,16 +49,23 @@ public final class Toolkits {
      * 未启用 → 工厂根本不会被调用（依赖缺失完全无感）。
      */
     public static List<AgentTool> buildToolkitTools(Settings settings) {
-        return buildToolkitTools(settings, null);
+        return buildToolkitTools(settings, null, null);
+    }
+
+    /** A-31 形态（只注入嵌入函数）。 */
+    public static List<AgentTool> buildToolkitTools(Settings settings,
+                                                    java.util.function.Function<java.util.List<String>, java.util.List<java.util.List<Float>>> embedBatch) {
+        return buildToolkitTools(settings, embedBatch, null);
     }
 
     /**
-     * 同上，附批量嵌入函数（A-31）：记忆插件端口注入（null=embedding
-     * 未配置/插件缺席）——web_search 的语义 rerank 复用它，检索侧零新增
-     * LLM 成本。
+     * 同上，附批量嵌入与查询改写函数（A-31/A-52）：记忆插件端口与
+     * AgentRuntime 注入（null=对应能力不可用）——web_search 的语义
+     * rerank 复用嵌入、多查询扩展复用改写，检索侧零新增 LLM 成本。
      */
     public static List<AgentTool> buildToolkitTools(Settings settings,
-                                                    java.util.function.Function<java.util.List<String>, java.util.List<java.util.List<Float>>> embedBatch) {
+                                                    java.util.function.Function<java.util.List<String>, java.util.List<java.util.List<Float>>> embedBatch,
+                                                    java.util.function.Function<String, java.util.List<String>> queryRewriter) {
         List<AgentTool> tools = new ArrayList<>();
         for (String name : settings.toolkit.enabled) {
             switch (name) {
@@ -71,7 +78,7 @@ public final class Toolkits {
                                 "toolkit tool '" + name + "' is enabled but unavailable: "
                                         + WebSearchTool.UNAVAILABLE_REASON);
                     }
-                    tools.add(WebSearchTool.build(settings, embedBatch));
+                    tools.add(WebSearchTool.build(settings, embedBatch, queryRewriter));
                 }
                 case "python_repl" -> throw new ToolkitException(
                         "python_repl 第一期未迁移：启用即承诺子进程隔离执行的 exec 级语义"

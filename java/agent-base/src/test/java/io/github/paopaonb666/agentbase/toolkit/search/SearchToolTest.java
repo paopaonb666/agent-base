@@ -667,6 +667,122 @@ class SearchToolTest {
                 "池下限 2（单候选无可重排）");
     }
 
+    // ── A-52 查询改写 ────────────────────────────────────────────────────
+
+    /** 脚本化快档：返回预置改写输出（空脚本=LLM 失败）。 */
+    private static final class ScriptedRewriterInvoker
+            implements io.github.paopaonb666.agentbase.core.AgentModule.ChatInvokerPort {
+        final java.util.Deque<String> responses = new java.util.ArrayDeque<>();
+        final List<String> prompts = new java.util.ArrayList<>();
+
+        @Override
+        public String invoke(List<dev.langchain4j.data.message.ChatMessage> messages) {
+            prompts.add(((dev.langchain4j.data.message.UserMessage) messages.get(0)).singleText());
+            String next = responses.poll();
+            if (next == null) {
+                throw new IllegalStateException("scripted rewriter exhausted");
+            }
+            return next;
+        }
+    }
+
+    /** 记录查询的假引擎：fixedUrl 时所有查询返回同 URL（供先见去重断言）。 */
+    private static final class RecordingEngine implements SearchEngine {
+        final List<String> queries = new java.util.ArrayList<>();
+        final boolean fixedUrl;
+
+        RecordingEngine(boolean fixedUrl) {
+            this.fixedUrl = fixedUrl;
+        }
+
+        @Override
+        public String name() {
+            return "recording";
+        }
+
+        @Override
+        public List<SearchResult> search(String query, int maxResults) {
+            queries.add(query);
+            String url = fixedUrl ? "https://e.example/x" : "https://e.example/" + query;
+            return List.of(new SearchResult("结果-" + query, url, "s", 1, name()));
+        }
+    }
+
+    @Test
+    void llmRewriterParsesJsonArrayAndSanitizes() {
+        // JSON 数组解析：trim/去空/去重/剔除与原查询相同条目/非字符串忽略。
+        ScriptedRewriterInvoker fast = new ScriptedRewriterInvoker();
+        fast.responses.add("[\"变体一\", \" 变体二 \", \"\", \"变体一\", \"原 查询\", 3]");
+        assertEquals(List.of("变体一", "变体二"),
+                WebSearchTool.llmRewriter(null, fast, 4).apply("原 查询"));
+        // 超过 variants 上限截断。
+        ScriptedRewriterInvoker fast2 = new ScriptedRewriterInvoker();
+        fast2.responses.add("[\"a\",\"b\",\"c\"]");
+        assertEquals(List.of("a", "b"), WebSearchTool.llmRewriter(null, fast2, 2).apply("q"));
+        // LLM 失败 → 空表（回退仅原查询）。
+        ScriptedRewriterInvoker fast3 = new ScriptedRewriterInvoker();
+        assertEquals(List.of(), WebSearchTool.llmRewriter(null, fast3, 2).apply("q"));
+        // 输出无 JSON 数组 → 空表。
+        ScriptedRewriterInvoker fast4 = new ScriptedRewriterInvoker();
+        fast4.responses.add("没有数组");
+        assertEquals(List.of(), WebSearchTool.llmRewriter(null, fast4, 2).apply("q"));
+    }
+
+    @Test
+    void queryRewriteExpandsSearchAndMergesByFirstSeenUrl() {
+        // 开+改写成功：引擎收到原查询+变体；同 URL 先见优先（原查询版本胜出）。
+        RecordingEngine engine = new RecordingEngine(true);
+        ScriptedRewriterInvoker fast = new ScriptedRewriterInvoker();
+        fast.responses.add("[\"变体\"]");
+        WebSearchTool tool = new WebSearchTool(new FallbackSearchManager(List.of(engine)),
+                new SearchCache(60), 15.0,
+                SearchPipeline.BASE_LOW_QUALITY_URL_PATTERNS,
+                SearchPipeline.BASE_LOW_QUALITY_TITLE_PATTERNS,
+                false, 20, null, true, 2, WebSearchTool.llmRewriter(null, fast, 2));
+        tool.call("{\"query\": \"原查询\"}", new AgentTool.ToolContext(null, null));
+        assertEquals(List.of("原查询", "变体"), engine.queries, "原查询+变体各自检索");
+        // 提示词含原查询与变体数。
+        assertTrue(fast.prompts.get(0).contains("原查询") && fast.prompts.get(0).contains("2"),
+                "改写提示词占位符已替换");
+    }
+
+    @Test
+    void queryRewriteOffFallsBackToSingleQueryAndFailureDegrades() {
+        // 关闭态：引擎只收到原查询（逐字节旧路径）。
+        RecordingEngine engine = new RecordingEngine(false);
+        WebSearchTool tool = new WebSearchTool(new FallbackSearchManager(List.of(engine)),
+                new SearchCache(60), 15.0);
+        tool.call("{\"query\": \"原查询\"}", new AgentTool.ToolContext(null, null));
+        assertEquals(List.of("原查询"), engine.queries);
+
+        // 开但改写 LLM 失败：回退仅原查询（与关闭态同结果）。
+        RecordingEngine engine2 = new RecordingEngine(false);
+        ScriptedRewriterInvoker fast = new ScriptedRewriterInvoker();
+        WebSearchTool tool2 = new WebSearchTool(new FallbackSearchManager(List.of(engine2)),
+                new SearchCache(60), 15.0,
+                SearchPipeline.BASE_LOW_QUALITY_URL_PATTERNS,
+                SearchPipeline.BASE_LOW_QUALITY_TITLE_PATTERNS,
+                false, 20, null, true, 2, WebSearchTool.llmRewriter(null, fast, 2));
+        tool2.call("{\"query\": \"原查询\"}", new AgentTool.ToolContext(null, null));
+        assertEquals(List.of("原查询"), engine2.queries);
+    }
+
+    @Test
+    void settingsCarriesQueryRewriteKeys() {
+        var configured = Settings.load(Map.of("ENV", "development",
+                "SEARCH_QUERY_REWRITE_ENABLED", "true",
+                "SEARCH_QUERY_REWRITE_VARIANTS", "3"), null);
+        assertTrue(configured.search.queryRewriteEnabled);
+        assertEquals(3, configured.search.queryRewriteVariants);
+        var defaults = Settings.load(Map.of("ENV", "development"), null);
+        assertFalse(defaults.search.queryRewriteEnabled, "默认关（关闭态零行为变化）");
+        assertEquals(2, defaults.search.queryRewriteVariants);
+        assertThrows(Settings.SettingsError.class,
+                () -> Settings.load(Map.of("ENV", "development",
+                        "SEARCH_QUERY_REWRITE_VARIANTS", "5"), null),
+                "变体数上界 4");
+    }
+
     private static int cacheSize(SearchCache cache) {
         try {
             var field = SearchCache.class.getDeclaredField("entries");
