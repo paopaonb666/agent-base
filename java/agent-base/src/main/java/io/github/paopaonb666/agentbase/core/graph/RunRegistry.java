@@ -133,4 +133,9 @@ public final class RunRegistry {
     public static LastRun lastRun(String threadId) {
         return LAST.get(threadId);
     }
+
+    /** 在途 run 数（/health threads 组件的活跃线程水位，A-#214）。 */
+    public static int activeCount() {
+        return ACTIVE.size();
+    }
 }

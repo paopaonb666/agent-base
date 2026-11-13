@@ -15,6 +15,13 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public final class RunGate {
 
+    /**
+     * 进程级活跃闸门（A-#214 /health sse 水位的读取缝）：AgentsRoutes 构造
+     * 时登记——单实例假设与 THREAD_LOCKS/RunRegistry 进程级静态同口径
+     * （多 AgentsRoutes 实例的测试直构以最后构造者为准，只影响观测面）。
+     */
+    private static volatile RunGate active;
+
     private final Semaphore permits;
     private final int configured;
     private final AtomicInteger inFlight = new AtomicInteger();
@@ -26,6 +33,12 @@ public final class RunGate {
         }
         this.permits = maxConcurrent <= 0 ? null : new Semaphore(maxConcurrent);
         this.configured = maxConcurrent;
+        active = this;
+    }
+
+    /** 活跃闸门（观测面读取缝）；尚无 AgentsRoutes 装配时返回 null。 */
+    public static RunGate active() {
+        return active;
     }
 
     /** 配置的并发上限（0 = 不限）——429 文案引用，不随负载漂移（review R3）。 */
