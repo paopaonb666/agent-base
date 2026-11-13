@@ -115,7 +115,9 @@ public final class MysqlCheckpointer implements Checkpointer {
                         return null;
                     }
                     // 分类解析（#200/#235）：损坏/未知版本返回 null 当缺失，
-                    // 但 ERROR 可见（MySQL 侧隔离表随后续迁移机制一起做）。
+                    // 但 ERROR 可见（MySQL 侧隔离表随后续迁移机制一起做；
+                    // 与 sqlite quarantine 的口径分化已登记差异表 §一——
+                    // A-7/审查 P2-7）。
                     String raw = rs.getString(1);
                     GraphStateJson.ParseResult parsed = GraphStateJson.fromJsonDetail(raw);
                     if (GraphStateJson.ParseResult.OK.equals(parsed.kind())) {
