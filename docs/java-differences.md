@@ -39,6 +39,7 @@
 | #199 取消轮落盘 | 取消（断连）后半步产出照常落盘并带快照行 `cancelled` 标记——「取消的轮次」在历史可见。Python asyncio 取消语义是中断的 superstep 不进 checkpoint（历史凭空消失）；Java 显式偏离并登记。半截 AiMessage 的悬挂 tool_calls 在落盘前剥除（OpenAI tool 配对要求） | `S/core/graph/CompiledGraph.java`（runLocked 取消分支）、`S/core/graph/GraphStateJson.java`（cancelled 键）；progress 登记 `199` 行 |
 | #310 覆盖率门 | JaCoCo BUNDLE 行覆盖门 0.78（#93 自 52% 分步收紧：52%→75%→78%，两 bundle 实测 0.7859/0.7915；80% 终值余量约 90 行，缺口清单在 pom 注释承载）。收紧=改 `java/pom.xml` 单行——流程项（非行为差异） | `java/pom.xml`（check-coverage execution）；progress 登记 Wave 0 `310`/2026-11-12 批6 行 |
 | #139 记忆 PATCH 目标消失 404 | 记忆块 PATCH/更新目标已消失（memory_id 不存在）时返回 404——**行为正确性登记**：目标消失属管理端并发删除的正常竞态，404（对齐「按 id 找不到即不存在」语义）优于静默重建；Java 与 Python 侧同语义，无行为分歧，登记以免后续周期当回归重查 | `M/api/MemoryApiController.java`（update/patch 目标校验）；progress 登记 2026-11-14 批10 `139` 行 |
+| #146 PDF 引擎差异 | 文档解析 PDF 引擎：Java 用 **PDFBox**，Python 用 **pypdf**——逐页提取的拼接语义一致（页间以换行拼接），行级空白处理有引擎差异（PDFBox 可产生行尾空白）；解析套件以**行级语料钉**锁定提取行为（`ParsingTest` 的 PDF 用例即 golden 锁：页序/页选/去重/加密文案/损坏可读异常），版本升级若改变空白行为只需重钉行级断言。文本语义无分歧 | `S/toolkit/parsing/DocumentParsers.java`（PdfParser）、`S/.../toolkit/parsing/ParsingTest.java`（golden 锁）；progress 登记 2026-11-14 批11 `146` 行 |
 | #200/#235 MySQL 损坏快照处置 | sqlite 侧 CORRUPT 进 `ab_thread_states_quarantine` 并移出主表（#235）；MySQL 侧仅 ERROR 日志后原行保留——**每次 get 重新解析+ERROR 反复**（无隔离表）。对齐需经迁移机制（SchemaMigrations）建隔离表+迁移存量，成本与收益不匹配；登记为有意差异，迁移机制立项后收口（A-7/审查 P2-7，此前代码注释自承缓做但未进台账） | `S/core/graph/MysqlCheckpointer.java:117-126`（对照 `SqliteCheckpointer.java:115-121` quarantine）；progress 登记 2026-11-13 批3 行 |
 
 ## 二、Java 侧扩展
