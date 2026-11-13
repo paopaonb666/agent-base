@@ -80,7 +80,9 @@ public final class Events {
      * </ul>
      */
     public enum RunTermination {
-        DONE, FAILED, PARTIAL, CANCELLED, RECURSION_LIMIT, THREAD_BUSY, INTERNAL_ERROR;
+        DONE, FAILED, PARTIAL, CANCELLED, RECURSION_LIMIT, THREAD_BUSY, INTERNAL_ERROR,
+        /** A-#26 审批暂停：命中危险工具名单、等待批准/拒绝（additive 值）。 */
+        PAUSED;
 
         /** wire 值：枚举名小写（RECURSION_LIMIT → "recursion_limit"）。 */
         @JsonValue

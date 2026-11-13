@@ -255,6 +255,16 @@ public final class Settings {
          * {@code toolkit.ToolResultLimits}。
          */
         public int toolResultSpillThreshold = 4000;
+        /**
+         * 危险工具审批门（A-#26）：{@code off}（默认，零行为变化）或逗号
+         * 分隔的工具名名单——命中名单的工具调用在执行前把 run 暂停
+         * （termination=paused，快照带 pending_approval 标记与悬挂
+         * tool_calls），审批端点按 call_id 记录批准/拒绝后续跑。审批决定
+         * 超 {@link #toolApprovalTimeoutSeconds} 未被续跑消费 = 视同拒绝。
+         */
+        public String toolApprovalMode = "off";
+        /** 审批决定的有效期（秒；0 = 不过期）。 */
+        public long toolApprovalTimeoutSeconds = 600;
     }
 
     /** 网络搜索（tools/search）配置节：env 前缀 {@code SEARCH_} / {@code TAVILY_}。 */
@@ -565,6 +575,8 @@ public final class Settings {
                 Map.entry("tool_timeout_seconds", "toolkit"),
                 Map.entry("tool_call_log_enabled", "toolkit"),
                 Map.entry("tool_result_untrusted_marker", "toolkit"),
+                Map.entry("tool_approval_mode", "toolkit"),
+                Map.entry("tool_approval_timeout_seconds", "toolkit"),
                 Map.entry("tool_result_spill_threshold", "toolkit"),
                 Map.entry("search_", "search"),
                 Map.entry("tavily_api_key", "search"),
@@ -579,6 +591,8 @@ public final class Settings {
                 "tool_call_log_enabled", "call_log_enabled",
                 "tool_result_untrusted_marker", "tool_result_untrusted_marker",
                 "tool_result_spill_threshold", "tool_result_spill_threshold",
+                "tool_approval_mode", "approval_mode",
+                "tool_approval_timeout_seconds", "approval_timeout_seconds",
                 "log_json", "log_json",
                 "health_probe_model", "health_probe_model",
                 "tavily_api_key", "tavily_api_key");
@@ -1003,6 +1017,25 @@ public final class Settings {
         ToolkitSettings t = s.toolkit;
         if (v.containsKey("enabled")) {
             t.enabled = parseCsvOrJsonList(v.get("enabled"), "TOOLKIT_ENABLED");
+        }
+        if (v.containsKey("approval_mode")) {
+            String value = v.get("approval_mode").trim();
+            if (!value.equalsIgnoreCase("off")) {
+                for (String name : value.split(",")) {
+                    if (name.strip().isEmpty()) {
+                        throw new SettingsError(
+                                "TOOL_APPROVAL_MODE 名单含空条目：'%s'".formatted(value));
+                    }
+                }
+            }
+            t.toolApprovalMode = value;
+        }
+        if (v.containsKey("approval_timeout_seconds")) {
+            long value = requireInt("approval_timeout_seconds", v.get("approval_timeout_seconds"));
+            if (value < 0) {
+                throw new SettingsError("TOOL_APPROVAL_TIMEOUT_SECONDS must be >= 0, got %d".formatted(value));
+            }
+            t.toolApprovalTimeoutSeconds = value;
         }
         if (v.containsKey("timeout_seconds")) {
             double value = requireFloat("timeout_seconds", v.get("timeout_seconds"));

@@ -809,9 +809,82 @@ public class AgentsRoutes {
         }
         RunConfig config = new RunConfig(fullThreadId, userId,
                 runtime.settings().agentRecursionLimit);
+        // A-#26：审批暂停快照带 resume_node——续跑从该节点（tools/execute）
+        // 继续，不重跑入口（被中断的 chat 轮不重新生成）。
+        String entryOverride = null;
+        GraphState snapshot = graph.getState(config);
+        if (snapshot != null
+                && snapshot.extra().get("pending_approval") instanceof Map<?, ?> pending) {
+            entryOverride = String.valueOf(pending.get("resume_node"));
+        }
         // 空输入续跑：快照即全部上下文（startStream 的空标题回退 userThreadId）。
-        return startStream(graph, List.of(), java.util.Map.of(), config, threadId, userId,
-                module, response, null);
+        return startStream(graph, List.of(), java.util.Map.of(),
+                new RunConfig(fullThreadId, userId, runtime.settings().agentRecursionLimit,
+                        entryOverride),
+                threadId, userId, module, response, null);
+    }
+
+    // ── POST /{module}/threads/{thread_id}/approvals/{call_id}：审批决定 ─
+
+    /**
+     * 工具审批决定（A-#26）：对暂停快照悬挂 tool_calls 里的某个 call_id
+     * 记录批准/拒绝（ApprovalLedger，provider id 在续跑时稳定）。决定后经
+     * POST resume 续跑：批准 → 工具照常执行；拒绝/超时 → 回喂提示文本不
+     * 执行。掩蔽与 resume 同口径：无 paused 记录/非属主/未知 call_id → 404。
+     */
+    @org.springframework.web.bind.annotation.PostMapping(
+            "/{module}/threads/{thread_id}/approvals/{call_id}")
+    public Map<String, Object> approveToolCall(@PathVariable("module") String module,
+                                               @PathVariable("thread_id") String threadId,
+                                               @PathVariable("call_id") String callId,
+                                               @RequestBody java.util.Map<String, Object> body,
+                                               @RequestHeader(value = "X-User-Id", required = false) String userIdHeader,
+                                               @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
+                                               @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,
+                                               @RequestHeader(value = "X-User-Nonce", required = false) String nonceHeader) {
+        String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
+        validateThreadId(threadId);
+        if (!knownModule(module)) {
+            throw new HttpError(404, ErrorCode.NOT_FOUND, "unknown module '" + module + "'");
+        }
+        Object decisionRaw = body == null ? null : body.get("decision");
+        if (!"approve".equals(decisionRaw) && !"reject".equals(decisionRaw)) {
+            throw new HttpError(422, ErrorCode.VALIDATION, "decision 必须是 approve|reject");
+        }
+        String fullThreadId = new ThreadId(module, threadId).toString();
+        RunRegistry.LastRun last = RunRegistry.lastRun(fullThreadId);
+        if (last == null || !userId.equals(last.userId())
+                || !"paused".equals(last.termination())) {
+            throw new HttpError(404, ErrorCode.NOT_FOUND, "thread 不存在或没有待审批的运行");
+        }
+        CompiledGraph graph = graphOr404(module);
+        GraphState snapshot = graph.getState(new RunConfig(fullThreadId, userId,
+                runtime.settings().agentRecursionLimit));
+        // call_id 校验：必须在暂停快照的悬挂 tool_calls 里（不给枚举通道）。
+        boolean known = false;
+        if (snapshot != null && !snapshot.messages().isEmpty()) {
+            ChatMessage tail = snapshot.messages().get(snapshot.messages().size() - 1);
+            if (tail instanceof dev.langchain4j.data.message.AiMessage ai
+                    && ai.hasToolExecutionRequests()) {
+                for (dev.langchain4j.agent.tool.ToolExecutionRequest request
+                        : ai.toolExecutionRequests()) {
+                    if (callId.equals(request.id())) {
+                        known = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!known) {
+            throw new HttpError(404, ErrorCode.NOT_FOUND, "未知 call_id（不在待审批清单）");
+        }
+        io.github.paopaonb666.agentbase.core.tools.ApprovalLedger.record(
+                fullThreadId, callId, "approve".equals(decisionRaw));
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("thread_id", threadId);
+        out.put("call_id", callId);
+        out.put("decision", String.valueOf(decisionRaw));
+        return out;
     }
 
     // ── GET /{module}/threads/{thread_id}/tool-calls：审计记录 ───────────

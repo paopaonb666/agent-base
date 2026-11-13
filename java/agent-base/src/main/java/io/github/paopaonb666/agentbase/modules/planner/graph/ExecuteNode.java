@@ -61,6 +61,12 @@ public final class ExecuteNode {
         io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStore fileStore = ctx.fileStore();
         int spillThresholdChars = ctx.settings() == null
                 ? 0 : ctx.settings().toolkit.toolResultSpillThreshold;
+        // A-#26：危险工具审批名单/有效期在构造期固化（与 Graphs tools 节点
+        // 同款；off=空集运行期零开销）。
+        java.util.Set<String> approvalList = io.github.paopaonb666.agentbase.core.graphs.ToolApprovalGate
+                .parseDangerous(ctx.settings() == null ? "off" : ctx.settings().toolkit.toolApprovalMode);
+        long approvalTtl = ctx.settings() == null
+                ? 600 : ctx.settings().toolkit.toolApprovalTimeoutSeconds;
 
         return (GraphState state, NodeContext nodeCtx) -> {
             int subtaskToolRounds = ctx.settings().planner.subtaskToolRounds;
@@ -115,6 +121,21 @@ public final class ExecuteNode {
                 for (int i = 0; i < toolCalls.size(); i++) {
                     anyIntercepted |= ToolLoopDetector.isIntercepted(loopRepeats[i], loopThreshold);
                 }
+                // A-#26 审批门（在任何执行之前）：非拦截请求里有命中名单且
+                // 无决定的 → 整批暂停（图层落盘 PAUSED，resume_node=execute）。
+                List<ToolExecutionRequest> loopExecutable = new ArrayList<>();
+                for (int i = 0; i < toolCalls.size(); i++) {
+                    if (!ToolLoopDetector.isIntercepted(loopRepeats[i], loopThreshold)) {
+                        loopExecutable.add(toolCalls.get(i));
+                    }
+                }
+                String pauseReason = io.github.paopaonb666.agentbase.core.graphs.ToolApprovalGate
+                        .pauseReason(loopExecutable, approvalList,
+                                nodeCtx.config().threadId(), approvalTtl);
+                if (pauseReason != null) {
+                    throw new io.github.paopaonb666.agentbase.core.graph.PauseForApprovalException(
+                            "execute", pauseReason);
+                }
                 if (anyIntercepted) {
                     // 达阈值：被拦截的请求不执行、回喂提示 ToolMessage（配对
                     // 完整）；其余照常执行后中断 ReAct 循环，子任务按 FAILED
@@ -129,11 +150,12 @@ public final class ExecuteNode {
                     }
                     produced.addAll(executeToolCallsWithLoopBreaks(toolCalls, loopRepeats,
                             loopThreshold, nodeCtx, untrustedMarker, toolResultCapTokens,
-                            fileStore, spillThresholdChars));
+                            fileStore, spillThresholdChars, approvalList, approvalTtl));
                     break;
                 }
                 produced.addAll(executeToolCalls(toolCalls, nodeCtx, untrustedMarker,
-                        toolResultCapTokens, fileStore, spillThresholdChars));
+                        toolResultCapTokens, fileStore, spillThresholdChars,
+                        approvalList, approvalTtl));
             }
             String status = exhausted || loopBrokenTool != null
                     ? PlannerState.FAILED : PlannerState.DONE;
@@ -172,35 +194,56 @@ public final class ExecuteNode {
                                                       boolean untrustedMarker,
                                                       int toolResultCapTokens,
                                                       io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStore fileStore,
-                                                      int spillThresholdChars) {
+                                                      int spillThresholdChars,
+                                                      java.util.Set<String> approvalList,
+                                                      long approvalTtl) {
         List<ChatMessage> results = new ArrayList<>(toolCalls.size());
+        // A-#26 决定分桶：拒绝/超时的请求不执行、回喂提示 ToolMessage（配对
+        // 完整；提示文本不包不可信标记/不外置/不计 TOOL_RESULTS——系统引导
+        // 非外部数据，与循环拦截提示同型）；批准与未命中名单的照常执行。
+        String[] approvalHints = new String[toolCalls.size()];
+        List<ToolExecutionRequest> executable = new ArrayList<>();
+        String threadId = nodeCtx.config() == null ? "" : nodeCtx.config().threadId();
+        for (int i = 0; i < toolCalls.size(); i++) {
+            ToolExecutionRequest call = toolCalls.get(i);
+            approvalHints[i] = io.github.paopaonb666.agentbase.core.graphs.ToolApprovalGate
+                    .hintText(call, approvalList, threadId, approvalTtl);
+            if (approvalHints[i] == null) {
+                executable.add(call);
+            }
+        }
         // #337：只读工具并发、有副作用串行，结果按请求序（池内通道保归一）；
         // 池未接（测试直构）退化为串行 callTool。
         List<String> outputs = nodeCtx.tools() == null
-                ? toolCalls.stream().map(c -> nodeCtx.callTool(
+                ? executable.stream().map(c -> nodeCtx.callTool(
                         c.name() == null ? "" : c.name(),
                         c.arguments() == null ? "{}" : c.arguments())).toList()
-                : nodeCtx.tools().callAll(toolCalls, nodeCtx.config(), nodeCtx,
+                : nodeCtx.tools().callAll(executable, nodeCtx.config(), nodeCtx,
                         call -> nodeCtx.callTool(call.name() == null ? "" : call.name(),
                                 call.arguments() == null ? "{}" : call.arguments()));
         int index = 0;
-        for (ToolExecutionRequest call : toolCalls) {
+        for (int i = 0; i < toolCalls.size(); i++) {
+            ToolExecutionRequest call = toolCalls.get(i);
             String name = call.name() == null ? "" : call.name();
-            String output = outputs.get(index);
-            // 条目 6：先 spill（外置摘要块是上下文文本基座）后 wrap 后 warn。
-            String threadId = nodeCtx.config() == null ? "" : nodeCtx.config().threadId();
-            String userId = nodeCtx.config() == null ? "" : nodeCtx.config().userId();
-            output = ContextEngine.spillIfNeeded(name, output, fileStore,
-                    threadId, userId, spillThresholdChars);
-            if (untrustedMarker) {
-                // #84①：与 Graphs 同规则（判据单源在 ContextEngine）。
-                boolean mcpTool = nodeCtx.tools() != null && nodeCtx.tools().isMcpTool(name);
-                output = ContextEngine.wrapUntrusted(name, output, mcpTool);
+            String output;
+            if (approvalHints[i] != null) {
+                output = approvalHints[i];
+            } else {
+                output = outputs.get(index);
+                index++;
+                // 条目 6：先 spill（外置摘要块是上下文文本基座）后 wrap 后 warn。
+                String userId = nodeCtx.config() == null ? "" : nodeCtx.config().userId();
+                output = ContextEngine.spillIfNeeded(name, output, fileStore,
+                        threadId, userId, spillThresholdChars);
+                if (untrustedMarker) {
+                    // #84①：与 Graphs 同规则（判据单源在 ContextEngine）。
+                    boolean mcpTool = nodeCtx.tools() != null && nodeCtx.tools().isMcpTool(name);
+                    output = ContextEngine.wrapUntrusted(name, output, mcpTool);
+                }
+                ContextEngine.warnIfToolResultOverCap(name, output, toolResultCapTokens);
             }
-            ContextEngine.warnIfToolResultOverCap(name, output, toolResultCapTokens);
             results.add(ToolExecutionResultMessage.from(
                     call.id() == null ? "" : call.id(), name, output));
-            index++;
         }
         return results;
     }
@@ -218,7 +261,9 @@ public final class ExecuteNode {
                                                                     boolean untrustedMarker,
                                                                     int toolResultCapTokens,
                                                                     io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStore fileStore,
-                                                                    int spillThresholdChars) {
+                                                                    int spillThresholdChars,
+                                                                    java.util.Set<String> approvalList,
+                                                                    long approvalTtl) {
         List<ChatMessage> results = new ArrayList<>(toolCalls.size());
         List<ToolExecutionRequest> executable = new ArrayList<>();
         List<Integer> executableSlots = new ArrayList<>();
@@ -235,7 +280,7 @@ public final class ExecuteNode {
             }
         }
         List<ChatMessage> executed = executeToolCalls(executable, nodeCtx, untrustedMarker,
-                toolResultCapTokens, fileStore, spillThresholdChars);
+                toolResultCapTokens, fileStore, spillThresholdChars, approvalList, approvalTtl);
         for (int k = 0; k < executed.size(); k++) {
             results.add(executableSlots.get(k), executed.get(k));
         }

@@ -198,7 +198,8 @@ public final class CompiledGraph {
         boolean cancelled = failure != null
                 ? (sink != null && sink.cancelled())
                         || failure instanceof java.util.concurrent.CancellationException
-                : outcome.termination() == Events.RunTermination.CANCELLED;
+                : outcome.termination() == Events.RunTermination.CANCELLED
+                        || outcome.termination() == Events.RunTermination.PAUSED;
         if (!cancelled) {
             notifyCompactionHook(config, outcome == null ? null : outcome.state());
         }
@@ -292,7 +293,9 @@ public final class CompiledGraph {
     private RunOutcome runLocked(GraphState input, RunConfig config, EventSink sink) {
         GraphState state = loadState(config);
         state.apply(input.updatePayload());
-        String current = entry;
+        // A-#26/#8：入口覆盖（审批暂停续跑指向 resume_node——如 tools 节点
+        // ，批准后从它继续执行而不重跑 chat）。未知节点由运行期兜底报错。
+        String current = config.entryOverride() != null ? config.entryOverride() : entry;
         int steps = 0;
         while (!GraphBuilder.END.equals(current)) {
             if (sink != null && sink.cancelled()) {
@@ -325,7 +328,23 @@ public final class CompiledGraph {
             if (sink != null) {
                 sink.accept(Events.StepEvent.running(current));
             }
-            Map<String, Object> update = executeNode(node, state, config, sink);
+            Map<String, Object> update;
+            try {
+                update = executeNode(node, state, config, sink);
+            } catch (PauseForApprovalException pause) {
+                // A-#26 审批暂停：状态带 pending_approval 标记落盘——悬挂
+                // tool_calls 有意保留（剥除守卫跳过），终态 PAUSED（wire
+                // "paused"，additive 值）；审批端点按 call_id 决策后续跑。
+                state.apply(Map.of("pending_approval", Map.of(
+                        "resume_node", pause.resumeNode(),
+                        "detail", pause.detail())));
+                persistState(config, state);
+                if (sink != null) {
+                    sink.accept(new Events.StepEvent("approval", "running", pause.detail()));
+                }
+                LOG.info("graph: 工具审批暂停（thread={}，{}）", config.threadId(), pause.detail());
+                return new RunOutcome(state, Events.RunTermination.PAUSED, null);
+            }
             if (sink != null && sink.cancelled()) {
                 // 节点已在途执行完（无法回滚）：半步产出照常进状态并落盘
                 // （#199 翻转基线——取消的轮次不再从历史里凭空消失），快照
@@ -342,6 +361,9 @@ public final class CompiledGraph {
                 return new RunOutcome(state, Events.RunTermination.CANCELLED, null);
             }
             state.apply(update);
+            // A-#26：续跑的审批节点完成——待审批调用已全部消费（执行或回喂
+            // 拒绝文本），pending_approval 标记退场（此后取消路径照常剥除）。
+            state.extra().remove("pending_approval");
             if (sink != null) {
                 sink.accept(Events.StepEvent.completed(current));
             }
@@ -460,6 +482,11 @@ public final class CompiledGraph {
      * tool_call_records 审计不受影响）。
      */
     private static void stripDanglingToolCalls(GraphState state) {
+        // A-#26：审批暂停快照的悬挂 tool_calls 是**有意保留**（等批准后续跑
+        // 执行）——pending_approval 标记在场时剥除守卫跳过。
+        if (state.extra().containsKey("pending_approval")) {
+            return;
+        }
         List<ChatMessage> messages = state.messages();
         if (messages.isEmpty()) {
             return;

@@ -106,6 +106,11 @@ public final class Graphs {
             // 条目 5：工具循环检测阈值在构建期读取（运行期零开销；0 = 关闭）。
             int loopThreshold = ctx.settings() == null
                     ? ToolLoopDetector.DEFAULT_THRESHOLD : ctx.settings().agentToolLoopThreshold;
+            // A-#26：危险工具审批名单在构建期解析（off=空集，运行期零开销）。
+            java.util.Set<String> approvalList = ToolApprovalGate.parseDangerous(
+                    ctx.settings() == null ? "off" : ctx.settings().toolkit.toolApprovalMode);
+            long approvalTtl = ctx.settings() == null
+                    ? 600 : ctx.settings().toolkit.toolApprovalTimeoutSeconds;
             // 工具失败在池内归一成模型可读文本反馈（坏掉的工具绝不打断对话）。
             builder.addNode("tools", (GraphState state, NodeContext nodeCtx) -> {
                 AiMessage last = lastAi(state);
@@ -113,6 +118,7 @@ public final class Graphs {
                     return Map.of();
                 }
                 List<ToolExecutionRequest> requests = last.toolExecutionRequests();
+                String threadId = nodeCtx.config().threadId();
                 // 条目 5：循环检测在 callAll 之前分桶——被拦截的请求不执行
                 // （省成本的前提），每个拦截请求回喂一条结构化提示 ToolMessage
                 // （配对完整、协议安全，#68 handoff 预算先例形态）。
@@ -129,6 +135,33 @@ public final class Graphs {
                     }
                 }
                 List<String> outputs;
+                // A-#26 审批门（在任何执行之前）：循环过滤后的可执行请求里
+                // 有命中名单且无决定的 → 整批暂停（PauseForApproval 上抛，
+                // 图层落盘 PAUSED 等审批）。有决定者按批准/拒绝/超时分桶，
+                // 拒绝与超时回喂提示文本不执行。
+                List<ToolExecutionRequest> loopExecutable = new ArrayList<>();
+                for (int i = 0; i < requests.size(); i++) {
+                    if (!loopIntercepted[i]) {
+                        loopExecutable.add(requests.get(i));
+                    }
+                }
+                String pauseReason = ToolApprovalGate.pauseReason(
+                        loopExecutable, approvalList, threadId, approvalTtl);
+                if (pauseReason != null) {
+                    throw new io.github.paopaonb666.agentbase.core.graph.PauseForApprovalException(
+                            "tools", pauseReason);
+                }
+                String[] approvalHints = new String[requests.size()];
+                List<ToolExecutionRequest> approvable = new ArrayList<>();
+                List<Integer> approvableSlots = new ArrayList<>();
+                for (int i = 0; i < requests.size(); i++) {
+                    approvalHints[i] = loopIntercepted[i] ? null
+                            : ToolApprovalGate.hintText(requests.get(i), approvalList, threadId, approvalTtl);
+                    if (!loopIntercepted[i] && approvalHints[i] == null) {
+                        approvable.add(requests.get(i));
+                        approvableSlots.add(i);
+                    }
+                }
                 if (anyIntercepted) {
                     // 分桶：拦截槽位不执行、先填提示文本；正常请求子列表照常
                     // 执行后按请求序回填（ToolPool.callAll 槽位重组先例）。
@@ -140,6 +173,8 @@ public final class Graphs {
                             slots.add(ToolLoopDetector.loopHintText(
                                     requests.get(i).name() == null ? "" : requests.get(i).name(),
                                     loopRepeats[i]));
+                        } else if (approvalHints[i] != null) {
+                            slots.add(approvalHints[i]); // 拒绝/超时提示文本（不执行）
                         } else {
                             slots.add(null); // 待执行回填
                             executable.add(requests.get(i));
@@ -153,6 +188,20 @@ public final class Graphs {
                                     request -> nodeCtx.callTool(request.name(), request.arguments()));
                     for (int k = 0; k < executed.size(); k++) {
                         slots.set(executableSlots.get(k), executed.get(k));
+                    }
+                    outputs = slots;
+                } else if (approvable.size() != requests.size()) {
+                    // 审批分桶形态：拒绝/超时槽位填提示文本，其余照常执行回填。
+                    List<String> slots = new ArrayList<>(requests.size());
+                    for (int i = 0; i < requests.size(); i++) {
+                        slots.add(approvalHints[i] != null ? approvalHints[i] : null);
+                    }
+                    List<String> executed = nodeCtx.tools() == null
+                            ? approvable.stream().map(r -> nodeCtx.callTool(r.name(), r.arguments())).toList()
+                            : nodeCtx.tools().callAll(approvable, nodeCtx.config(), nodeCtx,
+                                    request -> nodeCtx.callTool(request.name(), request.arguments()));
+                    for (int k = 0; k < executed.size(); k++) {
+                        slots.set(approvableSlots.get(k), executed.get(k));
                     }
                     outputs = slots;
                 } else {

@@ -800,6 +800,43 @@ class AgentsRoutesTest {
     }
 
     @Test
+    void approveEndpointMatrix() throws Exception {
+        // A-#26 审批端点：无 paused 记录/非属主/未知 call_id → 404；decision
+        // 校验 422；合法决定落账本（approve/reject 由后续 resume 消费）。
+        AgentRuntime runtime = buildRuntime(Map.of("chat", stubModule("chat")),
+                new InMemoryCheckpointer(), null, null, null, null, null);
+        AgentsRoutes routes = route(runtime);
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        HttpError none = httpErrorOf(() -> routes.approveToolCall("chat", "t12", "call-1",
+                Map.of("decision", "approve"), "u1", null, null, null));
+        assertEquals(404, none.status(), "无 paused 记录掩蔽 404");
+
+        io.github.paopaonb666.agentbase.core.graph.RunRegistry.recordLastRun(
+                "chat:t12", "owner-a", "run-x", "paused");
+        HttpError foreign = httpErrorOf(() -> routes.approveToolCall("chat", "t12", "call-1",
+                Map.of("decision", "approve"), "u1", null, null, null));
+        assertEquals(404, foreign.status(), "非属主掩蔽 404");
+
+        HttpError badDecision = httpErrorOf(() -> routes.approveToolCall("chat", "t12", "call-1",
+                Map.of("decision", "maybe"), "owner-a", null, null, null));
+        assertEquals(422, badDecision.status());
+
+        // 未知 call_id（快照无悬挂调用——stub 图没有 pending_approval）→ 404。
+        HttpError unknownCall = httpErrorOf(() -> routes.approveToolCall("chat", "t12", "call-1",
+                Map.of("decision", "approve"), "owner-a", null, null, null));
+        assertEquals(404, unknownCall.status(), "无暂停快照 → 404（call_id 校验）");
+
+        // 有暂停快照（真实暂停图语料难在路由测试直构——账本写入行为由
+        // ToolApprovalGateTest 图级 e2e 覆盖；此处核 422/404 掩蔽与账本键）。
+        io.github.paopaonb666.agentbase.core.tools.ApprovalLedger.record("chat:t12", "call-1", true);
+        assertEquals(io.github.paopaonb666.agentbase.core.tools.ApprovalLedger.Status.APPROVED,
+                io.github.paopaonb666.agentbase.core.tools.ApprovalLedger.status(
+                        "chat:t12", "call-1", 600));
+        io.github.paopaonb666.agentbase.core.tools.ApprovalLedger.clear("chat:t12", "call-1");
+    }
+
+    @Test
     void resumeEndpointMatrix() throws Exception {
         // #8 中断恢复端点：无记录/非属主 404 掩蔽、done 400、在途 409、
         // 可恢复 → SSE emitter（空输入重入图）。线程 id 独立（t10）——
