@@ -236,17 +236,30 @@ public final class AgentRuntime {
         }
         // 共享池经 ModuleContext 在 compile 期绑定（#238）：图的工具执行
         // 统一走共享池（超时 + 审计 + 指标收口），不再编译后覆写。
-        CompiledGraph graph = module.buildGraph(context());
-        graphs.put(moduleName, graph);
-        return graph;
+        // A-6（审查 P2-6）：构建收进 computeIfAbsent——并发冷启动下同一
+        // 模块的 buildGraph 恰好一次（此前的 get→build→put 非原子，竞态
+        // 会构建两个等价图、丢一个引用；良性但浪费且短暂违反「编译结果按
+        // 模块缓存」的单实例预期）。
+        return graphs.computeIfAbsent(moduleName, k -> module.buildGraph(context()));
     }
 
-    /** 惰性地在所有已注册模块之上构建 supervisor 图。 */
+    /**
+     * 惰性地在所有已注册模块之上构建 supervisor 图。A-6（审查 P2-6）：
+     * volatile 双检 + synchronized——并发冷启动下构建恰好一次（与模块图
+     * 的 computeIfAbsent 同口径）。
+     */
     public CompiledGraph supervisorGraph() {
-        if (supervisor == null) {
-            supervisor = SupervisorGraphs.buildSupervisorGraph(context(), modules);
+        CompiledGraph cached = supervisor;
+        if (cached == null) {
+            synchronized (this) {
+                cached = supervisor;
+                if (cached == null) {
+                    cached = SupervisorGraphs.buildSupervisorGraph(context(), modules);
+                    supervisor = cached;
+                }
+            }
         }
-        return supervisor;
+        return cached;
     }
 
     /** 释放运行时持有的资源（checkpointer 连接、审计写线程、MCP 子进程等）。 */

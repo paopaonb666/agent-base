@@ -128,6 +128,98 @@ class AgentRuntimeAssemblyTest {
         assertSame(first, runtime.graph(AgentRuntime.SUPERVISOR_MODULE));
     }
 
+    /** 慢构建桩：buildGraph 计数并短暂停顿——放大并发冷启动的竞态窗口。 */
+    private record SleepingModule(String moduleName, long sleepMillis, AtomicInteger counter)
+            implements AgentModule {
+
+        @Override
+        public String name() {
+            return moduleName;
+        }
+
+        @Override
+        public String description() {
+            return "slow counting stub module";
+        }
+
+        @Override
+        public CompiledGraph buildGraph(ModuleContext ctx) {
+            counter.incrementAndGet();
+            try {
+                Thread.sleep(sleepMillis);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return GraphBuilder.singleNode(moduleName, (state, nodeCtx) -> Map.of(),
+                    ctx.checkpointer() != null ? ctx.checkpointer() : null);
+        }
+
+        @Override
+        public List<io.github.paopaonb666.agentbase.core.tools.AgentTool> getTools() {
+            return List.of();
+        }
+    }
+
+    @Test
+    void concurrentColdStartBuildsGraphExactlyOnce() throws Exception {
+        // A-6（审查 P2-6）：graph() 的 get→build→put 非原子——并发冷启动下
+        // 同一模块可能构建两个等价 CompiledGraph（良性竞态但浪费、短暂违反
+        // 「编译结果按模块缓存」单实例预期）。computeIfAbsent 收紧后恰一次；
+        // 桩内 50ms sleep 放大竞态窗——修复前该断言竞态不稳（≥1，sleep 放大
+        // 下近必多建），修复后恒绿。
+        AtomicInteger builds = new AtomicInteger();
+        AgentRuntime rt = runtime(devSettings(),
+                Map.of("m1", new SleepingModule("m1", 50, builds)),
+                new InMemoryCheckpointer(), null, null, null, null, null);
+        int threads = 16;
+        java.util.concurrent.CyclicBarrier barrier = new java.util.concurrent.CyclicBarrier(threads);
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(threads);
+        try {
+            java.util.concurrent.Future<?>[] futures = new java.util.concurrent.Future<?>[threads];
+            for (int i = 0; i < threads; i++) {
+                futures[i] = pool.submit(() -> {
+                    barrier.await(10, java.util.concurrent.TimeUnit.SECONDS);
+                    return rt.graph("m1");
+                });
+            }
+            for (java.util.concurrent.Future<?> f : futures) {
+                f.get(10, java.util.concurrent.TimeUnit.SECONDS);
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+        assertEquals(1, builds.get(), "并发冷启动 buildGraph 恰一次");
+    }
+
+    @Test
+    void concurrentColdStartSupervisorReturnsSameInstance() throws Exception {
+        // A-6（审查 P2-6）supervisor 侧：volatile 判空后构建非原子——并发
+        // 冷启动可能构建两个 supervisor 图。双检收紧后所有线程拿到同一实例
+        // （构建无计数桩可挂，断言面=实例同一性）。
+        AgentRuntime rt = runtime(devSettings(),
+                Map.of("chat", new CountingModule("chat", new AtomicInteger())),
+                new InMemoryCheckpointer(), null, null, null, null, null);
+        int threads = 16;
+        java.util.concurrent.CyclicBarrier barrier = new java.util.concurrent.CyclicBarrier(threads);
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(threads);
+        java.util.List<CompiledGraph> seen = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+        try {
+            java.util.concurrent.Future<?>[] futures = new java.util.concurrent.Future<?>[threads];
+            for (int i = 0; i < threads; i++) {
+                futures[i] = pool.submit(() -> {
+                    barrier.await(10, java.util.concurrent.TimeUnit.SECONDS);
+                    return seen.add(rt.supervisorGraph());
+                });
+            }
+            for (java.util.concurrent.Future<?> f : futures) {
+                f.get(10, java.util.concurrent.TimeUnit.SECONDS);
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+        assertEquals(1, seen.stream().distinct().count(), "并发冷启动 supervisor 图恰一实例");
+    }
+
     // ── close() 资源收敛 ──────────────────────────────────────────────────
 
     @Test
