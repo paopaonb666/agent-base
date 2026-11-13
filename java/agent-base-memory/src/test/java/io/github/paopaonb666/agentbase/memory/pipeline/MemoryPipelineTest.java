@@ -811,4 +811,89 @@ class MemoryPipelineTest {
         assertFalse(main.prompts.get(0).contains("sk-"), "密钥不应出现在整合 prompt 里");
         assertTrue(main.prompts.get(0).contains("用户在杭州"));
     }
+
+    // ── A-43 抽取自检 ────────────────────────────────────────────────────
+
+    @Test
+    void selfCheckRejectsDropIndicesAndKeepsTheRest() {
+        ScriptedFast fast = new ScriptedFast();
+        fast.responses.add("[0]"); // 自检判定：剔除 0 号（列表内重复/低质）
+        MemoryPipeline pipeline = pipelineWith(new ScriptedMain(), fast, new RecordingOps());
+        var dropped = new MemoryPipeline.Candidate("重复内容 A", "semantic", 0.5, List.of());
+        var kept = new MemoryPipeline.Candidate("具体内容 B", "semantic", 0.5, List.of());
+        List<MemoryPipeline.Candidate> out = pipeline.selfCheckCandidates(List.of(dropped, kept));
+        assertEquals(List.of("具体内容 B"),
+                out.stream().map(MemoryPipeline.Candidate::content).toList());
+    }
+
+    @Test
+    void selfCheckPassThroughWhenNothingDropped() {
+        ScriptedFast fast = new ScriptedFast();
+        fast.responses.add("[]");
+        MemoryPipeline pipeline = pipelineWith(new ScriptedMain(), fast, new RecordingOps());
+        var candidate = new MemoryPipeline.Candidate("具体内容", "semantic", 0.5, List.of());
+        assertEquals(List.of(candidate), pipeline.selfCheckCandidates(List.of(candidate)),
+                "全部通过 → 原表返回");
+    }
+
+    @Test
+    void selfCheckFallsBackToOriginalOnLlmFailure() {
+        ScriptedFast fast = new ScriptedFast(); // 空脚本 → invoke 抛异常
+        MemoryPipeline pipeline = pipelineWith(new ScriptedMain(), fast, new RecordingOps());
+        var candidate = new MemoryPipeline.Candidate("内容", "semantic", 0.5, List.of());
+        assertEquals(List.of(candidate), pipeline.selfCheckCandidates(List.of(candidate)),
+                "LLM 失败 → 回退原判全保留（自检绝不阻断主管线）");
+    }
+
+    @Test
+    void selfCheckFallsBackOnUnparsableOutputAndFullDrop() {
+        ScriptedFast fast = new ScriptedFast();
+        fast.responses.add("完全不是 JSON");
+        fast.responses.add("[0,1,2]"); // 要求剔除全部 → 输出错乱防御
+        MemoryPipeline pipeline = pipelineWith(new ScriptedMain(), fast, new RecordingOps());
+        var c0 = new MemoryPipeline.Candidate("A", "semantic", 0.5, List.of());
+        var c1 = new MemoryPipeline.Candidate("B", "semantic", 0.5, List.of());
+        var c2 = new MemoryPipeline.Candidate("C", "semantic", 0.5, List.of());
+        assertEquals(List.of(c0, c1, c2), pipeline.selfCheckCandidates(List.of(c0, c1, c2)),
+                "不可解析 → 回退原判");
+        assertEquals(List.of(c0, c1, c2), pipeline.selfCheckCandidates(List.of(c0, c1, c2)),
+                "全剔除 → 防御回退原判");
+    }
+
+    @Test
+    void captureTurnSelfCheckWiring() {
+        // 开关关（默认）：无 self_check 审计 op（零额外 LLM 调用）。
+        ScriptedFast fast = new ScriptedFast();
+        fast.responses.add("[{\"content\": \"用户在杭州\", \"kind\": \"semantic\", \"salience\": 0.8}]");
+        ScriptedMain main = new ScriptedMain();
+        main.responses.add("{\"op\": \"NONE\", \"content\": \"用户在杭州\"}");
+        RecordingOps ops = new RecordingOps();
+        MemoryPipeline pipeline = pipelineWith(main, fast, ops);
+        pipeline.captureTurn("u1", "chat", "chat:t", "用户：我在杭州", 0, false);
+        assertFalse(ops.calls.contains("op:self_check|ok"), ops.calls.toString());
+
+        // 开关开：self_check op 夹在 extract 与 consolidate 之间；被剔除
+        // 候选不进整合 LLM（consolidate 只跑保留候选）。
+        ScriptedFast fast2 = new ScriptedFast();
+        fast2.responses.add("[{\"content\": \"低质候选\"}, {\"content\": \"用户在杭州\"}]");
+        fast2.responses.add("[0]");
+        fast2.responses.add("{\"基本信息\": [\"在杭州\"]}");
+        ScriptedMain main2 = new ScriptedMain();
+        main2.responses.add("{\"op\": \"ADD\", \"content\": \"用户在杭州\"}");
+        RecordingOps ops2 = new RecordingOps();
+        Settings settings = Settings.load(Map.of("ENV", "development",
+                "MEMORY_EXTRACTION_SELF_CHECK", "true"));
+        MemoryPipeline pipeline2 = new MemoryPipeline(main2, fast2, settings, ops2);
+        Map<String, Object> detail2 = pipeline2.captureTurn(
+                "u1", "chat", "chat:t", "用户：我在杭州", 0, false);
+        int extractAt = ops2.calls.indexOf("op:extract|ok");
+        int selfCheckAt = ops2.calls.indexOf("op:self_check|ok");
+        int consolidateAt = ops2.calls.indexOf("op:consolidate|ok");
+        assertTrue(extractAt >= 0 && selfCheckAt > extractAt && consolidateAt > selfCheckAt,
+                "self_check 夹在 extract 与 consolidate 之间：" + ops2.calls);
+        assertEquals(2, ((Number) detail2.get("candidates")).intValue(),
+                "candidates 记抽取原表条数（自检结果走 self_check 审计）");
+        assertEquals(1, main2.prompts.size(), "被剔除候选不进整合 LLM");
+        assertEquals(Map.of("用户在杭州", "ADD"), detail2.get("ops"));
+    }
 }

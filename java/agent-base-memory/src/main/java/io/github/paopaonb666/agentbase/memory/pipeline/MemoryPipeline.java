@@ -61,6 +61,20 @@ public final class MemoryPipeline {
             对话转写：
             {transcript}""";
 
+    /**
+     * 抽取候选二次 LLM 自检提示（A-43）：批量审查候选表——列表内去重/
+     * 特异性剔除，输出=要剔除的下标数组（全部通过输出空数组）。
+     */
+    public static final String SELF_CHECK_PROMPT = """
+            你是记忆抽取质检员。下面是从对话中抽取的候选记忆列表（编号从 0 开始）。请审查每一条：
+            1. 与列表内其他条目内容重复或几乎相同 → 只保留信息量最大的一条，其余剔除；
+            2. 泛泛而谈、无具体信息量（寒暄、空洞总结、"用户聊了天"之类）→ 剔除；
+            3. 其余通过。
+            只输出要剔除的下标 JSON 数字数组（如 [0,2]）；全部通过输出 []。不要输出其他内容。
+
+            候选列表：
+            {candidates}""";
+
     public static final String CONSOLIDATION_PROMPT = """
             你是记忆整合器。新候选记忆要与既有记忆保持一致：去重、纠错、剔除失效。
 
@@ -403,6 +417,72 @@ public final class MemoryPipeline {
         return candidates;
     }
 
+    // ── 抽取自检（A-43）──────────────────────────────────────────────
+
+    /**
+     * 抽取候选二次 LLM 自检（A-43，{@code MEMORY_EXTRACTION_SELF_CHECK}
+     * 默认关）：对候选表做一遍去重/特异性复核——批量单次 LLM 调用（快档，
+     * 与抽取同 {@link #bulkFast()} 口径），返回剔除后的候选表。三态：
+     * 判定剔除（下标命中）/ 通过（原表返回）/ LLM 失败或输出不可解析
+     * <b>回退原判全保留</b>——自检是质量增强层，绝不阻断主管线；越界/
+     * 非数字下标忽略。由 captureTurn 在 extract 与 consolidate 之间调用
+     * （开关关时整层跳过，零额外调用）。
+     */
+    public List<Candidate> selfCheckCandidates(List<Candidate> candidates) {
+        if (candidates.isEmpty()) {
+            return candidates;
+        }
+        StringBuilder listing = new StringBuilder();
+        for (int i = 0; i < candidates.size(); i++) {
+            listing.append(i).append(": ").append(candidates.get(i).content()).append('\n');
+        }
+        String raw;
+        try {
+            raw = complete(SELF_CHECK_PROMPT.replace("{candidates}", listing.toString()),
+                    bulkFast());
+        } catch (Exception e) {
+            LOG.warn("memory: 抽取自检 LLM 失败，回退原判（全保留 {} 条）", candidates.size(), e);
+            return candidates;
+        }
+        Object parsed;
+        try {
+            parsed = parseJsonBlock(raw);
+        } catch (Exception e) {
+            LOG.warn("memory: 抽取自检输出不可解析，回退原判（全保留 {} 条）", candidates.size());
+            return candidates;
+        }
+        if (!(parsed instanceof List<?> drops)) {
+            return candidates;
+        }
+        java.util.Set<Integer> dropIdx = new java.util.HashSet<>();
+        for (Object drop : drops) {
+            try {
+                int idx = Integer.parseInt(String.valueOf(drop).strip());
+                if (idx >= 0 && idx < candidates.size()) {
+                    dropIdx.add(idx);
+                }
+            } catch (NumberFormatException ignored) {
+                // 非数字下标忽略（宽容解析，回退=保留该候选）。
+            }
+        }
+        if (dropIdx.isEmpty()) {
+            return candidates;
+        }
+        if (dropIdx.size() >= candidates.size()) {
+            // 防御：LLM 要求剔除全部候选按理会发生在输出错乱时——全保留
+            // 回退原判（空表=整轮无记忆可落，等价静默丢弃，宁可保守）。
+            LOG.warn("memory: 抽取自检要求剔除全部 {} 条，视为输出错乱回退原判", candidates.size());
+            return candidates;
+        }
+        List<Candidate> kept = new ArrayList<>(candidates.size());
+        for (int i = 0; i < candidates.size(); i++) {
+            if (!dropIdx.contains(i)) {
+                kept.add(candidates.get(i));
+            }
+        }
+        return kept;
+    }
+
     // ── 整合 ─────────────────────────────────────────────────────────────
 
     /**
@@ -681,6 +761,19 @@ public final class MemoryPipeline {
                     () -> extractCandidates(transcript));
             if (extracted != null && !extracted.isEmpty()) {
                 detail.put("candidates", extracted.size());
+                // A-43 抽取自检（默认关）：extract 与 consolidate 之间的
+                // 质量闸——拒绝/通过/失败回退三态见 selfCheckCandidates；
+                // 审计走独立 self_check op（detail=保留候选摘要表）。
+                if (settings.memory.extractionSelfCheck) {
+                    // extracted 随后会被重赋值，lambda 捕获走 final 局部。
+                    final List<Candidate> preCheck = extracted;
+                    @SuppressWarnings("unchecked")
+                    List<Candidate> checked = (List<Candidate>) step.run("self_check",
+                            () -> selfCheckCandidates(preCheck));
+                    if (checked != null) {
+                        extracted = checked;
+                    }
+                }
                 List<String> accepted = new ArrayList<>();
                 for (Candidate candidate : extracted) {
                     String op = (String) step.run("consolidate",

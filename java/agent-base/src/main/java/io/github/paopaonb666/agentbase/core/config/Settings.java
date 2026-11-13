@@ -329,6 +329,13 @@ public final class Settings {
         public boolean dedupPrefilter = true;
         /** 预筛的「几乎相同」余弦阈值（bge-m3 经验值；换 embedding 模型须重校）。 */
         public double dedupSkipCosine = 0.92;
+        /**
+         * 抽取候选二次 LLM 自检（A-43）：extract 与 consolidate 之间的批量
+         * 快档审查（列表内去重/特异性剔除）。默认关——自检增一次 LLM 调用
+         * 且抽取质量待 #96 场景 eval 度量后再定默认值；LLM 失败/输出不可
+         * 解析回退原判全保留（自检绝不阻断主管线）。
+         */
+        public boolean extractionSelfCheck = false;
         public double weightVector = 0.40;
         public double weightKeyword = 0.30;
         public double weightRecency = 0.15;
@@ -1153,6 +1160,9 @@ public final class Settings {
         }
         if (v.containsKey("access_prior_enabled")) {
             t.accessPriorEnabled = requireBool("access_prior_enabled", v.get("access_prior_enabled"));
+        }
+        if (v.containsKey("extraction_self_check")) {
+            t.extractionSelfCheck = requireBool("extraction_self_check", v.get("extraction_self_check"));
         }
         if (v.containsKey("weight_access")) {
             double value = requireFloat("weight_access", v.get("weight_access"));
