@@ -159,6 +159,50 @@ class LangChain4jRuntimeTest {
     }
 
     @Test
+    void lateDeltasAfterStreamAbortAreDropped() throws Exception {
+        // A-3（审查 P2-3）：idle 超时上抛后 provider 恢复发流——迟到的
+        // onPartialResponse 不得 append / fire onDelta（会与重试流交错、把
+        // Resilient 的 deltaEmitted 置真污染判型）。idle=50ms：上抛发生在
+        // ~100-150ms；"late" 在 300ms 才发（aborted 已置位）——修复前它会
+        // 漏进 onDelta 列表（实测红），出口前的 "first" 是合法 delta 不受影响。
+        java.util.concurrent.atomic.AtomicReference<
+                dev.langchain4j.model.chat.response.StreamingChatResponseHandler> handlerRef =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.CountDownLatch lateFired = new java.util.concurrent.CountDownLatch(1);
+        dev.langchain4j.model.chat.StreamingChatModel lateResuming =
+                new dev.langchain4j.model.chat.StreamingChatModel() {
+                    @Override
+                    public void chat(dev.langchain4j.model.chat.request.ChatRequest request,
+                                     dev.langchain4j.model.chat.response.StreamingChatResponseHandler handler) {
+                        handlerRef.set(handler);
+                        handler.onPartialResponse("first");
+                        // 停顿后恢复：等看门狗上抛之后再发 delta。
+                        Thread sender = new Thread(() -> {
+                            try {
+                                Thread.sleep(300);
+                            } catch (InterruptedException ignored) {
+                                return;
+                            }
+                            handler.onPartialResponse("late");
+                            lateFired.countDown();
+                        }, "late-delta-sender");
+                        sender.setDaemon(true);
+                        sender.start();
+                    }
+                };
+        LangChain4jRuntime runtime = new LangChain4jRuntime(
+                new ScriptedModels.ScriptedChatModel(List.of()), lateResuming, "scripted-main",
+                false, 0, 50, null);
+        DeltaCapture capture = new DeltaCapture();
+        assertThrows(LangChain4jRuntime.StreamStalledException.class,
+                () -> runtime.stream(MESSAGES, List.of(), capture));
+        assertTrue(lateFired.await(2, java.util.concurrent.TimeUnit.SECONDS),
+                "迟到 delta 应已发出（时序前提）");
+        assertEquals(List.of("first"), capture.deltas,
+                "出口后的迟到 delta 整体丢弃——只保留出口前的合法 delta");
+    }
+
+    @Test
     void streamAggregatesToolCallsWithAccumulatedText() {
         ScriptedModels.ScriptedResponse scripted = ScriptedModels.ScriptedResponse.withToolCalls(
                 " I will use the tool. ", List.of(echoCall()));

@@ -311,6 +311,61 @@ class ResilientModelRuntimeTest {
     }
 
     @Test
+    void lateDeltaFromAbortedStreamDoesNotLeakIntoSse() throws Exception {
+        // A-3（审查 P2-3）端到端：主力静默断流（零 delta）→ idle 看门狗上抛
+        // → 正确切 fallback；provider 恢复发流后的迟到 delta 不得经 guarded
+        // 漏进 SSE 输出，也不得把 deltaEmitted 置真（修复前 seen 末尾多出
+        // "late"，实测红）。主力自身零 delta 发出，切换行为本身不受影响。
+        java.util.concurrent.atomic.AtomicReference<
+                dev.langchain4j.model.chat.response.StreamingChatResponseHandler> handlerRef =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.CountDownLatch lateFired = new java.util.concurrent.CountDownLatch(1);
+        dev.langchain4j.model.chat.StreamingChatModel stalling =
+                new dev.langchain4j.model.chat.StreamingChatModel() {
+                    @Override
+                    public void chat(dev.langchain4j.model.chat.request.ChatRequest request,
+                                     dev.langchain4j.model.chat.response.StreamingChatResponseHandler handler) {
+                        handlerRef.set(handler);
+                        // 上抛之后（300ms > idle 50ms 的 ~100-150ms 出口）再发。
+                        Thread sender = new Thread(() -> {
+                            try {
+                                Thread.sleep(300);
+                            } catch (InterruptedException ignored) {
+                                return;
+                            }
+                            handler.onPartialResponse("late");
+                            lateFired.countDown();
+                        }, "late-delta-sender");
+                        sender.setDaemon(true);
+                        sender.start();
+                    }
+                };
+        ModelRuntime main = new LangChain4jRuntime(new ScriptedModels.ScriptedChatModel(List.of()),
+                stalling, "scripted-main", false, 0, 50, null);
+        ModelRuntime backup = new ModelRuntime() {
+            @Override public dev.langchain4j.model.chat.ChatModel chat() { throw new UnsupportedOperationException(); }
+            @Override public dev.langchain4j.model.chat.StreamingChatModel streaming() { return null; }
+            @Override public AiMessage stream(List<ChatMessage> messages,
+                    List<dev.langchain4j.agent.tool.ToolSpecification> tools,
+                    java.util.function.Consumer<String> onDelta) {
+                onDelta.accept("fallback-answer");
+                return AiMessage.from("fallback-answer");
+            }
+            @Override public AiMessage invoke(List<ChatMessage> messages) {
+                return AiMessage.from("fallback-answer");
+            }
+        };
+        ResilientModelRuntime chain = new ResilientModelRuntime(main, List.of(backup), 0, 4, 0.0, 60, 20);
+        List<String> seen = new java.util.concurrent.CopyOnWriteArrayList<>();
+        AiMessage result = chain.stream(oneMessage(), List.of(), seen::add);
+        assertEquals("fallback-answer", result.text());
+        assertTrue(lateFired.await(2, java.util.concurrent.TimeUnit.SECONDS),
+                "迟到 delta 应已发出（时序前提）");
+        assertEquals(List.of("fallback-answer"), seen,
+                "出口后的迟到 delta 不得漏进 SSE 输出");
+    }
+
+    @Test
     void streamFallbackEmittingDeltaThenFailingDoesNotSwitchToNextFallback() {
         // 审查 A-P1：delta 纪律在链内同受约束——fallback#0 发出半截流后
         // 中断，继续切 fallback#1 = 半截输出重放；应原样上抛且 #1 不被调用

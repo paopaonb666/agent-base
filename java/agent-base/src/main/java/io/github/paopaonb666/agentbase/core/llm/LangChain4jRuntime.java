@@ -244,9 +244,21 @@ public final class LangChain4jRuntime implements ModelRuntime {
         // 记录最近活动时刻，等待侧轮询；idleMillis<=0 = 禁用（旧行为）。
         java.util.concurrent.atomic.AtomicLong lastActivity =
                 new java.util.concurrent.atomic.AtomicLong(System.nanoTime());
+        // A-3（审查 P2-3）：流出口中止标志——awaitResponse 返回/上抛时置位，
+        // 迟到的 onPartialResponse 整体丢弃。langchain4j 该面无取消 API，
+        // handler 在 idle 超时上抛后仍注册：provider 停顿后恢复发流时，
+        // 旧回调会经 guarded 直达 SSE（与重试流交错）并把 Resilient 的
+        // deltaEmitted 置真、污染重试判型方向。
+        java.util.concurrent.atomic.AtomicBoolean aborted =
+                new java.util.concurrent.atomic.AtomicBoolean();
         streamingModel.chat(request, new StreamingChatResponseHandler() {
             @Override
             public void onPartialResponse(String token) {
+                if (aborted.get()) {
+                    // 流已出口（超时上抛或正常返回）：不 append、不 fire
+                    // onDelta、不更新 lastActivity——不动 deltaEmitted。
+                    return;
+                }
                 lastActivity.set(System.nanoTime());
                 deltas.append(token);
                 onDelta.accept(token);
@@ -262,7 +274,15 @@ public final class LangChain4jRuntime implements ModelRuntime {
                 done.completeExceptionally(error);
             }
         });
-        ChatResponse response = awaitResponse(done, lastActivity);
+        ChatResponse response;
+        try {
+            response = awaitResponse(done, lastActivity);
+        } finally {
+            // 出口置位（成功/异常两路都覆盖）：done 完成前的 delta 都已合法
+            // 处理；此后的迟到回调按协议异常丢弃（重建文本不受影响——done
+            // 完成本身就是 provider 聚合完成的信号）。
+            aborted.set(true);
+        }
         AiMessage aggregated = response.aiMessage();
         List<ToolExecutionRequest> toolRequests = aggregated == null || aggregated.toolExecutionRequests() == null
                 ? List.of()
