@@ -553,4 +553,27 @@ class MemoryServicePipelineTest {
         MemoryService unavailable = service(new InMemoryMemoryStore(), settings());
         assertNull(unavailable.embedBatch().apply(List.of("查询", "候选")));
     }
+
+    @Test
+    void ingestProgressCallbackReportsChunkSequence() {
+        // A-#183：进度回调按 (done, total) 逐块推进（1..N 序，total 恒定）；
+        // 5 参旧口径不回调（零开销）。
+        InMemoryMemoryStore store = new InMemoryMemoryStore();
+        Settings s = settings();
+        s.memory.docChunkChars = 20;
+        s.memory.docChunkOverlap = 0;
+        MemoryService memory = service(store, s);
+        List<String> progress = new java.util.ArrayList<>();
+        int chunks = memory.ingestDocument("f1", "u", "chat", "字".repeat(50), "chat:t1",
+                (done, total) -> progress.add(done + "/" + total));
+        assertTrue(chunks >= 2);
+        assertEquals(chunks, progress.size());
+        for (int i = 0; i < chunks; i++) {
+            assertEquals((i + 1) + "/" + chunks, progress.get(i), "进度序 " + i);
+        }
+        List<String> silent = new java.util.ArrayList<>();
+        memory.ingestDocument("f2", "u", "chat", "字".repeat(50), "chat:t1",
+                (done, total) -> silent.add(done + "/" + total));
+        assertEquals(chunks, silent.size(), "回调形态同序");
+    }
 }

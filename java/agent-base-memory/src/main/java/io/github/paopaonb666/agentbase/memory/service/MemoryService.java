@@ -374,6 +374,16 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
     @Override
     public int ingestDocument(String fileId, String userId, String agentId, String text,
                               String threadId) {
+        return ingestDocument(fileId, userId, agentId, text, threadId, null);
+    }
+
+    /**
+     * 摄取（A-#183 进度形态）：{@code progress} 非 null 时每个分块落库后
+     * 回调 {@code (done, total)}——调用方（运维 CLI/后台回填）转结构化
+     * 日志或进度输出；请求路径（文件上传）保持 5 参不变零开销。
+     */
+    public int ingestDocument(String fileId, String userId, String agentId, String text,
+                              String threadId, java.util.function.BiConsumer<Integer, Integer> progress) {
         if (text == null || text.strip().isEmpty()) {
             return 0;
         }
@@ -392,6 +402,9 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
                         threadId == null ? "" : threadId, userId, agentId, i, span.text(),
                         span.segments(), vectors != null ? Models.encodeEmbedding(vectors.get(i)) : null,
                         vectors != null ? embedder.dims() : null, Models.now()));
+                if (progress != null) {
+                    progress.accept(i + 1, parts.size());
+                }
             }
             store.putChunks(chunks);
             long durationMs = (System.nanoTime() - started) / 1_000_000;
