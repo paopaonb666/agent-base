@@ -348,9 +348,19 @@ public final class ContextEngine {
      * <p>R2-F1 极小窗口钳制：floor 恒不高于窗口本身（钳制
      * {@code min(下限, window)}）——window &lt; 1024 时旧 floor
      * {@code max(1024, 窗口 - 输出预留)} 会把预算抬过窗口（超窗请求被
-     * provider 直接拒绝）；钳制后极小窗口预算=窗口，不再超窗。窗口 ≥ 下限
-     * 时行为不变（{@code min(1024, window)=1024}，与旧 floor 同值）。
+     * provider 直接拒绝）；钳制后极小窗口预算=窗口，不再超窗。
      * {@link #budgetAfterSystem} 委托本方法，自动跟随。
+     *
+     * <p>A-1（审查 P2-1）收口「floor 压过输出预留」的预算缝隙：记
+     * {@code cap = 窗口 - 输出预留}，旧式 {@code max(floor, cap)} 在
+     * {@code 0 < cap < floor}（窗口 ∈ (4096, 5120)）段取 floor=1024，
+     * 输入预算吃掉输出预留（input+system+生成可超窗，provider 兜底）——
+     * 现按三段式裁决取值：{@code cap ≥ floor}（窗口 ≥ 5120）与
+     * {@code 0 < cap < floor} 两段都取 {@code cap}（前者与旧式逐字节
+     * 等价；后者输出预留保住、输入预算饿死）；{@code cap ≤ 0}（窗口 ≤
+     * 4096）时输出预留本就装不下，floor 兜底保持 L83 语义——极小窗的
+     * <b>输出</b>超窗由 provider 兜底是有意取舍（floor 防的是 0/负预算
+     * 让修剪逻辑退化，不是保证生成装得下）。
      *
      * <p>条目 15 HISTORY 域：{@code memory.contextBudgetHistoryTokens > 0}
      * 时在结果上追加一段 min 封顶——历史体（尾部预算段）的<b>独立上限</b>，
@@ -361,10 +371,15 @@ public final class ContextEngine {
                                          io.github.paopaonb666.agentbase.core.llm.ModelRuntime llm) {
         int memoryBudget = settings.memory.contextMaxTokens;
         int window = llm == null ? 0 : llm.contextWindowTokens();
+        int windowCap = window - OUTPUT_RESERVE_TOKENS;
+        // A-1 三段式裁决的实现坍缩为两支：cap>0 取 cap（cap≥floor 段与旧
+        // max(floor,cap) 等价——cap 更大；0<cap<floor 段是本条收口：输出
+        // 预留保住、输入饿死）；cap≤0 时输出本就装不下，floor=min(下限,
+        // window) 兜底（R2-F1/L83 语义，极小窗输出超窗由 provider 兜底）。
         int budget = window <= 0
                 ? memoryBudget
-                : Math.min(memoryBudget, Math.max(Math.min(MIN_INPUT_BUDGET, window),
-                        window - OUTPUT_RESERVE_TOKENS));
+                : Math.min(memoryBudget, windowCap <= 0
+                        ? Math.min(MIN_INPUT_BUDGET, window) : windowCap);
         if (settings.memory.contextBudgetHistoryTokens > 0) {
             budget = Math.min(budget, settings.memory.contextBudgetHistoryTokens);
         }

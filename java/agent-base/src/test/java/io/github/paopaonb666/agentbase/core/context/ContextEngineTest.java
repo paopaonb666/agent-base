@@ -216,10 +216,36 @@ class ContextEngineTest {
         var settings = new io.github.paopaonb666.agentbase.core.config.Settings();
         // window=800 < 下限：预算=800（修复前被 floor 抬到 1024）。
         assertEquals(800, ContextEngine.resolveInputBudget(settings, stubRuntime(800)));
-        // window=5000：窗口-预留=904 < 下限 → 下限 1024 兜底（既有形态不回归）。
-        assertEquals(1024, ContextEngine.resolveInputBudget(settings, stubRuntime(5000)));
+        // window=5000：窗口-预留=904>0 但 < 下限 → A-1 收口取 904（输出
+        // 预留保住、输入预算饿死）；修复前 floor 1024 压过预留（超窗缝隙）。
+        assertEquals(5000 - ContextEngine.OUTPUT_RESERVE_TOKENS,
+                ContextEngine.resolveInputBudget(settings, stubRuntime(5000)));
         // window=32000：窗口-预留=27904 > 下限 → floor 不介入（既有形态不回归）。
         // 抬高 memoryBudget 让窗口推导值可见——默认 12000 会先被 memoryBudget 封顶。
+        settings.memory.contextMaxTokens = 40_000;
+        assertEquals(32000 - ContextEngine.OUTPUT_RESERVE_TOKENS,
+                ContextEngine.resolveInputBudget(settings, stubRuntime(32000)));
+    }
+
+    @Test
+    void resolveInputBudgetTinyWindowBoundaryMatrix() {
+        // A-1（审查 P2-1）边界矩阵：记 cap=window-输出预留——
+        // cap≤0 段（window≤4096）：floor=min(1024,window) 兜底（L83 语义）；
+        // 0<cap<1024 段（4096<window<5120）：取 cap（输出预留保住、输入饿死）；
+        // cap≥1024 段（window≥5120）：取 cap（与旧 max(floor,cap) 逐字节一致，
+        // 窗口 5120 恰为 cap==floor 边界点）。
+        var settings = new io.github.paopaonb666.agentbase.core.config.Settings();
+        int memoryBudget = settings.memory.contextMaxTokens;
+        assertEquals(memoryBudget, ContextEngine.resolveInputBudget(settings, stubRuntime(0)));
+        assertEquals(1024, ContextEngine.resolveInputBudget(settings, stubRuntime(1024)));
+        assertEquals(1024, ContextEngine.resolveInputBudget(settings, stubRuntime(4096)));
+        assertEquals(1, ContextEngine.resolveInputBudget(settings, stubRuntime(4097)));
+        assertEquals(5000 - ContextEngine.OUTPUT_RESERVE_TOKENS,
+                ContextEngine.resolveInputBudget(settings, stubRuntime(5000)));
+        assertEquals(5119 - ContextEngine.OUTPUT_RESERVE_TOKENS,
+                ContextEngine.resolveInputBudget(settings, stubRuntime(5119)));
+        assertEquals(1024, ContextEngine.resolveInputBudget(settings, stubRuntime(5120)));
+        // 抬高 memoryBudget 让窗口推导值可见（默认 12000 会先封顶）。
         settings.memory.contextMaxTokens = 40_000;
         assertEquals(32000 - ContextEngine.OUTPUT_RESERVE_TOKENS,
                 ContextEngine.resolveInputBudget(settings, stubRuntime(32000)));
