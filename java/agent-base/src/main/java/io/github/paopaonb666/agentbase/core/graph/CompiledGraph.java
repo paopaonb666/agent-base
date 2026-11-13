@@ -330,7 +330,7 @@ public final class CompiledGraph {
             }
             Map<String, Object> update;
             try {
-                update = executeNode(node, state, config, sink);
+                update = executeNode(node, current, state, config, sink);
             } catch (PauseForApprovalException pause) {
                 // A-#26 审批暂停：状态带 pending_approval 标记落盘——悬挂
                 // tool_calls 有意保留（剥除守卫跳过），终态 PAUSED（wire
@@ -391,7 +391,8 @@ public final class CompiledGraph {
         return new RunOutcome(state, Events.RunTermination.DONE, null);
     }
 
-    private Map<String, Object> executeNode(GraphBuilder.Node node, GraphState state,
+    private Map<String, Object> executeNode(GraphBuilder.Node node, String nodeName,
+                                            GraphState state,
                                             RunConfig config, EventSink sink) {
         NodeContext ctx = new NodeContext() {
             @Override
@@ -438,10 +439,13 @@ public final class CompiledGraph {
             throw e;
         } catch (Exception e) {
             // 节点内部异常归一抛出（SSE 层转 ErrorEvent；URL 脱敏在出口做）。
+            // A-#239：错误文本附节点名——「哪个节点炸了」从日志/事件文本可
+            // 直接定位（既有断言面无此文案，零断言同步）。
             if (e instanceof RuntimeException re) {
                 throw re;
             }
-            throw new IllegalStateException("节点执行失败: " + e.getMessage(), e);
+            throw new IllegalStateException(
+                    "节点执行失败[node=" + nodeName + "]: " + e.getMessage(), e);
         }
     }
 
