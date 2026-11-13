@@ -63,8 +63,28 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
     /** 向量索引（#324）：vectorPushdown 开启时装配（默认 brute-force 基线）。 */
     private final VectorIndexPort vectorIndex;
 
-    /** 按 user_id 的捕获串行化锁（锐评 #10：并发轮次重复 ADD 防护）。 */
-    private final Map<String, ReentrantLock> locks = new ConcurrentHashMap<>();
+    /**
+     * 按 user_id 的捕获串行化锁（锐评 #10：并发轮次重复 ADD 防护）。
+     * A-#163：per-user 无界 Map 改<b>固定条纹锁</b>（1024 桶，userId hash
+     * 取桶）——上限问题从构造上消除（淘汰持锁中的锁有竞态，stripe 的
+     * hash 冲突=无害假共享）；有界意图与 AuthBackends nonce LRU 等价、
+     * 实现无淘汰竞态。
+     */
+    private static final int CAPTURE_LOCK_STRIPES = 1024;
+    private final ReentrantLock[] captureLocks;
+
+    {
+        captureLocks = new ReentrantLock[CAPTURE_LOCK_STRIPES];
+        for (int i = 0; i < captureLocks.length; i++) {
+            captureLocks[i] = new ReentrantLock();
+        }
+    }
+
+    /** userId → 条纹锁（负 hash 掩蔽取正后取桶）。 */
+    private ReentrantLock captureLock(String userId) {
+        int hash = (userId == null ? 0 : userId.hashCode()) & 0x7fffffff;
+        return captureLocks[hash % CAPTURE_LOCK_STRIPES];
+    }
 
     /** #182 capture 失败重试队列：有界、满则丢弃可观测；不做持久化死信——
      * 每轮 captureTurn 持全量快照（非增量），下一轮成功的 capture 天然
@@ -900,7 +920,7 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
         if (transcript.strip().isEmpty()) {
             return null;
         }
-        ReentrantLock lock = locks.computeIfAbsent(userId, k -> new ReentrantLock());
+        ReentrantLock lock = captureLock(userId);
         lock.lock();
         Map<String, Object> detail;
         boolean captureFailed = false;
@@ -1010,7 +1030,7 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
                         task.userId());
                 break;
             }
-            ReentrantLock lock = locks.computeIfAbsent(task.userId(), k -> new ReentrantLock());
+            ReentrantLock lock = captureLock(task.userId());
             if (!lock.tryLock()) {
                 requeueCapture(task);
                 sleepQuietly(CAPTURE_RETRY_BACKOFF_MS);

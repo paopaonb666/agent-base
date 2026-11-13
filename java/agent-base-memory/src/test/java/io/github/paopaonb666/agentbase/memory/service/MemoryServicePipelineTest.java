@@ -4,6 +4,7 @@ import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.UserMessage;
 import io.github.paopaonb666.agentbase.core.config.Settings;
+import io.github.paopaonb666.agentbase.core.llm.ModelRuntime;
 import io.github.paopaonb666.agentbase.memory.embeddings.EmbeddingClient;
 import io.github.paopaonb666.agentbase.memory.pipeline.MemoryPipeline;
 import io.github.paopaonb666.agentbase.memory.retrieval.Retrieval;
@@ -525,6 +526,69 @@ class MemoryServicePipelineTest {
             }
             service.recordOp(op, userId, agentId, threadId, detail, status, errorText, durationMs);
         }
+    }
+
+    // ── A-163 capture 条纹锁 ─────────────────────────────────────────────
+
+    @Test
+    void captureLockSerializesSameUserTurns() throws Exception {
+        // A-#163 条纹锁回归：同 user 的并发 captureTurn 串行化（条纹锁与旧
+        // per-user Map 锁同互斥语义；hash 冲突=无害假共享）。脚本模型以在
+        // 飞计数哨兵侦测重入——重入即断言失败。
+        AtomicInteger inFlight = new AtomicInteger();
+        AtomicInteger reentries = new AtomicInteger();
+        EmbeddingClient never = new EmbeddingClient() {
+            @Override public Integer dims() { return null; }
+            @Override public List<List<Float>> embed(List<String> texts) { return null; }
+            @Override public boolean probe() { return false; }
+        };
+        ModelRuntime guarded = new ModelRuntime() {
+            private final java.util.Deque<AiMessage> script = new java.util.ArrayDeque<>(
+                    List.of(AiMessage.from("{\"op\": \"ADD\", \"content\": \"一\"}"),
+                            AiMessage.from("{\"op\": \"ADD\", \"content\": \"二\"}")));
+
+            @Override public dev.langchain4j.model.chat.ChatModel chat() {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override public dev.langchain4j.model.chat.StreamingChatModel streaming() {
+                return null;
+            }
+
+            @Override public AiMessage stream(List<ChatMessage> m,
+                    List<dev.langchain4j.agent.tool.ToolSpecification> t,
+                    java.util.function.Consumer<String> d) {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override public AiMessage invoke(List<ChatMessage> messages) {
+                if (inFlight.incrementAndGet() > 1) {
+                    reentries.incrementAndGet();
+                }
+                try {
+                    Thread.sleep(30);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                inFlight.decrementAndGet();
+                AiMessage next = script.poll();
+                return next == null ? AiMessage.from("{\"op\": \"NONE\"}") : next;
+            }
+        };
+        MemoryService service = new MemoryService(new InMemoryMemoryStore(), never,
+                settings(), guarded, null);
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(2);
+        try {
+            var f1 = pool.submit(() -> service.captureTurn("u-lock", "chat", "t:a",
+                    List.of(UserMessage.from("一")), false));
+            var f2 = pool.submit(() -> service.captureTurn("u-lock", "chat", "t:b",
+                    List.of(UserMessage.from("二")), false));
+            f1.get(5, java.util.concurrent.TimeUnit.SECONDS);
+            f2.get(5, java.util.concurrent.TimeUnit.SECONDS);
+        } finally {
+            pool.shutdownNow();
+        }
+        assertEquals(0, reentries.get(), "同 user 捕获必须串行（条纹锁互斥）");
     }
 
     // ── A-31 搜索 rerank 注入缝 ──────────────────────────────────────────
