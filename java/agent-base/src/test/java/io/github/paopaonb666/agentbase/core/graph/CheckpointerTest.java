@@ -220,4 +220,14 @@ class CheckpointerTest {
         extra.put("replans", 0);
         return new GraphState(messages, extra);
     }
+
+    @Test
+    void inMemoryHealthyFlipsFalseAfterClose() {
+        // A-#230：真实健康信号——关闭前恒绿（进程内存），close 后翻 false
+        //（关闭后的 put/get 属编程错误而非健康）。
+        InMemoryCheckpointer checkpointer = new InMemoryCheckpointer();
+        assertTrue(checkpointer.healthy());
+        checkpointer.close();
+        assertFalse(checkpointer.healthy());
+    }
 }

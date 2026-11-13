@@ -46,14 +46,20 @@ public final class InMemoryCheckpointer implements Checkpointer {
         return List.copyOf(states.keySet());
     }
 
-    /** 存储即进程内存，必然可读（/health 的组件探针恒绿）。 */
+    /**
+     * 存储即进程内存——关闭前必然可读（/health 组件恒绿）；close 后翻
+     * false（A-#230：真实信号，关闭后的 put/get 属于编程错误而非健康）。
+     */
+    private volatile boolean closed;
+
     @Override
     public boolean healthy() {
-        return true;
+        return !closed;
     }
 
     /** 无底层资源可释放（对应 Python close_checkpointer 对无连接实现的空操作）。 */
     @Override
     public void close() {
+        closed = true;
     }
 }
