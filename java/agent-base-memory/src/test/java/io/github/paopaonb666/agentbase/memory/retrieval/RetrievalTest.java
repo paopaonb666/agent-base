@@ -456,16 +456,21 @@ class RetrievalTest {
         // 开关关（默认）：components 不产生 access 键；同一条内容仅
         // access_count 不同（各自单候选打分——RRF 并列按候选序破平，
         // 同列表同内容不构成等分断言），分数相同（记账列不作先验）。
+        // 显式固定 now（便捷重载逐次采样 Models.now()，recency 微秒级
+        // 衰减会让 1e-12 等分断言时序性假红）。
         Settings config = new Settings();
-        double now = Models.now();
+        double now = 1_800_000_000.0;
         MemoryRecord withCount = new MemoryRecord("m1", "u1", "*", "semantic", "用户偏好深色主题",
                 List.of(), null, null, 0.5, "active", "", List.of(),
                 now, now, null, 500);
         MemoryRecord noCount = new MemoryRecord("m2", "u1", "*", "semantic", "用户偏好深色主题",
                 List.of(), null, null, 0.5, "active", "", List.of(),
                 now, now, null, 0);
-        ScoredMemory scoredWith = Retrieval.scoreMemories(List.of(withCount), "偏好", null, config).get(0);
-        ScoredMemory scoredWithout = Retrieval.scoreMemories(List.of(noCount), "偏好", null, config).get(0);
+        Retrieval.Weights weights = Retrieval.Weights.fromSettings(config);
+        ScoredMemory scoredWith = Retrieval.scoreMemories(List.of(withCount), "偏好", null,
+                now, config.memory.timeDecayHalfLifeDays, weights).get(0);
+        ScoredMemory scoredWithout = Retrieval.scoreMemories(List.of(noCount), "偏好", null,
+                now, config.memory.timeDecayHalfLifeDays, weights).get(0);
         assertFalse(scoredWith.components().containsKey("access"), "开关关时无 access 分量");
         assertEquals(0.0, scoredWith.accessScore(), 1e-12);
         assertEquals(scoredWithout.score(), scoredWith.score(), 1e-12,
@@ -475,7 +480,8 @@ class RetrievalTest {
     @Test
     void accessPriorEnabledRanksFrequentlyUsedMemoryHigher() {
         // 开关开：access 分量入 components（log 缩放因子经权重线性叠加——
-        // 元数据先验层，不进 RRF 证据通道）。单候选精确增量 + 同列表次序翻转。
+        // 元数据先验层，不进 RRF 证据通道）。单候选精确增量（固定 now）+
+        // 同列表次序翻转。
         Settings on = new Settings();
         on.memory.accessPriorEnabled = true;
         on.memory.weightVector = 0.40;
@@ -483,21 +489,25 @@ class RetrievalTest {
         on.memory.weightRecency = 0.15;
         on.memory.weightSalience = 0.15;
         on.memory.weightAccess = 0.10;
-        double now = Models.now();
+        double now = 1_800_000_000.0;
         MemoryRecord plain = new MemoryRecord("m1", "u1", "*", "semantic", "用户偏好深色主题",
                 List.of(), null, null, 0.5, "active", "", List.of(),
                 now, now, null, 0);
         MemoryRecord frequent = new MemoryRecord("m2", "u1", "*", "semantic", "用户偏好深色主题",
                 List.of(), null, null, 0.5, "active", "", List.of(),
                 now, now, null, 100);
+        Retrieval.Weights weights = Retrieval.Weights.fromSettings(on);
         // 单候选精确增量：count=100 → 因子 1.0，分数增量恰为 weight_access。
-        double base = Retrieval.scoreMemories(List.of(plain), "偏好", null, on).get(0).score();
-        ScoredMemory boosted = Retrieval.scoreMemories(List.of(frequent), "偏好", null, on).get(0);
+        double base = Retrieval.scoreMemories(List.of(plain), "偏好", null,
+                now, on.memory.timeDecayHalfLifeDays, weights).get(0).score();
+        ScoredMemory boosted = Retrieval.scoreMemories(List.of(frequent), "偏好", null,
+                now, on.memory.timeDecayHalfLifeDays, weights).get(0);
         assertEquals(1.0, boosted.accessScore(), 1e-12, "count=100 因子饱和到 1.0");
         assertEquals(base + 0.10, boosted.score(), 1e-12);
         // 同列表次序翻转：同内容并列（RRF 破平偏 index0 的 m1），开先验后
-        // m2 以 access 增益反超。
-        List<ScoredMemory> both = Retrieval.scoreMemories(List.of(plain, frequent), "偏好", null, on);
+        // m2 以 access 增益反超（次序断言对 recency 漂移鲁棒：增益 0.10）。
+        List<ScoredMemory> both = Retrieval.scoreMemories(List.of(plain, frequent), "偏好", null,
+                now, on.memory.timeDecayHalfLifeDays, weights);
         assertEquals("m2", both.get(0).record().memoryId(), "频次先验翻转次序");
     }
 
