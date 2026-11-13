@@ -333,6 +333,17 @@ public final class Settings {
         public double weightKeyword = 0.30;
         public double weightRecency = 0.15;
         public double weightSalience = 0.15;
+        /**
+         * 访问频次先验（A-46 反馈回路）：召回记账（recall 即 touch，
+         * access_count 活列）以 log 缩放因子作为第五个元数据先验线性入
+         * 总分（不进 RRF 证据通道——证据语义不动）。默认关：components
+         * 不产生 access 键，打分逐字节=四分量旧口径；开启时部署方需重配
+         * 其余四权重腾出 weight_access 份额（和=1 校验强制），默认值待
+         * #96 场景 eval 对比后定。
+         */
+        public boolean accessPriorEnabled = false;
+        /** access 分量权重（[0,1]，参与和=1 校验；开关关时不生效）。 */
+        public double weightAccess = 0.0;
         public int contextMaxChars = 3000;
         public int contextMaxTokens = 12_000;
         /** 注入快照缓存上限（成本治理 T2.1）：线程级冻结注入段的 LRU 容量。 */
@@ -1140,11 +1151,21 @@ public final class Settings {
             if (!(value >= 0.0 && value <= 1.0)) throw new SettingsError("weight_salience must be in [0, 1], got %s".formatted(value));
             t.weightSalience = value;
         }
-        double weightSum = t.weightVector + t.weightKeyword + t.weightRecency + t.weightSalience;
+        if (v.containsKey("access_prior_enabled")) {
+            t.accessPriorEnabled = requireBool("access_prior_enabled", v.get("access_prior_enabled"));
+        }
+        if (v.containsKey("weight_access")) {
+            double value = requireFloat("weight_access", v.get("weight_access"));
+            if (!(value >= 0.0 && value <= 1.0)) throw new SettingsError("weight_access must be in [0, 1], got %s".formatted(value));
+            t.weightAccess = value;
+        }
+        double weightSum = t.weightVector + t.weightKeyword + t.weightRecency + t.weightSalience
+                + t.weightAccess;
         if (Math.abs(weightSum - 1.0) > 0.01) {
             throw new SettingsError(
-                    "memory hybrid weights must sum to 1.0 (±0.01), got %s from (%s, %s, %s, %s)"
-                            .formatted(weightSum, t.weightVector, t.weightKeyword, t.weightRecency, t.weightSalience));
+                    "memory hybrid weights must sum to 1.0 (±0.01), got %s from (%s, %s, %s, %s, access=%s)"
+                            .formatted(weightSum, t.weightVector, t.weightKeyword, t.weightRecency,
+                                    t.weightSalience, t.weightAccess));
         }
         if (v.containsKey("context_max_chars")) {
             int value = requireInt("context_max_chars", v.get("context_max_chars"));

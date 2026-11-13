@@ -68,22 +68,56 @@ public final class Retrieval {
     public static final double BM25_K1 = 1.5;
     public static final double BM25_B = 0.75;
 
+    /**
+     * 访问频次先验的饱和常数（A-46）：log1p 缩放的分母基准——count≥100
+     * 因子饱和到 1.0（高频常驻记忆不再增益；低频新记忆仍可得小先验）。
+     */
+    public static final double ACCESS_PRIOR_SATURATION = 100.0;
+
+    /**
+     * 访问频次 → log 缩放先验因子（A-46）：{@code min(1, ln(1+count)/ln(1+100))}
+     * ——log 缩放抑制幂律尾巴（count 10000 与 100 同值），count≤0（从未被
+     * 召回记账/新记忆）= 0 不增益。
+     */
+    public static double accessFactor(int accessCount) {
+        if (accessCount <= 0) {
+            return 0.0;
+        }
+        return Math.min(1.0, Math.log1p(accessCount) / Math.log1p(ACCESS_PRIOR_SATURATION));
+    }
+
     /** 一天的秒数（时间衰减/TTL 换算）。 */
     private static final double DAY_SECONDS = 86400.0;
 
     private Retrieval() {}
 
-    /** 混合检索权重（对应 Python 的 weights mapping，四个固定键）。 */
-    public record Weights(double vector, double keyword, double recency, double salience) {
+    /**
+     * 混合检索权重（对应 Python 的 weights mapping，四个固定键 + A-46 的
+     * 访问频次先验开关/权重——第五分量是元数据先验不是检索证据）。
+     *
+     * @param accessPriorEnabled 访问频次先验开关（A-46，默认关）：关时
+     *                           components 不产生 access 键，打分逐字节=
+     *                           四分量旧口径；开时 {@link #access} 生效。
+     * @param access             access 分量权重（参与和=1 校验，默认 0.0
+     *                           → 和不变）；开关关时该值不生效（inert）。
+     */
+    public record Weights(double vector, double keyword, double recency, double salience,
+                          boolean accessPriorEnabled, double access) {
 
-        /** 默认权重（和为 1，与 M6b 一致）。 */
+        /** 默认权重（和为 1，与 M6b 一致；访问先验关闭）。 */
         public static final Weights DEFAULT =
                 new Weights(W_VECTOR, W_KEYWORD, W_RECENCY, W_SALIENCE);
+
+        /** 四参便捷构造（访问先验关闭——既有调用方/测试的旧口径）。 */
+        public Weights(double vector, double keyword, double recency, double salience) {
+            this(vector, keyword, recency, salience, false, 0.0);
+        }
 
         /** 从 Settings 的 memory 节读混合检索权重（锐评 #4：可配置化）。 */
         public static Weights fromSettings(Settings settings) {
             return new Weights(settings.memory.weightVector, settings.memory.weightKeyword,
-                    settings.memory.weightRecency, settings.memory.weightSalience);
+                    settings.memory.weightRecency, settings.memory.weightSalience,
+                    settings.memory.accessPriorEnabled, settings.memory.weightAccess);
         }
 
         double forName(String name) {
@@ -92,6 +126,7 @@ public final class Retrieval {
                 case "keyword" -> keyword;
                 case "recency" -> recency;
                 case "salience" -> salience;
+                case "access" -> access;
                 default -> throw new IllegalArgumentException("未知分量：" + name);
             };
         }
@@ -124,6 +159,11 @@ public final class Retrieval {
         /** 显著度分量（缺失按 0）。 */
         public double salienceScore() {
             return components.getOrDefault("salience", 0.0);
+        }
+
+        /** 访问频次先验分量（A-46；缺失按 0——开关关时恒 0）。 */
+        public double accessScore() {
+            return components.getOrDefault("access", 0.0);
         }
     }
 
@@ -350,7 +390,8 @@ public final class Retrieval {
     private static List<Hybrid> hybridScores(List<String> texts, List<byte[]> embeddings,
                                              double[] timestamps, Double[] saliences,
                                              String query, List<Float> queryEmbedding,
-                                             double now, double halfLifeDays, Weights weights) {
+                                             double now, double halfLifeDays, Weights weights,
+                                             int[] accessCounts) {
         Weights w = weights == null ? Weights.DEFAULT : weights;
         double[] bm25Raw = BM25_CACHE.scores(texts, tokenize(query));
         int[] keywordRanks = channelRanks(bm25Raw);
@@ -385,6 +426,11 @@ public final class Retrieval {
             Double salience = saliences[i];
             if (salience != null) {
                 components.put("salience", Math.min(Math.max(salience, 0.0), 1.0));
+            }
+            // A-46 访问频次先验：元数据层第五分量（不进 RRF 证据通道）——
+            // accessCounts 非空且开关开才装配（缺位=打分逐字节旧口径）。
+            if (accessCounts != null && w.accessPriorEnabled) {
+                components.put("access", accessFactor(accessCounts[i]));
             }
             // 向量分量：查询与候选必须同维可比（sims[i] 非 NaN 即可比）。
             if (!Double.isNaN(sims[i])) {
@@ -457,15 +503,17 @@ public final class Retrieval {
         List<byte[]> embeddings = new ArrayList<>(records.size());
         double[] timestamps = new double[records.size()];
         Double[] saliences = new Double[records.size()];
+        int[] accessCounts = new int[records.size()];
         for (int i = 0; i < records.size(); i++) {
             Models.MemoryRecord record = records.get(i);
             texts.add(record.content());
             embeddings.add(record.embedding());
             timestamps[i] = record.updatedAt();
             saliences[i] = record.salience();
+            accessCounts[i] = record.accessCount();
         }
         List<Hybrid> scored = hybridScores(texts, embeddings, timestamps, saliences, query,
-                queryEmbedding, now, halfLifeDays, weights);
+                queryEmbedding, now, halfLifeDays, weights, accessCounts);
         List<ScoredMemory> out = new ArrayList<>(records.size());
         for (int i = 0; i < records.size(); i++) {
             out.add(new ScoredMemory(records.get(i), scored.get(i).score(), scored.get(i).components()));
@@ -506,7 +554,7 @@ public final class Retrieval {
             saliences[i] = null;
         }
         List<Hybrid> scored = hybridScores(texts, embeddings, timestamps, saliences, query,
-                queryEmbedding, now, halfLifeDays, weights);
+                queryEmbedding, now, halfLifeDays, weights, null);
         List<ScoredChunk> out = new ArrayList<>(chunks.size());
         for (int i = 0; i < chunks.size(); i++) {
             out.add(new ScoredChunk(chunks.get(i), scored.get(i).score(), scored.get(i).components()));

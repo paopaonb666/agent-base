@@ -3,6 +3,7 @@ package io.github.paopaonb666.agentbase.memory.retrieval;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.ArrayList;
@@ -446,5 +447,103 @@ class RetrievalTest {
         ScoredMemory s = reweighted.get(0);
         double expected = 0.7 * s.keywordScore() + 0.1 * s.recencyScore() + 0.1 * s.salienceScore();
         assertEquals(expected, s.score(), 1e-12);
+    }
+
+    // ── A-46 访问频次先验 ─────────────────────────────────────────────
+
+    @Test
+    void accessPriorDisabledKeepsScoringUnchanged() {
+        // 开关关（默认）：components 不产生 access 键；同一条内容仅
+        // access_count 不同（各自单候选打分——RRF 并列按候选序破平，
+        // 同列表同内容不构成等分断言），分数相同（记账列不作先验）。
+        Settings config = new Settings();
+        double now = Models.now();
+        MemoryRecord withCount = new MemoryRecord("m1", "u1", "*", "semantic", "用户偏好深色主题",
+                List.of(), null, null, 0.5, "active", "", List.of(),
+                now, now, null, 500);
+        MemoryRecord noCount = new MemoryRecord("m2", "u1", "*", "semantic", "用户偏好深色主题",
+                List.of(), null, null, 0.5, "active", "", List.of(),
+                now, now, null, 0);
+        ScoredMemory scoredWith = Retrieval.scoreMemories(List.of(withCount), "偏好", null, config).get(0);
+        ScoredMemory scoredWithout = Retrieval.scoreMemories(List.of(noCount), "偏好", null, config).get(0);
+        assertFalse(scoredWith.components().containsKey("access"), "开关关时无 access 分量");
+        assertEquals(0.0, scoredWith.accessScore(), 1e-12);
+        assertEquals(scoredWithout.score(), scoredWith.score(), 1e-12,
+                "access_count 不作先验（关闭态零行为变化）");
+    }
+
+    @Test
+    void accessPriorEnabledRanksFrequentlyUsedMemoryHigher() {
+        // 开关开：access 分量入 components（log 缩放因子经权重线性叠加——
+        // 元数据先验层，不进 RRF 证据通道）。单候选精确增量 + 同列表次序翻转。
+        Settings on = new Settings();
+        on.memory.accessPriorEnabled = true;
+        on.memory.weightVector = 0.40;
+        on.memory.weightKeyword = 0.20;
+        on.memory.weightRecency = 0.15;
+        on.memory.weightSalience = 0.15;
+        on.memory.weightAccess = 0.10;
+        double now = Models.now();
+        MemoryRecord plain = new MemoryRecord("m1", "u1", "*", "semantic", "用户偏好深色主题",
+                List.of(), null, null, 0.5, "active", "", List.of(),
+                now, now, null, 0);
+        MemoryRecord frequent = new MemoryRecord("m2", "u1", "*", "semantic", "用户偏好深色主题",
+                List.of(), null, null, 0.5, "active", "", List.of(),
+                now, now, null, 100);
+        // 单候选精确增量：count=100 → 因子 1.0，分数增量恰为 weight_access。
+        double base = Retrieval.scoreMemories(List.of(plain), "偏好", null, on).get(0).score();
+        ScoredMemory boosted = Retrieval.scoreMemories(List.of(frequent), "偏好", null, on).get(0);
+        assertEquals(1.0, boosted.accessScore(), 1e-12, "count=100 因子饱和到 1.0");
+        assertEquals(base + 0.10, boosted.score(), 1e-12);
+        // 同列表次序翻转：同内容并列（RRF 破平偏 index0 的 m1），开先验后
+        // m2 以 access 增益反超。
+        List<ScoredMemory> both = Retrieval.scoreMemories(List.of(plain, frequent), "偏好", null, on);
+        assertEquals("m2", both.get(0).record().memoryId(), "频次先验翻转次序");
+    }
+
+    @Test
+    void accessPriorOffOrderUnchangedForSamePair() {
+        // 对照（关闭态）：同上同内容对，关先验时 index0 候选按 RRF 破平胜出
+        // ——access 记账不改变次序。
+        Settings off = new Settings();
+        double now = Models.now();
+        MemoryRecord plain = new MemoryRecord("m1", "u1", "*", "semantic", "用户偏好深色主题",
+                List.of(), null, null, 0.5, "active", "", List.of(),
+                now, now, null, 0);
+        MemoryRecord frequent = new MemoryRecord("m2", "u1", "*", "semantic", "用户偏好深色主题",
+                List.of(), null, null, 0.5, "active", "", List.of(),
+                now, now, null, 100);
+        List<ScoredMemory> both = Retrieval.scoreMemories(List.of(plain, frequent), "偏好", null, off);
+        assertEquals("m1", both.get(0).record().memoryId(), "关闭态：破平序保持，频次不影响");
+    }
+
+    @Test
+    void accessFactorLogScalesAndSaturates() {
+        assertEquals(0.0, Retrieval.accessFactor(0), 1e-12);
+        assertEquals(0.0, Retrieval.accessFactor(-3), 1e-12);
+        assertEquals(Math.log(2) / Math.log(101), Retrieval.accessFactor(1), 1e-12);
+        assertEquals(1.0, Retrieval.accessFactor(100), 1e-12);
+        assertEquals(1.0, Retrieval.accessFactor(10_000), 1e-12, "log 缩放：幂律尾巴饱和");
+        assertTrue(Retrieval.accessFactor(10) > Retrieval.accessFactor(3));
+    }
+
+    @Test
+    void accessWeightParticipatesInWeightSumValidation() {
+        // weight_access 参与和=1 校验：只加 access 不减其他 → 拒绝装配。
+        assertThrows(Settings.SettingsError.class,
+                () -> Settings.load(Map.of(
+                        "ENV", "development",
+                        "MEMORY_WEIGHT_ACCESS", "0.10"), null),
+                "和=1.10 必须被拒（防止 minScore 绝对门槛语义漂移）");
+        // 重配后合法（和=1.00）：开关+权重联动装载，Weights 携带两键。
+        Settings ok = Settings.load(Map.of(
+                "ENV", "development",
+                "MEMORY_ACCESS_PRIOR_ENABLED", "true",
+                "MEMORY_WEIGHT_ACCESS", "0.10",
+                "MEMORY_WEIGHT_RECENCY", "0.10",
+                "MEMORY_WEIGHT_SALIENCE", "0.10"), null);
+        assertTrue(ok.memory.accessPriorEnabled);
+        assertEquals(0.10, ok.memory.weightAccess, 1e-12);
+        assertTrue(Retrieval.Weights.fromSettings(ok).accessPriorEnabled());
     }
 }
