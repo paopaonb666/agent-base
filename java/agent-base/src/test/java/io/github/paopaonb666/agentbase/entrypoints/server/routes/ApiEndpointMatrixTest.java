@@ -324,6 +324,7 @@ class ApiEndpointMatrixTest {
         assertEquals(true, out.get("deleted"));
         assertEquals(3, out.get("chunks_removed"));
         verify(fileStore).deleteFile("f1");
+        awaitBackgroundIdle();
 
         // 非属主/不存在 → 404 掩蔽（不泄露存在性）。
         when(fileStore.getMany(List.of("f2"))).thenReturn(List.of());
@@ -331,6 +332,20 @@ class ApiEndpointMatrixTest {
         assertEquals(404, statusOf(() -> routes.revokeFile("chat", "f1", "bob", null, null, null)));
         // 未知模块 404。
         assertEquals(404, statusOf(() -> routes.revokeFile("nope", "f1", "alice", null, null, null)));
+    }
+
+    /**
+     * 等 Background 队列清空：revoke 成功路径异步 spawn {@code purgeOrphans}
+     * 打在 mock 上——与同测试后续 {@code when(...)} 桩并发会偷走 Mockito 的
+     * stubbing 帧（WrongTypeOfReturnValue: purgeOrphans should return int）。
+     * 全量套件的线程池时序 flake（流程事实⑨ 的单类跑不可见型），桩前静默。
+     */
+    private static void awaitBackgroundIdle() throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (io.github.paopaonb666.agentbase.entrypoints.server.Background.pending() > 0
+                && System.currentTimeMillis() < deadline) {
+            Thread.sleep(10);
+        }
     }
 
     @Test
