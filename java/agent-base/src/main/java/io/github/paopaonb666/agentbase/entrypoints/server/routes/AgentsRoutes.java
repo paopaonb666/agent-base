@@ -28,6 +28,7 @@ import io.github.paopaonb666.agentbase.core.context.ContextEngine;
 import io.github.paopaonb666.agentbase.core.graph.CompiledGraph;
 import io.github.paopaonb666.agentbase.core.graph.GraphState;
 import io.github.paopaonb666.agentbase.core.graph.RunConfig;
+import io.github.paopaonb666.agentbase.core.graph.RunRegistry;
 import io.github.paopaonb666.agentbase.core.llm.LlmFactory;
 import io.github.paopaonb666.agentbase.core.prompt.PromptComposer;
 import io.github.paopaonb666.agentbase.core.storage.ThreadIndexRecord;
@@ -710,8 +711,57 @@ public class AgentsRoutes {
         return out;
     }
 
-    // ── GET /{module}/threads/{thread_id}/tool-calls：审计记录 ───────────
+    // ── POST /{module}/threads/{thread_id}/steer：运行中插话（#7）────────
 
+    /**
+     * 用户中途插话（A-#7）：插话进在途 run 的 steering 队列（RunRegistry），
+     * 图执行线程在下一个步边界以 UserMessage 注入状态并发一条 {@code steer}
+     * step 事件（detail 标注入条数）。wire additive：新端点新键，既有契约
+     * 零扰动；忙线程 invoke 409 语义保留——本端点是插话通道，不抢 invoke。
+     *
+     * <p>掩蔽与既有面同口径：未知模块/无在途 run/非属主一律 404（不泄露
+     * 「线程存在且忙碌」）；队列满 429（runaway 防线）。尽力投递：run 在
+     * 最后一个步边界之后终止前到达的插话不被消费（v1 边界，RunRegistry
+     * javadoc 登记；#8 resume 落地后由生命周期记录兜底）。
+     */
+    @org.springframework.web.bind.annotation.PostMapping("/{module}/threads/{thread_id}/steer")
+    public Map<String, Object> steerThread(@PathVariable("module") String module,
+                                           @PathVariable("thread_id") String threadId,
+                                           @RequestBody java.util.Map<String, Object> body,
+                                           @RequestHeader(value = "X-User-Id", required = false) String userIdHeader,
+                                           @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
+                                           @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,
+                                           @RequestHeader(value = "X-User-Nonce", required = false) String nonceHeader) {
+        // 鉴权先行（对应 Python get_current_user 依赖）。
+        String userId = user(userIdHeader, sigHeader, tsHeader, nonceHeader);
+        validateThreadId(threadId);
+        if (!knownModule(module)) {
+            throw new HttpError(404, ErrorCode.NOT_FOUND, "unknown module '" + module + "'");
+        }
+        // 请求体校验（422 优先）：content 码点上限与 invoke.message 同界。
+        Object contentRaw = body == null ? null : body.get("content");
+        if (!(contentRaw instanceof String content) || content.isEmpty()
+                || CharMetrics.len(content) > 100_000) {
+            throw new HttpError(422, ErrorCode.VALIDATION, "content 必须是 1..100000 字符");
+        }
+        RunRegistry.RunHandle handle =
+                RunRegistry.lookup(new ThreadId(module, threadId).toString());
+        if (handle == null || !userId.equals(handle.userId())) {
+            // 无在途 run 或非属主：一律 404 掩蔽。
+            throw new HttpError(404, ErrorCode.NOT_FOUND, "thread 不存在或没有在途运行");
+        }
+        if (!handle.steer(new dev.langchain4j.data.message.UserMessage(content))) {
+            throw new HttpError(429, ErrorCode.RATE_LIMITED,
+                    "steering 队列已满（上限 " + RunRegistry.STEER_QUEUE_CAPACITY + "），请稍后重试");
+        }
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("thread_id", threadId);
+        out.put("module", module);
+        out.put("queued", true);
+        return out;
+    }
+
+    // ── GET /{module}/threads/{thread_id}/tool-calls：审计记录 ───────────
     @GetMapping("/{module}/threads/{thread_id}/tool-calls")
     public Map<String, Object> toolCalls(@PathVariable("module") String module,
                                          @PathVariable("thread_id") String threadId,

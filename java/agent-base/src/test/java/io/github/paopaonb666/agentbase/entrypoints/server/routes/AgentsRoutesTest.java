@@ -741,6 +741,54 @@ class AgentsRoutesTest {
     }
 
     @Test
+    void steerEndpointMatrix() throws Exception {
+        // #7 运行中插话端点：掩蔽 404（无在途 run/非属主）、422 校验、
+        // 429 队列满、成功 queued=true 入队待步边界消费。
+        AgentRuntime runtime = buildRuntime(Map.of("chat", stubModule("chat")),
+                new InMemoryCheckpointer(), null, null, null, null, null);
+        AgentsRoutes routes = route(runtime);
+
+        HttpError idle = httpErrorOf(() -> routes.steerThread("chat", "t1",
+                Map.of("content", "插话"), "u1", null, null, null));
+        assertEquals(404, idle.status(), "空闲线程掩蔽 404");
+
+        HttpError unknownModule = httpErrorOf(() -> routes.steerThread("nope", "t1",
+                Map.of("content", "插话"), "u1", null, null, null));
+        assertEquals(404, unknownModule.status());
+
+        io.github.paopaonb666.agentbase.core.graph.RunRegistry.RunHandle handle =
+                io.github.paopaonb666.agentbase.core.graph.RunRegistry.register("chat:t1", "owner-a");
+        try {
+            Map<String, Object> queued = routes.steerThread("chat", "t1",
+                    Map.of("content", "插话"), "owner-a", null, null, null);
+            assertEquals(Boolean.TRUE, queued.get("queued"));
+            assertEquals("t1", queued.get("thread_id"));
+            assertEquals(1, handle.pendingSteers());
+            assertEquals("插话", handle.drain().get(0).singleText());
+
+            HttpError foreign = httpErrorOf(() -> routes.steerThread("chat", "t1",
+                    Map.of("content", "插话"), "u1", null, null, null));
+            assertEquals(404, foreign.status(), "非属主掩蔽 404（不泄露在途状态）");
+
+            HttpError blank = httpErrorOf(() -> routes.steerThread("chat", "t1",
+                    Map.of("content", ""), "owner-a", null, null, null));
+            assertEquals(422, blank.status());
+            HttpError missing = httpErrorOf(() -> routes.steerThread("chat", "t1",
+                    Map.of(), "owner-a", null, null, null));
+            assertEquals(422, missing.status());
+
+            for (int i = 0; i < io.github.paopaonb666.agentbase.core.graph.RunRegistry.STEER_QUEUE_CAPACITY; i++) {
+                handle.steer(new dev.langchain4j.data.message.UserMessage("m" + i));
+            }
+            HttpError full = httpErrorOf(() -> routes.steerThread("chat", "t1",
+                    Map.of("content", "插话"), "owner-a", null, null, null));
+            assertEquals(429, full.status(), "队列满 429（runaway 防线）");
+        } finally {
+            io.github.paopaonb666.agentbase.core.graph.RunRegistry.unregister("chat:t1", handle);
+        }
+    }
+
+    @Test
     void chineseThreadIdRoundTripsThroughPathEndpoints() throws Exception {
         // #121 回归：中文 thread id 在 invoke 创建后在历史端点仍可读
         // （路径校验 (?U) 与请求体侧同 unicode 语义，对齐 Python \w）。

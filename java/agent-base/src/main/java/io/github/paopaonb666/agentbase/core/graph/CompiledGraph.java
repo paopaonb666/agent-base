@@ -169,13 +169,20 @@ public final class CompiledGraph {
         if (!lock.tryLock()) {
             throw new ThreadBusyError(config.threadId());
         }
+        // #7 run 生命周期注册（steering/resume 的共享地基）：per-thread 锁内
+        // 注册——同线程至多一个在途 run，句柄即权威。
+        RunRegistry.RunHandle handle = null;
         RunOutcome outcome = null;
         RuntimeException failure = null;
         try {
+            handle = RunRegistry.register(config.threadId(), config.userId());
             outcome = runLocked(input, config, sink);
         } catch (RuntimeException e) {
             failure = e;
         } finally {
+            if (handle != null) {
+                RunRegistry.unregister(config.threadId(), handle);
+            }
             lock.unlock();
         }
         // 压缩触发挂点（#328）：锁释放之后调用（hook 实现内部异步，绝不阻塞
@@ -210,6 +217,30 @@ public final class CompiledGraph {
         }
     }
 
+    /**
+     * #7 steering 步边界注入：把待消费的用户插话（{@link RunRegistry} 句柄
+     * 的队列）以 UserMessage 追加进状态（messages append-only，A-8 契约）
+     * 并落盘，随后发一条 {@code steer} step 事件（detail 标注入条数——wire
+     * 形态 additive：复用既有 StepEvent，无新事件类型）。队列空=零开销直返
+     * （事件流逐字节不变）。
+     */
+    private void drainSteering(RunConfig config, GraphState state, EventSink sink) {
+        RunRegistry.RunHandle handle = RunRegistry.lookup(config.threadId());
+        if (handle == null || handle.pendingSteers() == 0) {
+            return;
+        }
+        List<dev.langchain4j.data.message.UserMessage> injected = handle.drain();
+        for (dev.langchain4j.data.message.UserMessage message : injected) {
+            state.apply(Map.of(GraphState.MESSAGES, List.of(message)));
+        }
+        persistState(config, state);
+        if (sink != null) {
+            sink.accept(new Events.StepEvent("steer", "completed",
+                    "injected_messages=" + injected.size()));
+        }
+        LOG.debug("steering: 注入 {} 条用户插话（thread={}）", injected.size(), config.threadId());
+    }
+
     private RunOutcome runLocked(GraphState input, RunConfig config, EventSink sink) {
         GraphState state = loadState(config);
         state.apply(input.updatePayload());
@@ -230,6 +261,9 @@ public final class CompiledGraph {
                         config.threadId());
                 return new RunOutcome(state, Events.RunTermination.CANCELLED, null);
             }
+            // #7 steering 步边界（取消检查之后——取消竞态窗口的插话随取消
+            // 丢弃，注入矩阵窗口 c）。
+            drainSteering(config, state, sink);
             if (steps >= config.recursionLimit()) {
                 throw new GraphRecursionError(recursionMessage(config.recursionLimit()));
             }
