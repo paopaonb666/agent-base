@@ -373,4 +373,25 @@ public final class Metrics {
     public static EventDropMetrics events() { return EVENTS; }
 
     public static ContextMetrics context() { return CONTEXT; }
+
+    // ── A-#166：embedding 失败冷却 gauge ─────────────────────────────────
+
+    /** 冷却截止时刻（epoch millis；0=无冷却）。Embeddings 失败时打点。 */
+    private static final java.util.concurrent.atomic.AtomicLong EMBEDDING_COOLDOWN_UNTIL =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    /** 记录冷却截止时刻（Embeddings 失败降级时调用；更晚的截止覆盖更早的）。 */
+    public static void observeEmbeddingCooldownUntil(long untilEpochMillis) {
+        EMBEDDING_COOLDOWN_UNTIL.accumulateAndGet(untilEpochMillis, Math::max);
+    }
+
+    /** 渲染冷却 gauge（秒，向上取整；0=无冷却——时间基自然衰减）。 */
+    public static String renderEmbeddingCooldownMetrics() {
+        long remaining = Math.max(0, EMBEDDING_COOLDOWN_UNTIL.get() - System.currentTimeMillis());
+        return "# HELP agent_embedding_cooldown_seconds_remaining "
+                + "embedding 端点失败后的冷却剩余秒数。\n"
+                + "# TYPE agent_embedding_cooldown_seconds_remaining gauge\n"
+                + "agent_embedding_cooldown_seconds_remaining "
+                + (remaining + 999) / 1000 + "\n";
+    }
 }

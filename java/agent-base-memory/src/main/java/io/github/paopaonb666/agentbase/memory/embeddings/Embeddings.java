@@ -176,6 +176,10 @@ public final class Embeddings {
                 }
             } catch (EmbeddingError exc) {
                 blockedUntilNanos = System.nanoTime() + cooldownNanos;
+                // A-#166：冷却截止进 /metrics gauge（秒级剩余可见，时间基
+                // 自然衰减到 0）。
+                io.github.paopaonb666.agentbase.extensions.Metrics.observeEmbeddingCooldownUntil(
+                        System.currentTimeMillis() + cooldownNanos / 1_000_000L);
                 LOG.warn("memory: embedding 不可用，{}s 内走关键词降级：{}",
                         cooldownNanos / 1_000_000_000.0, exc.getMessage());
                 return null;

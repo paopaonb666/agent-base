@@ -361,4 +361,22 @@ class MetricsRenderTest {
             }
         };
     }
+
+    @Test
+    void embeddingCooldownGaugeRendersRemainingSecondsAndDecays() throws Exception {
+        // A-#166：冷却截止进 gauge（秒向上取整）；时间基自然衰减到 0。生产
+        // 只在失败时打未来截止、更晚截止覆盖更早——用例按时间升序打点。
+        Metrics.observeEmbeddingCooldownUntil(System.currentTimeMillis() + 400);
+        assertTrue(Metrics.renderEmbeddingCooldownMetrics()
+                        .contains("agent_embedding_cooldown_seconds_remaining 1"),
+                "400ms 余量向上取整为 1s");
+        Thread.sleep(700);
+        assertTrue(Metrics.renderEmbeddingCooldownMetrics()
+                        .contains("agent_embedding_cooldown_seconds_remaining 0"),
+                "截止过后自然衰减到 0");
+        Metrics.observeEmbeddingCooldownUntil(System.currentTimeMillis() + 4_500);
+        assertTrue(Metrics.renderEmbeddingCooldownMetrics()
+                        .contains("agent_embedding_cooldown_seconds_remaining 5"),
+                "4500ms 余量向上取整为 5s");
+    }
 }
