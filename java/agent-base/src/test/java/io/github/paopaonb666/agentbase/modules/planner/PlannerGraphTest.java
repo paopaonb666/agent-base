@@ -592,6 +592,42 @@ class PlannerGraphTest {
                 .extra().containsKey("pending_approval"), "标记退场");
     }
 
+    /** A-#62（审查 P1 修复锁）：批准→执行失败→replan 的修订版必须再次暂停——
+     *  陈旧 APPROVED 决定被 execute 消费即清，不得让修订版跳过审批。 */
+    @Test
+    void staleApprovalDoesNotSkipReplanPause() {
+        ScriptedModel model = new ScriptedModel(
+                AiMessage.from("[{\"id\": 1, \"goal\": \"A\"}]"),  // 首轮 plan → 暂停
+                AiMessage.from(""),                                   // 批准后 execute：空输出门 → failed
+                AiMessage.from("[{\"id\": 1, \"goal\": \"修订 A\"}]"), // replan 产出修订版
+                AiMessage.from("修订结果"),                            // 二次批准后 execute
+                AiMessage.from("最终答复"));
+        Settings settings = new Settings();
+        settings.planner.planApproval = true;
+        CompiledGraph graph = PlannerGraphs.buildPlannerGraph(new AgentModule.ModuleContext(
+                settings, model, new InMemoryCheckpointer(), List.of(), null,
+                new RecordingPlanStore()));
+        String threadId = "planner:t3";
+        graph.streamWithTermination(new GraphState(List.of(UserMessage.from("做 A")), Map.of()),
+                new RunConfig(threadId, "u1", 25), null);
+        io.github.paopaonb666.agentbase.core.tools.ApprovalLedger.record(
+                threadId, io.github.paopaonb666.agentbase.modules.planner.graph.PlanNode.PLAN_CALL_ID,
+                true);
+        // 批准 → resume 执行（失败）→ replan：修订版必须再次 PAUSED（修复前
+        // 陈旧 APPROVED 让 CheckNodes 清账本不挂 marker → 修订版直接执行）。
+        CompiledGraph.RunOutcome afterFail = graph.streamWithTermination(
+                new GraphState(), new RunConfig(threadId, "u1", 25, "execute"), null);
+        assertEquals(Events.RunTermination.PAUSED, afterFail.termination(),
+                "执行失败后的修订版计划必须再次暂停等批准");
+        // 修订版批准 → 完成。
+        io.github.paopaonb666.agentbase.core.tools.ApprovalLedger.record(
+                threadId, io.github.paopaonb666.agentbase.modules.planner.graph.PlanNode.PLAN_CALL_ID,
+                true);
+        CompiledGraph.RunOutcome finalOutcome = graph.streamWithTermination(
+                new GraphState(), new RunConfig(threadId, "u1", 25, "execute"), null);
+        assertEquals(Events.RunTermination.DONE, finalOutcome.termination());
+    }
+
     /** A-#62：拒绝→任务终止→replan 有界路由→修订版计划再次暂停→批准完成。 */
     @Test
     void planRejectionTerminatesTasksThenReplansWithBoundedPause() {

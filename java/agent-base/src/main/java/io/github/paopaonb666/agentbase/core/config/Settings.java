@@ -571,6 +571,11 @@ public final class Settings {
      * <b>字段类型</b>判定不靠名单（新增敏感键自动被掩）；其余值原样。
      * 导出面只读、不含运行时状态；reflection 只走本类内声明的节字段
      * （新增配置节自动进导出面）。
+     *
+     * <p>容器值（List/Map）递归消毒，非简单类型（如 record——{@code
+     * LlmFallbackSpec} 内嵌 Secret）渲染为 {@code String.valueOf}（Secret
+     * 的 toString 恒 "***"，掩码语义穿透嵌套）——保证 Jackson 可序列化
+     * （FAIL_ON_EMPTY_BEANS 下裸 Secret 会 500，审查 P1 修复）。
      */
     public Map<String, Object> exportForDiagnostics() {
         Map<String, Object> out = new LinkedHashMap<>();
@@ -589,8 +594,7 @@ public final class Settings {
                         continue;
                     }
                     f.setAccessible(true);
-                    values.put(camelToSnake(f.getName()), f.getType() == Secret.class
-                            ? "***" : f.get(section));
+                    values.put(camelToSnake(f.getName()), sanitizeExportValue(f.get(section)));
                 }
                 out.put(sectionField.getName(), values);
             } catch (IllegalAccessException e) {
@@ -598,6 +602,29 @@ public final class Settings {
             }
         }
         return out;
+    }
+
+    /** 导出值消毒：Secret 掩码、容器递归、非 Jackson 简单类型转字符串。 */
+    private static Object sanitizeExportValue(Object value) {
+        if (value == null || value instanceof Secret || value instanceof String
+                || value instanceof Number || value instanceof Boolean) {
+            return value instanceof Secret ? "***" : value;
+        }
+        if (value instanceof List<?> list) {
+            List<Object> out = new ArrayList<>(list.size());
+            for (Object item : list) {
+                out.add(sanitizeExportValue(item));
+            }
+            return out;
+        }
+        if (value instanceof Map<?, ?> map) {
+            Map<String, Object> out = new LinkedHashMap<>();
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                out.put(String.valueOf(entry.getKey()), sanitizeExportValue(entry.getValue()));
+            }
+            return out;
+        }
+        return String.valueOf(value);
     }
 
     /** camelCase → snake_case（导出键与 env 键约定一致）。 */

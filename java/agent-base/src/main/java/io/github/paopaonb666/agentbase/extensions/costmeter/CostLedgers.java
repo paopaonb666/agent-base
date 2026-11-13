@@ -352,7 +352,10 @@ public final class CostLedgers {
 
         /** 幂等建表（每连接首次操作时执行一次；对应 Python _ensure_table）。 */
         private void ensureTable(Connection conn) throws SQLException {
-            if (!tableReady) {
+            if (tableReady) {
+                return;
+            }
+            try {
                 try (Statement st = conn.createStatement()) {
                     st.execute(MYSQL_DDL);
                 }
@@ -389,9 +392,25 @@ public final class CostLedgers {
                             @Override public void execute(String sql) throws SQLException {
                                 try (Statement st = conn.createStatement()) {
                                     st.execute(sql);
+                                } catch (SQLException e) {
+                                    // A-审查 P2-1：MySQL DDL 隐式提交——ALTER 成功后
+                                    // recordVersion 前崩溃会在重放时报 Duplicate column
+                                    //（error 1060）。迁移重入安全靠吞掉该错误（列已在）
+                                    // + recordVersion 照记。
+                                    if (e.getErrorCode() == 1060) {
+                                        LOG.warn("cost: mysql 迁移列已存在（重入安全吞掉）：{}", sql);
+                                        return;
+                                    }
+                                    throw e;
                                 }
                             }
                         }, COST_MIGRATIONS, LOG);
+                tableReady = true;
+            } catch (Exception migrationError) {
+                // A-审查 P2-1：迁移失败不得杀死 cost-flusher 线程（线程死亡 =
+                // 账本静默停摆、pending 无上限堆积）——降级 tableReady 并让
+                // 后续 INSERT 以 SQLException 失败走 #262 重放缓冲。
+                LOG.error("cost: mysql 账本迁移失败（账本降级，写入进重放缓冲）", migrationError);
                 tableReady = true;
             }
         }

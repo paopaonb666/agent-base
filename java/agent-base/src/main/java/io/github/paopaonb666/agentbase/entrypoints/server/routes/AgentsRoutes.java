@@ -895,14 +895,15 @@ public class AgentsRoutes {
     }
 
     // ── GET /{module}/threads/{thread_id}/tool-calls：审计记录 ───────────
-    @GetMapping("/{module}/threads/{thread_id}/tool-calls")
-    /** 七参形态（A-#217 offset 缺省 0——既有调用方/测试的兼容入口）。 */
+
+    /** 七参形态（A-#217 offset 缺省 0——既有调用方/测试的兼容入口；无 mapping 注解，纯委托）。 */
     public Map<String, Object> toolCalls(String module, String threadId, int limit,
                                          String userIdHeader, String sigHeader,
                                          String tsHeader, String nonceHeader) {
         return toolCalls(module, threadId, limit, 0, userIdHeader, sigHeader, tsHeader, nonceHeader);
     }
 
+    @GetMapping("/{module}/threads/{thread_id}/tool-calls")
     public Map<String, Object> toolCalls(@PathVariable("module") String module,
                                          @PathVariable("thread_id") String threadId,
                                          @RequestParam(value = "limit", defaultValue = "100") int limit,

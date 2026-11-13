@@ -269,8 +269,14 @@ public final class ResilientModelRuntime implements ModelRuntime {
             int fallbackIndex = -1;
             int fallbackMarker = kind.indexOf("fallback#");
             if (fallbackMarker >= 0) {
-                fallbackIndex = Integer.parseInt(
-                        kind.substring(fallbackMarker + "fallback#".length()));
+                try {
+                    fallbackIndex = Integer.parseInt(
+                            kind.substring(fallbackMarker + "fallback#".length()));
+                } catch (NumberFormatException defensive) {
+                    // A-审查 P2-5：kind 格式漂移不触发重试风暴——防御性按主档
+                    // 尝试记账（fallback 列 NULL）。
+                    fallbackIndex = -1;
+                }
             }
             UsageSinks.setAttemptContext(new UsageSinks.AttemptContext(attempt, fallbackIndex));
             if (attempt > 0) {

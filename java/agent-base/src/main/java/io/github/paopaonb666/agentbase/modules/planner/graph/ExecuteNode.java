@@ -103,6 +103,16 @@ public final class ExecuteNode {
                         GraphState.MESSAGES, List.of(),
                         PlannerState.TASKS, tasks);
             }
+            // A-#62（审查 P1 修复）：APPROVED 决定被本次执行消费即清——否则
+            // 陈旧批准让后续 replan 的修订版计划跳过审批直接执行（CheckNodes
+            // 读到旧决定不挂 marker）。
+            if (planApproval
+                    && io.github.paopaonb666.agentbase.core.tools.ApprovalLedger.status(
+                            nodeCtx.config().threadId(), PlanNode.PLAN_CALL_ID, 0)
+                            == io.github.paopaonb666.agentbase.core.tools.ApprovalLedger.Status.APPROVED) {
+                io.github.paopaonb666.agentbase.core.tools.ApprovalLedger.clear(
+                        nodeCtx.config().threadId(), PlanNode.PLAN_CALL_ID);
+            }
             PlanStreaming.emitPlan(nodeCtx, tasks, "progress",
                     "子任务 " + (cursor + 1) + "/" + tasks.size() + " 执行中");
 
@@ -145,6 +155,11 @@ public final class ExecuteNode {
                 }
                 // A-#26 审批门（在任何执行之前）：非拦截请求里有命中名单且
                 // 无决定的 → 整批暂停（图层落盘 PAUSED，resume_node=execute）。
+                // 已知代价（审查 P2-3 登记）：暂停发生在 round k 工具执行前，
+                // round 0..k-1 的 produced（节点局部）随暂停丢弃——resume 后
+                // 本子任务从 round 0 重跑（客户端可见重复 delta；有副作用的
+                // 工具可能重复执行）。批内「整批暂停避免批一半」与跨轮重放
+                // 的取舍以此为准。
                 List<ToolExecutionRequest> loopExecutable = new ArrayList<>();
                 for (int i = 0; i < toolCalls.size(); i++) {
                     if (!ToolLoopDetector.isIntercepted(loopRepeats[i], loopThreshold)) {

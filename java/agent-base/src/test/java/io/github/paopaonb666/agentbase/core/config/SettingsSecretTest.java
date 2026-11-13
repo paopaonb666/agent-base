@@ -71,5 +71,17 @@ class SettingsSecretTest {
         assertFalse(rendered.contains("sk-main"));
         assertFalse(rendered.contains("tvly-1"));
         assertFalse(rendered.contains("pw-1"));
+
+        // A-审查 P1 回归锁：LLM_FALLBACKS 的嵌套 Secret（record 内 apiKey）
+        // 原样进导出树会让 Jackson（FAIL_ON_EMPTY_BEANS）500——消毒后按
+        // 字符串渲染且密钥不落明文。
+        Settings withFallback = Settings.load(java.util.Map.of(
+                "ENV", "development",
+                "LLM_FALLBACKS",
+                "[{\"base_url\":\"https://fb.example/v1\",\"model\":\"fb-m\",\"api_key\":\"sk-fallback\"}]"), null);
+        var fbOut = withFallback.exportForDiagnostics();
+        String fbRendered = String.valueOf(fbOut);
+        assertFalse(fbRendered.contains("sk-fallback"), "嵌套 Secret 不得落明文：" + fbRendered);
+        assertTrue(fbRendered.contains("***"), "嵌套 Secret 渲染为掩码：" + fbRendered);
     }
 }
