@@ -60,7 +60,7 @@ class SteeringTest {
     @Test
     void midRunSteerInjectsAtNextBoundaryBeforeNodeB() {
         CompiledGraph graph = twoStepGraph(() ->
-                RunRegistry.lookup("chat:t1").steer(new UserMessage("插话内容")));
+                RunRegistry.lookup("chat:t1").steer("user", "插话内容"));
         GraphState out = graph.invoke(new GraphState(), RunConfig.of("chat:t1", "u1"));
         // 注入发生在 a 之后、b 之前：messages = [a输出, 插话, b输出]。
         assertEquals(3, out.messages().size());
@@ -73,7 +73,7 @@ class SteeringTest {
     void steerStepEventOrderGoldenWithDetailCount() {
         RecordingSink sink = new RecordingSink();
         CompiledGraph graph = twoStepGraph(() ->
-                RunRegistry.lookup("chat:t1").steer(new UserMessage("插话内容")));
+                RunRegistry.lookup("chat:t1").steer("user", "插话内容"));
         graph.stream(new GraphState(), RunConfig.of("chat:t1", "u1"), sink);
         List<String> shape = new ArrayList<>();
         for (Object event : sink.events) {
@@ -97,7 +97,7 @@ class SteeringTest {
         // 循环顶取消检查先于 drain → 插话不注入、随 run 终止丢弃。
         RecordingSink sink = new RecordingSink();
         CompiledGraph graph = twoStepGraph(() -> {
-            RunRegistry.lookup("chat:t1").steer(new UserMessage("迟到的插话"));
+            RunRegistry.lookup("chat:t1").steer("user", "迟到的插话");
             sink.cancelled = true;
         });
         CompiledGraph.RunOutcome outcome =
@@ -125,9 +125,9 @@ class SteeringTest {
     void steerQueueDrainsExactlyOnceAndRespectsCapacity() {
         RunRegistry.RunHandle handle = new RunRegistry.RunHandle("u1");
         for (int i = 0; i < RunRegistry.STEER_QUEUE_CAPACITY; i++) {
-            assertTrue(handle.steer(new UserMessage("m" + i)), "容量内投递成功");
+            assertTrue(handle.steer("user", "m" + i), "容量内投递成功");
         }
-        assertFalse(handle.steer(new UserMessage("溢出")), "队列满投递失败（端点 429 依据）");
+        assertFalse(handle.steer("user", "溢出"), "队列满投递失败（端点 429 依据）");
         assertEquals(RunRegistry.STEER_QUEUE_CAPACITY, handle.pendingSteers());
         assertEquals(RunRegistry.STEER_QUEUE_CAPACITY, handle.drain().size());
         assertEquals(0, handle.pendingSteers());
@@ -143,6 +143,43 @@ class SteeringTest {
         } finally {
             RunRegistry.unregister("chat:t3", handle);
         }
+    }
+
+    @Test
+    void systemKindInjectsReminderPrefixedSystemMessage() {
+        // #14：kind=system → SystemMessage（SYSTEM_REMINDER_PREFIX 包裹），
+        // 事件 detail 追加 injected_kind=system（wire additive）。
+        RecordingSink sink = new RecordingSink();
+        CompiledGraph graph = twoStepGraph(() ->
+                RunRegistry.lookup("chat:t1").steer("system", "预算即将耗尽"));
+        GraphState out = graph.stream(new GraphState(), RunConfig.of("chat:t1", "u1"), sink);
+        assertEquals(3, out.messages().size());
+        assertEquals("a输出", ((AiMessage) out.messages().get(0)).text());
+        dev.langchain4j.data.message.SystemMessage reminder =
+                (dev.langchain4j.data.message.SystemMessage) out.messages().get(1);
+        assertEquals(CompiledGraph.SYSTEM_REMINDER_PREFIX + "预算即将耗尽", reminder.text());
+        assertEquals("b输出", ((AiMessage) out.messages().get(2)).text());
+        Events.StepEvent steer = sink.events.stream()
+                .filter(e -> e instanceof Events.StepEvent s && "steer".equals(s.name()))
+                .map(e -> (Events.StepEvent) e)
+                .findFirst().orElseThrow();
+        assertEquals("injected_messages=1;injected_kind=system", steer.detail());
+    }
+
+    @Test
+    void systemReminderPrefixDeliberatelyDiffersFromCompactionPrefix() {
+        // #14 与 #328 语义不冲突（计划裁决）：注入前缀与压缩摘要前缀字面量
+        // 刻意不同——压缩转写折叠只认摘要前缀，注入提醒永不被当摘要折叠。
+        assertFalse(CompiledGraph.SYSTEM_REMINDER_PREFIX.equals(
+                io.github.paopaonb666.agentbase.core.context.ContextEngine.COMPACTION_SUMMARY_PREFIX));
+    }
+
+    @Test
+    void steerItemKindIsClosedVocabulary() {
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+                () -> new RunRegistry.SteerItem("bogus", "x"));
+        assertEquals("user", new RunRegistry.SteerItem("user", "x").kind());
+        assertEquals("system", new RunRegistry.SteerItem("system", "x").kind());
     }
 
     @Test

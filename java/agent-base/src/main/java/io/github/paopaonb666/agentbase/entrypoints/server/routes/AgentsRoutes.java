@@ -738,11 +738,16 @@ public class AgentsRoutes {
         if (!knownModule(module)) {
             throw new HttpError(404, ErrorCode.NOT_FOUND, "unknown module '" + module + "'");
         }
-        // 请求体校验（422 优先）：content 码点上限与 invoke.message 同界。
+        // 请求体校验（422 优先）：content 码点上限与 invoke.message 同界；
+        // kind 可选（A-#14）：缺省 user，system = system-reminder 形态。
         Object contentRaw = body == null ? null : body.get("content");
         if (!(contentRaw instanceof String content) || content.isEmpty()
                 || CharMetrics.len(content) > 100_000) {
             throw new HttpError(422, ErrorCode.VALIDATION, "content 必须是 1..100000 字符");
+        }
+        String kind = body.get("kind") == null ? "user" : String.valueOf(body.get("kind"));
+        if (!"user".equals(kind) && !"system".equals(kind)) {
+            throw new HttpError(422, ErrorCode.VALIDATION, "kind 必须是 user|system");
         }
         RunRegistry.RunHandle handle =
                 RunRegistry.lookup(new ThreadId(module, threadId).toString());
@@ -750,7 +755,7 @@ public class AgentsRoutes {
             // 无在途 run 或非属主：一律 404 掩蔽。
             throw new HttpError(404, ErrorCode.NOT_FOUND, "thread 不存在或没有在途运行");
         }
-        if (!handle.steer(new dev.langchain4j.data.message.UserMessage(content))) {
+        if (!handle.steer(kind, content)) {
             throw new HttpError(429, ErrorCode.RATE_LIMITED,
                     "steering 队列已满（上限 " + RunRegistry.STEER_QUEUE_CAPACITY + "），请稍后重试");
         }

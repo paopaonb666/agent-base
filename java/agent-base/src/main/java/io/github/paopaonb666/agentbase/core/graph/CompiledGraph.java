@@ -247,27 +247,46 @@ public final class CompiledGraph {
     }
 
     /**
-     * #7 steering 步边界注入：把待消费的用户插话（{@link RunRegistry} 句柄
-     * 的队列）以 UserMessage 追加进状态（messages append-only，A-8 契约）
-     * 并落盘，随后发一条 {@code steer} step 事件（detail 标注入条数——wire
-     * 形态 additive：复用既有 StepEvent，无新事件类型）。队列空=零开销直返
-     * （事件流逐字节不变）。
+     * #14 system-reminder 注入前缀：运行中注入的 system 形态消息的标识
+     * 前缀——与 #328 的 {@code COMPACTION_SUMMARY_PREFIX}（会话历史摘要）
+     * 刻意不同字面量：压缩转写折叠只认摘要前缀，注入提醒不会被当成摘要
+     * 折叠（两者语义不冲突，注册在案）。
+     */
+    public static final String SYSTEM_REMINDER_PREFIX = "【系统提醒（运行中注入）】\n";
+
+    /**
+     * #7/#14 steering 步边界注入：把待消费的用户插话（{@link RunRegistry}
+     * 句柄的队列）注入状态（messages append-only，A-8 契约）并落盘，随后
+     * 发一条 {@code steer} step 事件（detail 标注入条数与形态——wire 形态
+     * additive：复用既有 StepEvent，无新事件类型）。kind=user → UserMessage
+     * 原样；kind=system → {@link #SYSTEM_REMINDER_PREFIX} 包裹的
+     * SystemMessage。队列空=零开销直返（事件流逐字节不变）。
      */
     private void drainSteering(RunConfig config, GraphState state, EventSink sink) {
         RunRegistry.RunHandle handle = RunRegistry.lookup(config.threadId());
         if (handle == null || handle.pendingSteers() == 0) {
             return;
         }
-        List<dev.langchain4j.data.message.UserMessage> injected = handle.drain();
-        for (dev.langchain4j.data.message.UserMessage message : injected) {
-            state.apply(Map.of(GraphState.MESSAGES, List.of(message)));
+        List<RunRegistry.SteerItem> injected = handle.drain();
+        boolean hasSystem = false;
+        for (RunRegistry.SteerItem item : injected) {
+            if ("system".equals(item.kind())) {
+                hasSystem = true;
+                state.apply(Map.of(GraphState.MESSAGES, List.of(
+                        dev.langchain4j.data.message.SystemMessage.from(
+                                SYSTEM_REMINDER_PREFIX + item.content()))));
+            } else {
+                state.apply(Map.of(GraphState.MESSAGES, List.of(
+                        new dev.langchain4j.data.message.UserMessage(item.content()))));
+            }
         }
         persistState(config, state);
         if (sink != null) {
             sink.accept(new Events.StepEvent("steer", "completed",
-                    "injected_messages=" + injected.size()));
+                    "injected_messages=" + injected.size()
+                            + (hasSystem ? ";injected_kind=system" : "")));
         }
-        LOG.debug("steering: 注入 {} 条用户插话（thread={}）", injected.size(), config.threadId());
+        LOG.debug("steering: 注入 {} 条插话（thread={}）", injected.size(), config.threadId());
     }
 
     private RunOutcome runLocked(GraphState input, RunConfig config, EventSink sink) {

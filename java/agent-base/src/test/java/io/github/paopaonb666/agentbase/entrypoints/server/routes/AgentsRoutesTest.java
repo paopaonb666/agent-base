@@ -764,7 +764,18 @@ class AgentsRoutesTest {
             assertEquals(Boolean.TRUE, queued.get("queued"));
             assertEquals("t1", queued.get("thread_id"));
             assertEquals(1, handle.pendingSteers());
-            assertEquals("插话", handle.drain().get(0).singleText());
+            var item = handle.drain().get(0);
+            assertEquals("user", item.kind());
+            assertEquals("插话", item.content());
+
+            // A-#14：kind=system 入队；非法 kind 422。
+            assertEquals(Boolean.TRUE, routes.steerThread("chat", "t1",
+                    Map.of("content", "提醒", "kind", "system"), "owner-a", null, null, null)
+                    .get("queued"));
+            assertEquals("system", handle.drain().get(0).kind());
+            HttpError badKind = httpErrorOf(() -> routes.steerThread("chat", "t1",
+                    Map.of("content", "插话", "kind", "bogus"), "owner-a", null, null, null));
+            assertEquals(422, badKind.status());
 
             HttpError foreign = httpErrorOf(() -> routes.steerThread("chat", "t1",
                     Map.of("content", "插话"), "u1", null, null, null));
@@ -778,7 +789,7 @@ class AgentsRoutesTest {
             assertEquals(422, missing.status());
 
             for (int i = 0; i < io.github.paopaonb666.agentbase.core.graph.RunRegistry.STEER_QUEUE_CAPACITY; i++) {
-                handle.steer(new dev.langchain4j.data.message.UserMessage("m" + i));
+                handle.steer("user", "m" + i);
             }
             HttpError full = httpErrorOf(() -> routes.steerThread("chat", "t1",
                     Map.of("content", "插话"), "owner-a", null, null, null));

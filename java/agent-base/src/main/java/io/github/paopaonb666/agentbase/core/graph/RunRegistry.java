@@ -27,13 +27,21 @@ public final class RunRegistry {
     public static final class RunHandle {
         private final String runId;
         private final String userId;
-        private final LinkedBlockingQueue<UserMessage> steering =
+        private final LinkedBlockingQueue<SteerItem> steering =
                 new LinkedBlockingQueue<>(STEER_QUEUE_CAPACITY);
 
         RunHandle(String userId) {
             this.runId = "run-"
                     + io.github.paopaonb666.agentbase.extensions.Observability.newRequestId();
             this.userId = userId;
+        }
+
+        /**
+         * 尽力投递一条插话；队列满返回 false（端点 429）。kind ∈
+         * {@code user|system}（#14 system-reminder 形态）。
+         */
+        public boolean steer(String kind, String content) {
+            return steering.offer(new SteerItem(kind, content));
         }
 
         /** 属主（端点掩蔽校验：非属主 404）。 */
@@ -46,24 +54,31 @@ public final class RunRegistry {
             return runId;
         }
 
-        /** 尽力投递一条插话；队列满返回 false（端点转 429）。 */
-        public boolean steer(UserMessage message) {
-            return steering.offer(message);
-        }
-
         /** 待消费插话数（观测/测试）。 */
         public int pendingSteers() {
             return steering.size();
         }
 
         /** 取走全部待注入插话（步边界由图执行线程调用；测试断言面）。 */
-        public List<UserMessage> drain() {
+        public List<SteerItem> drain() {
             if (steering.isEmpty()) {
                 return List.of();
             }
-            List<UserMessage> drained = new ArrayList<>(steering.size());
+            List<SteerItem> drained = new ArrayList<>(steering.size());
             steering.drainTo(drained);
             return List.copyOf(drained);
+        }
+    }
+
+    /**
+     * 一条待注入插话（#7/#14）：kind=user → UserMessage 原样注入；
+     * kind=system → system-reminder 形态（前缀见 CompiledGraph）。
+     */
+    public record SteerItem(String kind, String content) {
+        public SteerItem {
+            if (!"user".equals(kind) && !"system".equals(kind)) {
+                throw new IllegalArgumentException("steer kind 必须是 user|system: " + kind);
+            }
         }
     }
 
