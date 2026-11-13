@@ -69,6 +69,12 @@ java -jar agent-base/target/agent-base-0.3.0-exec.jar --version
 java -jar agent-base-memory/target/agent-base-memory-0.3.0-exec.jar --server
 ```
 
+**`--server` 旗标的语境说明（#281，事实以 CliMain 现码为准）**：`--server`
+是 **CliMain 的服务入口旗标**（对应 Python `uvicorn agent_base.entrypoints.server:app`）
+——`java -jar agent-base-...-exec.jar --server` 即起 SSE 服务；memory exec
+jar 的 CI 冒烟用同一旗标。旗标被 CliMain 识别（不会落「未知参数」退 2 桶）；
+真实启动面由 CI 冒烟与容器/compose 承载。
+
 配套前端 `agent-base-ui` 无需任何改动：SSE 事件契约（`ping/step/delta/
 tool_call/plan/sources/done/error`）、端点路径与状态码语义与 Python 版逐
 字节对齐（见仓库根 README 的「事件契约（SSE）」节）。Java 侧扩展（#91，

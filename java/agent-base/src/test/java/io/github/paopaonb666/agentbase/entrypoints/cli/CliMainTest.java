@@ -106,4 +106,20 @@ class CliMainTest {
                 AiMessage.from("with text"),
                 AiMessage.from(""))));
     }
+
+    @Test
+    void serverFlagIsRecognizedByCliMain() {
+        // A-#281 装配一致性锁（事实修正：CliMain 第 65 行有 --server 分支，
+        // 对应 uvicorn 的服务入口——#314 旧事实过期）：--server 被识别，
+        // 绝不落「未知参数」退 2 桶。装配在测试环境（无 LLM_API_KEY）失败
+        // 以异常冒出——boot 本身由 CI 冒烟与容器语境覆盖。README CLI 节的
+        // 语境说明与本测试互为文档/锁。
+        try {
+            String[] r = runCaptured("--server");
+            assertFalse(r[2].contains("未知参数 --server"), r[2]);
+        } catch (Exception bootFailure) {
+            assertFalse(String.valueOf(bootFailure).contains("未知参数"),
+                    "未知参数桶不应捕获 --server：" + bootFailure);
+        }
+    }
 }
