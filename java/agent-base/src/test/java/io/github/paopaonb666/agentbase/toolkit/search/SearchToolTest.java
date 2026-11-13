@@ -533,6 +533,55 @@ class SearchToolTest {
         assertEquals(SearchCache.CACHE_MAX_ENTRIES, cacheSize(cache));
     }
 
+    @Test
+    void baseLowQualityPatternsFilterPipelineArtifacts() {
+        // A-32：基座默认保守集——Google 缓存页/翻译代理页是流水线产物垃圾源
+        // （前者服务已停恒死链、后者机器翻译镜像非原始来源），宁缺毋滥；
+        // 业务名单（字典站/拼音站类）不入基座，属部署方覆写。
+        SearchResult cache = new SearchResult("Cached page",
+                "https://webcache.googleusercontent.com/search?q=cache:x", "s", 1, "fake");
+        SearchResult translated = new SearchResult("Translated",
+                "https://www-example-com.translate.goog/docs", "s", 2, "fake");
+        SearchResult normal = new SearchResult("Normal Result", "https://example.com/docs", "s", 3, "fake");
+        List<SearchResult> ranked = SearchPipeline.filterAndRank(
+                List.of(cache, translated, normal), "docs", 10);
+        assertEquals(List.of("Normal Result"), ranked.stream().map(SearchResult::title).toList(),
+                "基座默认模式滤掉缓存页与翻译代理页");
+        assertTrue(SearchPipeline.isLowQuality(cache));
+        assertTrue(SearchPipeline.isLowQuality(translated));
+        assertFalse(SearchPipeline.isLowQuality(normal));
+    }
+
+    @Test
+    void lowQualityPatternsParseNullFallsBackAndExplicitConfigReplaces() {
+        // parsePatterns：null=未配置回落基座默认；空串=显式清空；条目 trim+小写。
+        assertEquals(SearchPipeline.BASE_LOW_QUALITY_URL_PATTERNS,
+                SearchPipeline.parsePatterns(null, SearchPipeline.BASE_LOW_QUALITY_URL_PATTERNS));
+        assertTrue(SearchPipeline.parsePatterns("", List.of("x")).isEmpty(), "空串=显式清空");
+        assertEquals(List.of("pinyin.example", "dict.example"),
+                SearchPipeline.parsePatterns(" Pinyin.Example , dict.example ", List.of()),
+                "条目 trim+小写");
+        // 覆写整体替换（不是叠加）：业务名单接管后基座默认模式不再过滤。
+        List<String> business = SearchPipeline.parsePatterns("dict.example", List.of());
+        SearchResult cache = new SearchResult("t",
+                "https://webcache.googleusercontent.com/x", "s", 1, "fake");
+        assertFalse(SearchPipeline.isLowQuality(cache, business, List.of()),
+                "覆写替换默认——基座默认模式随覆写退场");
+    }
+
+    @Test
+    void settingsCarriesLowQualityPatternKeys() {
+        // Settings 装配面：两键装载 + 未配置 null 语义（回落基座默认）。
+        var configured = Settings.load(Map.of("ENV", "development",
+                "SEARCH_LOW_QUALITY_URL_PATTERNS", "dict.example, pinyin.example",
+                "SEARCH_LOW_QUALITY_TITLE_PATTERNS", ""), null);
+        assertEquals("dict.example, pinyin.example", configured.search.lowQualityUrlPatterns);
+        assertEquals("", configured.search.lowQualityTitlePatterns);
+        var defaults = Settings.load(Map.of("ENV", "development"), null);
+        assertNull(defaults.search.lowQualityUrlPatterns, "未配置=null→回落基座默认");
+        assertNull(defaults.search.lowQualityTitlePatterns);
+    }
+
     private static int cacheSize(SearchCache cache) {
         try {
             var field = SearchCache.class.getDeclaredField("entries");

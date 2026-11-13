@@ -77,6 +77,9 @@ public final class WebSearchTool implements AgentTool {
     private final FallbackSearchManager manager;
     private final SearchCache cache;
     private final double timeoutSeconds;
+    /** A-32：低质模式表（Settings 覆写口径；测试构造回落基座默认）。 */
+    private final List<String> lowQualityUrlPatterns;
+    private final List<String> lowQualityTitlePatterns;
 
     /** 生产装配：按 settings 组装引擎与缓存（注册表工厂调用）。 */
     public static WebSearchTool build(Settings settings) {
@@ -86,7 +89,11 @@ public final class WebSearchTool implements AgentTool {
                         settings.search.tavilyApiKey.value(),
                         settings.search.timeoutSeconds)),
                 new SearchCache(settings.search.cacheTtlSeconds),
-                settings.search.timeoutSeconds);
+                settings.search.timeoutSeconds,
+                SearchPipeline.parsePatterns(settings.search.lowQualityUrlPatterns,
+                        SearchPipeline.BASE_LOW_QUALITY_URL_PATTERNS),
+                SearchPipeline.parsePatterns(settings.search.lowQualityTitlePatterns,
+                        SearchPipeline.BASE_LOW_QUALITY_TITLE_PATTERNS));
     }
 
     /**
@@ -101,9 +108,19 @@ public final class WebSearchTool implements AgentTool {
 
     /** 测试路径：注入替身引擎（对应 Python 的 engine_factory 注入点）。 */
     public WebSearchTool(FallbackSearchManager manager, SearchCache cache, double timeoutSeconds) {
+        this(manager, cache, timeoutSeconds,
+                SearchPipeline.BASE_LOW_QUALITY_URL_PATTERNS,
+                SearchPipeline.BASE_LOW_QUALITY_TITLE_PATTERNS);
+    }
+
+    /** 全参形态（A-32）：低质模式表由 Settings 装配传入。 */
+    public WebSearchTool(FallbackSearchManager manager, SearchCache cache, double timeoutSeconds,
+                         List<String> lowQualityUrlPatterns, List<String> lowQualityTitlePatterns) {
         this.manager = manager;
         this.cache = cache;
         this.timeoutSeconds = timeoutSeconds;
+        this.lowQualityUrlPatterns = List.copyOf(lowQualityUrlPatterns);
+        this.lowQualityTitlePatterns = List.copyOf(lowQualityTitlePatterns);
     }
 
     @Override
@@ -200,7 +217,8 @@ public final class WebSearchTool implements AgentTool {
         // 时最坏等待不再无界放大（引擎线程被池掐断后继续跑完的泄漏，从源头
         // 收口）。
         List<SearchResult> raw = manager.search(query, maxResults * 2, timeoutSeconds);
-        List<SearchResult> ranked = SearchPipeline.filterAndRank(raw, query, maxResults);
+        List<SearchResult> ranked = SearchPipeline.filterAndRank(raw, query, maxResults,
+                lowQualityUrlPatterns, lowQualityTitlePatterns);
         if (!ranked.isEmpty()) {
             cache.put(query, ranked);
         }

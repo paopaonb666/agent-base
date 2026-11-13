@@ -268,6 +268,14 @@ public final class Settings {
         public Secret tavilyApiKey = Secret.of("");
         public double timeoutSeconds = 15.0;
         public double cacheTtlSeconds = 300.0;
+        /**
+         * 低质 URL/标题模式（逗号分隔，子串匹配，小写比较；A-32）：null=
+         * 未配置，用基座保守默认（SearchPipeline.BASE_LOW_QUALITY_*）；
+         * 非 null（含空串）=整体替换（空串=显式清空）。业务名单（字典站/
+         * 拼音站类垃圾源）属部署方，不入基座。
+         */
+        public String lowQualityUrlPatterns;
+        public String lowQualityTitlePatterns;
     }
 
     /** 文档解析（tools/parsing）配置节：env 前缀 {@code DOC_PARSE_}。 */
@@ -1003,6 +1011,12 @@ public final class Settings {
             t.enginePriority = value;
         }
         if (v.containsKey("tavily_api_key")) t.tavilyApiKey = Secret.of(v.get("tavily_api_key"));
+        if (v.containsKey("low_quality_url_patterns")) {
+            t.lowQualityUrlPatterns = v.get("low_quality_url_patterns");
+        }
+        if (v.containsKey("low_quality_title_patterns")) {
+            t.lowQualityTitlePatterns = v.get("low_quality_title_patterns");
+        }
         if (v.containsKey("timeout_seconds")) {
             double value = requireFloat("timeout_seconds", v.get("timeout_seconds"));
             if (!(value > 0)) {
