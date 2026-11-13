@@ -144,6 +144,13 @@ public final class CompiledGraph {
                     ? Events.RunTermination.CANCELLED
                     : Events.RunTermination.INTERNAL_ERROR;
             return new RunOutcome(null, termination, e);
+        } catch (Error e) {
+            // A-L84（R2-F2 收口）：JVM 级 Error（类缺失/OOM 等）同样入终止
+            // 枚举——复用 internal_error（不加新 wire 值），ErrorEvent+done
+            // 照常投递，SSE 消费者不再对 Error 路径盲等；runExit 的
+            // unregister/unlock finally 在 Error 路径本就执行（闸门/生命周期
+            // 释放不受影响）。
+            return new RunOutcome(null, Events.RunTermination.INTERNAL_ERROR, e);
         }
     }
 

@@ -204,6 +204,52 @@ class SseStreamsTest {
     }
 
     @Test
+    void jvmErrorBecomesInternalErrorTerminationWithSentinelAndGateRelease() throws Exception {
+        // A-L84（R2-F2 收口）：节点抛 JVM 级 Error（AssertionError 形态代
+        // NoClassDefFoundError/OOM 族）——catch(Error) 归一 internal_error
+        //（不加新 wire 值），ErrorEvent+done 照常投递；onTerminate（闸门
+        // 释放）在 Error 路径恰好一次（produce finally 语义）。
+        AgentModule.ModuleContext ctx = new AgentModule.ModuleContext(
+                new Settings(), null, new InMemoryCheckpointer(), List.of(), null, null);
+        CompiledGraph failing = GraphBuilder.begin()
+                .addNode("jvm", (GraphState state, NodeContext nodeCtx) -> {
+                    throw new AssertionError("模拟 JVM 级错误");
+                })
+                .entry("jvm")
+                .addEdge("jvm", GraphBuilder.END)
+                .compile(ctx.checkpointer(), "chat");
+        SseEmitter emitter = Mockito.mock(SseEmitter.class);
+        AtomicInteger sends = new AtomicInteger();
+        List<Object> builders = new CopyOnWriteArrayList<>();
+        doAnswer(inv -> {
+            sends.incrementAndGet();
+            builders.add(inv.getArgument(0));
+            return null;
+        }).when(emitter).send(any(SseEmitter.SseEventBuilder.class));
+        CountDownLatch normalCompleted = new CountDownLatch(1);
+        Mockito.doAnswer(inv -> {
+            normalCompleted.countDown();
+            return null;
+        }).when(emitter).complete();
+        AtomicInteger gateExits = new AtomicInteger();
+        // 8 参形态注入 mock emitter（:112 七参重载自建 emitter——mock 不被
+        // 触碰，sends 恒 0 的假象教训）。
+        SseStreams.open(failing, List.of(new dev.langchain4j.data.message.UserMessage("hi")),
+                Map.of(), config(), "sse-l84", null, gateExits::incrementAndGet, emitter);
+        assertTrue(normalCompleted.await(5, TimeUnit.SECONDS),
+                "DEBUG sends=" + sends.get() + " data=" + builders);
+        assertEquals(4, sends.get());
+        Mockito.verify(emitter, Mockito.never()).completeWithError(any(Throwable.class));
+        List<String> data = collectData(builders);
+        assertTrue(data.stream().anyMatch(d -> d.startsWith("{\"type\":\"error\"")),
+                "error 事件应在场：" + data);
+        assertTrue(data.stream().anyMatch(
+                        d -> d.startsWith("{\"type\":\"done\"") && d.contains("\"termination\":\"internal_error\"")),
+                "done 应带 termination=internal_error：" + data);
+        assertEquals(1, gateExits.get(), "闸门在 Error 路径释放恰好一次");
+    }
+
+    @Test
     void errorEventCarriesStructuredCodeForTypedFailures() throws Exception {
         // #91：可判型的失败（递归触顶）在 error 事件带 code=recursion_limit；
         // 不可判型的普通 provider 异常不带 code（wire 省键，旧形态）。

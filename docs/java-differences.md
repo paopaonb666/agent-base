@@ -61,6 +61,7 @@
 | #8 中断恢复 resume | `POST /{module}/threads/{thread_id}/resume` 端点：RunRegistry 末次终态记录判定可恢复性（非 done 终态可恢复；done=400），复用 startStream 全套机制以**空输入重入图**——快照即全部上下文、从入口节点续跑（chat 图语义=对被中断轮次的新回应）。在途 run 409（与 invoke 同码）、无记录/非属主 404 掩蔽。Python 无此面 | `S/core/graph/RunRegistry.java`（LastRun）、`S/entrypoints/server/routes/AgentsRoutes.java`（resumeThread）；progress 登记 2026-11-14 `#8` 行 |
 | #26 危险工具审批门 | `TOOL_APPROVAL_MODE`（off 默认/逗号名单）+ `TOOL_APPROVAL_TIMEOUT_SECONDS`：命中名单的工具调用执行前 run 暂停（RunTermination 新增 `paused` wire 值【additive】），快照带 pending_approval 标记且**悬挂 tool_calls 有意保留**（剥除守卫跳过）；`POST .../approvals/{call_id}` 记录批准/拒绝（ApprovalLedger，provider id 稳定；TTL 过期视同拒绝），resume 端点带 entryOverride 从暂停节点续跑——批准执行/拒绝回喂提示文本。Graphs tools 与 planner ExecuteNode 两接线点共用 ToolApprovalGate 单源。Python 无此面 | `S/core/graphs/ToolApprovalGate.java`、`S/core/tools/ApprovalLedger.java`、`S/core/graph/CompiledGraph.java`（PAUSED 分支）、`S/entrypoints/server/routes/AgentsRoutes.java`（approveToolCall）；progress 登记 2026-11-14 `#26` 行 |
 | #62 plan 审批门 | `PLANNER_APPROVAL`（默认关）：plan/replan 节点拆解出任务即暂停（pending_approval resume_node=execute，marker 型暂停——tasks 随 update 落盘）；`POST .../approvals/plan {decision}` 决定后 resume 续跑——批准照常执行子任务，拒绝把未完成任务标记 FAILED（summary=计划被用户拒绝）并走正常 replan 路由（修订版计划再次暂停等批准，replan 预算有界、未批准绝不执行）。Python 无此面 | `S/modules/planner/graph/{PlanNode,CheckNodes,ExecuteNode}.java`、`S/core/graph/CompiledGraph.java`（marker 型暂停）；progress 登记 2026-11-14 `#62` 行 |
+| L79+#76 账本 attempt/fallback 列 | `cost_usage` 增 `attempt INTEGER` / `fallback VARCHAR(64)` 两列（SchemaMigrations 迁移 `001_cost_attempt_fallback`，sqlite+MySQL 同一清单、版本表幂等；DDL 保守 8 列、新库旧库单一路径补列）——ResilientModelRuntime 经 ThreadLocal 写账上下文在每次真实调用时记账（attempt 位次；fallback 列="fallback#序号"，主档尝试 NULL），旧行/无弹性包装行为 NULL。Python 账本无此两列 | `S/core/llm/{UsageSinks,ResilientModelRuntime}.java`、`S/extensions/costmeter/{CostMeter,UsageRecord,CostLedgers}.java`；progress 登记 2026-11-14 批13 行 |
 | #29 MCP 健康可见 + 惰性重连 | `/health` 增 `mcp` 组件（down:server 名单，参与 degraded 判定）；McpClient 工厂形态断开后惰性重连（关旧通道→新通道→重新握手，写失败 force 重试一次、响应超时不重试）。Python MCP 无健康检查/重连 | `S/toolkit/mcp/{McpClient,McpTransportFactory,McpSources}.java`、`S/entrypoints/server/routes/SystemRoutes.java`；progress 登记 `29` 行 |
 | #91 结构化错误码 | HTTP 错误体 `{detail, code}` 旁挂 + SSE `error` 事件 `code` 键（NON_NULL，缺省省键=旧 wire 逐字节）：封闭枚举（rate_limited/budget_blocked/thread_busy/module_unavailable/llm_unavailable/recursion_limit 等 15 值）。Python 双通道均无 code——前端只认 code 的消费面按 Java 部署开发 | `S/entrypoints/server/ErrorCode.java`、`S/entrypoints/server/HttpError.java`、`S/entrypoints/server/GlobalExceptionHandler.java`、`S/extensions/events/Events.java`（ErrorEvent）；progress 登记 `91` 行 |
 | #50 知识检索父块推导 | knowledge_search 返回条目附加 `parent_text`/`parent_span`（同 file 内 ordinal 连续命中块按 offsets 推导合并，零 DDL）；工具渲染按父块合条（「第 N-M 段」）。Python search_knowledge 无父块概念 | `M/service/MemoryService.java`（deriveParents）、`M/tools/MemoryTools.java`（knowledge_search 渲染）；progress 登记 `50` 行 |
@@ -84,7 +85,5 @@
 
 ## 三、待修（登记待后续）
 
-| 项 | 说明 | 锚点 |
-| --- | --- | --- |
-| #75 attempt/fallback 列未进账本 schema | LLM 弹性包的重试 attempt 与回落（fast→main fallback）信息当前只进日志，未进 `cost_usage` 账本列——留 #76 做 schema 演进 | `S/core/llm/ResilientModelRuntime.java`；progress 登记 Wave 1 `1+10+73+75` 行 |
-| code review R2-F2 Error/Throwable 不入终止枚举 | streamWithTermination 的 catch 链只到 RuntimeException——Error（如 OOM）路径的 done 事件无 termination 标注（sentinel/闸门释放仍正常）；补 catch(Error) 属低收益高敏感改动，登记观察 | `S/core/graph/CompiledGraph.java`（catch 链） |
+> **2026-11-14 清零**：L79+#76（attempt/fallback 账本列，见 §二扩展行）与
+> L84（catch(Error) 入 internal_error 终止枚举）均已收口——本节无待修项。
