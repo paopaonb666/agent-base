@@ -78,7 +78,7 @@ public final class ToolCallLoggers {
     private static final String SELECT_SQL =
             "SELECT call_id, thread_id, module, request_id, tool, args_json, result_text,"
                     + " status, error_text, duration_ms FROM tool_call_records"
-                    + " WHERE thread_id = ? ORDER BY id DESC LIMIT ?";
+                    + " WHERE thread_id = ? ORDER BY id DESC LIMIT ? OFFSET ?";
 
     private ToolCallLoggers() {}
 
@@ -107,7 +107,31 @@ public final class ToolCallLoggers {
                     }
                 }
             }
-            return matched.subList(Math.max(0, matched.size() - limit), matched.size()).stream()
+            return tailWindow(matched, limit, 0);
+        }
+
+        @Override
+        public List<Map<String, Object>> listForThread(String threadId, int limit, int offset) {
+            List<ToolCallRecord> matched = new ArrayList<>();
+            synchronized (lock) {
+                for (ToolCallRecord r : records) {
+                    if (r.threadId().equals(threadId)) {
+                        matched.add(r);
+                    }
+                }
+            }
+            return tailWindow(matched, limit, offset);
+        }
+
+        /**
+         * A-#217 尾窗切片：时间升序列表取「最新 offset+limit 条中的
+         * offset 之后段」——offset 从最新一端跳过（与 #204 同语义）。
+         */
+        private static List<Map<String, Object>> tailWindow(List<ToolCallRecord> matched,
+                                                            int limit, int offset) {
+            int from = Math.max(0, matched.size() - limit - Math.max(0, offset));
+            int to = Math.max(from, matched.size() - Math.max(0, offset));
+            return matched.subList(from, to).stream()
                     .map(ToolCallRecord::asDict)
                     .toList();
         }
@@ -258,10 +282,16 @@ public final class ToolCallLoggers {
 
         @Override
         public List<Map<String, Object>> listForThread(String threadId, int limit) {
+            return listForThread(threadId, limit, 0);
+        }
+
+        @Override
+        public List<Map<String, Object>> listForThread(String threadId, int limit, int offset) {
             List<Object[]> rows = new ArrayList<>();
             try (PreparedStatement ps = conn.prepareStatement(SELECT_SQL)) {
                 ps.setString(1, threadId);
                 ps.setInt(2, limit);
+                ps.setInt(3, Math.max(0, offset));
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
                         rows.add(rowOf(rs));
@@ -355,11 +385,17 @@ public final class ToolCallLoggers {
 
         @Override
         public List<Map<String, Object>> listForThread(String threadId, int limit) {
+            return listForThread(threadId, limit, 0);
+        }
+
+        @Override
+        public List<Map<String, Object>> listForThread(String threadId, int limit, int offset) {
             List<Object[]> rows = new ArrayList<>();
             try (Connection conn = connect();
                  PreparedStatement ps = conn.prepareStatement(SELECT_SQL)) {
                 ps.setString(1, threadId);
                 ps.setInt(2, limit);
+                ps.setInt(3, Math.max(0, offset));
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
                         rows.add(new Object[]{

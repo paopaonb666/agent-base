@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -261,7 +262,7 @@ class ApiEndpointMatrixTest {
         when(index.getThreadIndex(anyString()))
                 .thenReturn(ThreadIndexRecord.create("chat:t1", "alice", "chat", "t"));
         var recorder = Mockito.mock(io.github.paopaonb666.agentbase.extensions.toollog.ToolCallRecorder.class);
-        when(recorder.listForThread(anyString(), anyInt())).thenReturn(List.of(
+        when(recorder.listForThread(anyString(), anyInt(), anyInt())).thenReturn(List.of(
                 new ToolCallRecord("c1", "web_search", "ok", "{}", "r", "", 12,
                         "chat:t1", "chat", "req").asDict()));
         AgentRuntime runtime = runtime(Map.of("chat", graphStub("chat")), null, index,
@@ -273,11 +274,49 @@ class ApiEndpointMatrixTest {
         List<Map<String, Object>> calls = (List<Map<String, Object>>) out.get("tool_calls");
         assertEquals(1, calls.size());
         ArgumentCaptor<Integer> limit = ArgumentCaptor.forClass(Integer.class);
-        verify(recorder).listForThread(eq("chat:t1"), limit.capture());
-        assertEquals(500, limit.getValue(), "limit 上钳 500");
+        ArgumentCaptor<Integer> offset = ArgumentCaptor.forClass(Integer.class);
+        verify(recorder).listForThread(eq("chat:t1"), limit.capture(), offset.capture());
+        assertEquals(501, limit.getValue(), "limit 上钳 500 后 +1 探针行（A-#217）");
+        assertEquals(0, offset.getValue(), "offset 缺省 0");
 
         routes.toolCalls("chat", "t1", 0, "alice", null, null, null);
-        verify(recorder).listForThread(eq("chat:t1"), eq(1));
+        verify(recorder).listForThread(eq("chat:t1"), eq(2), eq(0));
+    }
+
+    @Test
+    void toolCallsPaginationWalksByOffset() throws Exception {
+        // A-#217 分页行走（真实内存 recorder）：limit=2 取 3 条探针 →
+        // 首页 2 条 + next_offset=2；offset=2 → 余 1 条、无 next_offset 键
+        // （旧 wire 逐字节）。offset 从最新一端跳过——翻页向更旧方向走。
+        var index = Mockito.mock(io.github.paopaonb666.agentbase.core.storage.CoreStore.class);
+        when(index.getThreadIndex(anyString()))
+                .thenReturn(ThreadIndexRecord.create("chat:t1", "alice", "chat", "t"));
+        var recorder = new io.github.paopaonb666.agentbase.extensions.toollog.ToolCallLoggers
+                .MemoryToolCallRecorder();
+        for (int i = 1; i <= 3; i++) {
+            recorder.record(new ToolCallRecord("c" + i, "web_search", "ok", "{}",
+                    "r" + i, "", 10, "chat:t1", "chat", "req"));
+        }
+        AgentRuntime runtime = runtime(Map.of("chat", graphStub("chat")), null, null,
+                null, null, recorder, null);
+        AgentsRoutes routes = new AgentsRoutes(runtime, PASS_THROUGH_AUTH, providerOf(null));
+
+        Map<String, Object> page1 = mapOf(routes.toolCalls("chat", "t1", 2, 0,
+                "alice", null, null, null));
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> calls1 = (List<Map<String, Object>>) page1.get("tool_calls");
+        assertEquals(2, calls1.size());
+        assertEquals("c2", calls1.get(0).get("call_id"), "offset=0 取最新 2 条");
+        assertEquals("c3", calls1.get(1).get("call_id"));
+        assertEquals(2, page1.get("next_offset"));
+
+        Map<String, Object> page2 = mapOf(routes.toolCalls("chat", "t1", 2, 2,
+                "alice", null, null, null));
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> calls2 = (List<Map<String, Object>>) page2.get("tool_calls");
+        assertEquals(1, calls2.size());
+        assertEquals("c1", calls2.get(0).get("call_id"), "翻页向更旧方向");
+        assertFalse(page2.containsKey("next_offset"), "无更多时不发键");
 
         // recorder 缺席 → 空清单（审计旁路缺席不打断读取）。
         AgentRuntime bare = runtime(Map.of("chat", graphStub("chat")), null, index,

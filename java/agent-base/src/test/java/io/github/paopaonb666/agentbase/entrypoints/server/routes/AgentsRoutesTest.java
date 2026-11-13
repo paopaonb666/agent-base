@@ -981,7 +981,8 @@ class AgentsRoutesTest {
 
         routes.toolCalls("chat", "t1", 600, "u1", null, null, null);
         assertEquals(1, calls.size());
-        assertTrue(calls.get(0).contains("500"), calls.get(0));
+        // A-#217 探针行：limit 上钳 500 后 +1 探针（取 501 行判 has_more）。
+        assertTrue(calls.get(0).contains("501"), calls.get(0));
         // 无 recorder → 空列表（不抛错）。
         AgentRuntime bare = buildRuntime(Map.of("chat", stubModule("chat")),
                 new InMemoryCheckpointer(), null, null, null, null, null);

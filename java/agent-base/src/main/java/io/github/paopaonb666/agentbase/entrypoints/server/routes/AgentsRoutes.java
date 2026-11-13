@@ -896,9 +896,17 @@ public class AgentsRoutes {
 
     // ── GET /{module}/threads/{thread_id}/tool-calls：审计记录 ───────────
     @GetMapping("/{module}/threads/{thread_id}/tool-calls")
+    /** 七参形态（A-#217 offset 缺省 0——既有调用方/测试的兼容入口）。 */
+    public Map<String, Object> toolCalls(String module, String threadId, int limit,
+                                         String userIdHeader, String sigHeader,
+                                         String tsHeader, String nonceHeader) {
+        return toolCalls(module, threadId, limit, 0, userIdHeader, sigHeader, tsHeader, nonceHeader);
+    }
+
     public Map<String, Object> toolCalls(@PathVariable("module") String module,
                                          @PathVariable("thread_id") String threadId,
                                          @RequestParam(value = "limit", defaultValue = "100") int limit,
+                                         @RequestParam(value = "offset", defaultValue = "0") int offset,
                                          @RequestHeader(value = "X-User-Id", required = false) String userIdHeader,
                                          @RequestHeader(value = "X-User-Sig", required = false) String sigHeader,
                                          @RequestHeader(value = "X-User-Timestamp", required = false) String tsHeader,
@@ -914,8 +922,23 @@ public class AgentsRoutes {
         if (recorder == null) {
             return Map.of("tool_calls", List.of());
         }
-        return Map.of("tool_calls", recorder.listForThread(
-                new ThreadId(module, threadId).toString(), Math.max(1, Math.min(limit, 500))));
+        // A-#217 分页（#204 探针行先例）：offset 从最新一端跳过，取
+        // limit+1 探针行——多出 1 行即还有更旧记录，回 next_offset；无更多
+        // 时不发键（旧 wire 逐字节）。列表是时间升序（SQL DESC 查询已反转
+        // ——两实现同口径），探针窗超限裁剪取**尾部** limit 条（窗口内最新
+        // 段），升序进升序出。
+        int effLimit = Math.max(1, Math.min(limit, 500));
+        int effOffset = Math.max(0, offset);
+        List<Map<String, Object>> page = recorder.listForThread(
+                new ThreadId(module, threadId).toString(), effLimit + 1, effOffset);
+        Map<String, Object> out = new LinkedHashMap<>();
+        boolean hasMore = page.size() > effLimit;
+        out.put("tool_calls", hasMore
+                ? page.subList(page.size() - effLimit, page.size()) : page);
+        if (hasMore) {
+            out.put("next_offset", effOffset + effLimit);
+        }
+        return out;
     }
 
     // ── GET /{module}/threads/{thread_id}/plan：只读计划状态（M10 读表） ──

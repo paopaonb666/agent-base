@@ -18,6 +18,15 @@ public interface ToolCallRecorder {
     /** 某线程的审计记录（时间升序，最多 limit 条）。 */
     List<Map<String, Object>> listForThread(String threadId, int limit);
 
+    /**
+     * A-#217 分页形态：{@code offset} 从<b>最新一端</b>跳过（与 #204 线程
+     * 列表游标同语义——翻页向更旧的方向走）。default 委托 2 参旧形态
+     * （忽略 offset——兼容垫片）；SQL 实现覆写为 LIMIT/OFFSET 下推。
+     */
+    default List<Map<String, Object>> listForThread(String threadId, int limit, int offset) {
+        return listForThread(threadId, limit);
+    }
+
     /** 释放后台资源（写线程/连接）；默认无操作。 */
     default void close() {}
 }
