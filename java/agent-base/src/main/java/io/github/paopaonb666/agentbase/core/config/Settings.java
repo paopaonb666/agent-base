@@ -562,6 +562,50 @@ public final class Settings {
      * 对应 Python 侧 {@code Settings._lift_legacy_flat_fields}。
      * 注意 {@code llm_fast_} 必须排在 {@code llm_} 之前。
      */
+
+    // ── A-#118：诊断配置导出（敏感键逐键掩码）──────────────────────────
+
+    /**
+     * 诊断配置导出（A-#118，GET /v1/system/config 的载荷）：节名（camel）
+     * → 字段（snake）→ 值。{@link Secret} 族字段逐键掩码为 "***"——按
+     * <b>字段类型</b>判定不靠名单（新增敏感键自动被掩）；其余值原样。
+     * 导出面只读、不含运行时状态；reflection 只走本类内声明的节字段
+     * （新增配置节自动进导出面）。
+     */
+    public Map<String, Object> exportForDiagnostics() {
+        Map<String, Object> out = new LinkedHashMap<>();
+        for (java.lang.reflect.Field sectionField : Settings.class.getDeclaredFields()) {
+            if (java.lang.reflect.Modifier.isStatic(sectionField.getModifiers())
+                    || !sectionField.getType().getName()
+                            .startsWith(Settings.class.getName() + "$")) {
+                continue;
+            }
+            try {
+                sectionField.setAccessible(true);
+                Object section = sectionField.get(this);
+                Map<String, Object> values = new LinkedHashMap<>();
+                for (java.lang.reflect.Field f : sectionField.getType().getDeclaredFields()) {
+                    if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) {
+                        continue;
+                    }
+                    f.setAccessible(true);
+                    values.put(camelToSnake(f.getName()), f.getType() == Secret.class
+                            ? "***" : f.get(section));
+                }
+                out.put(sectionField.getName(), values);
+            } catch (IllegalAccessException e) {
+                throw new IllegalStateException("config export failed", e);
+            }
+        }
+        return out;
+    }
+
+    /** camelCase → snake_case（导出键与 env 键约定一致）。 */
+    static String camelToSnake(String name) {
+        return name.replaceAll("([a-z0-9])([A-Z])", "$1_$2")
+                .toLowerCase(java.util.Locale.ROOT);
+    }
+
     /**
      * 照旧文档/记忆写的平铺键会被更宽的前缀吞进错误配置节后被静默丢弃
      * （#101：LLM_HEALTH_PROBE_MODEL 被 {@code llm_} 前缀抬进 llm 节，

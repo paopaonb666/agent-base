@@ -45,4 +45,31 @@ class SettingsSecretTest {
         // 默认字段为空 Secret（不是 null），isBlank 判空语义保持。
         assertTrue(new Settings().llmFast.apiKey.isBlank());
     }
+
+    @Test
+    void diagnosticExportMasksEverySecretFieldByType() {
+        // A-#118：导出面 Secret 族逐键掩码——按字段类型判定（新增敏感键
+        // 自动被掩），非敏感值原样，键名与 env 约定同 snake_case。
+        Settings s = Settings.load(java.util.Map.of(
+                "ENV", "development",
+                "LLM_API_KEY", "sk-main",
+                "TAVILY_API_KEY", "tvly-1",
+                "CHECKPOINTER_MYSQL_PASSWORD", "pw-1"));
+        var out = s.exportForDiagnostics();
+        @SuppressWarnings("unchecked")
+        var llm = (java.util.Map<String, Object>) out.get("llm");
+        assertEquals("***", llm.get("api_key"));
+        @SuppressWarnings("unchecked")
+        var search = (java.util.Map<String, Object>) out.get("search");
+        assertEquals("***", search.get("tavily_api_key"));
+        assertEquals("tavily", search.get("engine_priority"));
+        @SuppressWarnings("unchecked")
+        var checkpointer = (java.util.Map<String, Object>) out.get("checkpointer");
+        assertEquals("***", checkpointer.get("mysql_password"));
+        // 全面性：导出树里除掩码外不出现任何 Secret 原值。
+        String rendered = String.valueOf(out);
+        assertFalse(rendered.contains("sk-main"));
+        assertFalse(rendered.contains("tvly-1"));
+        assertFalse(rendered.contains("pw-1"));
+    }
 }

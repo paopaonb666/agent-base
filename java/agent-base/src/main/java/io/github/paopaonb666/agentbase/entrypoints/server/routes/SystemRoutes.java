@@ -169,6 +169,14 @@ public class SystemRoutes {
         return Map.of("tools", tools);
     }
 
+    // ── GET /v1/system/config：诊断配置导出（A-#118，敏感键已掩码）──────
+
+    /** Settings.exportForDiagnostics 的端点壳——Secret 族逐键掩码见其 javadoc。 */
+    @GetMapping("/v1/system/config")
+    public Map<String, Object> configDiagnostics() {
+        return runtime.settings().exportForDiagnostics();
+    }
+
     // ── GET /health：组件健康；degraded 表示部分失败 ────────────────────
 
     @GetMapping("/health")
