@@ -146,6 +146,29 @@ public class SystemRoutes {
         return body;
     }
 
+    // ── GET /v1/tools：工具自描述清单（A-#34）────────────────────────────
+
+    /**
+     * 池内工具的自描述面（排障便利）：名+描述+参数 schema（langchain4j
+     * JsonObjectSchema 的渲染形态）——与 /v1/modules 同风格，按名字稳定
+     * 排序（#16 specifications() 契约）。池缺席（无工具装配）返回空表。
+     */
+    @GetMapping("/v1/tools")
+    public Map<String, Object> listTools() {
+        List<Map<String, Object>> tools = new ArrayList<>();
+        var pool = runtime.tools();
+        if (pool != null) {
+            for (dev.langchain4j.agent.tool.ToolSpecification spec : pool.specifications()) {
+                Map<String, Object> view = new LinkedHashMap<>();
+                view.put("name", spec.name());
+                view.put("description", spec.description() == null ? "" : spec.description());
+                view.put("parameters", String.valueOf(spec.parameters()));
+                tools.add(view);
+            }
+        }
+        return Map.of("tools", tools);
+    }
+
     // ── GET /health：组件健康；degraded 表示部分失败 ────────────────────
 
     @GetMapping("/health")
@@ -212,8 +235,16 @@ public class SystemRoutes {
                     + ",leaked:" + runtime.tools().leakedTaskCount() + ",");
         }
         components.put("pools", pools.toString());
+        // A-#214：sse 在途水位（在飞/闸门上限）与 threads 活跃数——观测数值
+        // 段，不参与 ok/degraded 判定（与 pools 同哲学）。闸门缺席（测试直
+        // 构 SystemRoutes）按 0/0 报告。
+        var gate = io.github.paopaonb666.agentbase.entrypoints.server.RunGate.active();
+        components.put("sse", "inflight:" + (gate == null ? 0 : gate.inFlight())
+                + "/" + (gate == null ? 0 : gate.maxConcurrent()));
+        components.put("threads", "active:" + io.github.paopaonb666.agentbase.core.graph.RunRegistry.activeCount());
         boolean allOk = components.entrySet().stream()
-                .filter(e -> !"pools".equals(e.getKey()))
+                .filter(e -> !"pools".equals(e.getKey()) && !"sse".equals(e.getKey())
+                        && !"threads".equals(e.getKey()))
                 .allMatch(e -> "ok".equals(e.getValue()));
         return Map.of("status", allOk ? "ok" : "degraded", "components", components);
     }
@@ -227,7 +258,8 @@ public class SystemRoutes {
                 + Metrics.memory().renderMemoryMetrics()
                 + Metrics.cost().renderCostMetrics()
                 + Metrics.events().renderEventDropMetrics()
-                + Metrics.context().renderContextMetrics();
+                + Metrics.context().renderContextMetrics()
+                + Metrics.renderEmbeddingCooldownMetrics();
         return ResponseEntity.ok().contentType(MediaType.parseMediaType(
                 "text/plain; version=0.0.4; charset=utf-8")).body(body);
     }

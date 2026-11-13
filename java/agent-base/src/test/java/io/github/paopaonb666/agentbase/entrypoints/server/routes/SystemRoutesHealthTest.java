@@ -3,12 +3,14 @@ package io.github.paopaonb666.agentbase.entrypoints.server.routes;
 import io.github.paopaonb666.agentbase.core.AgentModule;
 import io.github.paopaonb666.agentbase.core.AgentRuntime;
 import io.github.paopaonb666.agentbase.core.config.Settings;
+import io.github.paopaonb666.agentbase.core.tools.AgentTool;
 import io.github.paopaonb666.agentbase.extensions.costmeter.CostGovernor;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 import org.springframework.beans.factory.ObjectProvider;
 
 import java.lang.reflect.Constructor;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -201,7 +203,7 @@ class SystemRoutesHealthTest {
     @Test
     void componentOrderIsStableForHumans() throws Exception {
         // 渲染顺序锁定（LinkedHashMap）：checkpointer → model → memory → cost
-        // → pools（#81 观测数值段恒在尾部）。
+        // → pools → sse/threads（A-#214 观测数值段尾族）。
         Settings s = settingsWith("", "http://health-order-" + System.nanoTime(), false);
         var checkpointer = Mockito.mock(io.github.paopaonb666.agentbase.core.graph.Checkpointer.class);
         Mockito.when(checkpointer.healthy()).thenReturn(true);
@@ -211,8 +213,26 @@ class SystemRoutesHealthTest {
         CostGovernor governor = Mockito.mock(CostGovernor.class);
         Mockito.when(governor.status()).thenReturn("ok");
         Map<String, String> c = components(healthOf(buildRuntime(s, checkpointer, memory), governor));
-        assertEquals("[checkpointer, model, memory, cost, pools]", c.keySet().toString());
+        assertEquals("[checkpointer, model, memory, cost, pools, sse, threads]",
+                c.keySet().toString());
         assertTrue(c.containsKey("memory"));
+    }
+
+    @Test
+    void sseAndThreadsComponentsReportGaugesWithoutFlippingStatus() throws Exception {
+        // A-#214：sse（在飞/闸门上限；闸门缺席按 0/0）与 threads（RunRegistry
+        // 活跃数）是观测数值段——不参与 ok/degraded 判定（pools 同哲学）。
+        Settings s = settingsWith("", "http://health-sse-threads-" + System.nanoTime(), false);
+        var checkpointer = Mockito.mock(io.github.paopaonb666.agentbase.core.graph.Checkpointer.class);
+        Mockito.when(checkpointer.healthy()).thenReturn(true);
+        Map<String, String> c = components(healthOf(buildRuntime(s, checkpointer, null), null));
+        assertTrue(c.get("sse").startsWith("inflight:0/"), String.valueOf(c.get("sse")));
+        assertEquals("active:0", c.get("threads"), "无在途 run 时活跃数为 0");
+        // 其余组件全 ok 时整体状态仍 ok（sse/threads 不参与判定）。
+        Settings allOk = settingsWith("sk-test", "http://health-sse-ok-" + System.nanoTime(), false);
+        var okRuntime = buildRuntime(allOk, checkpointer, null);
+        Map<String, Object> health = healthOf(okRuntime, null);
+        assertEquals("ok", health.get("status"));
     }
 
     @Test
@@ -249,6 +269,67 @@ class SystemRoutesHealthTest {
         String withTool = components(health).get("pools");
         assertTrue(withTool.startsWith("tool:0/0,leaked:0,"), withTool);
         assertEquals("ok", health.get("status"), "pools 数值段不得翻转整体状态");
+    }
+
+    @Test
+    void toolsEndpointListsPoolSpecificationsSorted() throws Exception {
+        // A-#34：/v1/tools 自描述面——池内工具名+描述+参数 schema，名字典序
+        //（#16 specifications() 契约）；池缺席 → 空表。
+        AgentTool alpha = new AgentTool() {
+            @Override public String name() { return "alpha"; }
+            @Override public String description() { return "第一个"; }
+            @Override public dev.langchain4j.agent.tool.ToolSpecification specification() {
+                return dev.langchain4j.agent.tool.ToolSpecification.builder()
+                        .name("alpha").description("第一个").build();
+            }
+            @Override public String call(String argsJson, ToolContext ctx) { return ""; }
+        };
+        AgentTool beta = new AgentTool() {
+            @Override public String name() { return "beta"; }
+            @Override public String description() { return "第二个"; }
+            @Override public dev.langchain4j.agent.tool.ToolSpecification specification() {
+                return dev.langchain4j.agent.tool.ToolSpecification.builder()
+                        .name("beta").description("第二个")
+                        .parameters(dev.langchain4j.model.chat.request.json.JsonObjectSchema.builder()
+                                .addStringProperty("target").build())
+                        .build();
+            }
+            @Override public String call(String argsJson, ToolContext ctx) { return ""; }
+        };
+        // 注册序故意倒置——端点输出按名字稳定排序（#16）。
+        var pool = io.github.paopaonb666.agentbase.core.tools.ToolPool.build(
+                java.util.List.of(), java.util.List.of(beta, alpha), 30.0,
+                java.util.Map.of(), null);
+        var checkpointer = Mockito.mock(io.github.paopaonb666.agentbase.core.graph.Checkpointer.class);
+        Mockito.when(checkpointer.healthy()).thenReturn(true);
+        Constructor<AgentRuntime> ctor = AgentRuntime.class.getDeclaredConstructor(
+                Settings.class, io.github.paopaonb666.agentbase.core.llm.ModelRuntime.class,
+                Map.class, io.github.paopaonb666.agentbase.core.tools.ToolPool.class,
+                io.github.paopaonb666.agentbase.core.graph.Checkpointer.class,
+                io.github.paopaonb666.agentbase.extensions.toollog.ToolCallRecorder.class,
+                io.github.paopaonb666.agentbase.extensions.filestore.UploadedFileStore.class,
+                AgentModule.MemoryServicePort.class,
+                io.github.paopaonb666.agentbase.core.storage.CoreStore.class,
+                AgentModule.PlanStorePort.class);
+        ctor.setAccessible(true);
+        AgentRuntime withPool = ctor.newInstance(settingsWith("", "http://tools-endpoint", false),
+                null, Map.of(), pool, checkpointer, null, null, null, null, null);
+        Map<String, Object> out = new SystemRoutes(withPool,
+                providerOf(null)).listTools();
+        List<?> tools = (List<?>) out.get("tools");
+        assertEquals(2, tools.size());
+        Map<?, ?> first = (Map<?, ?>) tools.get(0);
+        assertEquals("alpha", first.get("name"));
+        assertEquals("第一个", first.get("description"));
+        Map<?, ?> second = (Map<?, ?>) tools.get(1);
+        assertEquals("beta", second.get("name"));
+        assertTrue(second.get("parameters") instanceof String
+                && !((String) second.get("parameters")).isEmpty(), "参数 schema 渲染在场");
+        // 池缺席 → 空表（runtime 无池）。
+        Map<String, Object> empty = new SystemRoutes(buildRuntime(
+                settingsWith("", "http://tools-empty", false), null, null),
+                providerOf(null)).listTools();
+        assertEquals(List.of(), empty.get("tools"));
     }
 
     @Test
