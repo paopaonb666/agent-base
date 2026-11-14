@@ -984,6 +984,7 @@ public class AgentsRoutes {
                 out.put("tasks", stored.getOrDefault("tasks", List.of()));
                 out.put("cursor", numberOr(stored.get("cursor"), 0));
                 out.put("replans", numberOr(stored.get("replans"), 0));
+                out.put("pending_approval", planPendingApproval(fullThreadId, userId));
                 return out;
             }
         }
@@ -996,7 +997,27 @@ public class AgentsRoutes {
         out.put("tasks", snapshot != null ? snapshot.getOrDefault("tasks", List.of()) : List.of());
         out.put("cursor", snapshot != null ? numberOr(snapshot.get("cursor"), 0) : 0);
         out.put("replans", snapshot != null ? numberOr(snapshot.get("replans"), 0) : 0);
+        out.put("pending_approval", planPendingApproval(fullThreadId, userId));
         return out;
+    }
+
+    /**
+     * 计划审批待决信号（GUI 验收缺陷 9 的 backend 半边）：lastRun 终态为
+     * paused 且快照 marker 的 detail=plan → true。工具门暂停（detail=
+     * pending_calls=…）不报——前端从历史悬挂 tool_calls 识别。additive 键
+     * （缺省 false，旧客户端忽略）；pending_approval marker 在快照 extras，
+     * 历史消息不可见，此端点是前端恢复暂停线程时唯一的权威来源。
+     */
+    private boolean planPendingApproval(String fullThreadId, String userId) {
+        RunRegistry.LastRun last = RunRegistry.lastRun(fullThreadId);
+        if (last == null || !"paused".equals(last.termination())) {
+            return false;
+        }
+        GraphState snapshot = runtime.graph("planner")
+                .getState(new RunConfig(fullThreadId, userId, runtime.settings().agentRecursionLimit));
+        return snapshot != null
+                && snapshot.extra().get("pending_approval") instanceof Map<?, ?> pending
+                && "plan".equals(String.valueOf(pending.get("detail")));
     }
 
     // ── DELETE /{module}/threads/{thread_id}：级联删除 ───────────────────

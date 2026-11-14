@@ -5,7 +5,9 @@ import io.github.paopaonb666.agentbase.core.AgentRuntime;
 import io.github.paopaonb666.agentbase.core.config.Settings;
 import io.github.paopaonb666.agentbase.core.graph.CompiledGraph;
 import io.github.paopaonb666.agentbase.core.graph.GraphBuilder;
+import io.github.paopaonb666.agentbase.core.graph.GraphState;
 import io.github.paopaonb666.agentbase.core.graph.InMemoryCheckpointer;
+import io.github.paopaonb666.agentbase.core.graph.RunRegistry;
 import io.github.paopaonb666.agentbase.core.storage.ThreadIndexRecord;
 import io.github.paopaonb666.agentbase.entrypoints.server.AuthBackends;
 import io.github.paopaonb666.agentbase.entrypoints.server.ErrorCode;
@@ -1282,5 +1284,26 @@ class AgentsRoutesTest {
         HttpError error = httpErrorOf(() ->
                 routes.threadPlan("chat", "t1", "u1", null, null, null));
         assertEquals(503, error.status());
+    }
+
+    @Test
+    void planEndpointFlagsPendingApprovalForPausedPlanGateThread() throws Exception {
+        // GUI 验收缺陷 9（backend）：前端恢复暂停线程需要权威的「计划审批待
+        // 决」信号——pending_approval marker 在快照 extras，不在历史消息里
+        // （工具门可从历史悬挂 tool_calls 启发式识别，计划门不行）。plan
+        // 端点 additive 键：lastRun 终态 paused 且 marker detail=plan → true。
+        InMemoryCheckpointer cp = new InMemoryCheckpointer();
+        cp.put("planner:t-pp", new GraphState(List.of(),
+                Map.of("pending_approval", Map.of("resume_node", "execute", "detail", "plan"))));
+        RunRegistry.recordLastRun("planner:t-pp", "u1", "run-pp", "paused");
+        AgentRuntime runtime = buildRuntime(Map.of("planner", stubModule("planner")),
+                cp, null, null, null, null, null);
+        AgentsRoutes routes = route(runtime);
+        Map<String, Object> out = routes.threadPlan("planner", "t-pp", "u1", null, null, null);
+        assertEquals(Boolean.TRUE, out.get("pending_approval"), "暂停计划线程应报待审批");
+        // 非暂停线程（lastRun done）→ false。
+        RunRegistry.recordLastRun("planner:t-done", "u1", "run-done", "done");
+        Map<String, Object> out2 = routes.threadPlan("planner", "t-done", "u1", null, null, null);
+        assertEquals(Boolean.FALSE, out2.get("pending_approval"), "非暂停线程不误报");
     }
 }
