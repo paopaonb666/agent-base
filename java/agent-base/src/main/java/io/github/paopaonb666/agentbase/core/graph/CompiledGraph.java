@@ -271,6 +271,11 @@ public final class CompiledGraph {
      * SystemMessage。队列空=零开销直返（事件流逐字节不变）。
      */
     private void drainSteering(RunConfig config, GraphState state, EventSink sink) {
+        drainSteering(config, state, sink, false);
+    }
+
+    private void drainSteering(RunConfig config, GraphState state, EventSink sink,
+                               boolean finalRerun) {
         RunRegistry.RunHandle handle = RunRegistry.lookup(config.threadId());
         if (handle == null || handle.pendingSteers() == 0) {
             return;
@@ -292,9 +297,11 @@ public final class CompiledGraph {
         if (sink != null) {
             sink.accept(new Events.StepEvent("steer", "completed",
                     "injected_messages=" + injected.size()
-                            + (hasSystem ? ";injected_kind=system" : "")));
+                            + (hasSystem ? ";injected_kind=system" : "")
+                            + (finalRerun ? ";rerun=true" : "")));
         }
-        LOG.debug("steering: 注入 {} 条插话（thread={}）", injected.size(), config.threadId());
+        LOG.debug("steering: 注入 {} 条插话（thread={}，rerun={}）",
+                injected.size(), config.threadId(), finalRerun);
     }
 
     private RunOutcome runLocked(GraphState input, RunConfig config, EventSink sink) {
@@ -304,6 +311,8 @@ public final class CompiledGraph {
         // ，批准后从它继续执行而不重跑 chat）。未知节点由运行期兜底报错。
         String current = config.entryOverride() != null ? config.entryOverride() : entry;
         int steps = 0;
+        // steer 终局重跑 guard（GUI 验收缺陷 3，方案 A）：每 run 至多一次。
+        boolean rerunUsed = false;
         while (!GraphBuilder.END.equals(current)) {
             if (sink != null && sink.cancelled()) {
                 // 循环顶取消（审查 A-P1 步间窗）：上一步的完成态可能已带着
@@ -393,7 +402,22 @@ public final class CompiledGraph {
             }
             persistState(config, state);
             steps++;
-            current = nextOf(current, state);
+            String next = nextOf(current, state);
+            // steer 终局重跑（GUI 验收缺陷 3，方案 A）：最后节点运行期到达的
+            // 插话在既有 loop-top（节点开始前）无注入机会——chat 图纯文本
+            // 回复只有一个节点，插话会被静默丢弃、steer 在最常见场景失效。
+            // 终局分支：下一跳=END 且队列非空 → 注入并重跑该节点一次（guard
+            // 每 run 一次；重跑期到达的插话随 run 终止丢弃=既有 v1 边界继续
+            // 成立；recursionLimit 照常计数）。wire=增量事件：SseStreams 的
+            // per-node first-seen 去重吞掉重跑的 running，前端 FIFO 配对幂
+            // 等兜底、delta 追加同一气泡，done 不变（逐字节兼容）。
+            if (GraphBuilder.END.equals(next) && !rerunUsed
+                    && RunRegistry.hasPendingSteers(config.threadId())) {
+                rerunUsed = true;
+                drainSteering(config, state, sink, true);
+                next = current;
+            }
+            current = next;
         }
         return new RunOutcome(state, Events.RunTermination.DONE, null);
     }

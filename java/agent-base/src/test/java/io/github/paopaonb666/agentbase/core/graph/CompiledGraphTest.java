@@ -960,4 +960,74 @@ class CompiledGraphTest {
                 new GraphState(), RunConfig.of("chat:t2", "u1"), null);
         assertEquals(Events.RunTermination.CANCELLED, outcome.termination());
     }
+
+    @Test
+    void steerArrivingDuringLastNodeIsInjectedAndNodeRerunsOnce() throws Exception {
+        // GUI 验收缺陷 3（方案 A 终局重跑）：chat 纯文本轮只有一个节点，
+        // 节点运行期到达的插话在既有 loop-top（节点开始前）无注入机会——
+        // 修复前随 run 终止静默丢弃（steer 在最常见场景失效）。修复=下一跳
+        // 为 END 且队列非空时注入并重跑该节点一次（guard 每 run 一次）。
+        CountDownLatch nodeStarted = new CountDownLatch(1);
+        CountDownLatch steerQueued = new CountDownLatch(1);
+        AtomicBoolean secondPass = new AtomicBoolean(false);
+        RecordingSink sink = new RecordingSink();
+        InMemoryCheckpointer cp = new InMemoryCheckpointer();
+        CompiledGraph graph = GraphBuilder.begin()
+                .addNode("agent", (state, ctx) -> {
+                    nodeStarted.countDown();
+                    try {
+                        steerQueued.await(5, java.util.concurrent.TimeUnit.SECONDS);
+                    } catch (InterruptedException ignored) {
+                        Thread.currentThread().interrupt();
+                    }
+                    if (secondPass.getAndSet(true)) {
+                        return Map.of(GraphState.MESSAGES,
+                                List.of(AiMessage.from("after-steer")));
+                    }
+                    return Map.of(GraphState.MESSAGES, List.of(AiMessage.from("first")));
+                })
+                .entry("agent")
+                .addEdge("agent", GraphBuilder.END)
+                .compile(cp, "chat");
+
+        Thread runner = new Thread(() -> graph.stream(
+                new GraphState(), RunConfig.of("chat:t-steer", "u1"), sink));
+        runner.start();
+        assertTrue(nodeStarted.await(5, java.util.concurrent.TimeUnit.SECONDS),
+                "节点应已开始执行（RunRegistry 已注册）");
+        RunRegistry.RunHandle handle = RunRegistry.lookup("chat:t-steer");
+        assertNotNull(handle, "run 在途句柄可用");
+        assertTrue(handle.steer("user", "改写结尾"), "插话入队");
+        steerQueued.countDown();
+        runner.join(10000);
+        assertFalse(runner.isAlive(), "图运行应在限时内结束");
+
+        // 注入落盘：快照 messages 含插话 UserMessage + 两轮 assistant 产出。
+        GraphState persisted = cp.get("chat:t-steer");
+        assertNotNull(persisted);
+        assertTrue(persisted.messages().stream().anyMatch(m ->
+                        m instanceof UserMessage um && "改写结尾".equals(um.singleText())),
+                "插话 UserMessage 应注入快照（修复前被静默丢弃）");
+        assertEquals(3, persisted.messages().size(), "first + 注入 + after-steer");
+        // guard 每 run 一次：事件流恰一条 steer completed（带 rerun 标记）。
+        long steerEvents = sink.events.stream()
+                .filter(e -> e instanceof Events.StepEvent se && "steer".equals(se.name()))
+                .count();
+        assertEquals(1, steerEvents, "终局重跑的 steer 事件恰一次");
+    }
+
+    @Test
+    void runRegistryRegisterIsIdempotentForTheSameOwner() {
+        // GUI 验收缺陷 2：routes 层预注册 + 图执行线程复用——同属主重复注册
+        // 返回同一句柄（修复前防御性抛 IllegalStateException → 预注册方案
+        // 不可行）。属主不一致仍抛出。
+        RunRegistry.RunHandle first = RunRegistry.register("chat:t-reg", "u1");
+        RunRegistry.RunHandle second = RunRegistry.register("chat:t-reg", "u1");
+        assertEquals(first.runId(), second.runId(), "幂等复用同一句柄");
+        assertThrows(IllegalStateException.class,
+                () -> RunRegistry.register("chat:t-reg", "someone-else"),
+                "属主不一致仍防御性抛出");
+        RunRegistry.unregister("chat:t-reg", first);
+        assertNull(RunRegistry.lookup("chat:t-reg"));
+    }
 }

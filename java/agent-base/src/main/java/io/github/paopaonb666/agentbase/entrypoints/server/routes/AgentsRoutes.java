@@ -481,13 +481,24 @@ public class AgentsRoutes {
             if (attachmentFileIds != null) {
                 runtime.fileStore().bindThread(attachmentFileIds, config.threadId());
             }
+            // steer 竞态收口（GUI 验收缺陷 2）：run 注册提前到返回 emitter
+            // 之前——「响应已可见、注册仍在异步图任务里」的窗口内到达的
+            // steer 会被 404 掩蔽。RunRegistry.register 幂等：图执行线程
+            // 复用同一句柄；open 失败由 catch 注销（finally 还闸门许可照旧）。
+            RunRegistry.RunHandle preRegistered =
+                    RunRegistry.register(config.threadId(), config.userId());
             // R1-F7：SSE emitter 可选超时（0 = 关闭，行为不变）——半开连接
             // （无 RST）不再无限占 #79 闸门额度。秒 → 毫秒：先升 long 再乘
             // （int * 1000L，溢出不进门）。
-            SseEmitter emitter = SseStreams.open(graph, messagesInput, effectiveExtra, config, userThreadId,
-                    onComplete, runGate::exit, runtime.settings().agentSseTimeoutSeconds * 1000L);
-            opened = true;
-            return emitter;
+            try {
+                SseEmitter emitter = SseStreams.open(graph, messagesInput, effectiveExtra, config, userThreadId,
+                        onComplete, runGate::exit, runtime.settings().agentSseTimeoutSeconds * 1000L);
+                opened = true;
+                return emitter;
+            } catch (RuntimeException e) {
+                RunRegistry.unregister(config.threadId(), preRegistered);
+                throw e;
+            }
         } finally {
             if (!opened) {
                 runGate.exit();

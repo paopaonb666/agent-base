@@ -98,16 +98,22 @@ public final class RunRegistry {
     }
 
     /**
-     * 注册在途 run（图执行线程在 per-thread 锁内调用——putIfAbsent 冲突即
-     * 编程错误，防御性抛出）。
+     * 注册在途 run。幂等：routes 层（startStream）在返回 emitter 前预注册
+     * ——消除「响应已可见、注册仍在异步图任务里」的竞态窗（GUI 验收缺陷
+     * 2：流开始后立即 steer 被 404 掩蔽）；图执行线程（per-thread 锁内）
+     * 复用同一句柄。属主不一致仍防御性抛出（同一 thread 换属主=编程错误）。
      */
     public static RunHandle register(String threadId, String userId) {
-        RunHandle handle = new RunHandle(userId);
-        if (ACTIVE.putIfAbsent(threadId, handle) != null) {
-            throw new IllegalStateException(
-                    "run already registered for thread " + threadId);
+        RunHandle existing = ACTIVE.putIfAbsent(threadId, new RunHandle(userId));
+        if (existing != null) {
+            if (!existing.userId().equals(userId)) {
+                throw new IllegalStateException(
+                        "run already registered for thread " + threadId
+                                + " with a different owner");
+            }
+            return existing;
         }
-        return handle;
+        return ACTIVE.get(threadId);
     }
 
     /** 注销（终态 finally；identity 语义防误删后继 run 的句柄）。 */
@@ -118,6 +124,12 @@ public final class RunRegistry {
     /** 查在途 run 句柄；线程空闲返回 null。 */
     public static RunHandle lookup(String threadId) {
         return ACTIVE.get(threadId);
+    }
+
+    /** 是否有待注入插话（图终局重跑分支的判据；线程空闲=false）。 */
+    public static boolean hasPendingSteers(String threadId) {
+        RunHandle handle = ACTIVE.get(threadId);
+        return handle != null && handle.pendingSteers() > 0;
     }
 
     /**
