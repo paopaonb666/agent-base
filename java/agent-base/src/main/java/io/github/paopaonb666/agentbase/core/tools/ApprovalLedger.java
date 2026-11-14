@@ -51,13 +51,27 @@ public final class ApprovalLedger {
      * 有效期）返回 EXPIRED 并清除记录；否则 APPROVED/REJECTED。
      */
     public static Status status(String threadId, String callId, long ttlSeconds) {
+        return status(threadId, callId, ttlSeconds, true);
+    }
+
+    /**
+     * 查决定状态，{@code consumeExpired} 决定 EXPIRED 时是否同时清除记录。
+     * 消费方（hintText / ExecuteNode 的回喂与执行点）用 true——过期即消费；
+     * 判定方用 false：同一门判定里 pauseReason 先问、hintText 后问，判定
+     * 阶段若把过期记录提前清掉，回喂文本只能落到 ABSENT 分支（GUI 验收
+     * 二轮 D6：「缺少审批决定」冒充「审批已超时」，模型收到错误归因）。
+     */
+    public static Status status(String threadId, String callId, long ttlSeconds,
+                                boolean consumeExpired) {
         Decision decision = LEDGER.get(key(threadId, callId));
         if (decision == null) {
             return Status.ABSENT;
         }
         if (ttlSeconds > 0
                 && System.currentTimeMillis() - decision.decidedAtMillis() > ttlSeconds * 1000L) {
-            LEDGER.remove(key(threadId, callId));
+            if (consumeExpired) {
+                LEDGER.remove(key(threadId, callId));
+            }
             return Status.EXPIRED;
         }
         return decision.approved() ? Status.APPROVED : Status.REJECTED;

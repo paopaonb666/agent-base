@@ -54,8 +54,11 @@ public final class ToolApprovalGate {
             if (!isDangerous(request, dangerous)) {
                 continue;
             }
+            // 判定不消费（D6）：EXPIRED 记录留待同一次门判定里 hintText
+            // 消费——否则回喂文本落到 ABSENT 分支（「缺少审批决定」冒充
+            // 「审批已超时」，模型收到错误归因）。
             ApprovalLedger.Status status =
-                    ApprovalLedger.status(threadId, request.id(), ttlSeconds);
+                    ApprovalLedger.status(threadId, request.id(), ttlSeconds, false);
             if (status == ApprovalLedger.Status.ABSENT) {
                 pending++;
                 if (names.length() > 0) {

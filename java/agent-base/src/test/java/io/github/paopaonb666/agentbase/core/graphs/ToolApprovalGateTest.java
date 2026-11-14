@@ -90,6 +90,22 @@ class ToolApprovalGateTest {
         assertEquals(ApprovalLedger.Status.ABSENT, ApprovalLedger.status("ht", "h3", 10));
     }
 
+    @Test
+    void expiredDecisionSurvivesPauseCheckSoHintTextSeesExpiry() {
+        // GUI 验收二轮 D6 回归锁：同一门判定里 pauseReason 先问、hintText
+        // 后问——判定阶段若消费掉过期记录，回喂文本只能落到 ABSENT 分支
+        // （「缺少审批决定」冒充「审批已超时」，模型收到错误归因）。
+        var dangerous = ToolApprovalGate.parseDangerous("deploy_prod");
+        ApprovalLedger.recordAt("px", "x1", true, System.currentTimeMillis() - 60_000);
+        // 判定阶段：EXPIRED 视同已拒绝 → 不暂停；记录不被消费。
+        assertNull(ToolApprovalGate.pauseReason(List.of(call("x1", "deploy_prod")),
+                dangerous, "px", 10));
+        // 消费阶段：hintText 仍能看到 EXPIRED → 超时提示文本。
+        String expired = ToolApprovalGate.hintText(call("x1", "deploy_prod"), dangerous, "px", 10);
+        assertTrue(expired.contains("审批已超时"), expired);
+        assertEquals(ApprovalLedger.Status.ABSENT, ApprovalLedger.status("px", "x1", 10));
+    }
+
     // ── 图级 e2e（真实 tools 节点）───────────────────────────────────────
 
     /** 脚本化主力：按序返回预置 AiMessage（工具调用轮→收尾轮）。 */
