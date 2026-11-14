@@ -349,6 +349,26 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
     /** 混合检索（注入路径与搜索端点共用）——内部打分视图。 */
     public List<Retrieval.ScoredMemory> searchScored(String userId, String agentId, String query,
                                                      Integer topK) {
+        return searchScored(userId, agentId, query, topK, true, null);
+    }
+
+    /**
+     * 混合检索，{@code applySalienceExempt=false} 为搜索端点专用收紧
+     * （GUI 验收二轮 D9）：不享受 #181 显著度豁免——显式查询的结果必须
+     * 有相关性证据且过总分门，空态才可达。chat 召回路径保持豁免。
+     */
+    public List<Retrieval.ScoredMemory> searchScored(String userId, String agentId, String query,
+                                                     Integer topK, boolean applySalienceExempt) {
+        return searchScored(userId, agentId, query, topK, applySalienceExempt, null);
+    }
+
+    /**
+     * 全参形态：候选状态集（GUI 验收二轮 D10）——null = 默认只召回
+     * active；搜索端点带状态筛选时传对应集合，归档/废弃条目才可被检索。
+     */
+    public List<Retrieval.ScoredMemory> searchScored(String userId, String agentId, String query,
+                                                     Integer topK, boolean applySalienceExempt,
+                                                     List<String> candidateStatuses) {
         long started = System.nanoTime();
         boolean hasEmbedding = embedder.dims() != null;
         double minScore = settings.memory.recallMinScore;
@@ -359,7 +379,7 @@ public final class MemoryService implements AgentModule.MemoryServicePort {
         }
         List<Retrieval.ScoredMemory> results = Retrieval.recallMemories(store, embedder, userId,
                 agentId, query, topK != null ? topK : settings.memory.recallTopK, minScore, settings,
-                vectorIndex);
+                vectorIndex, applySalienceExempt, candidateStatuses);
         // 降级观测（#195）：embedding 缺席的检索打 degraded（纯 BM25 路径
         // 与正常混合召回在监控上可区分），而不是一律 ok。
         Metrics.memory().observe("search", hasEmbedding ? "ok" : "degraded",

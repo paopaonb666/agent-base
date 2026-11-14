@@ -261,6 +261,25 @@ class RetrievalTest {
     }
 
     @Test
+    void searchPathIgnoresSalienceExemption() {
+        // GUI 验收二轮 D9 回归锁：applySalienceExempt=false（搜索端点）——
+        // 高显著度豁免不旁路双门槛，与 query 无词面/向量交集的常驻记忆不再
+        // 入榜，文本搜索的空态可达。chat 召回路径（同语料的
+        // highSalienceMemoryExemptFromEvidenceGate）保持豁免不受影响。
+        double now = Models.now();
+        Settings settings = Settings.load(java.util.Map.of("ENV", "development"), null);
+        MemoryRecord evidence = rec("ev", "semantic", "数据库备份在凌晨三点", null, 0.5, now);
+        MemoryRecord resident = new MemoryRecord("res", "u1", "*", "semantic",
+                "完全无关的常驻事实", List.of(), null, null, 1.0, "active", "", List.of(),
+                now, now, null, 0);
+        List<ScoredMemory> out = Retrieval.recallMemories(
+                new FakeStore(new ArrayList<>(List.of(resident, evidence))),
+                null, "u1", null, "数据库", 10, 0.5, settings, null, false);
+        assertEquals(List.of("ev"), out.stream().map(s -> s.record().memoryId()).toList(),
+                "搜索路径下豁免记忆不得绕过双门槛");
+    }
+
+    @Test
     void exemptMemoryDoesNotEvictEvidenceHitsWithinTopK() {
         // topK 内名额：豁免记忆按低总分排尾，不会顶掉有证据的记忆
         // （对照用例：2 条有证据 + 1 条豁免常驻，topK=2 只含证据记忆）。

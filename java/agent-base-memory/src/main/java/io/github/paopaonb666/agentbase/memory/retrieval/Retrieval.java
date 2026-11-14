@@ -707,16 +707,46 @@ public final class Retrieval {
         return recallMemories(store, embedder, userId, agentId, query, topK, minScore, config, null);
     }
 
+    public static List<ScoredMemory> recallMemories(MemoryStore store, EmbeddingClient embedder,
+                                                    String userId, String agentId, String query,
+                                                    Integer topK, double minScore,
+                                                    Settings config, VectorIndexPort vectorIndex) {
+        return recallMemories(store, embedder, userId, agentId, query, topK, minScore, config,
+                vectorIndex, true);
+    }
+
     /**
      * 向量下推变体（#324）：vectorIndex 非空且查询向量可用、候选集存在
      * 向量时，混合打分的候选池 = 向量 KNN top-N ∪ 无向量候选（关键词
      * 路径不受下推挤压）。否则与基线完全一致——brute-force 默认实现下
      * 排序逐条相同（#325 的语义基线）。
+     *
+     * <p>{@code applySalienceExempt=false}（GUI 验收二轮 D9）：搜索端点
+     * 专用——用户显式查询时结果必须有相关性证据且过总分门，#181 显著度
+     * 豁免不旁路双门槛，否则无关词也返回全量列表、空态不可达。chat 召回
+     * 路径保持 {@code true}（豁免语义不变）。
      */
     public static List<ScoredMemory> recallMemories(MemoryStore store, EmbeddingClient embedder,
                                                     String userId, String agentId, String query,
                                                     Integer topK, double minScore,
-                                                    Settings config, VectorIndexPort vectorIndex) {
+                                                    Settings config, VectorIndexPort vectorIndex,
+                                                    boolean applySalienceExempt) {
+        return recallMemories(store, embedder, userId, agentId, query, topK, minScore, config,
+                vectorIndex, applySalienceExempt, null);
+    }
+
+    /**
+     * 全参形态：在向量下推与豁免开关之上再开放候选状态集——
+     * {@code candidateStatuses} 为 null/空 = 默认只召回 active（chat 召回
+     * 语义）；搜索端点带状态筛选时传对应集合，归档/废弃条目才能被检索到
+     * （GUI 验收二轮 D10：候选池硬编码 active 时状态过滤形同虚设）。
+     */
+    public static List<ScoredMemory> recallMemories(MemoryStore store, EmbeddingClient embedder,
+                                                    String userId, String agentId, String query,
+                                                    Integer topK, double minScore,
+                                                    Settings config, VectorIndexPort vectorIndex,
+                                                    boolean applySalienceExempt,
+                                                    List<String> candidateStatuses) {
         // 容量契约（H2）：候选集上限与 store 的列表上限一致。达到上限说明
         // 用户记忆量已超出当前"全量拉取 + 内存打分"实现的设计容量——更早
         // 的记忆本轮永远召不回，必须显式告警而不是静默截断。
@@ -727,7 +757,9 @@ public final class Retrieval {
                 ? timestamp - config.memory.episodicTtlDays * DAY_SECONDS
                 : null;
         List<Models.MemoryRecord> records = store.listMemories(userId, agentId, true, null,
-                List.of("active"), CANDIDATE_LIMIT, false, episodicCutoff);
+                candidateStatuses == null || candidateStatuses.isEmpty()
+                        ? List.of("active") : candidateStatuses,
+                CANDIDATE_LIMIT, false, episodicCutoff);
         if (records.size() >= CANDIDATE_LIMIT) {
             LOG.warn(
                     "memory: 召回候选达到上限 {}（user='{}', agent='{}'）——更早的记忆不参与本轮检索；"
@@ -820,7 +852,9 @@ public final class Retrieval {
             for (ScoredMemory item : scored) {
                 // 两道同豁（#181）：只豁证据门则总分门（0.3 天花板 < 0.5）
                 // 仍拦死，豁免无效——豁免 = 整个双门槛旁路，排序照旧。
-                boolean exempt = config.memory.salienceExemptThreshold > 0
+                // 搜索端点（applySalienceExempt=false）不享受豁免（D9）。
+                boolean exempt = applySalienceExempt
+                        && config.memory.salienceExemptThreshold > 0
                         && item.record().salience() >= config.memory.salienceExemptThreshold;
                 if (exempt || (item.score() >= minScore
                         && (item.keywordScore() > 0 || item.vectorScore() > 0))) {

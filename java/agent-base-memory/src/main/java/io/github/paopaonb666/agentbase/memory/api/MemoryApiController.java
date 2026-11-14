@@ -142,8 +142,15 @@ public class MemoryApiController {
         Map<String, Object> out = new LinkedHashMap<>();
         if (q != null && !q.isEmpty()) {
             out.put("query", q);
+            // 搜索端点不享受 #181 显著度豁免（D9）：显式查询的结果必须有
+            // 相关性证据且过总分门——否则无关词也返回全量列表、空态不可达。
+            // chat 召回路径（MemoryService.searchScored 四参形态）保持豁免。
+            // status 同时下推候选集（D10：候选池硬编码 active 时，带检索词
+            // 的状态筛选形同虚设——归档/废弃条目连候选都进不了）。
+            List<String> statusFilter = status == null || status.isEmpty() ? null : List.of(status);
             List<Map<String, Object>> memories = new ArrayList<>();
-            for (var item : memory.searchScored(userId, module, q, clampedLimit)) {
+            for (var item : memory.searchScored(userId, module, q, clampedLimit, false,
+                    statusFilter)) {
                 if (kind != null && !kind.isEmpty() && !kind.equals(item.record().kind())) {
                     continue;
                 }
