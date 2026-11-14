@@ -243,7 +243,8 @@ public final class SupervisorGraphs {
                 config.userId(),
                 config.recursionLimit());
         EventSink forwardSink = nodeCtx::emit;
-        GraphState finalState = subgraph.stream(new GraphState(messages, Map.of()), subConfig, forwardSink);
+        GraphState finalState = subgraph.stream(
+                new GraphState(messagesForSubgraph(messages), Map.of()), subConfig, forwardSink);
         AiMessage reply = lastAi(finalState);
         if (reply == null) {
             return "";
@@ -261,6 +262,25 @@ public final class SupervisorGraphs {
             }
         }
         return null;
+    }
+
+    /**
+     * 子图入参（GUI 验收二轮 D1）：剥离尾部悬空的 handoff tool_calls
+     * AiMessage——handoffs 节点里它的 ToolMessage 要等本 {@code runHandoff}
+     * 返回后才回填，原样透传会让子图首轮 LLM 调用携带「assistant 带
+     * tool_calls 却无后续 tool 消息」的非法序列，被 provider 以
+     * invalid_request_error 拒绝（handoff 从未成功过）。剥离后子图看到的
+     * 上下文即用户请求+supervisor 叙事，与 langgraph-supervisor 的 handoff
+     * 语义一致（子 agent 不消费父 agent 的工具调用壳）。历史中更早的
+     * tool_calls 消息均与各自 ToolMessage 配对完整，不受影响。
+     */
+    static List<ChatMessage> messagesForSubgraph(List<ChatMessage> messages) {
+        if (!messages.isEmpty()
+                && messages.get(messages.size() - 1) instanceof AiMessage ai
+                && ai.hasToolExecutionRequests()) {
+            return messages.subList(0, messages.size() - 1);
+        }
+        return messages;
     }
 
     private static boolean lastAiHasToolCalls(GraphState state) {
