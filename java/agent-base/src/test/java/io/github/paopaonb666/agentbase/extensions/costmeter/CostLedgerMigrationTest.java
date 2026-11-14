@@ -121,4 +121,32 @@ class CostLedgerMigrationTest {
         }
         assertEquals(before + 1, CostMeters.cost().pendingRows(), "sink 形态入队一行");
     }
+
+    @Test
+    void readPathDoesNotHoldWriteLockForOtherConnections(@TempDir Path tempDir) throws Exception {
+        // GUI 验收缺陷 1（阻塞级）：账本连接常驻 autocommit(false)，读路径
+        // （/health 的 cost governor 每次调 totalsSince/totalsByDay）执行
+        // SELECT 后不结束事务 → SHARED 锁永久持有 → 同库所有其他连接的写
+        // （thread index claim 等）SQLITE_BUSY → invoke 全量 500。
+        // 回归锁：读路径之后，另一个连接必须能立即写入（修复前必红）。
+        Path db = tempDir.resolve("cost.db");
+        CostLedgers.SqliteCostLedger ledger = new CostLedgers.SqliteCostLedger(db.toString());
+        ledger.append(new UsageRecord(1000.0, "r1", "m", "main", 10, 5, 0, 0.02, null, null));
+        ledger.flush();
+        ledger.totalsSince(0);
+        ledger.totalsByDay();
+        // 第二个连接（短 busy_timeout，失败要快而不是等默认 3s）
+        org.sqlite.SQLiteConfig probeConfig = new org.sqlite.SQLiteConfig();
+        probeConfig.setBusyTimeout(300);
+        try (var probe = probeConfig.createConnection("jdbc:sqlite:" + db)) {
+            try (var ps = probe.prepareStatement(
+                    "INSERT INTO cost_usage (ts, request_id, model, profile, prompt_tokens,"
+                            + " completion_tokens, cache_read_tokens, cost_cny)"
+                            + " VALUES (1.0, 'probe', 'm', 'main', 0, 0, 0, 0)")) {
+                ps.executeUpdate();
+            }
+            // probe 默认 autocommit=true：语句即提交，无需显式 commit。
+        }
+        ledger.close();
+    }
 }

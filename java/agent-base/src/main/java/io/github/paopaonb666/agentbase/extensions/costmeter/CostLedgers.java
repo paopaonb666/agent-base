@@ -212,6 +212,11 @@ public final class CostLedgers {
         public SqliteCostLedger(String dbPath) {
             try {
                 this.conn = DriverManager.getConnection("jdbc:sqlite:" + dbPath);
+                // 初始化（DDL + 迁移）在显式事务里跑，完成后恢复 autocommit：
+                // 常驻 autocommit(false) 会让读路径（totalsSince/totalsByDay，
+                // /health 的 cost governor 每次调用）的 SELECT 打开读事务且永不
+                // 结束——SHARED 锁永久持有，同库其他连接（thread index claim）
+                // 的写全部 SQLITE_BUSY（GUI 验收缺陷 1，阻塞级）。
                 this.conn.setAutoCommit(false);
                 try (Statement st = conn.createStatement()) {
                     st.execute(SQLITE_DDL);
@@ -219,6 +224,7 @@ public final class CostLedgers {
                 }
                 conn.commit(); // 对应 Python aiosqlite 的显式 commit
                 applyMigrations();
+                this.conn.setAutoCommit(true);
             } catch (SQLException e) {
                 throw new IllegalStateException("cost: sqlite 账本初始化失败: " + e.getMessage(), e);
             }
@@ -270,6 +276,15 @@ public final class CostLedgers {
 
         @Override
         protected boolean insertRows(List<UsageRecord> rows) {
+            // 写批事务窗口（ToolCallLoggers 微批同款）：仅写期间切 autocommit
+            // false，半批可回滚（#262）；窗口外连接回到 autocommit——读路径与
+            // 其他连接的写不再被残留事务锁挡住。
+            try {
+                conn.setAutoCommit(false);
+            } catch (SQLException e) {
+                LOG.error("cost: sqlite autocommit switch failed", e);
+                return false;
+            }
             try {
                 try (PreparedStatement ps = conn.prepareStatement(INSERT_SQL)) {
                     for (UsageRecord r : rows) {
@@ -289,6 +304,12 @@ public final class CostLedgers {
                 }
                 LOG.error("cost: sqlite insert failed——批次将重放", e);
                 return false;
+            } finally {
+                try {
+                    conn.setAutoCommit(true);
+                } catch (SQLException e) {
+                    LOG.warn("cost: sqlite autocommit restore failed", e);
+                }
             }
         }
 
