@@ -194,6 +194,21 @@ class AgentsRoutesTest {
     // ── invoke 校验链（422 矩阵） ─────────────────────────────────────────
 
     @Test
+    void invokeRequestBindsSnakeCaseThreadId() throws Exception {
+        // 前端/Python wire 发 snake_case thread_id（java-differences.md 的兼容
+        // 声明）：Jackson 绑定必须接受 snake_case 别名，否则该键被静默丢弃、
+        // 服务端每轮都生成新线程 id，多轮对话完全失效。
+        // mapper 走 Spring Boot 默认装配路径（Jackson2ObjectMapperBuilder，
+        // FAIL_ON_UNKNOWN_PROPERTIES 关闭）——与生产 @RequestBody 绑定同口径。
+        // 回归锁：修复前 threadId 绑定为 null，本用例必红。
+        AgentsRoutes.InvokeRequest body = org.springframework.http.converter.json.Jackson2ObjectMapperBuilder
+                .json().build()
+                .readValue("{\"message\":\"hi\",\"thread_id\":\"wire-t1\",\"unknown_key\":1}",
+                        AgentsRoutes.InvokeRequest.class);
+        assertEquals("wire-t1", body.threadId());
+    }
+
+    @Test
     void invokeValidationMatrixGives422() throws Exception {
         AgentRuntime runtime = buildRuntime(Map.of("chat", stubModule("chat")),
                 null, null, null, null, null, null);

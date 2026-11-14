@@ -153,7 +153,9 @@ public class AgentsRoutes {
 
     // ── invoke 请求体（校验在 invoke 内手写 → 422，对齐 FastAPI 语义） ────
 
-    public record InvokeRequest(String message, String threadId, List<String> attachments,
+    public record InvokeRequest(String message,
+                                @com.fasterxml.jackson.annotation.JsonAlias("thread_id")
+                                String threadId, List<String> attachments,
                                 String mode, String profile,
                                 @com.fasterxml.jackson.annotation.JsonProperty("continue_plan")
                                 Boolean continuePlan) {
