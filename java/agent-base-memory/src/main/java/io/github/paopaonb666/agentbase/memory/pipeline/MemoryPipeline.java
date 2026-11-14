@@ -637,9 +637,20 @@ public final class MemoryPipeline {
         String raw = complete(PROFILE_MERGE_PROMPT
                 .replace("{profile}", profileJson)
                 .replace("{facts}", factLines.toString()), bulkFast());
-        Object merged = parseJsonBlock(raw);
+        // GUI 验收缺陷 7：模型偶发输出不可解析（非 JSON 散文/错误形态）——
+        // 此前抛 IllegalArgumentException 让画像轮记 error 中断。画像合并
+        // 是尽力而为的后台管线：解析失败保旧画像返回 false，一轮失败不让
+        // 画像退化（WARN 留痕）。
+        Object merged;
+        try {
+            merged = parseJsonBlock(raw);
+        } catch (IllegalArgumentException e) {
+            LOG.warn("memory: profile 合并输出不可解析，保持既有画像（user={}）", userId);
+            return false;
+        }
         if (!(merged instanceof Map<?, ?> rawMerged) || rawMerged.isEmpty()) {
-            throw new IllegalArgumentException("画像合并输出不是 JSON 对象");
+            LOG.warn("memory: profile 合并输出不是 JSON 对象，保持既有画像（user={}）", userId);
+            return false;
         }
         ops.saveProfile(userId, asStringMap(rawMerged));
         return true;

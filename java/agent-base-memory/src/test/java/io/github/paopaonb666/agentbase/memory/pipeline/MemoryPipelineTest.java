@@ -603,6 +603,25 @@ class MemoryPipelineTest {
     }
 
     @Test
+    void mergeProfileKeepsExistingProfileOnUnparsableOutput() {
+        // GUI 验收缺陷 7：模型偶发输出非 JSON——mergeProfile 此前抛
+        // IllegalArgumentException（pipeline 记 error、画像轮中断）。修复=
+        // 解析失败保旧画像返回 false，一轮失败不让画像退化。
+        ScriptedFast fast = new ScriptedFast();
+        fast.responses.add("我觉得画像应该是这样的，但我说不清楚格式。");
+        RecordingOps ops = new RecordingOps();
+        java.util.Map<String, Object> prior = new java.util.LinkedHashMap<>();
+        prior.put("基本信息", List.of("工程师"));
+        ops.profileToReturn = prior;
+        MemoryPipeline pipeline = pipelineWith(new ScriptedMain(), fast, ops);
+
+        assertFalse(pipeline.mergeProfile("u1", List.of("新事实")),
+                "不可解析输出保旧返回 false（修复前抛 IllegalArgumentException）");
+        assertTrue(ops.calls.stream().noneMatch(c -> c.startsWith("saveProfile:")),
+                "保旧——不得覆写画像");
+    }
+
+    @Test
     void updateSummaryCapsAtThousandChars() {
         ScriptedFast fast = new ScriptedFast();
         fast.responses.add("s".repeat(1200));
