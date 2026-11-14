@@ -660,4 +660,45 @@ class PlannerGraphTest {
         assertEquals("done", io.github.paopaonb666.agentbase.modules.planner.graph.PlannerState
                 .tasks(finalOutcome.state()).get(0).get(PlannerState.STATUS));
     }
+
+    /** GUI 验收缺陷 5：审批门开启时，已批准/执行过的计划快照线程上追加新
+     *  指令走 #66 continue-skip 分支直接放行执行——绕过审批门。修复=门开启
+     *  时 continue 分支同样打 pause marker（初始/continue/replan 三路统一）。 */
+    @Test
+    void continuePlanOnExecutedThreadStillPausesWhenGateOn() {
+        ScriptedModel model = new ScriptedModel(
+                AiMessage.from("[{\"id\": 1, \"goal\": \"A\"}]"),
+                AiMessage.from("A 的结果"),
+                AiMessage.from("综合答复：A 完成"),
+                AiMessage.from("第二轮的结果"));
+        Settings settings = new Settings();
+        settings.planner.planApproval = true;
+        CompiledGraph graph = PlannerGraphs.buildPlannerGraph(new AgentModule.ModuleContext(
+                settings, model, new InMemoryCheckpointer(), List.of(), null,
+                new RecordingPlanStore()));
+        String threadId = "planner:t-continue";
+        // 第一轮完整走完（plan → 暂停 → 批准 → resume 执行 → done）。
+        graph.streamWithTermination(new GraphState(List.of(UserMessage.from("做 A")), Map.of()),
+                new RunConfig(threadId, "u1", 25), null);
+        io.github.paopaonb666.agentbase.core.tools.ApprovalLedger.record(
+                threadId, io.github.paopaonb666.agentbase.modules.planner.graph.PlanNode.PLAN_CALL_ID,
+                true);
+        graph.streamWithTermination(new GraphState(), new RunConfig(threadId, "u1", 25, "execute"), null);
+        // 第二轮：同线程普通 invoke（新指令，无 continue_plan 请求）——快照
+        // seeded tasks 非空触发 continue-skip；门开启时必须再次暂停等批准。
+        CompiledGraph.RunOutcome second = graph.streamWithTermination(
+                new GraphState(List.of(UserMessage.from("再做一件事 B")), Map.of()),
+                new RunConfig(threadId, "u1", 25), null);
+        assertEquals(Events.RunTermination.PAUSED, second.termination(),
+                "已执行计划线程上的新指令必须再次受审批门（修复前 continue 分支直接放行）");
+        assertTrue(graph.getState(new RunConfig(threadId, "u1", 25))
+                .extra().containsKey("pending_approval"), "pending_approval 标记在场");
+        // 批准 → resume 从 execute 续跑剩余子任务。
+        io.github.paopaonb666.agentbase.core.tools.ApprovalLedger.record(
+                threadId, io.github.paopaonb666.agentbase.modules.planner.graph.PlanNode.PLAN_CALL_ID,
+                true);
+        CompiledGraph.RunOutcome resumed = graph.streamWithTermination(
+                new GraphState(), new RunConfig(threadId, "u1", 25, "execute"), null);
+        assertEquals(Events.RunTermination.DONE, resumed.termination());
+    }
 }

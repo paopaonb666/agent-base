@@ -50,10 +50,27 @@ public final class PlanNode {
             if (!seeded.isEmpty()) {
                 PlanStreaming.emitPlan(nodeCtx, seeded, "progress",
                         "延续既有计划（cursor=" + PlannerState.cursor(state) + "）");
-                return Map.of(
-                        PlannerState.TASKS, seeded,
-                        PlannerState.CURSOR, PlannerState.cursor(state),
-                        PlannerState.REPLANS, PlannerState.replans(state));
+                Map<String, Object> update = new java.util.LinkedHashMap<>();
+                update.put(PlannerState.TASKS, seeded);
+                update.put(PlannerState.CURSOR, PlannerState.cursor(state));
+                update.put(PlannerState.REPLANS, PlannerState.replans(state));
+                // GUI 验收缺陷 5：门开启时 continue 分支同样受审批——此前
+                // 直接放行执行，已批准计划线程上追加新指令（含未经批准的
+                // 新任务）会完全绕过审批门。三路（初始/continue/replan）统一：
+                // 已批准决定消费放行，否则打 pause marker（图层 apply 后
+                // PAUSED）。
+                if (planApproval) {
+                    if (io.github.paopaonb666.agentbase.core.tools.ApprovalLedger
+                            .status(nodeCtx.config().threadId(), PLAN_CALL_ID, 0)
+                            == io.github.paopaonb666.agentbase.core.tools.ApprovalLedger.Status.APPROVED) {
+                        io.github.paopaonb666.agentbase.core.tools.ApprovalLedger
+                                .clear(nodeCtx.config().threadId(), PLAN_CALL_ID);
+                    } else {
+                        update.put("pending_approval",
+                                Map.of("resume_node", "execute", "detail", "plan"));
+                    }
+                }
+                return update;
             }
             List<ChatMessage> messages = PlannerState.messages(state);
             String goal = PlannerState.lastHumanText(messages);
