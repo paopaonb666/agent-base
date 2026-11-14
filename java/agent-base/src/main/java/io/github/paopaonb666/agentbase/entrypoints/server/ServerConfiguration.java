@@ -111,9 +111,11 @@ public class ServerConfiguration {
             public void addCorsMappings(CorsRegistry registry) {
                 registry.addMapping("/**")
                         .allowedOrigins(settings.corsOrigins.toArray(String[]::new))
-                        // 全部路由只用 GET/POST/DELETE；HEAD/OPTIONS 供预检与探测。
-                        // 收窄自 "*"（Python 侧仍为 *，差异登记 #315）。
-                        .allowedMethods("GET", "POST", "DELETE", "HEAD", "OPTIONS")
+                        // 路由面方法集：GET/POST/DELETE/PATCH（PATCH=memory 记忆
+                        // 保留/停用等端点，浏览器端预检硬依赖）+ HEAD/OPTIONS
+                        // 供预检与探测。收窄自 "*"（Python 侧仍为 *，差异登记
+                        // #315）。
+                        .allowedMethods("GET", "POST", "PATCH", "DELETE", "HEAD", "OPTIONS")
                         // #227：前端消费端要读的两个响应头——X-Request-ID（排障
                         // 关联）与 Retry-After（429/409 的重试等待秒数）跨源可见。
                         .exposedHeaders("X-Request-ID", "Retry-After")

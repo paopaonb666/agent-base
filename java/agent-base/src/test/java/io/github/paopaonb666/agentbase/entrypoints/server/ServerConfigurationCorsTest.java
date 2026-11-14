@@ -12,7 +12,9 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-/** #117：CORS 方法集收窄——Java 路由面只有 GET/POST/DELETE，HEAD/OPTIONS 供预检与探测。 */
+/** #117：CORS 方法集收窄——GET/POST/DELETE/PATCH 是路由面实际用到的方法，
+ * HEAD/OPTIONS 供预检与探测；PATCH 是浏览器端客户端（agent-base-ui 记忆
+ * 保留/停用、审计编辑）的硬依赖——预检被拒 = 功能全死。 */
 class ServerConfigurationCorsTest {
 
     @Test
@@ -27,7 +29,7 @@ class ServerConfigurationCorsTest {
 
         new ServerConfiguration().corsConfigurer(new Settings()).addCorsMappings(registry);
 
-        verify(registration).allowedMethods("GET", "POST", "DELETE", "HEAD", "OPTIONS");
+        verify(registration).allowedMethods("GET", "POST", "PATCH", "DELETE", "HEAD", "OPTIONS");
         // #227：暴露给前端消费面的响应头（限流/闸门 429 与忙 409 都带
         // Retry-After；X-Request-ID 用于排障关联）。
         verify(registration).exposedHeaders("X-Request-ID", "Retry-After");
